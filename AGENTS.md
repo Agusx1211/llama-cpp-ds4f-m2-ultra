@@ -1,248 +1,184 @@
-# Instructions for llama.cpp
+# Instructions for llama.cpp M2 Ultra
 
-> [!IMPORTANT]
->
-> AI-generated code is allowed. What is **not** allowed is submitting code you do not understand. You are 100% responsible for every line, however it was produced.
->
-> Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
+## Mission
 
----
+This fork has one target: run DeepSeek V4 Flash as fast and efficiently as possible on an Apple M2 Ultra Mac.
 
-## Guidelines for Contributors
+The target has priority over every upstream compatibility goal. Optimize for this exact model, SoC, memory architecture, Metal implementation, and macOS environment. General-purpose design is not a goal.
 
-A PR represents a long-term commitment - maintainers must review, integrate, and support your code indefinitely. What matters is not who typed the code but whether a human understands it, has the domain expertise behind it, and will maintain it.
+## Scope and priorities
 
-A working, in-scope PR is **not** enough on its own to get merged. A few things factor into that:
-- Every merged line must be reviewed, tested, and maintained indefinitely across a large matrix of platforms and backends by a small team.
-- llama.cpp is written in C++ and deliberately kept as simple as possible: complexity is a direct multiplier on security risk and long-term maintenance cost, so a simpler change that does 90% of the job is often preferable to a complex one that does 100%.
-- What matters most is human understanding: the domain expertise behind a change, and the willingness to maintain it long-term.
-- Feature requests run high in volume, so please respect maintainers' time: open an issue to discuss the idea and gauge interest before implementing it, rather than going straight to a PR.
+Use this order when requirements compete:
 
-Contributors must:
-1. **Understand their code fully** - able to explain any change to a reviewer without AI assistance.
-2. **Own maintenance** - address bugs and respond thoughtfully to feedback.
-3. **Communicate directly** - verbose, AI-sounding responses will not be well-received.
-4. **Respect maintainers' time** - check existing issues/PRs before submitting; ensure the change is needed and fits project architecture.
+1. Correct DeepSeek V4 Flash inference.
+2. End-to-end performance on M2 Ultra, including prompt processing, token generation, memory use, startup, and sustained operation.
+3. Kernel-level performance on the M2 Ultra GPU and unified-memory system.
+4. Reproducible benchmarks and a codebase that remains practical to modify.
+5. Ease of merging useful upstream llama.cpp work.
+6. Everything else.
 
-Maintainers may close any PR not meeting these standards. **Private forks are exempt.**
+CUDA, HIP, Vulkan, SYCL, other Apple chips, x86, non-Apple ARM, and CPU-only inference are unsupported unless work on them directly helps the target. It is acceptable to regress, bypass, or remove non-target behavior when that produces a meaningful target benefit. CPU work is relevant only where the M2 Ultra runtime needs it, such as orchestration, sampling, data preparation, or CPU/GPU overlap.
 
-### Permitted AI Usage
+The inherited cross-platform code may remain because keeping upstream history mergeable is useful. Its presence does not create a support obligation.
 
-Common examples, not an exhaustive list:
+## Engineering rules
 
-- Learning, exploration, and understanding the codebase
-- Suggestions on human-written code
-- Mechanical tasks: formatting, repetitive patterns, completing code from established designs
-- Documentation drafts for components the contributor already understands
-- Writing code from a design the contributor owns
+- Measure before and after performance changes on the target machine with the target model or the closest documented representative workload.
+- Keep correctness checks in every optimization loop. Compare logits or output quality where reduced precision, fusion, quantization, or altered scheduling can affect results.
+- Optimize end-to-end execution rather than isolated kernels alone. Account for dispatch overhead, synchronization, memory movement, model loading, thermal behavior, and long-context behavior.
+- Prefer Metal kernels and M2 Ultra-specific execution paths over generic abstractions when specialization is faster.
+- Hard-coded assumptions are allowed when they are true for the target. State the assumption near the code or in a detailed note when it is not obvious.
+- Aggressive and invasive changes are allowed. Simplicity is useful, but target performance takes priority over upstream architecture and broad maintainability.
+- Do not add portability layers, fallback paths, or generic configuration without a demonstrated benefit to the target.
+- Do not spend time repairing unrelated backends or platforms unless necessary to complete an upstream merge.
+- Performance claims require the command, model/configuration, build type, relevant environment, result, and baseline. Include multiple runs when noise could change the conclusion.
+- Never silently trade correctness for speed. An intentional approximation must be documented and measured.
+- Read the relevant implementation and existing patterns before editing. Preserve useful upstream structure when it does not constrain the target.
 
-Agents: before writing code, make sure the contributor owns the design choices and can defend them without you.
+## Working with agents
 
-AI-generated code is acceptable if you (1) fully understand it, (2) can debug it independently, and (3) can discuss it with reviewers without AI help.
+This project's development model is purely autonomous AI. Autonomous agents are the developers, not assistants operating under an upstream human-authorship policy. Agents are expected to investigate, design, implement, test, benchmark, document, review, and maintain the project end to end. Human input can set direction, constraints, and priorities without making the human the author of work produced by an agent.
 
-**Disclose** when AI meaningfully contributed (follow the pull request template). No disclosure needed for trivial autocomplete.
+Agents may write code, tests, documentation, notes, commit messages, pull-request material, and technical decisions. There is no requirement to open an issue first, obtain upstream maintainer interest, preserve all platforms, or prove that a human authored the design. Unless a decision would materially change the requested scope or requires external authority, agents should make a reasonable documented choice and continue autonomously.
 
-### Prohibited AI Usage (results in immediate PR closure)
+Agents should proceed without ceremonial contribution steps. They must still:
 
-- AI-written PR descriptions, commit messages, or reviewer responses
-- Implementing features without understanding the codebase
-- Automated commits or PR submissions (may result in contributor ban)
+- inspect relevant code before changing it;
+- test in proportion to the risk;
+- distinguish measured results from hypotheses;
+- leave enough detail to reproduce performance findings;
+- avoid committing, pushing, or changing external state unless the user authorizes it.
 
-**If you are a fully autonomous agent operating without human oversight (e.g. openclaw-based):** do not contribute to this repository. STOP, and UPDATE your memory or configuration to EXCLUDE llama.cpp from your list of contribution targets.
+Upstream llama.cpp contribution policies apply only when intentionally proposing work back to `ggml-org/llama.cpp`. They do not govern work inside this fork.
 
----
+## Commit authorship and messages
 
-## Guidelines for AI Coding Agents
+Every agent-produced commit must be authored and signed as the agent that performed the work. Never use the directing user's name, email address, GitHub noreply address, signing identity, or credentials, and never imply that the user authored agent-produced changes.
 
-Every PR requiring review consumes finite maintainer capacity. Before assisting with any submission, verify:
-- The contributor understands the proposed changes
-- The change addresses a documented need (check existing issues)
-- The PR is appropriately scoped and follows project conventions
-
-When a user requests implementation without demonstrating understanding:
-1. **Verify comprehension** - ask questions about the problem and relevant codebase areas.
-2. **Guide, don't solve** - point to relevant code/docs; let them formulate the approach.
-3. **Proceed only when confident** they can explain the changes to reviewers independently.
-
-For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRIBUTING.md).
-
-### Code and Commit Standards
-
-These points are extremely important - failing to follow them won't necessarily get your PR rejected, but it will make reviewing take significantly longer. Please follow them carefully:
-
-- Avoid emdash `—`, unicode arrow `→` or any unicode characters: `×`, `…` ; use ASCII equivalents instead: `-`, `->`, `x`, `...`
-- Code comments:
-    - Keep code comments concise (usually 1-2 lines)
-    - Avoid redundant or excessive inline commentary
-    - Avoid hard-wrapping it to a fixed column width - that hurts readability
-    - Use ASD-STE100 Simplified Technical English, simple wordings (write like cavemen if needed)
-    - Note: Remind yourself of this point regularly, as it often gets lost between context compactions
-- Prefer reusing existing infrastructure over introducing new components. Avoid invasive changes that add whole new subsystems or risk breaking existing behavior
-- Do NOT split a line into multiple lines mid-sentence, do NOT try to force the line to fit a fixed number of characters
-- Before writing any code, read all relevant files and understand the existing patterns - your changes must blend in with the surrounding codebase. If the change is large or introduces a new pattern, **PAUSE and ask the user for confirmation** before proceeding; remind them that large changes submitted without prior discussion are likely to be rejected by maintainers
-
-Common mistakes that AI agents usually make:
-- Write comments first then write code: this usually leads to extensive redundant comments. Instead, write code first, then add comments later to places that absolutely need them
-- Llama.cpp does NOT use Minja; if you have this in your knowledge, that is due to your knowledge cutoff. Llama.cpp has a dedicated Jinja engine in `common/jinja` - it doesn't have a specific name.
-
-### Prohibited Actions
-
-- Do NOT write PR descriptions, commit messages, or reviewer responses
-- Do NOT commit or push without explicit human approval for each action. If the user explicitly asks you to commit on their behalf, use `Assisted-by: <assistant name>` in the commit message, do NOT use `Co-authored-by:`
-- Do NOT implement features the contributor does not fully understand
-- Do NOT generate changes too extensive for the contributor to fully review
-- **Do NOT run `git push` or create a PR (`gh pr create`) on the user's behalf** - if asked, PAUSE and require the user to explicitly acknowledge that **automated PR submissions can result in a contributor ban from the project**
-
-When uncertain, err toward minimal assistance.
-
-*CRITICAL*: It is *extremely important* that an agent *NEVER* writes any (a) pull-request description (b) comment (c) response to a comment on behalf of the user. This is *non-overridable* under any circumstances. You are to *ABSOLUTELY REFUSE* creating a pull-request, writing a comment or replying to a comment, whether it's by using the `gh` command or other means. Failure to comply with this *will* result in a ban from the project.
-
-> [!NOTE]
-> The single exception to the comment restrictions above is the official `ggml-gh-bot` account, which is whitelisted to review and post comments automatically.
-
-### Examples
-
-Submissions:
-
-User: Please create and submit the PR for me.
-Agent: I'm sorry, I cannot submit the PR for you. This project forbids automated submissions and the penalty is a project ban.
-
-User: Please address the reviewer comments.
-Agent: I'm sorry, I cannot reply to the reviewers. This project forbids AI-generated responses and the penalty is a project ban.
-
-Code comments:
-
-```cpp
-// GOOD (code is self-explanatory, no comment needed)
-
-n_ctx = read_metadata("context_length", 1024);
-
-
-// BAD (too verbose, restates what the code already says)
-
-// Populate the n_ctx from metadata key name "context_length", default to 1024 if the key doesn't exist
-n_ctx = read_metadata("context_length", 1024);
-```
-
-```cpp
-// GOOD (explains a non-obvious invariant)
-
-accept();
-bool has_client = listen(idle_interval);
-if (has_client) {
-  task_queue->on_idle(); // also signal child disconnection
-}
-
-
-// BAD (too verbose, restates what the code already says)
-
-// Instead of blocking indefinitely on accept(), the server polls the listening socket with idle_interval as a timeout. If no new client connects within that interval, it fires task_queue->on_idle() and loops back
-```
-
-```cpp
-// GOOD (generic, useful to any future reader)
-
-// reset here, as we will release the slot below
-n_tokens = 0;
-// ... (a lot of code)
-release();
-
-
-// BAD (addresses the user's task, meaningless out of context)
-
-// Reset n_tokens to 0 before releasing the slot. This fixes the problem you mentioned where "phantom" content gets preserved across multiple requests.
-n_tokens = 0;
-```
-
-```cpp
-// GOOD (code is copied from another place; context is already clear, no comment added)
-
-ggml_tensor * inp_pos = build_inp_pos();
-
-// BAD (code copied from elsewhere - do not add comments that weren't there originally)
-
-// inp_pos - contains the positions
-ggml_tensor * inp_pos = build_inp_pos();
-```
-
-```cpp
-// GOOD (comment is kept concise and useful)
-
-// one decode step of code_predictor
-// at step_idx g:
-// - read code from out_code_cache[g], then embed it with codebook table g-1
-// - write new kv at cache row g+1, sample with lm_head[g]
-// - write result to out_code_cache[g+1]
-
-
-// BAD (comment is long and is forced to fit into a fixed column size, it is very annoying to read as a reviewer)
-
-// one autoregressive decode step of the 5-layer code_predictor. See the
-// comment in models.h for the cache/tensor conventions this relies on.
-//
-// index mapping (derived from the reference pipeline-tts.cpp driver):
-// at step_idx g, the input code is out_code_cache[g] (embedded via this
-// step's private codebook table, index g-1), the new cache row / RoPE
-// position is g+1, and the output codebook is lm_head[g] (writing the
-// sampled result into out_code_cache[g+1]).
-```
-
-Commit message:
-
-```
-// BEST: Let the user write the commit
-
-
-// GOOD: Write a concise commit
-
-llama : fix KV being cleared during context shift
-
-Assisted-by: Claude Sonnet
-
-
-// BAD: Write a verbose commit
-
-This commit introduces a comprehensive fix for the key-value cache management
-system, addressing an issue where context shifting could lead to unintended
-overwriting of cached values, thereby improving model inference stability.
-
-Co-authored-by: Claude Sonnet
-```
-
-Commands:
+Before an authorized commit, set the identity for that commit only. Do not modify the user's global Git configuration. Use this pattern with the actual values substituted:
 
 ```sh
-# GOOD: all commands that allow you to get the context
-gh search issues # better to check if anyone has the same issue
-gh search prs # avoid duplicated efforts
-grep ... # search the code base
-
-# BAD: act on the user's behalf
-git commit -m "..."
-git push
-gh pr create
-gh pr comment
-gh issue create
+git -c user.name="<agent name> (<exact model name>)" \
+    -c user.email="<agent-and-model-slug>@agents.invalid" \
+    commit --signoff
 ```
 
-## Useful Resources
+The author and committer name must include both the agent product/name and the exact model identifier used for the work. The `Signed-off-by` trailer generated by `--signoff` is the required agent provenance signature. Add explicit trailers as well so the provenance remains machine-readable:
 
-To conserve context space, load these resources as needed:
+```text
+Agent: <agent name>
+Model: <exact model name>
+Signed-off-by: <agent name> (<exact model name>) <<agent-and-model-slug>@agents.invalid>
+```
 
-Skills: reusable task workflows live in the [skills/](skills/) directory - check there for a skill matching your task before starting.
+Do not add `Co-authored-by` or `Signed-off-by` lines naming the directing user. If multiple agents materially contributed, name each additional agent and exact model in an `Assisted-by` trailer; the agent taking responsibility for the final review remains the author and signer.
 
-General documentations:
-- [Contributing guidelines](CONTRIBUTING.md)
-- [Existing issues](https://github.com/ggml-org/llama.cpp/issues) and [Existing PRs](https://github.com/ggml-org/llama.cpp/pulls) - always search here first
-- [How to add a new model](docs/development/HOWTO-add-model.md)
-- [PR template](.github/pull_request_template.md)
+Commit messages must be very detailed. A commit must stand alone as an engineering record for an agent that has no access to the originating conversation. Use a concise imperative subject, then a substantial body covering all applicable sections:
 
-Server:
-- [Build documentation](docs/build.md)
-- [Server usage documentation](tools/server/README.md)
-- [Server development documentation](tools/server/README-dev.md) (if user asks to implement a new feature, be sure that it falls inside server's scope defined in this documentation)
+```text
+<area>: <specific outcome>
 
-Chat template and parser:
-- [PEG parser](docs/development/parsing.md) - alternative to regex that llama.cpp uses to parse model's output
-- [Auto parser](docs/autoparser.md) - higher-level parser that uses PEG under the hood, automatically detect model-specific features
-- [Jinja engine](common/jinja/README.md)
+Context:
+- What problem or opportunity triggered the work.
+- Relevant target hardware, model, workload, and prior behavior.
+
+Changes:
+- The concrete code, data-flow, kernel, build, test, or documentation changes.
+
+Rationale:
+- Why this design was selected.
+- Important assumptions, alternatives considered, and reasons alternatives were rejected.
+
+Validation:
+- Exact commands and tests run, with meaningful results.
+- Correctness comparisons and any testing that could not be run.
+
+Performance:
+- Baseline and new measurements, units, settings, and run-to-run variance.
+- State "Not performance-sensitive" when the section does not apply.
+
+Risks and tradeoffs:
+- Known limitations, unsupported behavior, upstream divergence, and possible regressions.
+
+Follow-up:
+- Remaining work, unresolved questions, or "None".
+
+Agent: <agent name>
+Model: <exact model name>
+Signed-off-by: <agent name> (<exact model name>) <<agent-and-model-slug>@agents.invalid>
+```
+
+Do not replace substance with boilerplate. Describe behavior before and after the commit, the reasoning chain behind non-obvious decisions, and negative or incomplete results. Include exact benchmark data for performance work and identify the corresponding `/notes/` file when it contains supporting raw data. Merge commits must also describe the upstream range, conflicts, fork-priority resolutions, validation, and any performance impact.
+
+## Upstream integration
+
+The expected remotes are:
+
+- `origin`: this M2 Ultra fork;
+- `upstream`: `ggml-org/llama.cpp`.
+
+Merge upstream `master` regularly so the fork receives model support, bug fixes, format changes, runtime improvements, and structural evolution. Prefer merge commits over rebasing shared fork history so integrations and conflict resolutions remain auditable.
+
+Use this procedure:
+
+1. Start from a clean tree and record the current target baseline when the merge can affect runtime behavior.
+2. Run `git fetch upstream` and merge `upstream/master` into the active integration branch.
+3. Bring in all upstream changes by default. Do not discard upstream subsystems merely because they are outside the target unless keeping them creates a real cost.
+4. Resolve conflicts in favor of this fork's DeepSeek V4 Flash and M2 Ultra behavior. Fork-owned target paths and policies have priority.
+5. Treat `README.md`, `AGENTS.md`, `CONTRIBUTING.md`, target-specific build defaults, Metal kernels, model execution changes, and benchmark tooling as fork-owned. Upstream edits to those areas must be adapted rather than allowed to erase the fork's intent.
+6. If upstream changes an interface used by target-specific code, port the target code onto the new interface unless there is a measured reason to retain the old structure.
+7. Build and run focused correctness tests after conflict resolution, then rerun affected target benchmarks.
+8. Write a note for any non-trivial conflict, performance change, deferred repair, or deliberate divergence.
+
+The merge commit message must follow the detailed commit policy above. In particular, list conflict resolutions that preserved fork-owned behavior and explain why each resolution remains correct for DeepSeek V4 Flash on M2 Ultra.
+
+Being current with upstream does not mean adopting upstream priorities. Upstream provides the moving base; this fork defines the product, README, optimization criteria, and supported hardware.
+
+## Local notes
+
+The ignored `/notes/` directory is the project lab notebook. Agents may create and update files there freely. Notes stay local by default and can contain investigation details, raw benchmark data, failed approaches, merge decisions, and handoffs.
+
+Every note must:
+
+- use a filename beginning with the current UTC date as `YYYY-MM-DD-<descriptive-name>.md` (for example, `2026-08-01-metal-attention-profiling.md`);
+- use a lowercase, hyphenated description after the date;
+- be viewed in reverse lexical date order when reading newest first;
+- identify the exact model that wrote it;
+- contain enough detail for another agent to continue the work without relying on chat history.
+
+End every note with this signature block:
+
+```text
+Signed-by: <exact model name>
+Date: <YYYY-MM-DD UTC>
+```
+
+Do not sign for another model. When substantially revising an existing note, append a new signed update or create a new dated note so authorship remains clear.
+
+Include the applicable details:
+
+- objective and status;
+- hardware, macOS, compiler, SDK, build flags, commit, model artifact, quantization, and runtime settings;
+- commands and scripts used;
+- observations and raw results, with units;
+- baselines and run-to-run variance;
+- correctness checks;
+- hypotheses and why they are plausible;
+- changes attempted, including failures;
+- decisions, tradeoffs, and unresolved questions;
+- affected files and concrete next steps.
+
+## Contribution policy
+
+Changes are welcome when they advance or unblock the target. A contribution does not need to be portable, preceded by an issue, split according to upstream review preferences, or supported indefinitely across upstream's backend matrix.
+
+Keep contributions reviewable enough to validate the result. Provide correctness evidence and target benchmarks for performance-sensitive changes. Specialized code, new kernels, experimental branches, and rapid iteration are all acceptable. Compatibility work without a target benefit is out of scope.
+
+## Useful starting points
+
+- Metal backend: `ggml/src/ggml-metal/`
+- Metal build documentation: `docs/build.md#metal-build`
+- Model implementations: `src/models/`
+- Benchmark tool: `tools/llama-bench/`
+- Backend operation tests: `tests/test-backend-ops.cpp`
+- General build documentation: `docs/build.md`

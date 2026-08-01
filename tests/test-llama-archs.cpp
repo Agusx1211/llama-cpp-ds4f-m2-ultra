@@ -11,7 +11,9 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
 
+#include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -82,7 +84,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
 static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
-    const uint32_t n_ctx = 128;
+    const uint32_t n_ctx = arch == LLM_ARCH_DEEPSEEK4 ? 256 : 128;
 
     uint32_t n_vocab = 128;
     uint32_t n_embd  = 256;
@@ -109,6 +111,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_embd = 128;
         n_head = 1;
         n_ff   = 192;
+    } else if (arch == LLM_ARCH_DEEPSEEK4) {
+        n_embd = 128;
+        n_head = 2;
+        n_ff   = 64;
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
     } else if (arch == LLM_ARCH_CHAMELEON) {
@@ -154,7 +160,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(1) : n_head);
     }
 
     ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS, 8.0f);
@@ -177,7 +183,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_EPS,          1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_GROUPS,       uint32_t(8));
-    ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,            uint32_t(512));
+    ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,            arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(64) : uint32_t(512));
     ms.add_kv(LLM_KV_ATTENTION_KV_LORA_RANK,           uint32_t(512));
     ms.add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT, uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,         n_ctx/8);
@@ -219,9 +225,23 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
-        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         uint32_t(2)); // sigmoid
+        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(4) : uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
+    }
+
+    if (arch == LLM_ARCH_DEEPSEEK4) {
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                    1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                     true);
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                        7.0f);
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,            uint32_t(1));
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,              uint32_t(32));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,       10000.0f);
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,               std::vector<uint32_t>({4, 128}));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,                  uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,    uint32_t(1));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,                1.0e-6f);
+        ms.add_kv(LLM_KV_HASH_LAYER_COUNT,                        uint32_t(0));
     }
 
     ms.add_kv(LLM_KV_POSNET_EMBEDDING_LENGTH,   n_embd);
@@ -261,9 +281,18 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
     return true;
 }
 
+struct test_context_config {
+    uint32_t n_ctx       = 0;
+    uint32_t n_batch     = 0;
+    uint32_t n_ubatch    = 64;
+    uint32_t n_seq_max   = 1;
+    bool     kv_unified  = false;
+};
+
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
+        const test_context_config & config = {}) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -273,11 +302,16 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     model_params.split_mode = split_mode;
 
     llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = 0;
+    ctx_params.n_ctx = config.n_ctx;
+    if (config.n_batch > 0) {
+        ctx_params.n_batch = config.n_batch;
+    }
+    ctx_params.n_seq_max = config.n_seq_max;
+    ctx_params.kv_unified = config.kv_unified;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
     if (!encode) {
-        ctx_params.n_ubatch = 64;
+        ctx_params.n_ubatch = config.n_ubatch;
     }
 
     size_t tmp = seed;
@@ -328,6 +362,457 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+struct dsv4_test_context {
+    llama_model_ptr   model;
+    llama_context_ptr lctx;
+    llama_batch       batch = {};
+    uint32_t          n_vocab;
+
+    dsv4_test_context(
+            size_t seed,
+            ggml_backend_dev_t dev,
+            uint32_t n_seq_max,
+            bool kv_unified,
+            uint32_t batch_capacity,
+            uint32_t max_seq_ids = 1) {
+        test_context_config config;
+        config.n_ctx = 256*n_seq_max;
+        config.n_batch = batch_capacity;
+        config.n_ubatch = batch_capacity;
+        config.n_seq_max = n_seq_max;
+        config.kv_unified = kv_unified;
+
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_DEEPSEEK4, true);
+        auto loaded = get_model_and_ctx(
+                gguf_ctx.get(), nullptr, seed, {dev}, LLAMA_SPLIT_MODE_LAYER, false, config);
+
+        model = std::move(loaded.first);
+        lctx = std::move(loaded.second);
+        n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        batch = llama_batch_init(batch_capacity, 0, max_seq_ids);
+    }
+
+    ~dsv4_test_context() {
+        llama_batch_free(batch);
+    }
+
+    void clear_batch() {
+        batch.n_tokens = 0;
+    }
+
+    void add(llama_token token, llama_pos pos, const std::vector<llama_seq_id> & seq_ids) {
+        common_batch_add(batch, token, pos, seq_ids, true);
+    }
+
+    void decode(const char * label) {
+        if (llama_decode(lctx.get(), batch) != 0) {
+            throw std::runtime_error(std::string("failed to decode DSV4 ") + label + " batch");
+        }
+    }
+
+    void append_logits(int32_t output_idx, std::vector<float> & dst) {
+        const float * logits = llama_get_logits_ith(lctx.get(), output_idx);
+        if (logits == nullptr) {
+            throw std::runtime_error("failed to retrieve DSV4 test logits");
+        }
+
+        dst.insert(dst.end(), logits, logits + n_vocab);
+    }
+};
+
+static std::vector<float> run_dsv4_isolated(
+        size_t seed,
+        ggml_backend_dev_t dev,
+        const std::vector<llama_token> & tokens,
+        uint32_t n_prompt) {
+    dsv4_test_context test(seed, dev, 1, false, 256);
+
+    for (uint32_t pos = 0; pos < n_prompt; ++pos) {
+        test.add(tokens[pos], pos, {0});
+    }
+
+    std::vector<float> result;
+    result.reserve(tokens.size()*test.n_vocab);
+
+    test.decode("isolated prompt");
+    for (uint32_t i = 0; i < n_prompt; ++i) {
+        test.append_logits(i, result);
+    }
+
+    for (uint32_t pos = n_prompt; pos < tokens.size(); ++pos) {
+        test.clear_batch();
+        test.add(tokens[pos], pos, {0});
+        test.decode("isolated decode");
+        test.append_logits(0, result);
+    }
+
+    return result;
+}
+
+struct dsv4_parallel_result {
+    std::vector<float> seq_a;
+    std::vector<float> seq_b;
+};
+
+static dsv4_parallel_result run_dsv4_parallel(
+        size_t seed,
+        ggml_backend_dev_t dev,
+        const std::vector<llama_token> & tokens_a,
+        const std::vector<llama_token> & tokens_b,
+        uint32_t n_prompt,
+        bool kv_unified,
+        uint32_t n_seq_max,
+        llama_seq_id seq_a,
+        llama_seq_id seq_b) {
+    GGML_ASSERT(tokens_a.size() == tokens_b.size());
+    GGML_ASSERT(seq_a >= 0 && (uint32_t) seq_a < n_seq_max);
+    GGML_ASSERT(seq_b >= 0 && (uint32_t) seq_b < n_seq_max);
+
+    dsv4_test_context test(seed, dev, n_seq_max, kv_unified, 2*n_prompt);
+    for (uint32_t pos = 0; pos < n_prompt; ++pos) {
+        test.add(tokens_a[pos], pos, {seq_a});
+    }
+    for (uint32_t pos = 0; pos < n_prompt; ++pos) {
+        test.add(tokens_b[pos], pos, {seq_b});
+    }
+
+    dsv4_parallel_result result;
+    result.seq_a.reserve(tokens_a.size()*test.n_vocab);
+    result.seq_b.reserve(tokens_b.size()*test.n_vocab);
+
+    test.decode("parallel prompt");
+    for (uint32_t i = 0; i < n_prompt; ++i) {
+        test.append_logits(i, result.seq_a);
+        test.append_logits(n_prompt + i, result.seq_b);
+    }
+
+    for (uint32_t pos = n_prompt; pos < tokens_a.size(); ++pos) {
+        test.clear_batch();
+        test.add(tokens_a[pos], pos, {seq_a});
+        test.add(tokens_b[pos], pos, {seq_b});
+        test.decode("parallel decode");
+        test.append_logits(0, result.seq_a);
+        test.append_logits(1, result.seq_b);
+    }
+
+    return result;
+}
+
+enum class dsv4_prefix_setup {
+    COUPLED,
+    COPIED,
+    RESTORED,
+};
+
+static dsv4_parallel_result run_dsv4_shared_prefix(
+        size_t seed,
+        ggml_backend_dev_t dev,
+        const std::vector<llama_token> & tokens_a,
+        const std::vector<llama_token> & tokens_b,
+        uint32_t n_prompt,
+        bool kv_unified,
+        dsv4_prefix_setup setup) {
+    GGML_ASSERT(tokens_a.size() == tokens_b.size());
+    GGML_ASSERT(std::equal(tokens_a.begin(), tokens_a.begin() + n_prompt, tokens_b.begin()));
+
+    const uint32_t max_seq_ids = setup == dsv4_prefix_setup::COUPLED ? 2 : 1;
+    dsv4_test_context test(seed, dev, 2, kv_unified, n_prompt, max_seq_ids);
+    const std::vector<llama_seq_id> prefix_seq_ids =
+            setup == dsv4_prefix_setup::COUPLED ? std::vector<llama_seq_id>{0, 1} : std::vector<llama_seq_id>{0};
+
+    for (uint32_t pos = 0; pos < n_prompt; ++pos) {
+        test.add(tokens_a[pos], pos, prefix_seq_ids);
+    }
+
+    dsv4_parallel_result result;
+    result.seq_a.reserve(tokens_a.size()*test.n_vocab);
+    result.seq_b.reserve(tokens_b.size()*test.n_vocab);
+
+    test.decode("shared prefix");
+    for (uint32_t i = 0; i < n_prompt; ++i) {
+        test.append_logits(i, result.seq_a);
+        test.append_logits(i, result.seq_b);
+    }
+
+    if (setup == dsv4_prefix_setup::COPIED) {
+        llama_memory_seq_cp(llama_get_memory(test.lctx.get()), 0, 1, -1, -1);
+    } else if (setup == dsv4_prefix_setup::RESTORED) {
+        std::vector<uint8_t> state(llama_state_seq_get_size(test.lctx.get(), 0));
+        const size_t n_copied = llama_state_seq_get_data(
+                test.lctx.get(), state.data(), state.size(), 0);
+        if (n_copied != state.size()) {
+            throw std::runtime_error("failed to save complete DSV4 sequence state");
+        }
+
+        const size_t n_restored = llama_state_seq_set_data(
+                test.lctx.get(), state.data(), state.size(), 1);
+        if (n_restored != state.size()) {
+            throw std::runtime_error("failed to restore complete DSV4 sequence state");
+        }
+    }
+
+    for (uint32_t pos = n_prompt; pos < tokens_a.size(); ++pos) {
+        test.clear_batch();
+        test.add(tokens_a[pos], pos, {0});
+        test.add(tokens_b[pos], pos, {1});
+        test.decode("shared-prefix decode");
+        test.append_logits(0, result.seq_a);
+        test.append_logits(1, result.seq_b);
+    }
+
+    return result;
+}
+
+static dsv4_parallel_result run_dsv4_asymmetric(
+        size_t seed,
+        ggml_backend_dev_t dev,
+        const std::vector<llama_token> & tokens_a,
+        const std::vector<llama_token> & tokens_b,
+        uint32_t n_prompt_a,
+        uint32_t n_prompt_b,
+        bool kv_unified) {
+    GGML_ASSERT(tokens_a.size() - n_prompt_a == tokens_b.size() - n_prompt_b);
+
+    dsv4_test_context test(seed, dev, 2, kv_unified, n_prompt_a + n_prompt_b);
+    for (uint32_t pos = 0; pos < n_prompt_a; ++pos) {
+        test.add(tokens_a[pos], pos, {0});
+    }
+    for (uint32_t pos = 0; pos < n_prompt_b; ++pos) {
+        test.add(tokens_b[pos], pos, {1});
+    }
+
+    dsv4_parallel_result result;
+    result.seq_a.reserve(tokens_a.size()*test.n_vocab);
+    result.seq_b.reserve(tokens_b.size()*test.n_vocab);
+
+    test.decode("asymmetric prompt");
+    for (uint32_t i = 0; i < n_prompt_a; ++i) {
+        test.append_logits(i, result.seq_a);
+    }
+    for (uint32_t i = 0; i < n_prompt_b; ++i) {
+        test.append_logits(n_prompt_a + i, result.seq_b);
+    }
+
+    const uint32_t n_decode = tokens_a.size() - n_prompt_a;
+    for (uint32_t i = 0; i < n_decode; ++i) {
+        test.clear_batch();
+        test.add(tokens_a[n_prompt_a + i], n_prompt_a + i, {0});
+        test.add(tokens_b[n_prompt_b + i], n_prompt_b + i, {1});
+        test.decode("asymmetric decode");
+        test.append_logits(0, result.seq_a);
+        test.append_logits(1, result.seq_b);
+    }
+
+    return result;
+}
+
+static dsv4_parallel_result run_dsv4_reused_slot(
+        size_t seed,
+        ggml_backend_dev_t dev,
+        const std::vector<llama_token> & discarded,
+        const std::vector<llama_token> & survivor,
+        const std::vector<llama_token> & replacement,
+        uint32_t n_prompt,
+        uint32_t n_decode_before_reuse,
+        bool kv_unified) {
+    GGML_ASSERT(discarded.size() >= n_prompt + n_decode_before_reuse);
+    GGML_ASSERT(survivor.size() == replacement.size() + n_decode_before_reuse);
+
+    dsv4_test_context test(seed, dev, 2, kv_unified, 2*n_prompt);
+    for (uint32_t pos = 0; pos < n_prompt; ++pos) {
+        test.add(discarded[pos], pos, {0});
+    }
+    for (uint32_t pos = 0; pos < n_prompt; ++pos) {
+        test.add(survivor[pos], pos, {1});
+    }
+
+    dsv4_parallel_result result;
+    result.seq_a.reserve(replacement.size()*test.n_vocab);
+    result.seq_b.reserve(survivor.size()*test.n_vocab);
+
+    test.decode("reuse prompt");
+    for (uint32_t i = 0; i < n_prompt; ++i) {
+        test.append_logits(n_prompt + i, result.seq_b);
+    }
+
+    for (uint32_t i = 0; i < n_decode_before_reuse; ++i) {
+        const uint32_t pos = n_prompt + i;
+        test.clear_batch();
+        test.add(discarded[pos], pos, {0});
+        test.add(survivor[pos], pos, {1});
+        test.decode("pre-reuse decode");
+        test.append_logits(1, result.seq_b);
+    }
+
+    if (!llama_memory_seq_rm(llama_get_memory(test.lctx.get()), 0, -1, -1)) {
+        throw std::runtime_error("failed to remove DSV4 sequence before slot reuse");
+    }
+
+    test.clear_batch();
+    for (uint32_t pos = 0; pos < n_prompt; ++pos) {
+        test.add(replacement[pos], pos, {0});
+    }
+    test.decode("replacement prompt");
+    for (uint32_t i = 0; i < n_prompt; ++i) {
+        test.append_logits(i, result.seq_a);
+    }
+
+    const uint32_t n_decode_after_reuse = replacement.size() - n_prompt;
+    for (uint32_t i = 0; i < n_decode_after_reuse; ++i) {
+        const uint32_t replacement_pos = n_prompt + i;
+        const uint32_t survivor_pos = n_prompt + n_decode_before_reuse + i;
+        test.clear_batch();
+        test.add(replacement[replacement_pos], replacement_pos, {0});
+        test.add(survivor[survivor_pos], survivor_pos, {1});
+        test.decode("post-reuse decode");
+        test.append_logits(0, result.seq_a);
+        test.append_logits(1, result.seq_b);
+    }
+
+    return result;
+}
+
+static bool compare_dsv4_trace(
+        const char * mode,
+        const char * sequence,
+        const std::vector<float> & expected,
+        const std::vector<float> & actual) {
+    if (expected.size() != actual.size()) {
+        fprintf(stderr, "DSV4 %s %s trace size mismatch: %zu != %zu\n",
+                mode, sequence, expected.size(), actual.size());
+        return false;
+    }
+
+    double sum_squared_error = 0.0;
+    double sum_squared_ref = 0.0;
+    double max_abs_error = 0.0;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const double error = (double) actual[i] - expected[i];
+        sum_squared_error += error*error;
+        sum_squared_ref += (double) expected[i]*expected[i];
+        max_abs_error = std::max(max_abs_error, std::abs(error));
+    }
+
+    const double trace_nmse = sum_squared_ref > 0.0 ? sum_squared_error/sum_squared_ref : sum_squared_error;
+    printf("DSV4 %-7s seq %s: NMSE = %.3e, max abs = %.3e\n", mode, sequence, trace_nmse, max_abs_error);
+
+    return trace_nmse <= 1.0e-8 && max_abs_error <= 1.0e-5;
+}
+
+static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
+    static constexpr uint32_t n_vocab = 128;
+    static constexpr uint32_t n_prompt = 128;
+    static constexpr uint32_t n_decode = 8;
+
+    const std::vector<llama_token> tokens_a = get_tokens(n_prompt + n_decode, n_vocab, seed + 1);
+    const std::vector<llama_token> tokens_b = get_tokens(n_prompt + n_decode, n_vocab, seed + 2);
+
+    const std::vector<float> isolated_a = run_dsv4_isolated(seed, dev, tokens_a, n_prompt);
+    const std::vector<float> isolated_b = run_dsv4_isolated(seed, dev, tokens_b, n_prompt);
+
+    struct parallel_case {
+        const char * name;
+        bool kv_unified;
+        uint32_t n_seq_max;
+        llama_seq_id seq_a;
+        llama_seq_id seq_b;
+    };
+
+    const parallel_case cases[] = {
+        { "split-contiguous",   false, 2, 0, 1 },
+        { "unified-contiguous", true,  2, 0, 1 },
+        { "split-sparse",       false, 4, 0, 2 },
+        { "unified-sparse",     true,  4, 0, 2 },
+    };
+
+    bool all_ok = true;
+    for (const parallel_case & test_case : cases) {
+        const dsv4_parallel_result parallel = run_dsv4_parallel(
+                seed, dev, tokens_a, tokens_b, n_prompt,
+                test_case.kv_unified, test_case.n_seq_max, test_case.seq_a, test_case.seq_b);
+        all_ok = compare_dsv4_trace(test_case.name, "A", isolated_a, parallel.seq_a) && all_ok;
+        all_ok = compare_dsv4_trace(test_case.name, "B", isolated_b, parallel.seq_b) && all_ok;
+    }
+
+    std::vector<llama_token> coupled_a = get_tokens(n_prompt + n_decode, n_vocab, seed + 3);
+    std::vector<llama_token> coupled_b = coupled_a;
+    const std::vector<llama_token> suffix_b = get_tokens(n_decode, n_vocab, seed + 4);
+    std::copy(suffix_b.begin(), suffix_b.end(), coupled_b.begin() + n_prompt);
+
+    const std::vector<float> isolated_coupled_a = run_dsv4_isolated(seed, dev, coupled_a, n_prompt);
+    const std::vector<float> isolated_coupled_b = run_dsv4_isolated(seed, dev, coupled_b, n_prompt);
+
+    for (bool kv_unified : { false, true }) {
+        const char * mode = kv_unified ? "unified-coupled" : "split-coupled";
+        const dsv4_parallel_result coupled = run_dsv4_shared_prefix(
+                seed, dev, coupled_a, coupled_b, n_prompt, kv_unified, dsv4_prefix_setup::COUPLED);
+        all_ok = compare_dsv4_trace(mode, "A", isolated_coupled_a, coupled.seq_a) && all_ok;
+        all_ok = compare_dsv4_trace(mode, "B", isolated_coupled_b, coupled.seq_b) && all_ok;
+    }
+
+    for (bool kv_unified : { false, true }) {
+        const char * mode = kv_unified ? "unified-copied" : "split-copied";
+        const dsv4_parallel_result copied = run_dsv4_shared_prefix(
+                seed, dev, coupled_a, coupled_b, n_prompt, kv_unified, dsv4_prefix_setup::COPIED);
+        all_ok = compare_dsv4_trace(mode, "A", isolated_coupled_a, copied.seq_a) && all_ok;
+        all_ok = compare_dsv4_trace(mode, "B", isolated_coupled_b, copied.seq_b) && all_ok;
+    }
+
+    for (bool kv_unified : { false, true }) {
+        const char * mode = kv_unified ? "unified-restored" : "split-restored";
+        const dsv4_parallel_result restored = run_dsv4_shared_prefix(
+                seed, dev, coupled_a, coupled_b, n_prompt, kv_unified, dsv4_prefix_setup::RESTORED);
+        all_ok = compare_dsv4_trace(mode, "A", isolated_coupled_a, restored.seq_a) && all_ok;
+        all_ok = compare_dsv4_trace(mode, "B", isolated_coupled_b, restored.seq_b) && all_ok;
+    }
+
+    static constexpr uint32_t n_short_prompt = 64;
+    const std::vector<llama_token> asymmetric_a = get_tokens(n_prompt + n_decode, n_vocab, seed + 5);
+    const std::vector<llama_token> asymmetric_b = get_tokens(n_short_prompt + n_decode, n_vocab, seed + 6);
+    const std::vector<float> isolated_asymmetric_a = run_dsv4_isolated(seed, dev, asymmetric_a, n_prompt);
+    const std::vector<float> isolated_asymmetric_b = run_dsv4_isolated(seed, dev, asymmetric_b, n_short_prompt);
+
+    for (bool kv_unified : { false, true }) {
+        const char * mode = kv_unified ? "unified-asymmetric" : "split-asymmetric";
+        const dsv4_parallel_result asymmetric = run_dsv4_asymmetric(
+                seed, dev, asymmetric_a, asymmetric_b, n_prompt, n_short_prompt, kv_unified);
+        all_ok = compare_dsv4_trace(mode, "A", isolated_asymmetric_a, asymmetric.seq_a) && all_ok;
+        all_ok = compare_dsv4_trace(mode, "B", isolated_asymmetric_b, asymmetric.seq_b) && all_ok;
+    }
+
+    static constexpr uint32_t n_decode_before_reuse = 4;
+    const std::vector<llama_token> discarded = get_tokens(
+            n_prompt + n_decode_before_reuse, n_vocab, seed + 7);
+    const std::vector<llama_token> survivor = get_tokens(
+            n_prompt + n_decode_before_reuse + n_decode, n_vocab, seed + 8);
+    const std::vector<llama_token> replacement = get_tokens(
+            n_prompt + n_decode, n_vocab, seed + 9);
+    const std::vector<float> isolated_survivor = run_dsv4_isolated(seed, dev, survivor, n_prompt);
+    const std::vector<float> isolated_replacement = run_dsv4_isolated(seed, dev, replacement, n_prompt);
+
+    for (bool kv_unified : { false, true }) {
+        const char * mode = kv_unified ? "unified-reuse" : "split-reuse";
+        const dsv4_parallel_result reused = run_dsv4_reused_slot(
+                seed, dev, discarded, survivor, replacement,
+                n_prompt, n_decode_before_reuse, kv_unified);
+        all_ok = compare_dsv4_trace(mode, "replacement", isolated_replacement, reused.seq_a) && all_ok;
+        all_ok = compare_dsv4_trace(mode, "survivor", isolated_survivor, reused.seq_b) && all_ok;
+    }
+
+    return all_ok;
+}
+
+static int test_dsv4_parallel(size_t seed) {
+    bool all_ok = true;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        printf("DSV4 parallel lifecycle on %s\n", ggml_backend_dev_description(dev));
+        all_ok = test_dsv4_parallel_device(seed, dev) && all_ok;
+    }
+
+    return all_ok ? 0 : 1;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -345,6 +830,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_EXAONE_MOE:
@@ -424,10 +910,6 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
         return false;
     }
-    if (arch == LLM_ARCH_DEEPSEEK4) {
-        return false;
-    }
-
     // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
 #ifdef GGML_USE_WEBGPU
     if (arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA) {
@@ -704,7 +1186,14 @@ int main(int argc, char ** argv) {
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
         }
-        return test_backends(arch, seed, log_level);
+        const int backends_result = test_backends(arch, seed, log_level);
+        if (backends_result != 0) {
+            return backends_result;
+        }
+        if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_DEEPSEEK4) {
+            return test_dsv4_parallel(seed);
+        }
+        return 0;
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;
