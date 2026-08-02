@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -27,6 +28,14 @@
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+
+// Exact-value, process-start benchmark control. The default reads the selected
+// verifier row directly from the target output buffer. The control retains the
+// old per-sequence copies for same-binary memory and throughput comparisons.
+static const bool SPEC_MTP_DIRECT_VERIFY_H_DISABLED = []() {
+    const char * value = std::getenv("LLAMA_SPEC_MTP_DIRECT_VERIFY_H_DISABLE");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}();
 
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
@@ -1317,10 +1326,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
 
-    // Hidden rows from the most recent target verification batch, grouped by seq.
-    // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
+    // Same-binary benchmark control: hidden rows from the most recent target
+    // verification batch, grouped by seq. The default path leaves both vectors
+    // empty and reads the accepted row from the current target output instead.
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
+
+    // The direct verifier-row path relies on common_speculative_accept() running
+    // after process() for the current target batch and before another target
+    // decode. Record enough of that output identity to assert the contract and
+    // the selected raw row for every sequence in a multi-sequence batch.
+    const float * verify_h_direct_base = nullptr;
+    int32_t verify_h_direct_n_tokens = 0;
+    std::vector<bool> verify_h_direct_ready;
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
@@ -1400,8 +1418,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
 
-        verify_h.assign(n_seq, {});
-        verify_h_rows.assign(n_seq, 0);
+        if (SPEC_MTP_DIRECT_VERIFY_H_DISABLED) {
+            SPC_INF("%s", "LLAMA_SPEC_MTP_DIRECT_VERIFY_H_DISABLE=1: retaining copied MTP verifier rows\n");
+            verify_h.assign(n_seq, {});
+            verify_h_rows.assign(n_seq, 0);
+        } else {
+            verify_h_direct_ready.assign(n_seq, false);
+        }
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1454,6 +1477,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t n_tokens = batch_in.n_tokens;
 
+        if (!SPEC_MTP_DIRECT_VERIFY_H_DISABLED) {
+            verify_h_direct_base = nullptr;
+            verify_h_direct_n_tokens = 0;
+            std::fill(verify_h_direct_ready.begin(), verify_h_direct_ready.end(), false);
+        }
+
         // remember the frist and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
@@ -1475,6 +1504,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+        GGML_ASSERT(h_tgt != nullptr);
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
@@ -1489,10 +1520,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-            }
+            std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
 
             // fill the pending embeddings from a previous run
             auto set_h = [&](int idx, const float * h_row) {
@@ -1545,16 +1573,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-            verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            if (SPEC_MTP_DIRECT_VERIFY_H_DISABLED) {
+                verify_h_rows[seq_id] = n_rows;
+                verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                for (int32_t i = 0; i < n_rows; ++i) {
+                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                }
+            } else {
+                GGML_ASSERT(i_batch_beg[seq_id] >= 0);
+                GGML_ASSERT(i_batch_end[seq_id] < n_tokens);
+                verify_h_direct_ready[seq_id] = true;
             }
 
-            std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            if (SPEC_MTP_DIRECT_VERIFY_H_DISABLED) {
+                std::memcpy(pending_h[seq_id].data(),
+                        verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            } else {
+                std::memcpy(pending_h[seq_id].data(),
+                        h_tgt + (size_t) i_batch_end[seq_id] * n_embd, row_bytes);
+            }
+        }
+
+        if (!SPEC_MTP_DIRECT_VERIFY_H_DISABLED) {
+            verify_h_direct_base = h_tgt;
+            verify_h_direct_n_tokens = n_tokens;
         }
 
         return true;
@@ -1716,14 +1760,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        const int32_t n_rows = verify_h_rows[seq_id];
-        if (n_rows <= 0) {
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        if (SPEC_MTP_DIRECT_VERIFY_H_DISABLED) {
+            const int32_t n_rows = verify_h_rows[seq_id];
+            if (n_rows <= 0) {
+                return;
+            }
+
+            const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+            std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
             return;
         }
 
+        GGML_ASSERT(verify_h_direct_base != nullptr);
+        GGML_ASSERT(verify_h_direct_n_tokens > 0);
+        GGML_ASSERT(verify_h_direct_ready[seq_id]);
+        GGML_ASSERT(i_batch_beg[seq_id] >= 0);
+        GGML_ASSERT(i_batch_end[seq_id] >= i_batch_beg[seq_id]);
+        GGML_ASSERT(i_batch_end[seq_id] < verify_h_direct_n_tokens);
+
+        const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        const int32_t i_row = i_batch_beg[seq_id] + i_h;
+        GGML_ASSERT(i_row >= i_batch_beg[seq_id] && i_row <= i_batch_end[seq_id]);
+
+        const float * h_row = llama_get_embeddings_nextn_ith(params.ctx_tgt, i_row);
+        GGML_ASSERT(h_row == verify_h_direct_base + (size_t) i_row * n_embd &&
+                "MTP verifier row is not in the current unmasked target output");
+
+        std::memcpy(pending_h[seq_id].data(), h_row, row_bytes);
+        verify_h_direct_ready[seq_id] = false;
     }
 
     bool need_embd() const override {
