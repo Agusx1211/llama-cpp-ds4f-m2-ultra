@@ -44,8 +44,26 @@ struct ggml_metal_encoder_profile_result {
     uint64_t projected_plan_bytes;
 };
 
-void ggml_metal_encoder_profile_begin(void);
-struct ggml_metal_encoder_profile_result ggml_metal_encoder_profile_end(void);
+struct ggml_metal_encoder_scalar_record {
+    uint32_t command_ordinal;
+    int32_t argument_index;
+    uint32_t size;
+    uint32_t data_offset;
+};
+
+struct ggml_metal_encoder_scalar_capture {
+    uint64_t thread_id;
+    uint32_t n_records;
+    uint32_t n_bytes;
+    uint32_t truncated;
+    uint32_t reserved;
+    struct ggml_metal_encoder_scalar_record * records;
+    uint8_t * bytes;
+};
+
+void ggml_metal_encoder_profile_begin(bool capture_scalar_delta);
+struct ggml_metal_encoder_profile_result ggml_metal_encoder_profile_end(
+        struct ggml_metal_encoder_scalar_capture * scalar_capture);
 
 struct ggml_metal_encode_profile_sample {
     bool valid;
@@ -67,6 +85,7 @@ struct ggml_metal_encode_profile_sample {
     int64_t total_us;
 
     struct ggml_metal_encoder_profile_result commands;
+    struct ggml_metal_encoder_scalar_capture scalars;
 };
 
 struct ggml_metal_encode_profile_segment {
@@ -80,6 +99,7 @@ struct ggml_metal_encode_profile_segment {
     bool use_concurrency;
 
     struct ggml_metal_encoder_profile_result reference;
+    struct ggml_metal_encoder_scalar_capture reference_scalars;
     struct ggml_metal_encode_profile_sample last;
 
     uint64_t samples;
@@ -115,6 +135,7 @@ struct ggml_metal {
     bool use_graph_optimize;
     bool use_dsv4_split_tuning;
     bool use_dsv4_encode_profile;
+    bool use_dsv4_encode_profile_scalar_delta;
 
     int dsv4_encode_profile_interval;
 
@@ -203,6 +224,100 @@ static bool ggml_metal_encode_profile_key_equal(
            segment->idx_end         == sample->idx_end &&
            segment->use_fusion      == sample->use_fusion &&
            segment->use_concurrency == sample->use_concurrency;
+}
+
+static void ggml_metal_encode_profile_scalar_capture_free(
+        struct ggml_metal_encoder_scalar_capture * capture) {
+    free(capture->records);
+    free(capture->bytes);
+    memset(capture, 0, sizeof(*capture));
+}
+
+static void ggml_metal_encode_profile_log_scalar_delta(
+        const struct ggml_metal_encode_profile_segment * segment,
+        const struct ggml_metal_encode_profile_sample * sample,
+        int cb_idx) {
+    const struct ggml_metal_encoder_scalar_capture * reference = &segment->reference_scalars;
+    const struct ggml_metal_encoder_scalar_capture * current = &sample->scalars;
+
+    if (reference->truncated || current->truncated ||
+            reference->records == NULL || current->records == NULL ||
+            reference->bytes == NULL || current->bytes == NULL) {
+        GGML_LOG_INFO("dsv4_encode_profile: scalar_delta uid=%" PRIu64 " cb=%d status=unavailable"
+                " reference_thread=0x%016" PRIx64 " current_thread=0x%016" PRIx64
+                " reference_records=%u current_records=%u reference_bytes=%u current_bytes=%u"
+                " reference_truncated=%u current_truncated=%u\n",
+                sample->uid, cb_idx, reference->thread_id, current->thread_id,
+                reference->n_records, current->n_records, reference->n_bytes, current->n_bytes,
+                reference->truncated, current->truncated);
+        return;
+    }
+
+    const uint32_t n_records = MIN(reference->n_records, current->n_records);
+    for (uint32_t i = 0; i < n_records; ++i) {
+        const struct ggml_metal_encoder_scalar_record * lhs = &reference->records[i];
+        const struct ggml_metal_encoder_scalar_record * rhs = &current->records[i];
+
+        if (lhs->command_ordinal != rhs->command_ordinal ||
+                lhs->argument_index != rhs->argument_index || lhs->size != rhs->size) {
+            GGML_LOG_INFO("dsv4_encode_profile: scalar_delta uid=%" PRIu64 " cb=%d status=metadata"
+                    " scalar_record=%u reference_thread=0x%016" PRIx64 " current_thread=0x%016" PRIx64
+                    " reference_ordinal=%u current_ordinal=%u reference_arg=%d current_arg=%d"
+                    " reference_length=%u current_length=%u\n",
+                    sample->uid, cb_idx, i, reference->thread_id, current->thread_id,
+                    lhs->command_ordinal, rhs->command_ordinal,
+                    lhs->argument_index, rhs->argument_index, lhs->size, rhs->size);
+            return;
+        }
+
+        const uint8_t * lhs_bytes = reference->bytes + lhs->data_offset;
+        const uint8_t * rhs_bytes = current->bytes + rhs->data_offset;
+        if (memcmp(lhs_bytes, rhs_bytes, lhs->size) == 0) {
+            continue;
+        }
+
+        char byte_deltas[512] = { 0 };
+        uint32_t n_different = 0;
+        uint32_t n_reported = 0;
+        for (uint32_t j = 0; j < lhs->size; ++j) {
+            if (lhs_bytes[j] == rhs_bytes[j]) {
+                continue;
+            }
+
+            n_different++;
+            if (n_reported < 16) {
+                const size_t used = strlen(byte_deltas);
+                if (used < sizeof(byte_deltas)) {
+                    snprintf(byte_deltas + used, sizeof(byte_deltas) - used,
+                            "%s%u:%02x>%02x", n_reported > 0 ? "," : "", j,
+                            (unsigned int) lhs_bytes[j], (unsigned int) rhs_bytes[j]);
+                }
+                n_reported++;
+            }
+        }
+
+        GGML_LOG_INFO("dsv4_encode_profile: scalar_delta uid=%" PRIu64 " cb=%d status=bytes"
+                " scalar_record=%u command_ordinal=%u arg=%d length=%u"
+                " reference_thread=0x%016" PRIx64 " current_thread=0x%016" PRIx64
+                " differing_bytes=%u reported=%u deltas=%s\n",
+                sample->uid, cb_idx, i, lhs->command_ordinal, lhs->argument_index, lhs->size,
+                reference->thread_id, current->thread_id,
+                n_different, n_reported, byte_deltas);
+        return;
+    }
+
+    if (reference->n_records != current->n_records || reference->n_bytes != current->n_bytes) {
+        GGML_LOG_INFO("dsv4_encode_profile: scalar_delta uid=%" PRIu64 " cb=%d status=count"
+                " reference_thread=0x%016" PRIx64 " current_thread=0x%016" PRIx64
+                " reference_records=%u current_records=%u reference_bytes=%u current_bytes=%u\n",
+                sample->uid, cb_idx, reference->thread_id, current->thread_id,
+                reference->n_records, current->n_records, reference->n_bytes, current->n_bytes);
+        return;
+    }
+
+    GGML_LOG_INFO("dsv4_encode_profile: scalar_delta uid=%" PRIu64 " cb=%d status=no-byte-delta"
+            " reference_thread=0x%016" PRIx64 " current_thread=0x%016" PRIx64 "\n",
+            sample->uid, cb_idx, reference->thread_id, current->thread_id);
 }
 
 static void ggml_metal_encode_profile_diff_add(char * dst, size_t size, const char * field) {
@@ -318,10 +433,15 @@ static void ggml_metal_encode_profile_update(
 
     const bool same_key = ggml_metal_encode_profile_key_equal(segment, sample);
     const bool exact = same_key && ggml_metal_encode_profile_commands_equal(&segment->reference, &sample->commands);
+    const bool scalar_changed = same_key &&
+            (segment->reference.scalar_fingerprint != sample->commands.scalar_fingerprint ||
+             segment->reference.n_scalars != sample->commands.n_scalars ||
+             segment->reference.scalar_bytes != sample->commands.scalar_bytes);
 
     char diff[96];
     const char * reason = "periodic";
     if (!same_key) {
+        ggml_metal_encode_profile_scalar_capture_free(&segment->reference_scalars);
         memset(segment, 0, sizeof(*segment));
         segment->valid           = true;
         segment->uid             = sample->uid;
@@ -331,6 +451,8 @@ static void ggml_metal_encode_profile_update(
         segment->use_fusion      = sample->use_fusion;
         segment->use_concurrency = sample->use_concurrency;
         segment->reference       = sample->commands;
+        segment->reference_scalars = sample->scalars;
+        memset(&sample->scalars, 0, sizeof(sample->scalars));
 
         ctx->dsv4_encode_profile_key_misses++;
         ctx->dsv4_encode_profile_replay_misses++;
@@ -347,8 +469,13 @@ static void ggml_metal_encode_profile_update(
             ctx->dsv4_encode_profile_replay_misses++;
             ctx->dsv4_encode_profile_changes++;
             ggml_metal_encode_profile_diff(&segment->reference, &sample->commands, diff, sizeof(diff));
+            if (ctx->use_dsv4_encode_profile_scalar_delta && scalar_changed) {
+                ggml_metal_encode_profile_log_scalar_delta(segment, sample, cb_idx);
+            }
             reason = "changed";
         }
+
+        ggml_metal_encode_profile_scalar_capture_free(&sample->scalars);
     }
 
     segment->last = *sample;
@@ -430,6 +557,15 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     }
 
     {
+        const bool requested = getenv("GGML_METAL_DSV4_ENCODE_PROFILE_SCALAR_DELTA") != NULL;
+        res->use_dsv4_encode_profile_scalar_delta = res->use_dsv4_encode_profile && requested;
+        if (requested && !res->use_dsv4_encode_profile) {
+            GGML_LOG_WARN("%s: GGML_METAL_DSV4_ENCODE_PROFILE_SCALAR_DELTA requires GGML_METAL_DSV4_ENCODE_PROFILE\n",
+                    __func__);
+        }
+    }
+
+    {
         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
         res->debug_graph = val ? atoi(val) : 0;
     }
@@ -453,6 +589,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     if (res->use_dsv4_encode_profile) {
         GGML_LOG_INFO("%s: DSV4 encode profile = true (interval = %d)\n",
                 __func__, res->dsv4_encode_profile_interval);
+        GGML_LOG_INFO("%s: DSV4 encode scalar delta = %s\n", __func__,
+                res->use_dsv4_encode_profile_scalar_delta ? "true" : "false");
     }
 
     res->capture_compute = 0;
@@ -498,6 +636,13 @@ void ggml_metal_free(ggml_metal_t ctx) {
             }
         }
         ggml_metal_encode_profile_log_summary(ctx, "final");
+    }
+
+    for (int cb_idx = 0; cb_idx <= GGML_METAL_MAX_COMMAND_BUFFERS; ++cb_idx) {
+        ggml_metal_encode_profile_scalar_capture_free(
+                &ctx->dsv4_encode_profile_samples[cb_idx].scalars);
+        ggml_metal_encode_profile_scalar_capture_free(
+                &ctx->dsv4_encode_profile_segments[cb_idx].reference_scalars);
     }
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
@@ -834,6 +979,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         ctx->dsv4_encode_profile_active = profile_dsv4_encode &&
                 !use_capture && !ctx->capture_started && ctx->debug_graph == 0;
         if (ctx->dsv4_encode_profile_active) {
+            for (int cb_idx = 0; cb_idx <= GGML_METAL_MAX_COMMAND_BUFFERS; ++cb_idx) {
+                ggml_metal_encode_profile_scalar_capture_free(
+                        &ctx->dsv4_encode_profile_samples[cb_idx].scalars);
+            }
             memset(ctx->dsv4_encode_profile_samples, 0, sizeof(ctx->dsv4_encode_profile_samples));
         }
 
@@ -1044,7 +1193,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         const bool profile_dsv4_encode = ctx->dsv4_encode_profile_active;
         const int64_t profile_start_us = profile_dsv4_encode ? ggml_time_us() : 0;
         if (profile_dsv4_encode) {
-            ggml_metal_encoder_profile_begin();
+            ggml_metal_encoder_profile_begin(ctx->use_dsv4_encode_profile_scalar_delta);
         }
 
         ggml_metal_op_t ctx_op = ggml_metal_op_init(
@@ -1103,7 +1252,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             sample->finish_us       = profile_finished_us - profile_encoded_us;
             sample->commit_us       = profile_committed_us - profile_finished_us;
             sample->total_us        = profile_committed_us - profile_start_us;
-            sample->commands        = ggml_metal_encoder_profile_end();
+            sample->commands        = ggml_metal_encoder_profile_end(&sample->scalars);
         }
     });
 }

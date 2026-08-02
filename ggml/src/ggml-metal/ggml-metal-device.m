@@ -8,6 +8,7 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <pthread.h>
 
 #define GGML_METAL_PROFILE_UNLIKELY(x) __builtin_expect(!!(x), 0)
 
@@ -495,19 +496,43 @@ struct ggml_metal_encoder_profile_result {
     uint64_t projected_plan_bytes;
 };
 
-void ggml_metal_encoder_profile_begin(void);
-struct ggml_metal_encoder_profile_result ggml_metal_encoder_profile_end(void);
+struct ggml_metal_encoder_scalar_record {
+    uint32_t command_ordinal;
+    int32_t argument_index;
+    uint32_t size;
+    uint32_t data_offset;
+};
+
+struct ggml_metal_encoder_scalar_capture {
+    uint64_t thread_id;
+    uint32_t n_records;
+    uint32_t n_bytes;
+    uint32_t truncated;
+    uint32_t reserved;
+    struct ggml_metal_encoder_scalar_record * records;
+    uint8_t * bytes;
+};
+
+void ggml_metal_encoder_profile_begin(bool capture_scalar_delta);
+struct ggml_metal_encoder_profile_result ggml_metal_encoder_profile_end(
+        struct ggml_metal_encoder_scalar_capture * scalar_capture);
 
 struct ggml_metal_encoder_profile_tls {
     bool enabled;
     uint64_t sequence;
     struct ggml_metal_encoder_profile_result result;
+    struct ggml_metal_encoder_scalar_capture scalar_capture;
 };
 
 static _Thread_local struct ggml_metal_encoder_profile_tls ggml_metal_encoder_profile;
 
 static const uint64_t GGML_METAL_ENCODER_PROFILE_FNV_OFFSET = 14695981039346656037ULL;
 static const uint64_t GGML_METAL_ENCODER_PROFILE_FNV_PRIME  = 1099511628211ULL;
+
+// The observed DSV4 worker segment records about 4k scalar commands and 400 KiB
+// of scalar data. Keep the one-run diagnostic bounded well above that workload.
+static const uint32_t GGML_METAL_ENCODER_PROFILE_MAX_SCALARS      = 16384;
+static const uint32_t GGML_METAL_ENCODER_PROFILE_MAX_SCALAR_BYTES = 1024*1024;
 
 static void ggml_metal_encoder_profile_hash(uint64_t * hash, const void * data, size_t size) {
     const uint8_t * bytes = data;
@@ -541,7 +566,35 @@ static void ggml_metal_encoder_profile_value(
     ggml_metal_encoder_profile_hash(category_fingerprint, data, size);
 }
 
-void ggml_metal_encoder_profile_begin(void) {
+static void ggml_metal_encoder_profile_record_scalar(
+        struct ggml_metal_encoder_profile_tls * profile,
+        const void * data,
+        size_t size,
+        int idx) {
+    struct ggml_metal_encoder_scalar_capture * capture = &profile->scalar_capture;
+    if (capture->records == NULL || capture->bytes == NULL || capture->truncated) {
+        return;
+    }
+
+    if (profile->sequence > UINT32_MAX ||
+            capture->n_records >= GGML_METAL_ENCODER_PROFILE_MAX_SCALARS ||
+            size > GGML_METAL_ENCODER_PROFILE_MAX_SCALAR_BYTES ||
+            capture->n_bytes > GGML_METAL_ENCODER_PROFILE_MAX_SCALAR_BYTES - size) {
+        capture->truncated = true;
+        return;
+    }
+
+    struct ggml_metal_encoder_scalar_record * record = &capture->records[capture->n_records++];
+    record->command_ordinal = (uint32_t) profile->sequence;
+    record->argument_index = idx;
+    record->size = (uint32_t) size;
+    record->data_offset = capture->n_bytes;
+
+    memcpy(capture->bytes + capture->n_bytes, data, size);
+    capture->n_bytes += (uint32_t) size;
+}
+
+void ggml_metal_encoder_profile_begin(bool capture_scalar_delta) {
     GGML_ASSERT(!ggml_metal_encoder_profile.enabled);
 
     memset(&ggml_metal_encoder_profile, 0, sizeof(ggml_metal_encoder_profile));
@@ -555,12 +608,32 @@ void ggml_metal_encoder_profile_begin(void) {
     result->threadgroup_memory_fingerprint = GGML_METAL_ENCODER_PROFILE_FNV_OFFSET;
     result->dispatch_fingerprint           = GGML_METAL_ENCODER_PROFILE_FNV_OFFSET;
     result->barrier_fingerprint            = GGML_METAL_ENCODER_PROFILE_FNV_OFFSET;
+
+    if (capture_scalar_delta) {
+        struct ggml_metal_encoder_scalar_capture * capture = &ggml_metal_encoder_profile.scalar_capture;
+        capture->thread_id = (uint64_t) (uintptr_t) pthread_self();
+        capture->records = malloc(
+                GGML_METAL_ENCODER_PROFILE_MAX_SCALARS*sizeof(struct ggml_metal_encoder_scalar_record));
+        capture->bytes = malloc(GGML_METAL_ENCODER_PROFILE_MAX_SCALAR_BYTES);
+        if (capture->records == NULL || capture->bytes == NULL) {
+            free(capture->records);
+            free(capture->bytes);
+            capture->records = NULL;
+            capture->bytes = NULL;
+            capture->truncated = true;
+        }
+    }
 }
 
-struct ggml_metal_encoder_profile_result ggml_metal_encoder_profile_end(void) {
+struct ggml_metal_encoder_profile_result ggml_metal_encoder_profile_end(
+        struct ggml_metal_encoder_scalar_capture * scalar_capture) {
     GGML_ASSERT(ggml_metal_encoder_profile.enabled);
+    GGML_ASSERT(scalar_capture != NULL);
 
     ggml_metal_encoder_profile.enabled = false;
+
+    *scalar_capture = ggml_metal_encoder_profile.scalar_capture;
+    memset(&ggml_metal_encoder_profile.scalar_capture, 0, sizeof(ggml_metal_encoder_profile.scalar_capture));
 
     return ggml_metal_encoder_profile.result;
 }
@@ -658,6 +731,7 @@ void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, siz
         struct ggml_metal_encoder_profile_tls * profile = encoder->profile;
         uint64_t * fingerprint = &profile->result.scalar_fingerprint;
 
+        ggml_metal_encoder_profile_record_scalar(profile, data, size, idx);
         ggml_metal_encoder_profile_command(profile, GGML_METAL_ENCODER_PROFILE_SCALAR, fingerprint);
         ggml_metal_encoder_profile_value(profile, fingerprint, &idx, sizeof(idx));
         ggml_metal_encoder_profile_value(profile, fingerprint, &size, sizeof(size));
