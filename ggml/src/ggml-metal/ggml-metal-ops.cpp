@@ -3068,6 +3068,40 @@ size_t ggml_metal_op_mul_mat_id_extra_work(const ggml_tensor * op) {
     return ggml_metal_checked_add(work_offset - map_size, work_size);
 }
 
+static ggml_tensor * ggml_metal_op_mul_mat_id_dsv4_map_pair(
+        ggml_metal_op_t ctx,
+        int idx,
+        ggml_tensor * op) {
+    static const bool enabled = std::getenv("GGML_METAL_DSV4_GATE_UP_MAP_DISABLE") == nullptr;
+    static constexpr ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID };
+    static constexpr int outputs[] = { 0, 1 };
+
+    if (!enabled || !ctx->use_fusion ||
+            op->src[0]->ne[0] != 4096 || op->src[0]->ne[1] != 2048 ||
+            ctx->can_fuse_subgraph_raw(idx, ops, 2, outputs, 2) != 2) {
+        return nullptr;
+    }
+
+    ggml_tensor * pair = ctx->node(idx + 1);
+    const bool same_inputs =
+        pair->src[1] == op->src[1] &&
+        pair->src[2] == op->src[2];
+    const bool same_weight_layout =
+        ggml_are_same_shape(pair->src[0], op->src[0]) &&
+        ggml_are_same_stride(pair->src[0], op->src[0]);
+    const bool same_output_layout =
+        pair->type == op->type &&
+        ggml_are_same_shape(pair, op) &&
+        ggml_are_same_stride(pair, op);
+
+    if (!same_inputs || !same_weight_layout || !same_output_layout ||
+            !ggml_metal_op_mul_mat_id_use_dsv4_worklist(pair)) {
+        return nullptr;
+    }
+
+    return pair;
+}
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3134,6 +3168,11 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         const bool use_dsv4_worklist =
             props_dev->device_id == GGML_METAL_DEVICE_M2_ULTRA &&
             ggml_metal_op_mul_mat_id_use_dsv4_worklist(op);
+        ggml_tensor * dsv4_map_pair = use_dsv4_worklist ?
+            ggml_metal_op_mul_mat_id_dsv4_map_pair(ctx, idx, op) : nullptr;
+        if (dsv4_map_pair) {
+            n_fuse = 2;
+        }
 
         auto pipeline_mm = ggml_metal_library_get_pipeline_mul_mm_id(lib, op, use_dsv4_worklist);
         const int nr1 = pipeline_mm.nr1;
@@ -3210,25 +3249,40 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_pipeline(enc, pipeline_mm);
             ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
             ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
             ggml_metal_encoder_set_buffer  (enc, bid_tpe,  3);
             ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
-            ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
             ggml_metal_encoder_set_buffer  (enc, bid_work, 6);
 
             const size_t smem = pipeline_mm.smem;
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
+            int mm_tg0;
+            int mm_tg2;
             if (use_dsv4_worklist) {
                 const size_t work_cap = ggml_metal_op_mul_mat_id_work_cap(op);
                 GGML_ASSERT(work_cap <= (size_t) std::numeric_limits<int>::max());
-                ggml_metal_encoder_dispatch_threadgroups(
-                    enc, (int) work_cap, (ne01 + 63)/64, 1, 128, 1, 1);
+                mm_tg0 = (int) work_cap;
+                mm_tg2 = 1;
             } else {
+                mm_tg0 = (ne21 + nr1 - 1)/nr1;
+                mm_tg2 = ne02;
+            }
+
+            const auto dispatch = [&](ggml_tensor * mm_op) {
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mm_op->src[0]), 1);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mm_op),         5);
                 ggml_metal_encoder_dispatch_threadgroups(
-                    enc, (ne21 + nr1 - 1)/nr1, (ne01 + 63)/64, ne02, 128, 1, 1);
+                    enc, mm_tg0, (ne01 + 63)/64, mm_tg2, 128, 1, 1);
+            };
+
+            dispatch(op);
+            if (dsv4_map_pair) {
+                // Both independent matrix dispatches consume the same immutable
+                // route map. Keep them barrier-free so the concurrent encoder
+                // can schedule gate and up together without sharing accumulators.
+                dispatch(dsv4_map_pair);
             }
         }
     } else {
