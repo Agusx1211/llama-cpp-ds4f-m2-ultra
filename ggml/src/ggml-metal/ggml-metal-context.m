@@ -11,6 +11,8 @@
 
 #import <Metal/Metal.h>
 
+#include <inttypes.h>
+
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -18,6 +20,78 @@
 
 // max number of MTLCommandBuffer used to submit a graph for processing
 #define GGML_METAL_MAX_COMMAND_BUFFERS 8
+
+// Private ABI shared with ggml-metal-device.m. Keeping it out of the public
+// Metal headers avoids exposing this target-only instrumentation prototype.
+struct ggml_metal_encoder_profile_result {
+    uint64_t fingerprint;
+    uint64_t pipeline_fingerprint;
+    uint64_t scalar_fingerprint;
+    uint64_t buffer_fingerprint;
+    uint64_t threadgroup_memory_fingerprint;
+    uint64_t dispatch_fingerprint;
+    uint64_t barrier_fingerprint;
+
+    uint64_t n_commands;
+    uint64_t n_pipelines;
+    uint64_t n_scalars;
+    uint64_t n_buffers;
+    uint64_t n_threadgroup_memories;
+    uint64_t n_dispatches;
+    uint64_t n_barriers;
+
+    uint64_t scalar_bytes;
+    uint64_t projected_plan_bytes;
+};
+
+void ggml_metal_encoder_profile_begin(void);
+struct ggml_metal_encoder_profile_result ggml_metal_encoder_profile_end(void);
+
+struct ggml_metal_encode_profile_sample {
+    bool valid;
+    bool committed;
+
+    uint64_t uid;
+    int n_cb;
+    int idx_start;
+    int idx_end;
+    int n_raw_nodes;
+    int n_filtered_nodes;
+    bool use_fusion;
+    bool use_concurrency;
+
+    int64_t prepare_us;
+    int64_t encode_us;
+    int64_t finish_us;
+    int64_t commit_us;
+    int64_t total_us;
+
+    struct ggml_metal_encoder_profile_result commands;
+};
+
+struct ggml_metal_encode_profile_segment {
+    bool valid;
+
+    uint64_t uid;
+    int n_cb;
+    int idx_start;
+    int idx_end;
+    bool use_fusion;
+    bool use_concurrency;
+
+    struct ggml_metal_encoder_profile_result reference;
+    struct ggml_metal_encode_profile_sample last;
+
+    uint64_t samples;
+    uint64_t matches;
+    uint64_t changes;
+
+    int64_t prepare_us;
+    int64_t encode_us;
+    int64_t finish_us;
+    int64_t commit_us;
+    int64_t total_us;
+};
 
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
@@ -40,6 +114,9 @@ struct ggml_metal {
     bool use_concurrency;
     bool use_graph_optimize;
     bool use_dsv4_split_tuning;
+    bool use_dsv4_encode_profile;
+
+    int dsv4_encode_profile_interval;
 
     int debug_graph;
     int debug_fusion;
@@ -67,6 +144,19 @@ struct ggml_metal {
     // n_cb command buffers + 1 used by the main thread
     struct ggml_metal_command_buffer cmd_bufs[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
 
+    // Opt-in instrumentation state. Each worker owns its indexed sample while
+    // encoding; the caller compares and logs samples only after dispatch_apply.
+    bool dsv4_encode_profile_active;
+    struct ggml_metal_encode_profile_sample dsv4_encode_profile_samples[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
+    struct ggml_metal_encode_profile_segment dsv4_encode_profile_segments[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
+    uint64_t dsv4_encode_profile_graphs;
+    uint64_t dsv4_encode_profile_key_hits;
+    uint64_t dsv4_encode_profile_key_misses;
+    uint64_t dsv4_encode_profile_replay_hits;
+    uint64_t dsv4_encode_profile_replay_misses;
+    uint64_t dsv4_encode_profile_changes;
+    int64_t dsv4_encode_profile_graph_host_us;
+
     // extra command buffers for things like getting, setting and copying tensors
     NSMutableArray * cmd_bufs_ext;
 
@@ -81,6 +171,198 @@ struct ggml_metal {
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
 };
+
+static bool ggml_metal_encode_profile_commands_equal(
+        const struct ggml_metal_encoder_profile_result * lhs,
+        const struct ggml_metal_encoder_profile_result * rhs) {
+    return lhs->fingerprint                    == rhs->fingerprint &&
+           lhs->pipeline_fingerprint           == rhs->pipeline_fingerprint &&
+           lhs->scalar_fingerprint             == rhs->scalar_fingerprint &&
+           lhs->buffer_fingerprint             == rhs->buffer_fingerprint &&
+           lhs->threadgroup_memory_fingerprint == rhs->threadgroup_memory_fingerprint &&
+           lhs->dispatch_fingerprint           == rhs->dispatch_fingerprint &&
+           lhs->barrier_fingerprint            == rhs->barrier_fingerprint &&
+           lhs->n_commands                     == rhs->n_commands &&
+           lhs->n_pipelines                    == rhs->n_pipelines &&
+           lhs->n_scalars                      == rhs->n_scalars &&
+           lhs->n_buffers                      == rhs->n_buffers &&
+           lhs->n_threadgroup_memories         == rhs->n_threadgroup_memories &&
+           lhs->n_dispatches                   == rhs->n_dispatches &&
+           lhs->n_barriers                     == rhs->n_barriers &&
+           lhs->scalar_bytes                   == rhs->scalar_bytes &&
+           lhs->projected_plan_bytes           == rhs->projected_plan_bytes;
+}
+
+static bool ggml_metal_encode_profile_key_equal(
+        const struct ggml_metal_encode_profile_segment * segment,
+        const struct ggml_metal_encode_profile_sample * sample) {
+    return segment->valid &&
+           segment->uid             == sample->uid &&
+           segment->n_cb            == sample->n_cb &&
+           segment->idx_start       == sample->idx_start &&
+           segment->idx_end         == sample->idx_end &&
+           segment->use_fusion      == sample->use_fusion &&
+           segment->use_concurrency == sample->use_concurrency;
+}
+
+static void ggml_metal_encode_profile_diff_add(char * dst, size_t size, const char * field) {
+    const size_t used = strlen(dst);
+    if (used >= size) {
+        return;
+    }
+
+    snprintf(dst + used, size - used, "%s%s", used > 0 ? "," : "", field);
+}
+
+static void ggml_metal_encode_profile_diff(
+        const struct ggml_metal_encoder_profile_result * reference,
+        const struct ggml_metal_encoder_profile_result * current,
+        char * dst,
+        size_t size) {
+    dst[0] = '\0';
+
+    if (reference->pipeline_fingerprint != current->pipeline_fingerprint ||
+            reference->n_pipelines != current->n_pipelines) {
+        ggml_metal_encode_profile_diff_add(dst, size, "pipeline");
+    }
+    if (reference->scalar_fingerprint != current->scalar_fingerprint ||
+            reference->n_scalars != current->n_scalars ||
+            reference->scalar_bytes != current->scalar_bytes) {
+        ggml_metal_encode_profile_diff_add(dst, size, "scalar");
+    }
+    if (reference->buffer_fingerprint != current->buffer_fingerprint ||
+            reference->n_buffers != current->n_buffers) {
+        ggml_metal_encode_profile_diff_add(dst, size, "buffer+offset");
+    }
+    if (reference->threadgroup_memory_fingerprint != current->threadgroup_memory_fingerprint ||
+            reference->n_threadgroup_memories != current->n_threadgroup_memories) {
+        ggml_metal_encode_profile_diff_add(dst, size, "tgmem");
+    }
+    if (reference->dispatch_fingerprint != current->dispatch_fingerprint ||
+            reference->n_dispatches != current->n_dispatches) {
+        ggml_metal_encode_profile_diff_add(dst, size, "grid");
+    }
+    if (reference->barrier_fingerprint != current->barrier_fingerprint ||
+            reference->n_barriers != current->n_barriers) {
+        ggml_metal_encode_profile_diff_add(dst, size, "barrier");
+    }
+    if (dst[0] == '\0' && reference->fingerprint != current->fingerprint) {
+        ggml_metal_encode_profile_diff_add(dst, size, "overall-order");
+    }
+    if (dst[0] == '\0') {
+        snprintf(dst, size, "none");
+    }
+}
+
+static void ggml_metal_encode_profile_log_segment(
+        const struct ggml_metal_encode_profile_segment * segment,
+        int cb_idx,
+        const char * reason,
+        const char * diff) {
+    const struct ggml_metal_encode_profile_sample * sample = &segment->last;
+    const struct ggml_metal_encoder_profile_result * commands = &sample->commands;
+    const uint64_t comparisons = segment->matches + segment->changes;
+    const double stable_pct = comparisons > 0 ? 100.0*segment->matches/comparisons : 0.0;
+    const double samples = segment->samples > 0 ? (double) segment->samples : 1.0;
+
+    GGML_LOG_INFO("dsv4_encode_profile: uid=%" PRIu64 " cb=%d/%d range=%d:%d reason=%s diff=%s samples=%" PRIu64
+            " matches=%" PRIu64 " changes=%" PRIu64 " stable=%.2f%% raw=%d filtered=%d committed=%s\n",
+            sample->uid, cb_idx, sample->n_cb, sample->idx_start, sample->idx_end, reason, diff,
+            segment->samples, segment->matches, segment->changes, stable_pct,
+            sample->n_raw_nodes, sample->n_filtered_nodes, sample->committed ? "true" : "false");
+    GGML_LOG_INFO("dsv4_encode_profile: timing_us prepare=%" PRId64 "/%.1f encode=%" PRId64 "/%.1f finish=%" PRId64
+            "/%.1f commit=%" PRId64 "/%.1f total=%" PRId64 "/%.1f commands=%" PRIu64
+            " projected_bytes=%" PRIu64 " scalar_bytes=%" PRIu64 "\n",
+            sample->prepare_us, segment->prepare_us/samples,
+            sample->encode_us,  segment->encode_us/samples,
+            sample->finish_us,  segment->finish_us/samples,
+            sample->commit_us,  segment->commit_us/samples,
+            sample->total_us,   segment->total_us/samples,
+            commands->n_commands, commands->projected_plan_bytes, commands->scalar_bytes);
+    GGML_LOG_INFO("dsv4_encode_profile: fingerprints all=%016" PRIx64 " pipeline=%016" PRIx64 " scalar=%016" PRIx64
+            " buffer_offset=%016" PRIx64 " tgmem=%016" PRIx64 " grid=%016" PRIx64 " barrier=%016" PRIx64
+            " counts=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
+            commands->fingerprint, commands->pipeline_fingerprint, commands->scalar_fingerprint,
+            commands->buffer_fingerprint, commands->threadgroup_memory_fingerprint,
+            commands->dispatch_fingerprint, commands->barrier_fingerprint,
+            commands->n_pipelines, commands->n_scalars, commands->n_buffers,
+            commands->n_threadgroup_memories, commands->n_dispatches, commands->n_barriers);
+}
+
+static void ggml_metal_encode_profile_log_summary(ggml_metal_t ctx, const char * reason) {
+    const uint64_t key_samples = ctx->dsv4_encode_profile_key_hits + ctx->dsv4_encode_profile_key_misses;
+    const uint64_t replay_samples = ctx->dsv4_encode_profile_replay_hits + ctx->dsv4_encode_profile_replay_misses;
+    const double key_hit_pct = key_samples > 0 ? 100.0*ctx->dsv4_encode_profile_key_hits/key_samples : 0.0;
+    const double replay_hit_pct = replay_samples > 0 ? 100.0*ctx->dsv4_encode_profile_replay_hits/replay_samples : 0.0;
+    const double graph_host_us = ctx->dsv4_encode_profile_graphs > 0 ?
+            (double) ctx->dsv4_encode_profile_graph_host_us/ctx->dsv4_encode_profile_graphs : 0.0;
+
+    GGML_LOG_INFO("dsv4_encode_profile: summary=%s graphs=%" PRIu64 " graph_host_us_avg=%.1f key_hits=%" PRIu64
+            " key_misses=%" PRIu64 " key_hit=%.2f%% replay_hits=%" PRIu64 " replay_misses=%" PRIu64
+            " replay_hit=%.2f%% same_key_changes=%" PRIu64 "\n",
+            reason, ctx->dsv4_encode_profile_graphs, graph_host_us,
+            ctx->dsv4_encode_profile_key_hits, ctx->dsv4_encode_profile_key_misses, key_hit_pct,
+            ctx->dsv4_encode_profile_replay_hits, ctx->dsv4_encode_profile_replay_misses, replay_hit_pct,
+            ctx->dsv4_encode_profile_changes);
+}
+
+static void ggml_metal_encode_profile_update(
+        ggml_metal_t ctx,
+        int cb_idx,
+        bool periodic) {
+    struct ggml_metal_encode_profile_sample * sample = &ctx->dsv4_encode_profile_samples[cb_idx];
+    struct ggml_metal_encode_profile_segment * segment = &ctx->dsv4_encode_profile_segments[cb_idx];
+    if (!sample->valid) {
+        return;
+    }
+
+    const bool same_key = ggml_metal_encode_profile_key_equal(segment, sample);
+    const bool exact = same_key && ggml_metal_encode_profile_commands_equal(&segment->reference, &sample->commands);
+
+    char diff[96];
+    const char * reason = "periodic";
+    if (!same_key) {
+        memset(segment, 0, sizeof(*segment));
+        segment->valid           = true;
+        segment->uid             = sample->uid;
+        segment->n_cb            = sample->n_cb;
+        segment->idx_start       = sample->idx_start;
+        segment->idx_end         = sample->idx_end;
+        segment->use_fusion      = sample->use_fusion;
+        segment->use_concurrency = sample->use_concurrency;
+        segment->reference       = sample->commands;
+
+        ctx->dsv4_encode_profile_key_misses++;
+        ctx->dsv4_encode_profile_replay_misses++;
+        snprintf(diff, sizeof(diff), "new-key");
+        reason = "new-key";
+    } else {
+        ctx->dsv4_encode_profile_key_hits++;
+        if (exact) {
+            segment->matches++;
+            ctx->dsv4_encode_profile_replay_hits++;
+            snprintf(diff, sizeof(diff), "none");
+        } else {
+            segment->changes++;
+            ctx->dsv4_encode_profile_replay_misses++;
+            ctx->dsv4_encode_profile_changes++;
+            ggml_metal_encode_profile_diff(&segment->reference, &sample->commands, diff, sizeof(diff));
+            reason = "changed";
+        }
+    }
+
+    segment->last = *sample;
+    segment->samples++;
+    segment->prepare_us += sample->prepare_us;
+    segment->encode_us  += sample->encode_us;
+    segment->finish_us  += sample->finish_us;
+    segment->commit_us  += sample->commit_us;
+    segment->total_us   += sample->total_us;
+
+    if (!same_key || !exact || periodic) {
+        ggml_metal_encode_profile_log_segment(segment, cb_idx, reason, diff);
+    }
+}
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: allocating\n", __func__);
@@ -139,6 +421,15 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     res->use_dsv4_split_tuning = getenv("GGML_METAL_DSV4_SPLIT_DISABLE") == nil;
 
     {
+        const char * val = getenv("GGML_METAL_DSV4_ENCODE_PROFILE");
+        res->use_dsv4_encode_profile = val != NULL;
+        res->dsv4_encode_profile_interval = val ? atoi(val) : 0;
+        if (res->use_dsv4_encode_profile && res->dsv4_encode_profile_interval <= 0) {
+            res->dsv4_encode_profile_interval = 64;
+        }
+    }
+
+    {
         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
         res->debug_graph = val ? atoi(val) : 0;
     }
@@ -159,6 +450,10 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: use fusion         = %s\n", __func__, res->use_fusion         ? "true" : "false");
     GGML_LOG_INFO("%s: use concurrency    = %s\n", __func__, res->use_concurrency    ? "true" : "false");
     GGML_LOG_INFO("%s: use graph optimize = %s\n", __func__, res->use_graph_optimize ? "true" : "false");
+    if (res->use_dsv4_encode_profile) {
+        GGML_LOG_INFO("%s: DSV4 encode profile = true (interval = %d)\n",
+                __func__, res->dsv4_encode_profile_interval);
+    }
 
     res->capture_compute = 0;
     res->capture_started = false;
@@ -172,6 +467,10 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     }
 
     res->has_error = false;
+
+    res->dsv4_encode_profile_active = false;
+    memset(res->dsv4_encode_profile_samples, 0, sizeof(res->dsv4_encode_profile_samples));
+    memset(res->dsv4_encode_profile_segments, 0, sizeof(res->dsv4_encode_profile_segments));
 
     res->gf = nil;
     res->encode_async = nil;
@@ -190,6 +489,16 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
+
+    if (ctx->use_dsv4_encode_profile && ctx->dsv4_encode_profile_graphs > 0) {
+        for (int cb_idx = 0; cb_idx <= GGML_METAL_MAX_COMMAND_BUFFERS; ++cb_idx) {
+            if (ctx->dsv4_encode_profile_segments[cb_idx].valid) {
+                ggml_metal_encode_profile_log_segment(
+                        &ctx->dsv4_encode_profile_segments[cb_idx], cb_idx, "final", "none");
+            }
+        }
+        ggml_metal_encode_profile_log_summary(ctx, "final");
+    }
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
@@ -453,6 +762,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     const bool tune_dsv4_split = ctx->use_dsv4_split_tuning &&
             props_dev->device_id == GGML_METAL_DEVICE_M2_ULTRA && gf->n_nodes >= 3000;
     const int n_main = tune_dsv4_split ? 512 : MAX(64, 0.1*gf->n_nodes);
+    const bool profile_dsv4_encode = ctx->use_dsv4_encode_profile && tune_dsv4_split && gf->uid != 0;
+    const int64_t profile_graph_start_us = profile_dsv4_encode ? ggml_time_us() : 0;
     if (ctx->debug_graph > 0) {
         GGML_LOG_DEBUG("%s: nodes = %d, main-thread nodes = %d, DSV4 split tuning = %s\n",
                 __func__, gf->n_nodes, n_main, tune_dsv4_split ? "true" : "false");
@@ -517,6 +828,15 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             }
         }
 
+        // Capture and graph-debug encoders can add commands that are not part
+        // of the stable production decode program. Leave those runs out of the
+        // replay-feasibility fingerprint.
+        ctx->dsv4_encode_profile_active = profile_dsv4_encode &&
+                !use_capture && !ctx->capture_started && ctx->debug_graph == 0;
+        if (ctx->dsv4_encode_profile_active) {
+            memset(ctx->dsv4_encode_profile_samples, 0, sizeof(ctx->dsv4_encode_profile_samples));
+        }
+
         // short-hand
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
 
@@ -562,6 +882,21 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+
+        if (ctx->dsv4_encode_profile_active) {
+            const int64_t graph_host_us = ggml_time_us() - profile_graph_start_us;
+            ctx->dsv4_encode_profile_graphs++;
+            ctx->dsv4_encode_profile_graph_host_us += graph_host_us;
+
+            const bool periodic = ctx->dsv4_encode_profile_graphs % ctx->dsv4_encode_profile_interval == 0;
+            for (int cb_idx = 0; cb_idx <= n_cb; ++cb_idx) {
+                ggml_metal_encode_profile_update(ctx, cb_idx, periodic);
+            }
+
+            if (periodic) {
+                ggml_metal_encode_profile_log_summary(ctx, "periodic");
+            }
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
@@ -706,6 +1041,12 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
         id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
 
+        const bool profile_dsv4_encode = ctx->dsv4_encode_profile_active;
+        const int64_t profile_start_us = profile_dsv4_encode ? ggml_time_us() : 0;
+        if (profile_dsv4_encode) {
+            ggml_metal_encoder_profile_begin();
+        }
+
         ggml_metal_op_t ctx_op = ggml_metal_op_init(
             ctx->dev,
             cmd_buf,
@@ -718,6 +1059,9 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->debug_graph,
             ctx->debug_fusion);
 
+        const int64_t profile_prepared_us = profile_dsv4_encode ? ggml_time_us() : 0;
+        const int n_filtered_nodes = profile_dsv4_encode ? ggml_metal_op_n_nodes(ctx_op) : 0;
+
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);
             if (res == 0) {
@@ -727,10 +1071,39 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             idx += res - 1;
         }
 
+        const int64_t profile_encoded_us = profile_dsv4_encode ? ggml_time_us() : 0;
+
         ggml_metal_op_free(ctx_op);
 
+        const int64_t profile_finished_us = profile_dsv4_encode ? ggml_time_us() : 0;
+
+        bool committed = false;
+        int64_t profile_committed_us = profile_finished_us;
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
             [cmd_buf commit];
+            committed = true;
+            profile_committed_us = profile_dsv4_encode ? ggml_time_us() : profile_finished_us;
+        }
+
+        if (profile_dsv4_encode) {
+            struct ggml_metal_encode_profile_sample * sample = &ctx->dsv4_encode_profile_samples[cb_idx];
+
+            sample->valid           = true;
+            sample->committed       = committed;
+            sample->uid             = ctx->gf->uid;
+            sample->n_cb            = n_cb_l;
+            sample->idx_start        = idx_start;
+            sample->idx_end          = idx_end;
+            sample->n_raw_nodes      = idx_end - idx_start;
+            sample->n_filtered_nodes = n_filtered_nodes;
+            sample->use_fusion      = ctx->use_fusion;
+            sample->use_concurrency = ctx->use_concurrency;
+            sample->prepare_us      = profile_prepared_us - profile_start_us;
+            sample->encode_us       = profile_encoded_us - profile_prepared_us;
+            sample->finish_us       = profile_finished_us - profile_encoded_us;
+            sample->commit_us       = profile_committed_us - profile_finished_us;
+            sample->total_us        = profile_committed_us - profile_start_us;
+            sample->commands        = ggml_metal_encoder_profile_end();
         }
     });
 }

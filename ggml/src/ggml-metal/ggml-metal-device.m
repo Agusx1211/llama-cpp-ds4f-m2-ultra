@@ -9,6 +9,8 @@
 
 #include <stdatomic.h>
 
+#define GGML_METAL_PROFILE_UNLIKELY(x) __builtin_expect(!!(x), 0)
+
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
 #endif
@@ -463,8 +465,142 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 // MTLComputeCommandEncoder wrapper
 //
 
+enum ggml_metal_encoder_profile_opcode {
+    GGML_METAL_ENCODER_PROFILE_PIPELINE,
+    GGML_METAL_ENCODER_PROFILE_SCALAR,
+    GGML_METAL_ENCODER_PROFILE_BUFFER,
+    GGML_METAL_ENCODER_PROFILE_THREADGROUP_MEMORY,
+    GGML_METAL_ENCODER_PROFILE_DISPATCH,
+    GGML_METAL_ENCODER_PROFILE_BARRIER,
+};
+
+struct ggml_metal_encoder_profile_result {
+    uint64_t fingerprint;
+    uint64_t pipeline_fingerprint;
+    uint64_t scalar_fingerprint;
+    uint64_t buffer_fingerprint;
+    uint64_t threadgroup_memory_fingerprint;
+    uint64_t dispatch_fingerprint;
+    uint64_t barrier_fingerprint;
+
+    uint64_t n_commands;
+    uint64_t n_pipelines;
+    uint64_t n_scalars;
+    uint64_t n_buffers;
+    uint64_t n_threadgroup_memories;
+    uint64_t n_dispatches;
+    uint64_t n_barriers;
+
+    uint64_t scalar_bytes;
+    uint64_t projected_plan_bytes;
+};
+
+struct ggml_metal_encoder_profile_tls {
+    bool enabled;
+    uint64_t sequence;
+    struct ggml_metal_encoder_profile_result result;
+};
+
+static _Thread_local struct ggml_metal_encoder_profile_tls ggml_metal_encoder_profile;
+
+static const uint64_t GGML_METAL_ENCODER_PROFILE_FNV_OFFSET = 14695981039346656037ULL;
+static const uint64_t GGML_METAL_ENCODER_PROFILE_FNV_PRIME  = 1099511628211ULL;
+
+static void ggml_metal_encoder_profile_hash(uint64_t * hash, const void * data, size_t size) {
+    const uint8_t * bytes = data;
+
+    for (size_t i = 0; i < size; ++i) {
+        *hash ^= bytes[i];
+        *hash *= GGML_METAL_ENCODER_PROFILE_FNV_PRIME;
+    }
+}
+
+static void ggml_metal_encoder_profile_command(
+        struct ggml_metal_encoder_profile_tls * profile,
+        enum ggml_metal_encoder_profile_opcode opcode,
+        uint64_t * category_fingerprint) {
+    const uint64_t sequence = profile->sequence++;
+
+    ggml_metal_encoder_profile_hash(&profile->result.fingerprint, &opcode, sizeof(opcode));
+    ggml_metal_encoder_profile_hash(&profile->result.fingerprint, &sequence, sizeof(sequence));
+    ggml_metal_encoder_profile_hash(category_fingerprint, &opcode, sizeof(opcode));
+    ggml_metal_encoder_profile_hash(category_fingerprint, &sequence, sizeof(sequence));
+
+    profile->result.n_commands++;
+}
+
+static void ggml_metal_encoder_profile_value(
+        struct ggml_metal_encoder_profile_tls * profile,
+        uint64_t * category_fingerprint,
+        const void * data,
+        size_t size) {
+    ggml_metal_encoder_profile_hash(&profile->result.fingerprint, data, size);
+    ggml_metal_encoder_profile_hash(category_fingerprint, data, size);
+}
+
+void ggml_metal_encoder_profile_begin(void) {
+    GGML_ASSERT(!ggml_metal_encoder_profile.enabled);
+
+    memset(&ggml_metal_encoder_profile, 0, sizeof(ggml_metal_encoder_profile));
+    ggml_metal_encoder_profile.enabled = true;
+
+    struct ggml_metal_encoder_profile_result * result = &ggml_metal_encoder_profile.result;
+    result->fingerprint                    = GGML_METAL_ENCODER_PROFILE_FNV_OFFSET;
+    result->pipeline_fingerprint           = GGML_METAL_ENCODER_PROFILE_FNV_OFFSET;
+    result->scalar_fingerprint             = GGML_METAL_ENCODER_PROFILE_FNV_OFFSET;
+    result->buffer_fingerprint             = GGML_METAL_ENCODER_PROFILE_FNV_OFFSET;
+    result->threadgroup_memory_fingerprint = GGML_METAL_ENCODER_PROFILE_FNV_OFFSET;
+    result->dispatch_fingerprint           = GGML_METAL_ENCODER_PROFILE_FNV_OFFSET;
+    result->barrier_fingerprint            = GGML_METAL_ENCODER_PROFILE_FNV_OFFSET;
+}
+
+struct ggml_metal_encoder_profile_result ggml_metal_encoder_profile_end(void) {
+    GGML_ASSERT(ggml_metal_encoder_profile.enabled);
+
+    ggml_metal_encoder_profile.enabled = false;
+
+    return ggml_metal_encoder_profile.result;
+}
+
+struct ggml_metal_encoder_profile_pipeline_command {
+    uint8_t opcode;
+    uintptr_t pipeline;
+};
+
+struct ggml_metal_encoder_profile_scalar_command {
+    uint8_t opcode;
+    int idx;
+    size_t size;
+};
+
+struct ggml_metal_encoder_profile_buffer_command {
+    uint8_t opcode;
+    int idx;
+    uintptr_t buffer;
+    size_t offset;
+};
+
+struct ggml_metal_encoder_profile_threadgroup_memory_command {
+    uint8_t opcode;
+    int idx;
+    size_t size;
+};
+
+struct ggml_metal_encoder_profile_dispatch_command {
+    uint8_t opcode;
+    int dimensions[6];
+};
+
+struct ggml_metal_encoder_profile_barrier_command {
+    uint8_t opcode;
+};
+
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+
+    // Points to thread-local profiling state only while an opt-in recording
+    // scope is active. It does not retain any Metal object.
+    struct ggml_metal_encoder_profile_tls * profile;
 };
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
@@ -477,6 +613,8 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
     } else {
         res->obj = [cmd_buf computeCommandEncoder];
     }
+
+    res->profile = ggml_metal_encoder_profile.enabled ? &ggml_metal_encoder_profile : NULL;
 
     [res->obj retain];
 
@@ -497,26 +635,100 @@ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
 }
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline) {
+    if (GGML_METAL_PROFILE_UNLIKELY(encoder->profile != NULL)) {
+        struct ggml_metal_encoder_profile_tls * profile = encoder->profile;
+        uint64_t * fingerprint = &profile->result.pipeline_fingerprint;
+        const uintptr_t pipeline_obj = (uintptr_t) pipeline.pipeline->obj;
+
+        ggml_metal_encoder_profile_command(profile, GGML_METAL_ENCODER_PROFILE_PIPELINE, fingerprint);
+        ggml_metal_encoder_profile_value(profile, fingerprint, &pipeline_obj, sizeof(pipeline_obj));
+
+        profile->result.n_pipelines++;
+        profile->result.projected_plan_bytes += sizeof(struct ggml_metal_encoder_profile_pipeline_command);
+    }
+
     [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
 }
 
 void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, size_t size, int idx) {
+    if (GGML_METAL_PROFILE_UNLIKELY(encoder->profile != NULL)) {
+        struct ggml_metal_encoder_profile_tls * profile = encoder->profile;
+        uint64_t * fingerprint = &profile->result.scalar_fingerprint;
+
+        ggml_metal_encoder_profile_command(profile, GGML_METAL_ENCODER_PROFILE_SCALAR, fingerprint);
+        ggml_metal_encoder_profile_value(profile, fingerprint, &idx, sizeof(idx));
+        ggml_metal_encoder_profile_value(profile, fingerprint, &size, sizeof(size));
+        ggml_metal_encoder_profile_value(profile, fingerprint, data, size);
+
+        profile->result.n_scalars++;
+        profile->result.scalar_bytes += size;
+        profile->result.projected_plan_bytes += sizeof(struct ggml_metal_encoder_profile_scalar_command) + size;
+    }
+
     [encoder->obj setBytes:data length:size atIndex:idx];
 }
 
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx) {
+    if (GGML_METAL_PROFILE_UNLIKELY(encoder->profile != NULL)) {
+        struct ggml_metal_encoder_profile_tls * profile = encoder->profile;
+        uint64_t * fingerprint = &profile->result.buffer_fingerprint;
+        const uintptr_t buffer_obj = (uintptr_t) buffer.metal;
+
+        ggml_metal_encoder_profile_command(profile, GGML_METAL_ENCODER_PROFILE_BUFFER, fingerprint);
+        ggml_metal_encoder_profile_value(profile, fingerprint, &idx, sizeof(idx));
+        ggml_metal_encoder_profile_value(profile, fingerprint, &buffer_obj, sizeof(buffer_obj));
+        ggml_metal_encoder_profile_value(profile, fingerprint, &buffer.offs, sizeof(buffer.offs));
+
+        profile->result.n_buffers++;
+        profile->result.projected_plan_bytes += sizeof(struct ggml_metal_encoder_profile_buffer_command);
+    }
+
     [encoder->obj setBuffer:buffer.metal offset:buffer.offs atIndex:idx];
 }
 
 void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder, size_t size, int idx) {
+    if (GGML_METAL_PROFILE_UNLIKELY(encoder->profile != NULL)) {
+        struct ggml_metal_encoder_profile_tls * profile = encoder->profile;
+        uint64_t * fingerprint = &profile->result.threadgroup_memory_fingerprint;
+
+        ggml_metal_encoder_profile_command(profile, GGML_METAL_ENCODER_PROFILE_THREADGROUP_MEMORY, fingerprint);
+        ggml_metal_encoder_profile_value(profile, fingerprint, &idx, sizeof(idx));
+        ggml_metal_encoder_profile_value(profile, fingerprint, &size, sizeof(size));
+
+        profile->result.n_threadgroup_memories++;
+        profile->result.projected_plan_bytes += sizeof(struct ggml_metal_encoder_profile_threadgroup_memory_command);
+    }
+
     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
 }
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+    if (GGML_METAL_PROFILE_UNLIKELY(encoder->profile != NULL)) {
+        struct ggml_metal_encoder_profile_tls * profile = encoder->profile;
+        uint64_t * fingerprint = &profile->result.dispatch_fingerprint;
+        const int dimensions[6] = { tg0, tg1, tg2, tptg0, tptg1, tptg2 };
+
+        ggml_metal_encoder_profile_command(profile, GGML_METAL_ENCODER_PROFILE_DISPATCH, fingerprint);
+        ggml_metal_encoder_profile_value(profile, fingerprint, dimensions, sizeof(dimensions));
+
+        profile->result.n_dispatches++;
+        profile->result.projected_plan_bytes += sizeof(struct ggml_metal_encoder_profile_dispatch_command);
+    }
+
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
 }
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
+    if (GGML_METAL_PROFILE_UNLIKELY(encoder->profile != NULL)) {
+        struct ggml_metal_encoder_profile_tls * profile = encoder->profile;
+        uint64_t * fingerprint = &profile->result.barrier_fingerprint;
+
+        ggml_metal_encoder_profile_command(profile, GGML_METAL_ENCODER_PROFILE_BARRIER, fingerprint);
+
+        profile->result.n_barriers++;
+        profile->result.projected_plan_bytes += sizeof(struct ggml_metal_encoder_profile_barrier_command);
+    }
+
     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
