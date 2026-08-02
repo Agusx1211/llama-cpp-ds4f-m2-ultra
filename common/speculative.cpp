@@ -190,6 +190,13 @@ struct common_speculative_impl {
     // Optional runtime tuning hooks for workload-adaptive draft models.
     virtual bool set_draft_options(int32_t /*n_max*/, float /*p_min*/) { return false; }
     virtual bool set_enabled(bool /*enabled*/) { return false; }
+
+    // Optional contract for a draft implementation that can retain a committed
+    // input row and omit its duplicate from the following process() call.
+    virtual bool prepare_draft_reuse(llama_seq_id /*seq_id*/, llama_pos /*committed_pos*/) { return false; }
+
+    // Optional implementation-specific counters appended to the shared stats.
+    virtual std::string extra_stats() const { return {}; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1343,6 +1350,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    struct dsv4_depth1_cycle {
+        llama_pos committed_pos = -1;
+        bool      compatible    = false;
+        bool      reuse_armed   = false;
+    };
+
+    bool                           dsv4_depth1_reuse_compatible = false;
+    bool                           dsv4_depth1_reuse_enabled    = false;
+    std::vector<dsv4_depth1_cycle> dsv4_depth1_cycles;
+
+    uint64_t dsv4_depth1_draft_rows   = 0;
+    uint64_t dsv4_depth1_catchup_rows = 0;
+    uint64_t dsv4_depth1_reused_rows  = 0;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1403,6 +1424,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
+        const auto is_deepseek4 = [](const llama_model * model) {
+            char arch[32] = {};
+            return llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) >= 0 &&
+                    std::strcmp(arch, "deepseek4") == 0;
+        };
+
+        // This is deliberately narrower than the generic MTP implementation.
+        // DSV4 depth one has exactly one committed input row followed by one
+        // proposal row, and both independent contexts have one rollback plane.
+        dsv4_depth1_reuse_compatible =
+                !is_mem_shared &&
+                !chain_heads &&
+                llama_model_n_layer_nextn(llama_get_model(ctx_dft)) == 1 &&
+                this->params.n_max == 1 &&
+                llama_n_rs_seq(ctx_tgt) == 1 &&
+                llama_n_rs_seq(ctx_dft) == 1 &&
+                is_deepseek4(llama_get_model(ctx_tgt)) &&
+                is_deepseek4(llama_get_model(ctx_dft));
+        dsv4_depth1_reuse_enabled = dsv4_depth1_reuse_compatible &&
+                std::getenv("LLAMA_DSV4_MTP_RETAIN_DRAFT_ROW_DISABLE") == nullptr;
+
+        if (dsv4_depth1_reuse_compatible) {
+            SPC_INF("DSV4 depth-one committed draft-row reuse = %s\n",
+                    dsv4_depth1_reuse_enabled ? "enabled" : "disabled by environment");
+        }
+
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
 
@@ -1425,6 +1472,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         } else {
             verify_h_direct_ready.assign(n_seq, false);
         }
+        dsv4_depth1_cycles.resize(n_seq);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1511,29 +1559,63 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!is_mem_shared) {
             common_batch_clear(batch);
 
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-            }
+            const bool reuse_draft_rows = std::any_of(
+                    dsv4_depth1_cycles.begin(), dsv4_depth1_cycles.end(),
+                    [](const dsv4_depth1_cycle & cycle) { return cycle.reuse_armed; });
 
-            // shift the tgt embeddings to the right by one position
-            // assumes that the tokens in the batch are sequential for each sequence
-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
-            //                                                       ^--- this is a problem
-            // TODO:this is generally true, but would be nice to assert it
-            std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+            if (reuse_draft_rows) {
+                for (int k = 0; k < n_tokens; ++k) {
+                    const llama_seq_id seq_id = batch_in.seq_id[k][0];
+                    GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
 
-            // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
+                    auto & cycle = dsv4_depth1_cycles[seq_id];
+                    if (cycle.reuse_armed) {
+                        const int32_t i_beg = i_batch_beg[seq_id];
+                        const int32_t i_end = i_batch_end[seq_id];
+                        GGML_ASSERT(i_end - i_beg + 1 == 2);
+                        GGML_ASSERT(batch_in.pos[i_beg] == cycle.committed_pos);
+                        GGML_ASSERT(batch_in.pos[i_end] == cycle.committed_pos + 1);
 
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (i_batch_beg[seq_id] < 0) {
-                    continue;
+                        if (k == i_beg) {
+                            dsv4_depth1_reused_rows++;
+                            continue;
+                        }
+                    }
+
+                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { seq_id }, 0);
+
+                    const int32_t i_beg = i_batch_beg[seq_id];
+                    const float * h_row = k == i_beg ?
+                            pending_h[seq_id].data() :
+                            llama_get_embeddings_nextn_ith(ctx_tgt, k - 1);
+                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                }
+            } else {
+                for (int k = 0; k < n_tokens; ++k) {
+                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                // Shift target rows right and fill each sequence's first row
+                // from the cross-batch carry. This is the existing generic
+                // catch-up path and remains unchanged when reuse is not armed.
+                std::memcpy(batch.embd + (size_t) n_embd, h_tgt, row_bytes * (n_tokens - 1));
+
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] >= 0) {
+                        std::memcpy(batch.embd + (size_t) i_batch_beg[seq_id] * n_embd,
+                                pending_h[seq_id].data(), row_bytes);
+                    }
+                }
             }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                const auto & cycle = dsv4_depth1_cycles[seq_id];
+                if (cycle.compatible && i_batch_beg[seq_id] >= 0) {
+                    dsv4_depth1_catchup_rows += cycle.reuse_armed ? 1 : 2;
+                }
+            }
+
+            GGML_ASSERT(batch.n_tokens > 0);
 
             auto * mem_dft = llama_get_memory(ctx_dft);
 
@@ -1565,6 +1647,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!ok) {
                 return false;
             }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                const auto & cycle = dsv4_depth1_cycles[seq_id];
+                if (cycle.reuse_armed) {
+                    GGML_ASSERT(llama_memory_seq_pos_max(mem_dft, seq_id) == cycle.committed_pos + 1);
+                }
+            }
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1594,6 +1683,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 std::memcpy(pending_h[seq_id].data(),
                         h_tgt + (size_t) i_batch_end[seq_id] * n_embd, row_bytes);
             }
+
+            dsv4_depth1_cycles[seq_id] = {};
         }
 
         if (!SPEC_MTP_DIRECT_VERIFY_H_DISABLED) {
@@ -1617,6 +1708,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
+
+            dsv4_depth1_cycles[seq_id] = {};
 
             if (!dp.drafting) {
                 continue;
@@ -1752,7 +1845,50 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+
+            // Compatibility already proves that this implementation can draft
+            // exactly one MTP row. dp.n_max is the server's remaining request
+            // allowance, not the configured speculative depth, so it is usually
+            // much larger than one during generation.
+            if (dsv4_depth1_reuse_compatible && dp.result->size() == 1) {
+                dsv4_depth1_cycles[seq_id] = {
+                    /* .committed_pos = */ dp.n_past,
+                    /* .compatible    = */ true,
+                    /* .reuse_armed   = */ false,
+                };
+                dsv4_depth1_draft_rows++;
+            }
         }
+    }
+
+    bool prepare_draft_reuse(llama_seq_id seq_id, llama_pos committed_pos) override {
+        if (!dsv4_depth1_reuse_enabled || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        auto & cycle = dsv4_depth1_cycles[seq_id];
+        if (!cycle.compatible) {
+            return false;
+        }
+
+        GGML_ASSERT(cycle.committed_pos == committed_pos);
+        GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id) == committed_pos);
+        cycle.reuse_armed = true;
+        return true;
+    }
+
+    std::string extra_stats() const override {
+        if (!dsv4_depth1_reuse_compatible || dsv4_depth1_draft_rows == 0) {
+            return {};
+        }
+
+        std::ostringstream oss;
+        oss << ", DSV4 MTP rows(draft,catchup,reused,total) = ("
+            << dsv4_depth1_draft_rows << ", "
+            << dsv4_depth1_catchup_rows << ", "
+            << dsv4_depth1_reused_rows << ", "
+            << dsv4_depth1_draft_rows + dsv4_depth1_catchup_rows << ")";
+        return oss.str();
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
@@ -2668,6 +2804,18 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     return spec->dparams[seq_id];
 }
 
+bool common_speculative_prepare_draft_reuse(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        llama_pos committed_pos) {
+    if (spec == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) spec->impl_last.size()) {
+        return false;
+    }
+
+    common_speculative_impl * impl = spec->impl_last[seq_id];
+    return impl != nullptr && impl->prepare_draft_reuse(seq_id, committed_pos);
+}
+
 bool common_speculative_set_draft_options(
         common_speculative * spec,
         common_speculative_type type,
@@ -2912,6 +3060,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
         } else {
             str_perf = "";
         }
+        str_perf += impl->extra_stats();
 
         std::string str_stats;
         if (impl->n_call_accept > 0) {
