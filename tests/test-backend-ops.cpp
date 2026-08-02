@@ -4536,7 +4536,26 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
+enum class mul_mat_id_ids {
+    shuffled,
+    concentrated,
+    tile_boundaries,
+};
+
+static const char * mul_mat_id_ids_name(mul_mat_id_ids ids) {
+    switch (ids) {
+        case mul_mat_id_ids::shuffled:        return "shuffled";
+        case mul_mat_id_ids::concentrated:    return "concentrated";
+        case mul_mat_id_ids::tile_boundaries: return "tile_boundaries";
+    }
+    GGML_ABORT("invalid MUL_MAT_ID id pattern");
+}
+
+static void init_mul_mat_id_tensors(
+        ggml_context * ctx,
+        int n_mats,
+        int n_used,
+        mul_mat_id_ids ids = mul_mat_id_ids::shuffled) {
     std::random_device rd;
     std::default_random_engine rng(rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
@@ -4548,7 +4567,30 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
                 for (int i = 0; i < t->ne[0]; i++) {
                     data[i] = i % n_mats;
                 }
-                std::shuffle(data.begin(), data.end(), rng);
+
+                if (ids == mul_mat_id_ids::shuffled) {
+                    std::shuffle(data.begin(), data.end(), rng);
+                } else if (ids == mul_mat_id_ids::concentrated) {
+                    // Every token uses the same experts, leaving the other 250
+                    // target experts empty while each live expert spans 14 tiles.
+                    GGML_ASSERT(n_used <= n_mats);
+                } else {
+                    // Give experts 0/1/2 exactly 15/16/17 routes. The remaining
+                    // slots use experts 3..255, so every token still has unique
+                    // top-k ids while all 16-column boundary cases are covered.
+                    GGML_ASSERT(n_mats >= n_used + 3);
+                    int j = 0;
+                    if (r < 15) {
+                        data[j++] = 0;
+                    } else if (r < 31) {
+                        data[j++] = 1;
+                    } else if (r < 48) {
+                        data[j++] = 2;
+                    }
+                    for (int i = 0; j < n_used; i++) {
+                        data[j++] = 3 + (r*n_used + i) % (n_mats - 3);
+                    }
+                }
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
             }
         } else {
@@ -4567,9 +4609,11 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const mul_mat_id_ids ids;
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k) +
+            ",ids=" + mul_mat_id_ids_name(ids);
     }
 
     double max_nmse_err() override {
@@ -4591,9 +4635,10 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32,
+            mul_mat_id_ids ids = mul_mat_id_ids::shuffled)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), ids(ids) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -4619,7 +4664,7 @@ struct test_mul_mat_id : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats);
+        init_mul_mat_id_tensors(ctx, n_mats, n_used, ids);
     }
 };
 
@@ -4693,7 +4738,7 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats);
+        init_mul_mat_id_tensors(ctx, n_mats, n_used);
     }
 
     bool run_whole_graph() override { return true; }
@@ -6427,7 +6472,7 @@ struct test_mul_mat_vec_fusion : public test_case {
                 init_tensor_uniform(t);
             }
         } else {
-            init_mul_mat_id_tensors(ctx, n_mats);
+            init_mul_mat_id_tensors(ctx, n_mats, n_used);
         }
     }
 
@@ -10434,6 +10479,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Target-shape oracle for the DSV4 prompt-time expert MM path.
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 2048, 224, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 224, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(
+                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 2048, 224, 4096,
+                mul_mat_id_ids::concentrated));
+    test_cases.emplace_back(new test_mul_mat_id(
+                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 224, 2048,
+                mul_mat_id_ids::tile_boundaries));
     // DSV4 decode down projection with its routed-weight multiply.
     test_cases.emplace_back(new test_mul_mat_id_fusion(
                 GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 1, 2048, 1, true));
@@ -10482,7 +10533,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id_fusion(
                     GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, true, 2048, bs, 4096, 2));
     }
-    for (int bs : { 128, 192, 224, 256, 512 }) {
+    for (int bs : { 128, 192, 224, 256, 512, 1024, 2048 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 2048, bs, 4096));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, bs, 2048));
     }

@@ -2976,6 +2976,71 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
     return ggml_type_size(GGML_TYPE_I32)*ne02*ne21;
 }
 
+static bool ggml_metal_op_mul_mat_id_use_dsv4_worklist(const ggml_tensor * op) {
+    static const bool enabled =
+        std::getenv("GGML_METAL_DSV4_MM_WORKLIST_DISABLE") == nullptr &&
+        std::getenv("GGML_METAL_DSV4_MM_TILE_DISABLE") == nullptr;
+
+    return enabled &&
+        op->src[0]->type == GGML_TYPE_MXFP4 && op->src[1]->type == GGML_TYPE_F32 &&
+        op->src[0]->ne[2] == 256 && op->src[2]->ne[0] == 6 && op->src[2]->ne[1] >= 224 &&
+        ((op->src[0]->ne[0] == 4096 && op->src[0]->ne[1] == 2048) ||
+         (op->src[0]->ne[0] == 2048 && op->src[0]->ne[1] == 4096));
+}
+
+static size_t ggml_metal_checked_add(size_t a, size_t b) {
+    GGML_ASSERT(b <= std::numeric_limits<size_t>::max() - a);
+    return a + b;
+}
+
+static size_t ggml_metal_checked_mul(size_t a, size_t b) {
+    GGML_ASSERT(a == 0 || b <= std::numeric_limits<size_t>::max()/a);
+    return a*b;
+}
+
+static size_t ggml_metal_checked_align(size_t size, size_t alignment) {
+    GGML_ASSERT(alignment > 0 && (alignment & (alignment - 1)) == 0);
+    return ggml_metal_checked_add(size, alignment - 1) & ~(alignment - 1);
+}
+
+static size_t ggml_metal_op_mul_mat_id_work_cap(const ggml_tensor * op) {
+    static constexpr size_t tile = 16;
+
+    const size_t n_expert = op->src[0]->ne[2];
+    const size_t n_token  = op->src[2]->ne[1];
+    const size_t n_used   = op->src[2]->ne[0];
+
+    const size_t n_route = ggml_metal_checked_mul(n_token, n_used);
+    const size_t padding = ggml_metal_checked_mul(tile - 1, n_expert);
+    return ggml_metal_checked_add(ggml_metal_checked_add(n_route, padding), tile - 1)/tile;
+}
+
+size_t ggml_metal_op_mul_mat_id_extra_work(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_MUL_MAT_ID);
+
+    if (!ggml_metal_op_mul_mat_id_use_dsv4_worklist(op)) {
+        return 0;
+    }
+
+    static constexpr size_t work_alignment = 2*sizeof(uint32_t);
+    static constexpr size_t work_header    = 2*sizeof(uint32_t);
+    static constexpr size_t work_item      = 2*sizeof(uint32_t);
+
+    // The target F32 output, token-per-expert table, and id map all end on an
+    // eight-byte boundary today. Keep the padding calculation explicit so a
+    // later layout change cannot make the uint2 work items misaligned.
+    GGML_ASSERT(ggml_nbytes(op) % work_alignment == 0);
+    const size_t map_size = ggml_metal_checked_add(
+        ggml_metal_op_mul_mat_id_extra_tpe(op),
+        ggml_metal_op_mul_mat_id_extra_ids(op));
+    const size_t work_offset = ggml_metal_checked_align(map_size, work_alignment);
+    const size_t work_size = ggml_metal_checked_add(
+        work_header,
+        ggml_metal_checked_mul(ggml_metal_op_mul_mat_id_work_cap(op), work_item));
+
+    return ggml_metal_checked_add(work_offset - map_size, work_size);
+}
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3039,12 +3104,27 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         //    default: break;
         //}
 
+        const bool use_dsv4_worklist =
+            props_dev->device_id == GGML_METAL_DEVICE_M2_ULTRA &&
+            ggml_metal_op_mul_mat_id_use_dsv4_worklist(op);
+
+        auto pipeline_mm = ggml_metal_library_get_pipeline_mul_mm_id(lib, op, use_dsv4_worklist);
+        const int nr1 = pipeline_mm.nr1;
+
         // extra buffers for intermediate id mapping
         ggml_metal_buffer_id bid_tpe = bid_dst;
         bid_tpe.offs += ggml_nbytes(op);
 
         ggml_metal_buffer_id bid_ids = bid_tpe;
         bid_ids.offs += ggml_metal_op_mul_mat_id_extra_tpe(op);
+
+        ggml_metal_buffer_id bid_work = bid_tpe;
+        if (use_dsv4_worklist) {
+            const size_t map_size = ggml_metal_checked_add(
+                ggml_metal_op_mul_mat_id_extra_tpe(op),
+                ggml_metal_op_mul_mat_id_extra_ids(op));
+            bid_work.offs += ggml_metal_checked_align(map_size, 2*sizeof(uint32_t));
+        }
 
         {
             ggml_metal_kargs_mul_mm_id_map0 args = {
@@ -3058,7 +3138,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 nb21,
             };
 
-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20);
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20, use_dsv4_worklist);
 
             const size_t smem = pipeline.smem;
 
@@ -3071,6 +3151,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_src2, 1);
             ggml_metal_encoder_set_buffer  (enc, bid_tpe,  2);
             ggml_metal_encoder_set_buffer  (enc, bid_ids,  3);
+            ggml_metal_encoder_set_buffer  (enc, bid_work, 4);
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
@@ -3081,9 +3162,6 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_op_concurrency_reset(ctx);
 
         {
-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op);
-            const int nr1 = pipeline.nr1;
-
             ggml_metal_kargs_mul_mm_id args = {
                 /*.ne00  =*/ ne00,
                 /*.ne02  =*/ ne02,
@@ -3103,19 +3181,28 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 /*.r3    =*/ r3,
             };
 
-            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_pipeline(enc, pipeline_mm);
             ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
             ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
             ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
             ggml_metal_encoder_set_buffer  (enc, bid_tpe,  3);
             ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
             ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+            ggml_metal_encoder_set_buffer  (enc, bid_work, 6);
 
-            const size_t smem = pipeline.smem;
+            const size_t smem = pipeline_mm.smem;
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + nr1 - 1)/nr1, (ne01 + 63)/64, ne02, 128, 1, 1);
+            if (use_dsv4_worklist) {
+                const size_t work_cap = ggml_metal_op_mul_mat_id_work_cap(op);
+                GGML_ASSERT(work_cap <= (size_t) std::numeric_limits<int>::max());
+                ggml_metal_encoder_dispatch_threadgroups(
+                    enc, (int) work_cap, (ne01 + 63)/64, 1, 128, 1, 1);
+            } else {
+                ggml_metal_encoder_dispatch_threadgroups(
+                    enc, (ne21 + nr1 - 1)/nr1, (ne01 + 63)/64, ne02, 128, 1, 1);
+            }
         }
     } else {
         ggml_tensor * weights = nullptr;

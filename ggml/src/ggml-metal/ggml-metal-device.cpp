@@ -1029,11 +1029,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(
+        ggml_metal_library_t lib,
+        int ne02,
+        int ne20,
+        bool compact) {
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_mul_mm_id_map0_ne20_%d", ne20);
+    if (compact) {
+        GGML_ASSERT(ne20 == 6);
+        snprintf(base, 256, "kernel_mul_mm_id_map0_ne20_6_dsv4_n16");
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_id_map0_ne20_%d", ne20);
+    }
     snprintf(name, 256, "%s_ne02=%d", base, ne02);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -1046,7 +1055,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(g
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(
+        ggml_metal_library_t lib,
+        const ggml_tensor * op,
+        bool compact) {
     char base[256];
     char name[256];
 
@@ -1066,8 +1078,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
          (op->src[0]->ne[0] == 2048 && op->src[0]->ne[1] == 4096));
 
     if (use_dsv4_tile) {
-        snprintf(base, 256, "kernel_mul_mm_id_mxfp4_f32_dsv4_n16");
+        snprintf(base, 256, "%s", compact ?
+                "kernel_mul_mm_id_mxfp4_f32_dsv4_n16_compact" :
+                "kernel_mul_mm_id_mxfp4_f32_dsv4_n16");
     } else {
+        GGML_ASSERT(!compact);
         snprintf(base, 256, "kernel_mul_mm_id_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
     }
     snprintf(name, 256, "%s_bci=%d", base, bc_inp);
