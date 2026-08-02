@@ -3292,6 +3292,58 @@ static ggml_tensor * ggml_metal_op_mul_mat_id_dsv4_map_pair(
     return pair;
 }
 
+struct ggml_metal_dsv4_down_weight_fusion {
+    ggml_tensor * weights = nullptr;
+    ggml_tensor * out     = nullptr;
+};
+
+static ggml_metal_dsv4_down_weight_fusion ggml_metal_op_mul_mat_id_dsv4_down_weight(
+        ggml_metal_op_t ctx,
+        int idx,
+        ggml_tensor * op,
+        bool prompt) {
+    static const bool enabled =
+        std::getenv("GGML_METAL_DSV4_DOWN_WEIGHT_DISABLE") == nullptr;
+    static const bool prompt_enabled =
+        std::getenv("GGML_METAL_DSV4_PROMPT_DOWN_WEIGHT_DISABLE") == nullptr;
+    static constexpr ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL };
+
+    const int64_t n_tokens = op->src[2]->ne[1];
+    const bool token_shape = prompt ?
+        (prompt_enabled && n_tokens >= 224 && n_tokens <= 2048) : n_tokens == 1;
+
+    if (!enabled || !ctx->use_fusion || !token_shape ||
+            ggml_metal_device_get_props(ctx->dev)->device_id != GGML_METAL_DEVICE_M2_ULTRA ||
+            op->src[0]->type != GGML_TYPE_MXFP4 || op->src[1]->type != GGML_TYPE_F32 ||
+            op->src[2]->type != GGML_TYPE_I32 || op->type != GGML_TYPE_F32 ||
+            op->src[0]->ne[0] != 2048 || op->src[0]->ne[1] != 4096 ||
+            op->src[0]->ne[2] != 256  || op->src[0]->ne[3] != 1 ||
+            op->src[1]->ne[0] != 2048 || op->src[1]->ne[1] != 6 ||
+            op->src[1]->ne[2] != n_tokens || op->src[1]->ne[3] != 1 ||
+            op->src[2]->ne[0] != 6 || op->src[2]->ne[2] != 1 || op->src[2]->ne[3] != 1 ||
+            op->ne[0] != 4096 || op->ne[1] != 6 ||
+            op->ne[2] != n_tokens || op->ne[3] != 1 ||
+            !ggml_is_contiguous(op) || !ctx->can_fuse(idx, ops, 2)) {
+        return {};
+    }
+
+    ggml_tensor * mul = ctx->node(idx + 1);
+    ggml_tensor * weights = mul->src[0] == op ? mul->src[1] :
+        (mul->src[1] == op ? mul->src[0] : nullptr);
+
+    const bool shape_ok = weights != nullptr &&
+        ggml_are_same_shape(op, mul) && ggml_are_same_stride(op, mul) &&
+        weights->ne[0] == 1 && weights->ne[1] == 6 &&
+        weights->ne[2] == n_tokens && weights->ne[3] == 1;
+    const bool type_layout_ok = weights != nullptr &&
+        mul->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(mul) && ggml_is_contiguous(weights);
+
+    return shape_ok && type_layout_ok ?
+        ggml_metal_dsv4_down_weight_fusion { weights, mul } :
+        ggml_metal_dsv4_down_weight_fusion {};
+}
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3358,9 +3410,16 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         const bool use_dsv4_worklist =
             props_dev->device_id == GGML_METAL_DEVICE_M2_ULTRA &&
             ggml_metal_op_mul_mat_id_use_dsv4_worklist(op);
+        const ggml_metal_dsv4_down_weight_fusion dsv4_down_weight =
+            use_dsv4_worklist ?
+                ggml_metal_op_mul_mat_id_dsv4_down_weight(ctx, idx, op, true) :
+                ggml_metal_dsv4_down_weight_fusion {};
         ggml_tensor * dsv4_map_pair = use_dsv4_worklist ?
             ggml_metal_op_mul_mat_id_dsv4_map_pair(ctx, idx, op) : nullptr;
+        GGML_ASSERT(dsv4_down_weight.out == nullptr || dsv4_map_pair == nullptr);
         if (dsv4_map_pair) {
+            n_fuse = 2;
+        } else if (dsv4_down_weight.out) {
             n_fuse = 2;
         }
 
@@ -3368,9 +3427,10 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             std::getenv("GGML_METAL_DSV4_GATE_UP_DISPATCH_DISABLE") == nullptr;
         const bool use_dsv4_paired_dispatch =
             dsv4_paired_dispatch_enabled && dsv4_map_pair != nullptr;
+        const bool use_dsv4_down_weight = dsv4_down_weight.out != nullptr;
 
         auto pipeline_mm = ggml_metal_library_get_pipeline_mul_mm_id(
-            lib, op, use_dsv4_worklist, use_dsv4_paired_dispatch);
+            lib, op, use_dsv4_worklist, use_dsv4_paired_dispatch, use_dsv4_down_weight);
         const int nr1 = pipeline_mm.nr1;
 
         // extra buffers for intermediate id mapping
@@ -3449,6 +3509,9 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_tpe,  3);
             ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
             ggml_metal_encoder_set_buffer  (enc, bid_work, 6);
+            if (use_dsv4_down_weight) {
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(dsv4_down_weight.weights), 7);
+            }
 
             const size_t smem = pipeline_mm.smem;
 
@@ -3466,9 +3529,9 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 mm_tg2 = ne02;
             }
 
-            const auto dispatch = [&](ggml_tensor * mm_op) {
+            const auto dispatch = [&](ggml_tensor * mm_op, ggml_tensor * mm_out) {
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mm_op->src[0]), 1);
-                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mm_op),         5);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mm_out),        5);
                 ggml_metal_encoder_dispatch_threadgroups(
                     enc, mm_tg0, (ne01 + 63)/64, mm_tg2, 128, 1, 1);
             };
@@ -3483,50 +3546,26 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_dispatch_threadgroups(
                     enc, mm_tg0, (ne01 + 63)/64, 2, 128, 1, 1);
             } else {
-                dispatch(op);
+                dispatch(op, use_dsv4_down_weight ? dsv4_down_weight.out : op);
                 if (dsv4_map_pair) {
                     // Both independent matrix dispatches consume the same immutable
                     // route map. Keep them barrier-free so the concurrent encoder
                     // can schedule gate and up together without sharing accumulators.
-                    dispatch(dsv4_map_pair);
+                    dispatch(dsv4_map_pair, dsv4_map_pair);
                 }
+            }
+
+            if (use_dsv4_down_weight && ctx->debug_fusion > 1) {
+                GGML_LOG_DEBUG("%s: fuse: DSV4 prompt MUL_MAT_ID + routed MUL (%lld tokens)\n",
+                    __func__, (long long) ne21);
             }
         }
     } else {
-        ggml_tensor * weights = nullptr;
-        ggml_tensor * weighted_out = nullptr;
+        const ggml_metal_dsv4_down_weight_fusion dsv4_down_weight =
+            ggml_metal_op_mul_mat_id_dsv4_down_weight(ctx, idx, op, false);
 
-        static const bool dsv4_down_weight_enabled =
-            std::getenv("GGML_METAL_DSV4_DOWN_WEIGHT_DISABLE") == nullptr;
-        static constexpr ggml_op weighted_ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL };
-
-        if (dsv4_down_weight_enabled && ctx->use_fusion &&
-                props_dev->device_id == GGML_METAL_DEVICE_M2_ULTRA &&
-                op->src[0]->type == GGML_TYPE_MXFP4 && op->src[1]->type == GGML_TYPE_F32 &&
-                ne00 == 2048 && ne01 == 4096 && ne02 == 256 && ne20 == 6 && ne21 == 1 &&
-                ctx->can_fuse(idx, weighted_ops, 2)) {
-            ggml_tensor * mul = ctx->node(idx + 1);
-            if (mul->src[0] == op) {
-                weights = mul->src[1];
-            } else if (mul->src[1] == op) {
-                weights = mul->src[0];
-            }
-
-            const bool shape_ok = weights != nullptr &&
-                ggml_are_same_shape(op, mul) &&
-                weights->ne[0] == 1 && weights->ne[1] == ne20 &&
-                weights->ne[2] == ne21 && weights->ne[3] == 1;
-            const bool type_layout_ok = weights != nullptr &&
-                mul->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 &&
-                ggml_is_contiguous(mul) && ggml_is_contiguous(weights);
-
-            if (shape_ok && type_layout_ok) {
-                weighted_out = mul;
-                n_fuse = 2;
-            }
-        }
-
-        const bool weighted = weighted_out != nullptr;
+        const bool weighted = dsv4_down_weight.out != nullptr;
+        n_fuse = weighted ? 2 : 1;
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op, weighted);
 
         const int nr0 = pipeline.nr0;
@@ -3568,10 +3607,10 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer(enc, bid_src0, 1);
         ggml_metal_encoder_set_buffer(enc, bid_src1, 2);
-        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(weighted ? weighted_out : op), 3);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(weighted ? dsv4_down_weight.out : op), 3);
         ggml_metal_encoder_set_buffer(enc, bid_src2, 4);
         if (weighted) {
-            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(weights), 5);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(dsv4_down_weight.weights), 5);
         }
 
         const int64_t _ne1 = 1;
