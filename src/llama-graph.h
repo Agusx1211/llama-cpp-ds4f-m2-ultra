@@ -474,6 +474,38 @@ public:
     const llama_kv_cache_iswa_context * mctx;
 };
 
+// K-only MLA cache used by DeepSeek V4 DSpark. Every query in a draft block
+// attends the same last-n_swa target states and the entire current block.
+class llm_graph_input_attn_k_iswa : public llm_graph_input_i {
+public:
+    llm_graph_input_attn_k_iswa(
+            const llama_cparams & cparams,
+            const llama_kv_cache_iswa_context * mctx) :
+        cparams(cparams), mctx(mctx) {}
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * get_k_idxs()     const { return self_k_idxs; }
+    ggml_tensor * get_k_idxs_swa() const { return self_k_idxs_swa; }
+    ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
+    ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
+
+    ggml_tensor * self_k_idxs     = nullptr;
+    ggml_tensor * self_k_idxs_swa = nullptr;
+
+    ggml_tensor * self_kq_mask         = nullptr;
+    ggml_tensor * self_kq_mask_cnv     = nullptr;
+    ggml_tensor * self_kq_mask_swa     = nullptr;
+    ggml_tensor * self_kq_mask_swa_cnv = nullptr;
+
+    ggml_tensor * self_k_rot     = nullptr;
+    ggml_tensor * self_k_rot_swa = nullptr;
+
+    const llama_cparams cparams;
+    const llama_kv_cache_iswa_context * mctx;
+};
+
 // DSV4 raw graph inputs are SWA-only, but their mask may be stream-shaped
 // so raw K can be concatenated with DSV4 compressed K in one attention op.
 class llm_graph_input_dsv4_raw {
@@ -1149,6 +1181,21 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
+
+    llm_graph_input_attn_k_iswa * build_attn_inp_k_iswa() const;
+
+    ggml_tensor * build_attn(
+            llm_graph_input_attn_k_iswa * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il) const;
 
     llm_graph_input_dsv4 * build_inp_dsv4() const;
 

@@ -1143,6 +1143,13 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * inp_pos,
                 int il) const;
 
+        ggml_tensor * build_dspark_attention(
+                const llama_model & model,
+                llm_graph_input_attn_k_iswa * inp_attn,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                int il) const;
+
         ggml_tensor * build_hca_compressed_kv_from_state(
                 ggml_tensor * kv_state,
                 ggml_tensor * score_state,
@@ -1220,6 +1227,14 @@ struct llama_model_deepseek4 : public llama_model_base {
 
     struct graph_mtp : public graph {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+    };
+
+    struct graph_dspark_encoder : public llm_graph_context {
+        graph_dspark_encoder(const llama_model & model, const llm_graph_params & params);
+    };
+
+    struct graph_dspark : public graph {
+        graph_dspark(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

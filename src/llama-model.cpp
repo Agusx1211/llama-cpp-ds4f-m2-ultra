@@ -2264,21 +2264,43 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             }
                         }
 
-                        res = new llama_kv_cache_dsv4(
-                                *this,
-                                params.type_k,
-                                params.type_v,
-                                !cparams.flash_attn,
-                                cparams.offload_kqv,
-                                params.swa_full,
-                                cparams.kv_unified,
-                                cparams.n_ctx_seq,
-                                cparams.n_seq_max,
-                                cparams.n_ubatch,
-                                1,
-                                cparams.n_rs_seq,
-                                filter,
-                                reuse);
+                        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_dspark_block_size > 0) {
+                            // Official DSV4 DSpark stages use a K-only latent
+                            // SWA cache, unlike the target trunk's compressed
+                            // DSV4 cache hierarchy.
+                            res = new llama_kv_cache_iswa(
+                                    *this,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    params.swa_full,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    cparams.n_ubatch,
+                                    1,
+                                    nullptr,
+                                    filter,
+                                    reuse,
+                                    nullptr);
+                        } else {
+                            res = new llama_kv_cache_dsv4(
+                                    *this,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    params.swa_full,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    cparams.n_ubatch,
+                                    1,
+                                    cparams.n_rs_seq,
+                                    filter,
+                                    reuse);
+                        }
                     } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
@@ -2762,6 +2784,7 @@ bool llama_model_has_encoder(const llama_model * model) {
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_EAGLE3:
         case LLM_ARCH_DFLASH:    return true;
+        case LLM_ARCH_DEEPSEEK4: return model->hparams.n_dspark_block_size > 0;
         default:                 return false;
     }
 }
