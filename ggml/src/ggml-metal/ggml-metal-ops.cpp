@@ -970,15 +970,120 @@ static int ggml_metal_op_dsv4_router_fused(ggml_metal_op_t ctx, int idx) {
     return n_filtered;
 }
 
+static int ggml_metal_op_dsv4_swiglu_clamp_fused(ggml_metal_op_t ctx, int idx) {
+    static const bool disabled = std::getenv("GGML_METAL_DSV4_SWIGLU_CLAMP_DISABLE") != nullptr;
+    static constexpr ggml_op ops[] = { GGML_OP_CLAMP, GGML_OP_CLAMP, GGML_OP_GLU };
+    static constexpr int outputs[] = { 2 };
+
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+    if (disabled || props_dev->device_id != GGML_METAL_DEVICE_M2_ULTRA) {
+        return 0;
+    }
+
+    const int n_filtered = ctx->can_fuse_subgraph_raw(idx, ops, 3, outputs, 1);
+    if (n_filtered == 0) {
+        return 0;
+    }
+
+    ggml_tensor * clamp0 = ctx->node(idx);
+    ggml_tensor * clamp1 = ctx->node(idx + 1);
+    ggml_tensor * glu    = ctx->node(idx + 2);
+
+    ggml_tensor * gate_clamp = nullptr;
+    ggml_tensor * up_clamp   = nullptr;
+    if (glu->src[0] == clamp0 && glu->src[1] == clamp1) {
+        gate_clamp = clamp0;
+        up_clamp   = clamp1;
+    } else if (glu->src[0] == clamp1 && glu->src[1] == clamp0) {
+        gate_clamp = clamp1;
+        up_clamp   = clamp0;
+    } else {
+        return 0;
+    }
+
+    ggml_tensor * gate = gate_clamp->src[0];
+    ggml_tensor * up   = up_clamp->src[0];
+
+    const float gate_min = ggml_get_op_params_f32(gate_clamp, 0);
+    const float limit    = ggml_get_op_params_f32(gate_clamp, 1);
+    const float up_min   = ggml_get_op_params_f32(up_clamp, 0);
+    const float up_max   = ggml_get_op_params_f32(up_clamp, 1);
+
+    const bool edges_ok =
+        ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+        ggml_get_op_params_i32(glu, 1) == 0;
+    const bool shape_ok =
+        glu->ne[0] == 2048 && glu->ne[1] == 6 &&
+        glu->ne[2] >= 224 && glu->ne[2] <= 2048 && glu->ne[3] == 1 &&
+        ggml_are_same_shape(gate, up) && ggml_are_same_shape(gate, glu);
+    const bool type_layout_ok =
+        gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous_1(gate) && ggml_is_contiguous_1(up) && ggml_is_contiguous_1(glu);
+    const bool clamp_ok =
+        std::isinf(gate_min) && gate_min < 0.0f &&
+        std::isfinite(limit) && limit > 0.0f &&
+        up_min == -limit && up_max == limit;
+
+    if (!edges_ok || !shape_ok || !type_layout_ok || !clamp_ok) {
+        return 0;
+    }
+
+    ggml_metal_kargs_glu args = {
+        /*.ne00 =*/ gate->ne[0],
+        /*.nb01 =*/ gate->nb[1],
+        /*.ne10 =*/ up->ne[0],
+        /*.nb11 =*/ up->nb[1],
+        /*.ne0  =*/ glu->ne[0],
+        /*.nb1  =*/ glu->nb[1],
+        /*.i00  =*/ 0,
+        /*.i10  =*/ 0,
+        /*.alpha=*/ 0.0f,
+        /*.limit=*/ limit,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_dsv4_swiglu_clamp(ctx->lib);
+    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+    ggml_metal_encoder_set_bytes (ctx->enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(gate), 1);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(up),   2);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(glu),  3);
+
+    for (int i = 1; i < n_filtered; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    const int32_t nth = std::min(
+        ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), (int) gate->ne[0]/2);
+    ggml_metal_encoder_dispatch_threadgroups(
+        ctx->enc, ggml_nrows(gate), 1, 1, nth, 1, 1);
+
+    if (ctx->debug_fusion > 1) {
+        GGML_LOG_DEBUG("%s: fuse: DSV4 clamp + SwiGLU (%lld tokens)\n",
+            __func__, (long long) glu->ne[2]);
+    }
+
+    return n_filtered;
+}
+
 int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
     if (ctx->use_fusion) {
+        if (op->op == GGML_OP_CLAMP) {
+            const int n_clamp_fuse = ggml_metal_op_dsv4_swiglu_clamp_fused(ctx, idx);
+            if (n_clamp_fuse > 0) {
+                return n_clamp_fuse;
+            }
+        }
+
         const int n_fuse = ggml_metal_op_dsv4_router_fused(ctx, idx);
         if (n_fuse > 0) {
             return n_fuse;
         }
     }
-
-    ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;

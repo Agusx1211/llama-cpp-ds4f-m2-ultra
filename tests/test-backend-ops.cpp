@@ -2183,6 +2183,50 @@ struct test_glu_split : public test_case {
     }
 };
 
+struct test_dsv4_swiglu_clamp_fusion : public test_case {
+    const int64_t n_tokens;
+    const float limit;
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_tokens, limit);
+    }
+
+    test_dsv4_swiglu_clamp_fusion(int64_t n_tokens, float limit = 7.0f)
+        : n_tokens(n_tokens), limit(limit) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2048, 6, n_tokens);
+        ggml_set_name(gate, "gate");
+
+        ggml_tensor * up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2048, 6, n_tokens);
+        ggml_set_name(up, "up");
+
+        gate = ggml_clamp(ctx, gate, -INFINITY, limit);
+        ggml_set_name(gate, "gate_clamped");
+
+        up = ggml_clamp(ctx, up, -limit, limit);
+        ggml_set_name(up, "up_clamped");
+
+        ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -2.0f*limit, 2.0f*limit);
+        }
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_SWIGLU_CLAMP_FUSION";
+    }
+};
+
 struct test_swiglu_oai : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
@@ -8819,6 +8863,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_swiglu_oai(GGML_TYPE_F32, { 128, 2, 2, 2 }, v, alpha, limit));
             }
         }
+    }
+
+    for (int n_tokens : {224, 512, 2048}) {
+        test_cases.emplace_back(new test_dsv4_swiglu_clamp_fusion(n_tokens));
     }
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {
