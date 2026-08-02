@@ -4668,7 +4668,7 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
-// GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
+// Multiple GGML_OP_MUL_MAT_ID outputs with an ADD/SUB reduction or routed MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -4680,9 +4680,11 @@ struct test_mul_mat_id_fusion : public test_case {
     const int64_t k;
     const uint32_t o; // number of outputs
     const bool mul;
+    const bool subtract; // make the two-output oracle order-sensitive
 
     std::string vars() override {
-        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, o, mul);
+        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, o, mul) +
+            ",subtract=" + std::to_string(subtract);
     }
 
     double max_nmse_err() override {
@@ -4696,9 +4698,10 @@ struct test_mul_mat_id_fusion : public test_case {
 
     test_mul_mat_id_fusion(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32, uint32_t o = 1, bool mul = false)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, uint32_t o = 1,
+            bool mul = false, bool subtract = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), o(o), mul(mul) {
+            m(m), n(n), k(k), o(o), mul(mul), subtract(subtract) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -4724,7 +4727,7 @@ struct test_mul_mat_id_fusion : public test_case {
             ggml_tensor * a2 = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
             ggml_tensor * out2 = ggml_mul_mat_id(ctx, a2, b, ids);
             ggml_set_name(out2, "out2");
-            out = ggml_add(ctx, out, out2);
+            out = subtract ? ggml_sub(ctx, out, out2) : ggml_add(ctx, out, out2);
         }
 
         if (mul) {
@@ -10485,6 +10488,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(
                 GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 224, 2048,
                 mul_mat_id_ids::tile_boundaries));
+    // DSV4 prompt gate/up pair: both matrix outputs remain externally visible
+    // while Metal shares their identical route map and compact worklist.
+    test_cases.emplace_back(new test_mul_mat_id_fusion(
+                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, true, 2048, 224, 4096, 2, false, true));
     // DSV4 decode down projection with its routed-weight multiply.
     test_cases.emplace_back(new test_mul_mat_id_fusion(
                 GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 1, 2048, 1, true));
@@ -10530,6 +10537,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_id_fusion(
                 GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 1, 2048, 1, true));
     for (int bs : { 1, 4, 32 }) {
+        test_cases.emplace_back(new test_mul_mat_id_fusion(
+                    GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, true, 2048, bs, 4096, 2));
+    }
+    for (int bs : { 224, 256, 512, 1024, 2048 }) {
         test_cases.emplace_back(new test_mul_mat_id_fusion(
                     GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, true, 2048, bs, 4096, 2));
     }
