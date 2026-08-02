@@ -1522,6 +1522,7 @@ struct test_case {
         ggml_context_ptr ctx_weights(use_weights ? ggml_init(params) : nullptr);
         GGML_ASSERT(!use_weights || ctx_weights);
 
+        gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_tensor * out             = build_graph(ctx.get(), ctx_weights.get());
         current_op_name               = op_desc(out);
         if (!matches_filter(out, op_names_filter)) {
@@ -1564,7 +1565,6 @@ struct test_case {
         }
 
         // build graph
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(gf, out);
 
         // warmup run
@@ -1577,7 +1577,9 @@ struct test_case {
         // determine number of runs
         int n_runs;
         bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        if (op_flops(out) > 0) {
+        if (run_whole_graph()) {
+            n_runs = 1;
+        } else if (op_flops(out) > 0) {
             // based on flops
             const uint64_t GFLOP = 1000 * 1000 * 1000;
             const uint64_t target_flops_cpu =   8ULL * GFLOP;
@@ -2186,6 +2188,8 @@ struct test_glu_split : public test_case {
 struct test_dsv4_swiglu_clamp_fusion : public test_case {
     const int64_t n_tokens;
     const float limit;
+    ggml_tensor * shared_out = nullptr;
+    ggml_tensor * routed_out = nullptr;
 
     std::string vars() override {
         return VARS_TO_STR2(n_tokens, limit);
@@ -2195,22 +2199,39 @@ struct test_dsv4_swiglu_clamp_fusion : public test_case {
         : n_tokens(n_tokens), limit(limit) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2048, 6, n_tokens);
-        ggml_set_name(gate, "gate");
+        ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2048, n_tokens);
+        ggml_set_name(shared_gate, "shared_gate");
+        ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2048, n_tokens);
+        ggml_set_name(shared_up, "shared_up");
+        ggml_tensor * routed_gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2048, 6, n_tokens);
+        ggml_set_name(routed_gate, "routed_gate");
+        ggml_tensor * routed_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2048, 6, n_tokens);
+        ggml_set_name(routed_up, "routed_up");
 
-        ggml_tensor * up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2048, 6, n_tokens);
-        ggml_set_name(up, "up");
+        shared_gate = ggml_clamp(ctx, shared_gate, -INFINITY, limit);
+        ggml_set_name(shared_gate, "shared_gate_clamped");
+        shared_up = ggml_clamp(ctx, shared_up, -limit, limit);
+        ggml_set_name(shared_up, "shared_up_clamped");
+        routed_gate = ggml_clamp(ctx, routed_gate, -INFINITY, limit);
+        ggml_set_name(routed_gate, "routed_gate_clamped");
+        routed_up = ggml_clamp(ctx, routed_up, -limit, limit);
+        ggml_set_name(routed_up, "routed_up_clamped");
 
-        gate = ggml_clamp(ctx, gate, -INFINITY, limit);
-        ggml_set_name(gate, "gate_clamped");
+        shared_out = ggml_swiglu_split(ctx, shared_gate, shared_up);
+        ggml_set_name(shared_out, "shared_out");
+        routed_out = ggml_swiglu_split(ctx, routed_gate, routed_up);
+        ggml_set_name(routed_out, "routed_out");
 
-        up = ggml_clamp(ctx, up, -limit, limit);
-        ggml_set_name(up, "up_clamped");
+        // Match the production layers 3-42 topological order exactly: all
+        // four clamps are already roots before the two SwiGLU outputs.
+        GGML_ASSERT(gf != nullptr);
+        ggml_build_forward_expand(gf, shared_gate);
+        ggml_build_forward_expand(gf, shared_up);
+        ggml_build_forward_expand(gf, routed_gate);
+        ggml_build_forward_expand(gf, routed_up);
+        ggml_build_forward_expand(gf, shared_out);
 
-        ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
-        ggml_set_name(out, "out");
-
-        return out;
+        return routed_out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -2220,6 +2241,8 @@ struct test_dsv4_swiglu_clamp_fusion : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { shared_out, routed_out }; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -10578,6 +10601,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 4096, 1, 1, 1, GGML_TYPE_F16));
+    for (int n_tokens : { 224, 512, 2048 }) {
+        test_cases.emplace_back(new test_dsv4_swiglu_clamp_fusion(n_tokens));
+    }
     // DSV4 CSA decode after selecting 512 compressed rows plus the 128-row
     // raw window. Compare the normal 64-head vector layout with the sparse
     // prefill path's equivalent 64-query-row layout at one and four streams.
