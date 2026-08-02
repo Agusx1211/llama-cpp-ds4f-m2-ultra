@@ -211,6 +211,10 @@ struct llama_layer_shortconv {
 };
 
 struct llama_layer_nextn {
+    // DSpark target-feature fusion, present on the first draft block.
+    struct ggml_tensor * dspark_main_proj       = nullptr;
+    struct ggml_tensor * dspark_main_norm       = nullptr;
+
     struct ggml_tensor * eh_proj               = nullptr;
     struct ggml_tensor * eh_proj_s             = nullptr;
     struct ggml_tensor * eh_proj_in_s          = nullptr;

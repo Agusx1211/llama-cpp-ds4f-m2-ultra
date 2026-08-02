@@ -486,30 +486,37 @@ class DeepseekV4Model(TextModel):
 
         self._n_trunk_layers = self.hparams["num_hidden_layers"]
         n_nextn_config = int(self.hparams.get("num_nextn_predict_layers", 0) or 0)
+        self._is_dspark = int(self.hparams.get("dspark_block_size", 0) or 0) > 0
 
         # DSV4 stores each MTP block under mtp.{i}.*. Rekey it as an appended
         # decoder block so all existing FP8 pairing and native MXFP4 expert
         # repacking applies without a second conversion implementation.
-        mtp_indices: set[int] = set()
+        mtp_names: list[tuple[str, re.Match[str]]] = []
         for name in list(self.model_tensors.keys()):
             match = re.match(r"mtp\.(\d+)\.(.*)", name)
             if match is None:
                 continue
 
-            mtp_index = int(match.group(1))
-            if mtp_index >= n_nextn_config:
-                raise ValueError(
-                    f"DeepSeek-V4 tensor {name!r} exceeds num_nextn_predict_layers={n_nextn_config}"
-                )
-            new_name = f"layers.{self._n_trunk_layers + mtp_index}.{match.group(2)}"
-            self.model_tensors[new_name] = self.model_tensors.pop(name)
-            mtp_indices.add(mtp_index)
+            mtp_names.append((name, match))
+
+        mtp_indices = {int(match.group(1)) for _, match in mtp_names}
+
+        if self._is_dspark and mtp_indices:
+            # The released V4 DSpark config retains num_nextn_predict_layers=1
+            # from the target while the speculative module contains three
+            # stages. Its contiguous mtp.* namespace is authoritative.
+            n_nextn_config = max(mtp_indices) + 1
 
         if mtp_indices and mtp_indices != set(range(n_nextn_config)):
             raise ValueError(
                 f"DeepSeek-V4 MTP tensor indices {sorted(mtp_indices)} do not cover "
                 f"configured layers 0..{n_nextn_config - 1}"
             )
+
+        for name, match in mtp_names:
+            mtp_index = int(match.group(1))
+            new_name = f"layers.{self._n_trunk_layers + mtp_index}.{match.group(2)}"
+            self.model_tensors[new_name] = self.model_tensors.pop(name)
 
         self._n_nextn = n_nextn_config if mtp_indices else 0
         if n_nextn_config and not self._n_nextn:
@@ -522,6 +529,9 @@ class DeepseekV4Model(TextModel):
             )
 
         self.block_count = self._n_trunk_layers + self._n_nextn
+        self._is_sidecar = self._n_nextn > 0 and not any(
+            name.startswith("layers.0.") for name in self.model_tensors
+        )
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
         self._mtp_proj: dict[int, dict[str, Tensor]] = {}
 
@@ -569,6 +579,11 @@ class DeepseekV4Model(TextModel):
 
         if self._n_nextn:
             self.gguf_writer.add_nextn_predict_layers(self._n_nextn)
+
+        if self._is_dspark:
+            self.gguf_writer.add_block_size(int(hparams["dspark_block_size"]))
+            self.gguf_writer.add_target_layers(hparams["dspark_target_layer_ids"])
+            self.gguf_writer.add_mask_token_id(int(hparams["dspark_noise_token_id"]))
 
         self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
         self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
@@ -697,8 +712,9 @@ class DeepseekV4Model(TextModel):
         if self._dsv4_mxfp4_generated:
             return ()
 
-        consumed: list[str] = self._write_hash_routing_tensors()
-        for bid in range(self.block_count):
+        consumed: list[str] = [] if self._is_sidecar else self._write_hash_routing_tensors()
+        first_block = self._n_trunk_layers if self._is_sidecar else 0
+        for bid in range(first_block, self.block_count):
             consumed.extend(self._write_mxfp4_expert_tensor(bid, "w1", gguf.MODEL_TENSOR.FFN_GATE_EXP))
             consumed.extend(self._write_mxfp4_expert_tensor(bid, "w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP))
             consumed.extend(self._write_mxfp4_expert_tensor(bid, "w3", gguf.MODEL_TENSOR.FFN_UP_EXP))
@@ -771,6 +787,11 @@ class DeepseekV4Model(TextModel):
             "hc_head_fn": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_FN, ".weight"),
             "hc_head_base": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_BASE, ".weight"),
             "hc_head_scale": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_SCALE, ".weight"),
+            "main_proj.weight": (gguf.MODEL_TENSOR.DSPARK_MAIN_PROJ, ".weight"),
+            "main_norm.weight": (gguf.MODEL_TENSOR.DSPARK_MAIN_NORM, ".weight"),
+            "markov_head.markov_w1.weight": (gguf.MODEL_TENSOR.DSPARK_MARKOV_W1, ".weight"),
+            "markov_head.markov_w2.weight": (gguf.MODEL_TENSOR.DSPARK_MARKOV_W2, ".weight"),
+            "confidence_head.proj.weight": (gguf.MODEL_TENSOR.DSPARK_CONF_PROJ, ".weight"),
         }
 
         tensor_name = match.group(2)
@@ -824,7 +845,7 @@ class DeepseekV4Model(TextModel):
         del new_name, bid  # unused
 
         if name in self._dsv4_fp8_dequantized and n_dims >= 2:
-            return gguf.GGMLQuantizationType.Q8_0
+            return gguf.GGMLQuantizationType.Q8_0 if self._fp8_as_q8 else gguf.GGMLQuantizationType.BF16
         if name in self._dsv4_f32_tensors:
             return gguf.GGMLQuantizationType.F32
         if name in self._dsv4_bf16_tensors and n_dims >= 2:

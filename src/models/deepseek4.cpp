@@ -20,9 +20,18 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     // The released model appends one MTP decoder block after the 43-layer
     // trunk. Read this before sizing any per-layer metadata through n_layer().
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+    ml.get_key(LLM_KV_BLOCK_SIZE, hparams.n_dspark_block_size, false);
     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < block_count");
-    if (hparams.n_layer_nextn > 1) {
+    if (hparams.n_layer_nextn > 1 && hparams.n_dspark_block_size == 0) {
         throw std::runtime_error("DeepSeek-V4 supports exactly one MTP block");
+    }
+    if (hparams.n_dspark_block_size > 0) {
+        if (hparams.n_layer_nextn != 3) {
+            throw std::runtime_error("DeepSeek-V4 DSpark requires exactly three draft blocks");
+        }
+        if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false) || target_layer_ids.size() != 3) {
+            throw std::runtime_error("DeepSeek-V4 DSpark requires three target layer ids");
+        }
     }
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -97,19 +106,22 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     const int64_t hc_dim      = hc_mult * n_embd;
     const int64_t hc_mix_dim  = (2 + hc_mult) * hc_mult;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+    // A speculative sidecar can omit the target embedding and output matrices.
+    // They are resolved through ctx_other when the draft context is created.
+    const bool is_sidecar = hparams.n_layer_nextn > 0 && ml.get_weight("blk.0.attn_norm.weight") == nullptr;
+    const int root_flags = is_sidecar ? TENSOR_NOT_REQUIRED : 0;
 
-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, root_flags);
 
-    hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN, "weight"),    {hc_dim, hc_mult}, 0);
-    hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, 0);
-    hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
+    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, root_flags);
+    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, root_flags);
 
-    // An MTP-only GGUF contains root embedding/head tensors plus block 43,
-    // while deliberately omitting the target's blocks 0..42.
-    const bool mtp_only = hparams.n_layer_nextn > 0 && ml.get_weight("blk.0.attn_norm.weight") == nullptr;
-    const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+    hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN, "weight"),    {hc_dim, hc_mult}, root_flags);
+    hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, root_flags);
+    hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, root_flags);
+
+    // Speculative GGUFs deliberately omit the target's blocks 0..42.
+    const int trunk_flags = is_sidecar ? TENSOR_NOT_REQUIRED : 0;
     const int mtp_flags = ml.load_mtp ? 0 : TENSOR_SKIP;
 
     for (int i = 0; i < n_layer_all; ++i) {
@@ -174,16 +186,36 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, flags);
 
         if (i >= n_layer) {
-            layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), {2*n_embd, n_embd}, flags);
-            layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd}, flags);
-            layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd}, flags);
-            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, flags);
+            const int nextn_flags = hparams.n_dspark_block_size > 0 ? flags | TENSOR_NOT_REQUIRED : flags;
+            layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), {2*n_embd, n_embd}, nextn_flags);
+            layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd}, nextn_flags);
+            layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd}, nextn_flags);
+            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, nextn_flags);
             // Bundled conversion keeps the MTP-specific mixer here. MTP-only
             // sidecars expose the same three tensors through the root head.
             layer.nextn.hc_head_fn       = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_FN,       "weight", i), {hc_dim, hc_mult}, flags | TENSOR_NOT_REQUIRED);
             layer.nextn.hc_head_base     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_BASE,     "weight", i), {hc_mult}, flags | TENSOR_NOT_REQUIRED);
             layer.nextn.hc_head_scale    = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_SCALE,    "weight", i), {1}, flags | TENSOR_NOT_REQUIRED);
+
+            if (hparams.n_dspark_block_size > 0 && i == n_layer) {
+                layer.nextn.dspark_main_proj = create_tensor(tn(LLM_TENSOR_DSPARK_MAIN_PROJ, "weight", i),
+                        {(int64_t) target_layer_ids.size()*n_embd, n_embd}, flags);
+                layer.nextn.dspark_main_norm = create_tensor(tn(LLM_TENSOR_DSPARK_MAIN_NORM, "weight", i),
+                        {n_embd}, flags);
+            }
         }
+    }
+
+    if (hparams.n_dspark_block_size > 0) {
+        const int dspark_flags = ml.load_mtp ? 0 : TENSOR_SKIP;
+        const ggml_tensor * markov_meta = ml.get_tensor_meta("markov_w1.weight");
+        if (markov_meta == nullptr) {
+            throw std::runtime_error("DeepSeek-V4 DSpark sidecar is missing its Markov head");
+        }
+        const int64_t rank = markov_meta->ne[0];
+        dspark_markov_w1 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), {rank, n_vocab}, dspark_flags);
+        dspark_markov_w2 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), {rank, n_vocab}, dspark_flags);
+        dspark_conf_proj = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight"), {n_embd + rank, 1}, dspark_flags);
     }
 }
 

@@ -1304,6 +1304,14 @@ class TensorNameMap:
             "model.fc", # dflash
         ),
 
+        MODEL_TENSOR.DSPARK_MAIN_PROJ: (
+            "model.main_proj", # dspark
+        ),
+
+        MODEL_TENSOR.DSPARK_MAIN_NORM: (
+            "model.main_norm", # dspark
+        ),
+
         MODEL_TENSOR.DSPARK_MARKOV_W1: (
             "model.markov_head.markov_w1", # dspark
         ),

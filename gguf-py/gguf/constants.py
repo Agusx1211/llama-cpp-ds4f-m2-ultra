@@ -994,6 +994,8 @@ class MODEL_TENSOR(IntEnum):
     FC                     = auto()  # feature fusion layer
     D2T                    = auto()  # draft to target vocabulary mapping
     # dspark
+    DSPARK_MAIN_PROJ       = auto()  # target feature fusion projection
+    DSPARK_MAIN_NORM       = auto()  # target feature fusion normalization
     DSPARK_MARKOV_W1       = auto()  # markov head: prev-token embed
     DSPARK_MARKOV_W2       = auto()  # markov head: bias projection
     DSPARK_CONF_PROJ       = auto()  # confidence head
@@ -1637,6 +1639,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HC_HEAD_BASE:        "blk.{bid}.nextn.hc_head_base",
     MODEL_TENSOR.NEXTN_HC_HEAD_SCALE:       "blk.{bid}.nextn.hc_head_scale",
     MODEL_TENSOR.FC:                        "fc",
+    MODEL_TENSOR.DSPARK_MAIN_PROJ:          "blk.{bid}.dspark.main_proj",
+    MODEL_TENSOR.DSPARK_MAIN_NORM:          "blk.{bid}.dspark.main_norm",
     MODEL_TENSOR.DSPARK_MARKOV_W1:          "markov_w1",
     MODEL_TENSOR.DSPARK_MARKOV_W2:          "markov_w2",
     MODEL_TENSOR.DSPARK_CONF_PROJ:          "conf_proj",
@@ -3344,6 +3348,11 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_HC_HEAD_FN,
         MODEL_TENSOR.NEXTN_HC_HEAD_BASE,
         MODEL_TENSOR.NEXTN_HC_HEAD_SCALE,
+        MODEL_TENSOR.DSPARK_MAIN_PROJ,
+        MODEL_TENSOR.DSPARK_MAIN_NORM,
+        MODEL_TENSOR.DSPARK_MARKOV_W1,
+        MODEL_TENSOR.DSPARK_MARKOV_W2,
+        MODEL_TENSOR.DSPARK_CONF_PROJ,
     ],
     MODEL_ARCH.ERNIE4_5_MOE: [
         MODEL_TENSOR.TOKEN_EMBD,
