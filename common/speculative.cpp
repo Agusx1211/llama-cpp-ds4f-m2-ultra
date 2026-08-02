@@ -1846,7 +1846,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 dp.result->clear();
             }
 
-            if (dsv4_depth1_reuse_compatible && dp.n_max == 1 && dp.result->size() == 1) {
+            // Compatibility already proves that this implementation can draft
+            // exactly one MTP row. dp.n_max is the server's remaining request
+            // allowance, not the configured speculative depth, so it is usually
+            // much larger than one during generation.
+            if (dsv4_depth1_reuse_compatible && dp.result->size() == 1) {
                 dsv4_depth1_cycles[seq_id] = {
                     /* .committed_pos = */ dp.n_past,
                     /* .compatible    = */ true,
