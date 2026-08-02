@@ -646,6 +646,18 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const bool is_dsv4_dspark = model.arch == LLM_ARCH_DEEPSEEK4 &&
+        model.hparams.n_dspark_block_size > 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+
+    // Official DSV4 DSpark has two unrelated graph shapes in one context:
+    // a projection-only encoder that consumes full target-feature microbatches,
+    // and a three-stage draft decoder whose real batches cannot exceed the
+    // trained block size per sequence. Reserving the decoder at n_ubatch can
+    // waste more than a GiB on Metal while describing a workload that the
+    // speculative driver will never issue.
+    const uint32_t n_tokens_pp = is_dsv4_dspark
+        ? std::min(n_tokens, model.hparams.n_dspark_block_size*n_seqs)
+        : n_tokens;
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -679,22 +691,40 @@ void llama_context::sched_reserve() {
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
 
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    const uint32_t n_outputs_pp = std::min(n_tokens_pp, cparams.n_outputs_max);
+    std::vector<size_t> dspark_encoder_sizes;
+
+    if (is_dsv4_dspark) {
+        if (model.hparams.no_alloc) {
+            dspark_encoder_sizes.resize(backend_ptrs.size());
+        }
+        const uint32_t n_outputs_enc = std::min(n_tokens, cparams.n_outputs_max);
+        auto * gf = graph_reserve_type(n_tokens, n_seqs, n_outputs_enc, mctx.get(),
+                LLM_GRAPH_TYPE_ENCODER, model.hparams.no_alloc,
+                model.hparams.no_alloc ? dspark_encoder_sizes.data() : nullptr);
+        if (!gf) {
+            throw std::runtime_error("failed to allocate DSV4 DSpark encoder compute buffers");
+        }
+    }
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+        auto * gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
             }
+        }
+
+        for (size_t i = 0; i < dspark_encoder_sizes.size(); ++i) {
+            backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], dspark_encoder_sizes[i]);
         }
 
         n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
@@ -718,7 +748,7 @@ void llama_context::sched_reserve() {
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
         //
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
@@ -740,13 +770,13 @@ void llama_context::sched_reserve() {
     if (n_nodes_pp == n_nodes_tg) {
         LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);
     } else {
-        LLAMA_LOG_INFO("%s: graph nodes  = %d (with bs=%d), %d (with bs=1)\n", __func__, n_nodes_pp, n_tokens, n_nodes_tg);
+        LLAMA_LOG_INFO("%s: graph nodes  = %d (with bs=%d), %d (with bs=1)\n", __func__, n_nodes_pp, n_tokens_pp, n_nodes_tg);
     }
 
     if (n_splits_pp == n_splits_tg) {
         LLAMA_LOG_INFO("%s: graph splits = %d\n", __func__, n_splits_pp);
     } else {
-        LLAMA_LOG_INFO("%s: graph splits = %d (with bs=%d), %d (with bs=1)\n", __func__, n_splits_pp, n_tokens, n_splits_tg);
+        LLAMA_LOG_INFO("%s: graph splits = %d (with bs=%d), %d (with bs=1)\n", __func__, n_splits_pp, n_tokens_pp, n_splits_tg);
     }
 
     const int64_t t_end_us = ggml_time_us();
@@ -2446,6 +2476,13 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+    return graph_reserve_type(n_tokens, n_seqs, n_outputs, mctx,
+            ctx_type_to_graph_type(cparams.ctx_type), split_only, sizes);
+}
+
+ggml_cgraph * llama_context::graph_reserve_type(
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx,
+        llm_graph_type gtype, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -2479,7 +2516,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     res->reset();
 
