@@ -207,6 +207,18 @@ static bool run_rollback_depth(llama_context *                  ctx_src,
         return false;
     }
 
+    // Measure ordinary two-token verification at the same positions. This
+    // separates Metal batch-shape drift from rollback snapshot corruption.
+    if (!decode_tokens(ctx_dst, tokens, 0, prefix_count) || !decode_tokens(ctx_dst, tokens, prefix_count, 2, 1)) {
+        fprintf(stderr, "%s : depth %u failed to decode two-token batch control\n", __func__, depth);
+        return false;
+    }
+    std::vector<float> logits_batch_control;
+    if (!copy_logits(ctx_dst, n_vocab, depth, "two-token batch control", logits_batch_control, 1)) {
+        return false;
+    }
+    llama_memory_clear(llama_get_memory(ctx_dst), true);
+
     // Evaluate one accepted token followed by `depth` speculative tokens in a
     // single batch. Request logits for the first token that will be rejected.
     if (!decode_tokens(ctx_src, tokens, 0, prefix_count) ||
@@ -241,11 +253,13 @@ static bool run_rollback_depth(llama_context *                  ctx_src,
         !copy_logits(ctx_dst, n_vocab, depth, "clean checkpoint replay", logits_dst)) {
         return false;
     }
-    if (!compare_checkpoint_logits(logits_src, logits_dst, depth, "clean checkpoint") ||
-        !compare_distributions(logits_src, logits_ref, depth, "rollback vs sequential") ||
-        !compare_distributions(logits_src, logits_batch, depth, "rollback vs batched")) {
-        return false;
-    }
+    bool all_ok = true;
+    all_ok      = compare_checkpoint_logits(logits_src, logits_dst, depth, "clean checkpoint") && all_ok;
+    all_ok = compare_distributions(logits_batch_control, logits_ref, depth, "two-token batch vs sequential") && all_ok;
+    all_ok = compare_distributions(logits_batch, logits_batch_control, depth, "speculative batch vs two-token batch") &&
+             all_ok;
+    all_ok = compare_distributions(logits_src, logits_ref, depth, "rollback vs sequential") && all_ok;
+    all_ok = compare_distributions(logits_src, logits_batch, depth, "rollback vs speculative batch") && all_ok;
 
     // Load the same checkpoint into a destination whose state planes and
     // rollback index contain a different speculative history at this depth.
@@ -269,8 +283,13 @@ static bool run_rollback_depth(llama_context *                  ctx_src,
     }
 
     std::vector<float> logits_dirty;
-    if (!copy_logits(ctx_dirty, n_vocab, depth, "dirty checkpoint replay", logits_dirty) ||
-        !compare_checkpoint_logits(logits_src, logits_dirty, depth, "dirty checkpoint")) {
+    if (!copy_logits(ctx_dirty, n_vocab, depth, "dirty checkpoint replay", logits_dirty)) {
+        return false;
+    }
+    all_ok = compare_checkpoint_logits(logits_src, logits_dirty, depth, "dirty checkpoint") && all_ok;
+
+    if (!all_ok) {
+        fprintf(stderr, "%s : depth %u recurrent rollback oracle failed\n", __func__, depth);
         return false;
     }
 
