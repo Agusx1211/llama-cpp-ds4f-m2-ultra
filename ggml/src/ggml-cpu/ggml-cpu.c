@@ -2064,6 +2064,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
             } break;
+        case GGML_OP_DSV4_COMPRESS:
+            {
+                ggml_compute_forward_dsv4_compress(params, tensor);
+            } break;
+        case GGML_OP_DSV4_TOP_K_MASK:
+            {
+                ggml_compute_forward_dsv4_top_k_mask(params, tensor);
+            } break;
         case GGML_OP_DSV4_HC_COMB:
             {
                 ggml_compute_forward_dsv4_hc_comb(params, tensor);
@@ -2075,6 +2083,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_DSV4_HC_POST:
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
+            } break;
+        case GGML_OP_DSV4_SPARSE_PACK:
+            {
+                ggml_compute_forward_dsv4_sparse_pack(params, tensor);
             } break;
         case GGML_OP_MAP_CUSTOM1:
             {
@@ -2256,9 +2268,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_DSV4_COMPRESS:
+        case GGML_OP_DSV4_TOP_K_MASK:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_DSV4_SPARSE_PACK:
             {
                 n_tasks = n_threads;
             } break;
@@ -2997,6 +3012,12 @@ struct ggml_cplan ggml_graph_plan(
                         // temp buffer for dequantizing lightning indexer keys
                         const int64_t ne10 = node->src[1]->ne[0];
                         cur += sizeof(float)*ne10*n_tasks;
+                    } break;
+                case GGML_OP_DSV4_SPARSE_PACK:
+                    {
+                        if (node->src[0]->type != GGML_TYPE_F16) {
+                            cur += sizeof(float)*node->src[0]->ne[0]*n_tasks;
+                        }
                     } break;
                 default:
                     break;

@@ -39,6 +39,7 @@ struct ggml_metal {
     bool use_fusion;
     bool use_concurrency;
     bool use_graph_optimize;
+    bool use_dsv4_split_tuning;
 
     int debug_graph;
     int debug_fusion;
@@ -133,8 +134,9 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
 
-    res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
-    res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
+    res->use_fusion            = getenv("GGML_METAL_FUSION_DISABLE") == nil;
+    res->use_concurrency       = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
+    res->use_dsv4_split_tuning = getenv("GGML_METAL_DSV4_SPLIT_DISABLE") == nil;
 
     {
         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
@@ -441,8 +443,20 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         return GGML_STATUS_FAILED;
     }
 
-    // number of nodes encoded by the main thread (empirically determined)
-    const int n_main = MAX(64, 0.1*gf->n_nodes);
+    // Number of nodes encoded by the main thread. A DSV4 decode graph on the
+    // M2 Ultra has about 6.8k raw nodes (about 4k after Metal fusion). Its
+    // generic 10% split delays the first submission enough to leave a
+    // repeatable GPU bubble. A measured 512-node prefix starts the GPU earlier
+    // while still covering async encoding of the remainder. Keep small and
+    // non-target graphs on the established generic policy.
+    const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+    const bool tune_dsv4_split = ctx->use_dsv4_split_tuning &&
+            props_dev->device_id == GGML_METAL_DEVICE_M2_ULTRA && gf->n_nodes >= 3000;
+    const int n_main = tune_dsv4_split ? 512 : MAX(64, 0.1*gf->n_nodes);
+    if (ctx->debug_graph > 0) {
+        GGML_LOG_DEBUG("%s: nodes = %d, main-thread nodes = %d, DSV4 split tuning = %s\n",
+                __func__, gf->n_nodes, n_main, tune_dsv4_split ? "true" : "false");
+    }
 
     // number of threads in addition to the main thread
     const int n_cb = ctx->n_cb;

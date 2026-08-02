@@ -25,8 +25,61 @@ static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
 
+using dsv4_sparse_buft_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, uint32_t);
+
+static ggml_backend_buffer_type_t dsv4_sparse_buft(
+        const llama_model & model,
+        uint32_t n_seq_max) {
+    if (n_seq_max <= 1) {
+        return nullptr;
+    }
+
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        auto * dev = model.dev_layer(il);
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            continue;
+        }
+        auto * get_buft = (dsv4_sparse_buft_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_metal_dsv4_sparse_buffer_type");
+        if (get_buft != nullptr) {
+            if (auto * buft = get_buft(dev, n_seq_max)) {
+                return buft;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+bool llama_kv_cache_dsv4_supports_elastic_metal(
+        const llama_model & model,
+        uint32_t n_seq_max) {
+    return dsv4_sparse_buft(model, n_seq_max) != nullptr;
+}
+
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
+}
+
+static void * dsv4_backend_proc(const ggml_tensor * tensor, const char * name) {
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        return nullptr;
+    }
+    auto * buft = ggml_backend_buffer_get_type(tensor->buffer);
+    auto * dev = ggml_backend_buft_get_device(buft);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+
+static int dsv4_sparse_unmap_tensor_range(
+        ggml_tensor * tensor,
+        size_t offset,
+        size_t size) {
+    using unmap_fn = int (*)(ggml_tensor *, size_t, size_t);
+    auto * unmap = (unmap_fn) dsv4_backend_proc(
+            tensor, "ggml_backend_metal_dsv4_sparse_unmap_tensor_range");
+    return unmap ? unmap(tensor, offset, size) : 0;
 }
 
 static void dsv4_clear_tensor_stream(ggml_tensor * tensor, uint32_t stream) {
@@ -35,7 +88,106 @@ static void dsv4_clear_tensor_stream(ggml_tensor * tensor, uint32_t stream) {
     GGML_ASSERT(stream < (uint32_t) tensor->ne[2]);
 
     const size_t stream_size = tensor->nb[2];
+    const bool page_aligned = stream_size % (64*1024) == 0 &&
+            (uintptr_t) tensor->data % (64*1024) == 0;
+    const int sparse = page_aligned ? dsv4_sparse_unmap_tensor_range(
+            tensor, stream*stream_size, stream_size) : 0;
+    if (sparse < 0) {
+        throw std::runtime_error("failed to reclaim DSV4 sparse tensor stream");
+    }
+    if (sparse > 0) {
+        return;
+    }
     ggml_backend_tensor_memset(tensor, 0, stream*stream_size, stream_size);
+}
+
+struct dsv4_sparse_range {
+    ggml_tensor * tensor;
+    size_t offset;
+    size_t size;
+};
+
+static bool dsv4_sparse_map_ranges(const std::vector<dsv4_sparse_range> & ranges) {
+    struct range_group {
+        std::vector<ggml_tensor *> tensors;
+        std::vector<size_t> offsets;
+        std::vector<size_t> sizes;
+    };
+    std::map<ggml_backend_buffer_t, range_group> groups;
+
+    for (const auto & range : ranges) {
+        if (range.size == 0) {
+            continue;
+        }
+        auto & group = groups[range.tensor->buffer];
+        group.tensors.push_back(range.tensor);
+        group.offsets.push_back(range.offset);
+        group.sizes.push_back(range.size);
+    }
+
+    using map_fn = bool (*)(
+            ggml_tensor * const *, const size_t *, const size_t *, size_t);
+    for (auto & [_, group] : groups) {
+        auto * map = (map_fn) dsv4_backend_proc(
+                group.tensors[0], "ggml_backend_metal_dsv4_sparse_map_tensor_ranges");
+        if (map != nullptr && !map(
+                    group.tensors.data(), group.offsets.data(), group.sizes.data(), group.tensors.size())) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool dsv4_sparse_ensure_k_rows(
+        const llama_kv_cache * kv,
+        std::vector<int64_t> rows) {
+    if (rows.empty()) {
+        return true;
+    }
+
+    const int64_t n_rows_total = (int64_t) kv->get_size()*kv->get_n_stream();
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    if (rows.front() < 0 || rows.back() >= n_rows_total) {
+        return false;
+    }
+
+    std::vector<std::pair<int64_t, int64_t>> runs;
+    for (size_t i = 0; i < rows.size();) {
+        const int64_t begin = rows[i];
+        int64_t end = begin + 1;
+        while (++i < rows.size() && rows[i] == end) {
+            ++end;
+        }
+        runs.emplace_back(begin, end);
+    }
+
+    std::vector<dsv4_sparse_range> ranges;
+    ranges.reserve(kv->get_layer_ids().size()*runs.size());
+    for (uint32_t il : kv->get_layer_ids()) {
+        ggml_tensor * tensor = kv->get_k_storage(il);
+        for (const auto & [begin, end] : runs) {
+            ranges.push_back({
+                tensor,
+                (size_t) begin*tensor->nb[1],
+                (size_t) (end - begin)*tensor->nb[1],
+            });
+        }
+    }
+    return dsv4_sparse_map_ranges(ranges);
+}
+
+static bool dsv4_sparse_ensure_slot(
+        const llama_kv_cache * kv,
+        const llama_kv_cache::slot_info & sinfo) {
+    std::vector<int64_t> rows;
+    for (size_t s = 0; s < sinfo.n_stream(); ++s) {
+        for (uint32_t idx : sinfo.idxs[s]) {
+            rows.push_back((int64_t) sinfo.strm[s]*kv->get_size() + idx);
+        }
+    }
+    return dsv4_sparse_ensure_k_rows(kv, std::move(rows));
 }
 
 static uint32_t dsv4_state_n_used_k_rows(llama_pos pos_max, uint32_t ratio, uint32_t kv_size) {
@@ -1038,7 +1190,13 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         return true;
     };
 
-    GGML_UNUSED(unified);
+    ggml_backend_buffer_type_t sparse_buft = nullptr;
+    if (unified && n_seq_max > 1) {
+        sparse_buft = dsv4_sparse_buft(model, n_seq_max);
+        if (sparse_buft == nullptr) {
+            throw std::runtime_error("DSV4 unified context requires target Metal sparse pages");
+        }
+    }
 
     // Keep DSV4 KV/state streams per sequence even when public KV mode is unified.
     const bool unified_raw = false;
@@ -1087,7 +1245,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, sparse_buft);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_HCA_RATIO));
@@ -1095,7 +1253,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_hca = std::make_unique<llama_kv_cache>(
             model, hparams_hca, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr, sparse_buft);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
@@ -1103,7 +1261,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, sparse_buft);
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
@@ -1510,6 +1668,7 @@ static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv
 }
 
 llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv) :
+    kv_base(kv->get_base()),
     kv_swa(kv->get_swa()),
     ctx_base_mem(nullptr),
     ctx_swa_mem(nullptr),
@@ -1523,6 +1682,7 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
         llama_kv_cache_iswa * kv,
         llama_context * lctx,
         bool optimize) :
+    kv_base(kv->get_base()),
     kv_swa(kv->get_swa()),
     ctx_base_mem(kv->get_base()->init_update(lctx, optimize)),
     ctx_swa_mem(kv->get_swa()->init_update(lctx, optimize)),
@@ -1537,13 +1697,15 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
         slot_info_vec_t sinfos_swa_read,
         std::vector<llama_ubatch> ubatches,
         std::vector<llama_ubatch> ubatches_write) :
+    kv_base(kv->get_base()),
     kv_swa(kv->get_swa()),
+    sinfos_base_write(std::move(sinfos_base_write)),
     sinfos_write(std::move(sinfos_swa_write)),
     sinfos_read(std::move(sinfos_swa_read)),
     ubatches(std::move(ubatches)),
     ubatches_write(std::move(ubatches_write)),
     ctx_base_mem(std::make_unique<llama_kv_cache_context>(
-                kv->get_base(), std::move(sinfos_base_write), this->ubatches_write)),
+                kv_base, this->sinfos_base_write, this->ubatches_write)),
     ctx_swa_mem(nullptr),
     n_kv(kv_swa->get_size()),
     status(LLAMA_MEMORY_STATUS_SUCCESS) {
@@ -1580,6 +1742,14 @@ bool llama_kv_cache_dsv4_raw_context::apply() {
     }
 
     return res;
+}
+
+bool llama_kv_cache_dsv4_raw_context::ensure_backing() const {
+    if (ubatches_write.empty()) {
+        return true;
+    }
+    return dsv4_sparse_ensure_slot(kv_base, sinfos_base_write[i_next]) &&
+           dsv4_sparse_ensure_slot(kv_swa,  sinfos_write[i_next]);
 }
 
 llama_memory_status llama_kv_cache_dsv4_raw_context::get_status() const {
@@ -1729,6 +1899,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(llama_memory_status sta
 
 llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         llama_kv_cache_dsv4 * kv) :
+    kv(kv),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw())),
     ctx_csa_mem(kv->get_csa()->init_full()),
     ctx_hca_mem(kv->get_hca()->init_full()),
@@ -1752,6 +1923,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         stream_copy_info sc_info_csa,
         stream_copy_info sc_info_hca,
         stream_copy_info sc_info_lid) :
+    kv(kv),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw(), lctx, optimize)),
     ctx_csa_mem(kv->get_csa()->init_update(lctx, optimize)),
     ctx_hca_mem(kv->get_hca()->init_update(lctx, optimize)),
@@ -1777,6 +1949,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         slot_info_vec_t sinfos_raw_swa_read,
         std::vector<llama_ubatch> ubatches,
         std::vector<llama_ubatch> ubatches_raw) :
+    kv(kv),
     ubatches(std::move(ubatches)),
     plans_csa(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream())),
@@ -1830,6 +2003,16 @@ bool llama_kv_cache_dsv4_context::next() {
 
 bool llama_kv_cache_dsv4_context::apply() {
     assert(!llama_memory_status_is_fail(status));
+
+    if (!ubatches.empty()) {
+        if (!ctx_raw->ensure_backing() ||
+                !dsv4_sparse_ensure_k_rows(kv->get_csa(), plans_csa[i_next].state_write_idxs) ||
+                !dsv4_sparse_ensure_k_rows(kv->get_hca(), plans_hca[i_next].state_write_idxs) ||
+                !dsv4_sparse_ensure_k_rows(kv->get_lid(), plans_lid[i_next].state_write_idxs)) {
+            LLAMA_LOG_WARN("%s: DSV4 elastic Metal page pool is full\n", __func__);
+            return false;
+        }
+    }
 
     bool res = true;
 

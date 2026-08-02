@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -61,6 +62,18 @@ static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_dsv4_compress_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_COMPRESS,
+    /*.name             =*/ "fused DeepSeek V4 compressor",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_top_k_mask_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_TOP_K_MASK,
+    /*.name             =*/ "fused DeepSeek V4 top-k mask",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
     /*.name             =*/ "fused DeepSeek V4 HC pre",
@@ -77,6 +90,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_POST,
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_sparse_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_SPARSE_PACK,
+    /*.name             =*/ "fused DeepSeek V4 sparse attention packing",
+    /*.n_tokens_per_seq =*/ 512,
 };
 
 llama_context::llama_context(
@@ -253,10 +272,17 @@ llama_context::llama_context(
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
 
+    cparams.fused_dsv4_compress   = true;
+    cparams.fused_dsv4_top_k_mask = true;
+    cparams.auto_fdsv4_aux        = true;
+
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
+
+    cparams.fused_dsv4_sparse = true;
+    cparams.auto_fdsv4_sparse = true;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -267,6 +293,22 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+
+    // DSV4 retains one affine virtual stream per sequence. On the target M2
+    // Ultra, placement-sparse Metal buffers provide an elastic physical page
+    // pool underneath those streams. Other devices keep the safe fixed split.
+    if (model.arch == LLM_ARCH_DEEPSEEK4 && cparams.kv_unified && cparams.n_seq_max > 1) {
+        if (llama_kv_cache_dsv4_supports_elastic_metal(model, cparams.n_seq_max)) {
+            LLAMA_LOG_INFO("%s: DeepSeek V4 using elastic Metal KV pages: "
+                    "%u total cells across %u virtual streams\n",
+                    __func__, cparams.n_ctx, cparams.n_seq_max);
+        } else {
+            LLAMA_LOG_WARN("%s: DeepSeek V4 elastic Metal KV pages unavailable; "
+                    "partitioning %u context cells across %u sequences\n",
+                    __func__, cparams.n_ctx, cparams.n_seq_max);
+            cparams.kv_unified = false;
+        }
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -570,6 +612,19 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
         cparams.auto_fhc = false;
+    }
+
+    if (cparams.auto_fdsv4_sparse) {
+        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 sparse attention support:\n", func);
+        resolve(llm_fused_op_dsv4_sparse_probe, cparams.fused_dsv4_sparse);
+        cparams.auto_fdsv4_sparse = false;
+    }
+
+    if (cparams.auto_fdsv4_aux) {
+        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 auxiliary ops support:\n", func);
+        resolve(llm_fused_op_dsv4_compress_probe,   cparams.fused_dsv4_compress);
+        resolve(llm_fused_op_dsv4_top_k_mask_probe, cparams.fused_dsv4_top_k_mask);
+        cparams.auto_fdsv4_aux = false;
     }
 }
 

@@ -362,6 +362,14 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+static bool dsv4_test_has_elastic_pages(ggml_backend_dev_t dev, uint32_t n_seq_max) {
+    using sparse_buft_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, uint32_t);
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    auto * get_buft = reg ? (sparse_buft_fn) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_metal_dsv4_sparse_buffer_type") : nullptr;
+    return get_buft && get_buft(dev, n_seq_max) != nullptr;
+}
+
 struct dsv4_test_context {
     llama_model_ptr   model;
     llama_context_ptr lctx;
@@ -374,9 +382,10 @@ struct dsv4_test_context {
             uint32_t n_seq_max,
             bool kv_unified,
             uint32_t batch_capacity,
-            uint32_t max_seq_ids = 1) {
+            uint32_t max_seq_ids = 1,
+            uint32_t n_ctx_total = 0) {
         test_context_config config;
-        config.n_ctx = 256*n_seq_max;
+        config.n_ctx = n_ctx_total > 0 ? n_ctx_total : 256*n_seq_max;
         config.n_batch = batch_capacity;
         config.n_ubatch = batch_capacity;
         config.n_seq_max = n_seq_max;
@@ -388,6 +397,11 @@ struct dsv4_test_context {
 
         model = std::move(loaded.first);
         lctx = std::move(loaded.second);
+        GGML_ASSERT(llama_n_ctx(lctx.get()) == config.n_ctx);
+        const uint32_t expected_seq_ctx = kv_unified && dsv4_test_has_elastic_pages(dev, n_seq_max)
+            ? config.n_ctx
+            : config.n_ctx/n_seq_max;
+        GGML_ASSERT(llama_n_ctx_seq(lctx.get()) == expected_seq_ctx);
         n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         batch = llama_batch_init(batch_capacity, 0, max_seq_ids);
     }
@@ -699,6 +713,33 @@ static bool compare_dsv4_trace(
     return trace_nmse <= 1.0e-8 && max_abs_error <= 1.0e-5;
 }
 
+static bool test_dsv4_elastic_borrow(size_t seed, ggml_backend_dev_t dev) {
+    static constexpr uint32_t n_ctx_total = 512;
+    static constexpr uint32_t n_tokens = 300;
+
+    if (!dsv4_test_has_elastic_pages(dev, 2)) {
+        return true;
+    }
+
+    const std::vector<llama_token> tokens = get_tokens(n_tokens, 128, seed + 10);
+    const auto run = [&](uint32_t n_seq_max, bool kv_unified) {
+        dsv4_test_context test(seed, dev, n_seq_max, kv_unified, n_tokens, 1, n_ctx_total);
+        for (uint32_t pos = 0; pos < n_tokens; ++pos) {
+            test.add(tokens[pos], pos, {0});
+        }
+        test.decode("elastic borrowing");
+
+        std::vector<float> result;
+        result.reserve(test.n_vocab);
+        test.append_logits(n_tokens - 1, result);
+        return result;
+    };
+
+    const std::vector<float> isolated = run(1, false);
+    const std::vector<float> elastic  = run(2, true);
+    return compare_dsv4_trace("elastic-borrow", "A", isolated, elastic);
+}
+
 static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     static constexpr uint32_t n_vocab = 128;
     static constexpr uint32_t n_prompt = 128;
@@ -720,12 +761,13 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
 
     const parallel_case cases[] = {
         { "split-contiguous",   false, 2, 0, 1 },
-        { "unified-contiguous", true,  2, 0, 1 },
+        { "requested-unified-contiguous",          true,  2, 0, 1 },
         { "split-sparse",       false, 4, 0, 2 },
-        { "unified-sparse",     true,  4, 0, 2 },
+        { "requested-unified-sparse",              true,  4, 0, 2 },
     };
 
     bool all_ok = true;
+    all_ok = test_dsv4_elastic_borrow(seed, dev) && all_ok;
     for (const parallel_case & test_case : cases) {
         const dsv4_parallel_result parallel = run_dsv4_parallel(
                 seed, dev, tokens_a, tokens_b, n_prompt,
@@ -743,7 +785,8 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     const std::vector<float> isolated_coupled_b = run_dsv4_isolated(seed, dev, coupled_b, n_prompt);
 
     for (bool kv_unified : { false, true }) {
-        const char * mode = kv_unified ? "unified-coupled" : "split-coupled";
+        const char * mode = kv_unified ?
+            "requested-unified-coupled" : "split-coupled";
         const dsv4_parallel_result coupled = run_dsv4_shared_prefix(
                 seed, dev, coupled_a, coupled_b, n_prompt, kv_unified, dsv4_prefix_setup::COUPLED);
         all_ok = compare_dsv4_trace(mode, "A", isolated_coupled_a, coupled.seq_a) && all_ok;
@@ -751,7 +794,8 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     }
 
     for (bool kv_unified : { false, true }) {
-        const char * mode = kv_unified ? "unified-copied" : "split-copied";
+        const char * mode = kv_unified ?
+            "requested-unified-copied" : "split-copied";
         const dsv4_parallel_result copied = run_dsv4_shared_prefix(
                 seed, dev, coupled_a, coupled_b, n_prompt, kv_unified, dsv4_prefix_setup::COPIED);
         all_ok = compare_dsv4_trace(mode, "A", isolated_coupled_a, copied.seq_a) && all_ok;
@@ -759,7 +803,8 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     }
 
     for (bool kv_unified : { false, true }) {
-        const char * mode = kv_unified ? "unified-restored" : "split-restored";
+        const char * mode = kv_unified ?
+            "requested-unified-restored" : "split-restored";
         const dsv4_parallel_result restored = run_dsv4_shared_prefix(
                 seed, dev, coupled_a, coupled_b, n_prompt, kv_unified, dsv4_prefix_setup::RESTORED);
         all_ok = compare_dsv4_trace(mode, "A", isolated_coupled_a, restored.seq_a) && all_ok;
@@ -773,7 +818,8 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     const std::vector<float> isolated_asymmetric_b = run_dsv4_isolated(seed, dev, asymmetric_b, n_short_prompt);
 
     for (bool kv_unified : { false, true }) {
-        const char * mode = kv_unified ? "unified-asymmetric" : "split-asymmetric";
+        const char * mode = kv_unified ?
+            "requested-unified-asymmetric" : "split-asymmetric";
         const dsv4_parallel_result asymmetric = run_dsv4_asymmetric(
                 seed, dev, asymmetric_a, asymmetric_b, n_prompt, n_short_prompt, kv_unified);
         all_ok = compare_dsv4_trace(mode, "A", isolated_asymmetric_a, asymmetric.seq_a) && all_ok;
@@ -791,7 +837,8 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     const std::vector<float> isolated_replacement = run_dsv4_isolated(seed, dev, replacement, n_prompt);
 
     for (bool kv_unified : { false, true }) {
-        const char * mode = kv_unified ? "unified-reuse" : "split-reuse";
+        const char * mode = kv_unified ?
+            "requested-unified-reuse" : "split-reuse";
         const dsv4_parallel_result reused = run_dsv4_reused_slot(
                 seed, dev, discarded, survivor, replacement,
                 n_prompt, n_decode_before_reuse, kv_unified);

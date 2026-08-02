@@ -15,6 +15,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>

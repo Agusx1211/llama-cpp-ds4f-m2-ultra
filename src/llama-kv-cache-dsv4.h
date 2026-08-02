@@ -8,6 +8,12 @@
 #include <unordered_map>
 #include <vector>
 
+// True only for the target M2 Ultra Metal backend when placement-sparse
+// buffers can provide DSV4's elastic physical page pool.
+bool llama_kv_cache_dsv4_supports_elastic_metal(
+        const llama_model & model,
+        uint32_t n_seq_max);
+
 class llama_dsv4_comp_state {
 public:
     using stream_copy_info = llama_kv_cache::stream_copy_info;
@@ -183,6 +189,7 @@ public:
 
     bool next() override;
     bool apply() override;
+    bool ensure_backing() const;
 
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -203,8 +210,10 @@ public:
 private:
     size_t i_next = 0;
 
-    llama_kv_cache * kv_swa = nullptr;
+    llama_kv_cache * kv_base = nullptr;
+    llama_kv_cache * kv_swa  = nullptr;
 
+    slot_info_vec_t sinfos_base_write;
     slot_info_vec_t sinfos_write;
     slot_info_vec_t sinfos_read;
     std::vector<llama_ubatch> ubatches;
@@ -347,6 +356,8 @@ public:
     const comp_plan & get_lid_plan(const llama_ubatch & ubatch) const;
 
 private:
+    llama_kv_cache_dsv4 * kv = nullptr;
+
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;

@@ -3,6 +3,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <cstdlib>
 #include <vector>
 
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)
@@ -188,6 +189,7 @@ struct node_info {
     ggml_tensor * node;
 
     std::vector<ggml_tensor *> fused;
+    std::vector<ggml_tensor *> extra_dsts;
 
     ggml_op op() const {
         return node->op;
@@ -203,6 +205,10 @@ struct node_info {
 
     void add_fused(ggml_tensor * t) {
         fused.push_back(t);
+    }
+
+    void add_dst(ggml_tensor * t) {
+        extra_dsts.push_back(t);
     }
 };
 
@@ -228,7 +234,16 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             }
         }
 
-        return ggml_mem_ranges_add_dst(mrs, node.dst());
+        if (!ggml_mem_ranges_add_dst(mrs, node.dst())) {
+            return false;
+        }
+        for (const auto * dst : node.extra_dsts) {
+            if (!ggml_mem_ranges_add_dst(mrs, dst)) {
+                return false;
+            }
+        }
+
+        return true;
     };
 
     // helper to check if a node can run concurrently with the existing set of nodes
@@ -251,7 +266,16 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             }
         }
 
-        return ggml_mem_ranges_check_dst(mrs, node.dst());
+        if (!ggml_mem_ranges_check_dst(mrs, node.dst())) {
+            return false;
+        }
+        for (const auto * dst : node.extra_dsts) {
+            if (!ggml_mem_ranges_check_dst(mrs, dst)) {
+                return false;
+            }
+        }
+
+        return true;
     };
 
     // perform reorders only across these types of ops
@@ -372,6 +396,64 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     return res;
 }
 
+static constexpr int GGML_METAL_DSV4_ROUTER_NODES      = 13;
+static constexpr int GGML_METAL_DSV4_ROUTER_IDS_NODE   = 5;
+static constexpr int GGML_METAL_DSV4_ROUTER_FINAL_NODE = 12;
+
+static bool ggml_metal_can_pack_dsv4_router(const ggml_cgraph * gf, int i) {
+    static const bool disabled = std::getenv("GGML_METAL_DSV4_ROUTER_DISABLE") != nullptr;
+    if (disabled) {
+        return false;
+    }
+
+    static constexpr ggml_op pattern[] = {
+        GGML_OP_UNARY, GGML_OP_SQRT, GGML_OP_RESHAPE, GGML_OP_ADD,
+        GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
+        GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE,
+        GGML_OP_SCALE,
+    };
+    static_assert(sizeof(pattern)/sizeof(pattern[0]) == GGML_METAL_DSV4_ROUTER_NODES);
+
+    if (i + GGML_METAL_DSV4_ROUTER_NODES > gf->n_nodes) {
+        return false;
+    }
+
+    const int outputs[] = {
+        i + GGML_METAL_DSV4_ROUTER_IDS_NODE,
+        i + GGML_METAL_DSV4_ROUTER_FINAL_NODE,
+    };
+    if (!ggml_can_fuse_subgraph(gf, i, GGML_METAL_DSV4_ROUTER_NODES, pattern, outputs, 2)) {
+        return false;
+    }
+
+    const ggml_tensor * softplus = gf->nodes[i + 0];
+    const ggml_tensor * sqrt_node = gf->nodes[i + 1];
+    const ggml_tensor * reshape_p = gf->nodes[i + 2];
+    const ggml_tensor * add       = gf->nodes[i + 3];
+    const ggml_tensor * argsort   = gf->nodes[i + 4];
+    const ggml_tensor * ids       = gf->nodes[i + 5];
+    const ggml_tensor * get_rows  = gf->nodes[i + 6];
+    const ggml_tensor * reshape_w = gf->nodes[i + 7];
+    const ggml_tensor * sum_rows  = gf->nodes[i + 8];
+    const ggml_tensor * clamp     = gf->nodes[i + 9];
+    const ggml_tensor * div       = gf->nodes[i + 10];
+    const ggml_tensor * reshape_n = gf->nodes[i + 11];
+    const ggml_tensor * scale     = gf->nodes[i + 12];
+
+    const bool edges_ok =
+        sqrt_node->src[0] == softplus && reshape_p->src[0] == sqrt_node &&
+        add->src[0] == sqrt_node && argsort->src[0] == add && ids->src[0] == argsort &&
+        get_rows->src[0] == reshape_p && get_rows->src[1] == ids &&
+        reshape_w->src[0] == get_rows && sum_rows->src[0] == reshape_w &&
+        clamp->src[0] == sum_rows && div->src[0] == reshape_w && div->src[1] == clamp &&
+        reshape_n->src[0] == div && scale->src[0] == reshape_n;
+
+    return edges_ok &&
+        softplus->op == GGML_OP_UNARY && ggml_get_unary_op(softplus) == GGML_UNARY_OP_SOFTPLUS &&
+        softplus->src[0]->type == GGML_TYPE_F32 && softplus->src[0]->ne[0] == 256 &&
+        ids->type == GGML_TYPE_I32 && ids->ne[0] == 6 && scale->type == GGML_TYPE_F32;
+}
+
 void ggml_graph_optimize(ggml_cgraph * gf) {
     constexpr int MAX_FUSE = 16;
 
@@ -389,11 +471,17 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
         node_info node = {
             /*.node =*/ gf->nodes[i],
             /*.fused =*/ {},
+            /*.extra_dsts =*/ {},
         };
 
+        if (ggml_metal_can_pack_dsv4_router(gf, i)) {
+            node.add_dst(gf->nodes[i + GGML_METAL_DSV4_ROUTER_IDS_NODE]);
+            for (int k = 1; k < GGML_METAL_DSV4_ROUTER_NODES; ++k) {
+                node.add_fused(gf->nodes[++i]);
+            }
         // fuse only ops that start with these operations
         // can be expanded when needed
-        if (node.op() == GGML_OP_ADD ||
+        } else if (node.op() == GGML_OP_ADD ||
             node.op() == GGML_OP_NORM ||
             node.op() == GGML_OP_RMS_NORM) {
             ops[0] = node.op();
@@ -431,15 +519,8 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
         nodes.push_back(std::move(node));
     }
 
-#if 1
     // reorder to improve concurrency
     const auto order = ggml_metal_graph_optimize_reorder(nodes);
-#else
-    std::vector<int> order(nodes.size());
-    for (size_t i = 0; i < nodes.size(); i++) {
-        order[i] = i;
-    }
-#endif
 
     // unfuse
     {

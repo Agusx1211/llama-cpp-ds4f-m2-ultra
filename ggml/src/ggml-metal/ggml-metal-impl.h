@@ -394,6 +394,7 @@ typedef struct {
     float    m0;
     float    m1;
     int32_t  n_head_log2;
+    int32_t  sinks_rows;
     float    logit_softcap;
 } ggml_metal_kargs_flash_attn_ext;
 
@@ -429,6 +430,7 @@ typedef struct {
     float    m0;
     float    m1;
     int32_t  n_head_log2;
+    int32_t  sinks_rows;
     float    logit_softcap;
 } ggml_metal_kargs_flash_attn_ext_vec;
 
@@ -1170,6 +1172,145 @@ typedef struct {
 typedef struct {
     int64_t val;
 } ggml_metal_kargs_memset;
+
+typedef struct {
+    int32_t  n_tokens;
+    int32_t  n_iter;
+    uint64_t nb_m0;
+    uint64_t nb_m1;
+    uint64_t nb_s0;
+    uint64_t nb_b0;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+    uint64_t nb_d2;
+    float    eps;
+} ggml_metal_kargs_dsv4_hc_comb;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_blocks;
+    int32_t  n_rows;
+    int32_t  ratio;
+    int32_t  overlap;
+    uint64_t nb_k0;
+    uint64_t nb_k1;
+    uint64_t nb_s0;
+    uint64_t nb_s1;
+    uint64_t nb_i0;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+} ggml_metal_kargs_dsv4_compress;
+
+typedef struct {
+    int32_t  n_raw;
+    int32_t  n_comp;
+    int32_t  n_select;
+    int32_t  n_query;
+    uint64_t nb_rm1;
+    uint64_t nb_rm3;
+    uint64_t nb_cm1;
+    uint64_t nb_cm3;
+    uint64_t nb_ci1;
+    uint64_t nb_ci3;
+    uint64_t nb_d1;
+    uint64_t nb_d3;
+} ggml_metal_kargs_dsv4_top_k_mask;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_w0;
+    uint64_t nb_w1;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+} ggml_metal_kargs_dsv4_hc_pre;
+
+// Fixed-shape DeepSeek V4 learned router: 256 F32 logits, 6 selected experts.
+// ID rows retain the stride of the 256-wide argsort backing tensor, while the
+// final scaled weights are contiguous [1, 6, n_tokens].
+typedef struct {
+    int32_t  n_tokens;
+    uint64_t nb_l1;
+    uint64_t nb_i1;
+    uint64_t nb_w2;
+    float    clamp_min;
+    float    scale;
+} ggml_metal_kargs_dsv4_router;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_w0;
+    uint64_t nb_w1;
+    uint64_t nb_n0;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+    float    eps;
+} ggml_metal_kargs_dsv4_hc_pre_norm;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
+    uint64_t nb_r0;
+    uint64_t nb_r1;
+    uint64_t nb_r2;
+    uint64_t nb_p0;
+    uint64_t nb_p1;
+    uint64_t nb_c0;
+    uint64_t nb_c1;
+    uint64_t nb_c2;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+    uint64_t nb_d2;
+} ggml_metal_kargs_dsv4_hc_post;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_batch;
+    int32_t  n_raw;
+    int32_t  n_raw_k;
+    int32_t  n_comp;
+    uint64_t nb_rk2;
+    uint64_t nb_rk3;
+    uint64_t nb_ck2;
+    uint64_t nb_ck3;
+    uint64_t nb_rm0;
+    uint64_t nb_rm1;
+    uint64_t nb_rm3;
+    uint64_t nb_cm0;
+    uint64_t nb_cm1;
+    uint64_t nb_cm3;
+    uint64_t nb_ci0;
+    uint64_t nb_ci1;
+    uint64_t nb_ci3;
+    uint64_t nb_d1;
+} ggml_metal_kargs_dsv4_sparse_pack;
+
+typedef struct {
+    int32_t  n_kv;
+    int32_t  n_batch;
+    int32_t  kv_offset;
+    int32_t  mask_ne3;
+    uint64_t nb1;
+    uint64_t nb3;
+    uint64_t nbq1;
+    uint64_t nbq2;
+    uint64_t nbq3;
+    uint64_t nbk2;
+    uint64_t nbk3;
+    uint64_t nbw1;
+    uint64_t nbw3;
+    uint64_t nbm1;
+    uint64_t nbm3;
+} ggml_metal_kargs_lightning_indexer;
 
 typedef struct {
     int32_t  ne00;

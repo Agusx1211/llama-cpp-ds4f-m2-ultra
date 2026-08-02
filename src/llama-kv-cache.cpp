@@ -17,6 +17,56 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+// Metal placement-sparse DSV4 buffers can alias populated source pages into a
+// destination stream. The backend performs copy-on-write when either stream is
+// subsequently updated. Return 0 when the tensor is not sparse, 1 when handled,
+// and -1 on an invalid sparse layout or mapping failure.
+static int llama_kv_sparse_alias_rows(
+        const ggml_tensor * src,
+        ggml_tensor * dst) {
+    if (src == nullptr || dst == nullptr || src->buffer == nullptr) {
+        return 0;
+    }
+
+    auto * buft = ggml_backend_buffer_get_type(src->buffer);
+    auto * dev = ggml_backend_buft_get_device(buft);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return 0;
+    }
+
+    using alias_fn = int (*)(
+            const ggml_tensor *, ggml_tensor *, const size_t *, const size_t *, size_t);
+    auto * alias = (alias_fn) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_metal_dsv4_sparse_alias_tensor_rows");
+    if (alias == nullptr) {
+        return 0;
+    }
+
+    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
+            src->nb[1]*(size_t) src->ne[1] != ggml_nbytes(src)) {
+        // The only caller using this buffer type is DSV4's K-only cache. Keep
+        // the page alias contract strict rather than guessing at transposed V.
+        return -1;
+    }
+    if (ggml_nbytes(src) % (64*1024) != 0 ||
+            (uintptr_t) src->data % (64*1024) != 0 ||
+            (uintptr_t) dst->data % (64*1024) != 0) {
+        // Tiny synthetic test caches can place multiple streams in one sparse
+        // page. Fall back to an exact blit there; production DSV4 streams are
+        // page-aligned and use zero-copy page aliases.
+        return 0;
+    }
+
+    // Alias every currently backed source page. Unbacked source pages remain
+    // unbacked at the destination, so this copies compressed DSV4 rows even
+    // though those graph-owned rows do not participate in generic KV metadata.
+    const std::vector<size_t> offsets = { 0 };
+    const std::vector<size_t> sizes   = { ggml_nbytes(src) };
+
+    return alias(src, dst, offsets.data(), sizes.data(), offsets.size());
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -77,7 +127,8 @@ llama_kv_cache::llama_kv_cache(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+    const  layer_share_cb & share,
+    ggml_backend_buffer_type_t buft_override) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -213,7 +264,9 @@ llama_kv_cache::llama_kv_cache(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
+            buft = buft_override && ggml_backend_buft_get_device(buft_override) == dev
+                ? buft_override
+                : ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
         }
@@ -901,14 +954,24 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             for (uint32_t il = 0; il < layers.size(); ++il) {
                 const auto & layer = layers[il];
 
-                ggml_backend_tensor_copy(layer.k_stream[ssrc], layer.k_stream[sdst]);
+                const auto copy_stream = [&](const ggml_tensor * src, ggml_tensor * dst) {
+                    const int sparse = llama_kv_sparse_alias_rows(src, dst);
+                    if (sparse < 0) {
+                        throw std::runtime_error("failed to alias DSV4 sparse KV stream");
+                    }
+                    if (sparse == 0) {
+                        ggml_backend_tensor_copy(src, dst);
+                    }
+                };
+
+                copy_stream(layer.k_stream[ssrc], layer.k_stream[sdst]);
 
                 if (layer.v_stream[ssrc]) {
-                    ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
+                    copy_stream(layer.v_stream[ssrc], layer.v_stream[sdst]);
                 }
                 if (layer.k_idx_stream[ssrc]) {
                     GGML_ASSERT(layer.k_idx_stream[sdst]);
-                    ggml_backend_tensor_copy(layer.k_idx_stream[ssrc], layer.k_idx_stream[sdst]);
+                    copy_stream(layer.k_idx_stream[ssrc], layer.k_idx_stream[sdst]);
                 }
             }
         }
