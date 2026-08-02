@@ -7960,13 +7960,18 @@ struct test_dsv4_sparse_pack : public test_case {
 struct test_dsv4_sparse_attention : public test_case {
     static constexpr int64_t d  = 512;
     static constexpr int64_t nh = 64;
-    static constexpr int64_t nr = 128;
     static constexpr int64_t nc = 1024;
     static constexpr int64_t nk = 512;
 
     const int64_t n_stream;
+    const int64_t n_raw;
+    const int64_t n_finite_raw;
 
-    explicit test_dsv4_sparse_attention(int64_t n_stream) : n_stream(n_stream) {}
+    explicit test_dsv4_sparse_attention(int64_t n_stream, int64_t n_raw = 128, int64_t n_finite_raw = 128)
+        : n_stream(n_stream), n_raw(n_raw), n_finite_raw(n_finite_raw) {
+        GGML_ASSERT(n_raw > 0);
+        GGML_ASSERT(n_finite_raw >= 0 && n_finite_raw <= n_raw);
+    }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -7974,7 +7979,7 @@ struct test_dsv4_sparse_attention : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR1(n_stream);
+        return VARS_TO_STR3(n_stream, n_raw, n_finite_raw);
     }
 
     bool run_whole_graph() override {
@@ -7987,9 +7992,9 @@ struct test_dsv4_sparse_attention : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, nh, n_stream, 1);
-        ggml_tensor * raw_k  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, 1, nr, n_stream);
+        ggml_tensor * raw_k  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, 1, n_raw, n_stream);
         ggml_tensor * comp_k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, 1, nc, n_stream);
-        ggml_tensor * raw_m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, nr, 1, 1, n_stream);
+        ggml_tensor * raw_m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_raw, 1, 1, n_stream);
         ggml_tensor * comp_m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, nc, 1, 1, n_stream);
         ggml_tensor * idx    = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, nk, 1, 1, n_stream);
         ggml_tensor * sinks  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
@@ -8006,7 +8011,7 @@ struct test_dsv4_sparse_attention : public test_case {
         ggml_tensor * gathered = ggml_view_4d(ctx, packed, d, 1, nk, n_stream,
                 d*sizeof(ggml_fp16_t), d*sizeof(ggml_fp16_t), packed->nb[1], 0);
         ggml_tensor * k_sel = ggml_concat(ctx, raw_k, gathered, 2);
-        ggml_tensor * k_fa = ggml_view_4d(ctx, k_sel, d, nr + nk, 1, n_stream,
+        ggml_tensor * k_fa = ggml_view_4d(ctx, k_sel, d, n_raw + nk, 1, n_stream,
                 k_sel->nb[2], k_sel->nb[3], k_sel->nb[3], 0);
 
         ggml_tensor * selected_m = ggml_view_4d(ctx, packed, nk, 1, 1, n_stream,
@@ -8035,9 +8040,10 @@ struct test_dsv4_sparse_attention : public test_case {
             } else if (strcmp(t->name, "raw_mask") == 0) {
                 std::vector<ggml_fp16_t> data(ggml_nelements(t));
                 for (int64_t is = 0; is < n_stream; ++is) {
-                    for (int64_t i = 0; i < nr; ++i) {
+                    for (int64_t i = 0; i < n_raw; ++i) {
+                        const bool finite = ((i + 1)*n_finite_raw)/n_raw != (i*n_finite_raw)/n_raw;
                         const float value = -0.03125f*(float) (i % 17);
-                        data[is*nr + i] = ggml_fp32_to_fp16(value);
+                        data[is*n_raw + i] = ggml_fp32_to_fp16(finite ? value : -INFINITY);
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
@@ -10478,6 +10484,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 128, GGML_TYPE_Q8_0, 128, 517, 512));
     test_cases.emplace_back(new test_dsv4_sparse_attention(2));
     test_cases.emplace_back(new test_dsv4_sparse_attention(4));
+    // Long-context DSV4 retains a physically padded raw cache while only 128
+    // distributed mask rows remain finite, producing the target 1280-row FA.
+    test_cases.emplace_back(new test_dsv4_sparse_attention(2, 768, 128));
 
     // Target-shape oracle for the DSV4 prompt-time expert MM path.
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 2048, 224, 4096));
@@ -10529,6 +10538,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {1, n_stream}, 640, 64, true, true,
                     0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true));
+    }
+    // Direct target geometry for profiling the retained DSV4 sparse vector FA.
+    // Returning FLASH_ATTN_EXT itself is important: perf mode duplicates the
+    // returned node, so a trailing reshape would measure that view instead.
+    for (int n_stream : { 2, 4 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, n_stream}, 1280, 1, true, true,
+                    0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
     // DeepSeek V4 BF16 vocabulary projection (129280 x 4096) at decode batch 1.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 129280, 1, 4096, {1, 1}, {1, 1}));
