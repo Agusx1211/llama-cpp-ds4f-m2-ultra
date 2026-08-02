@@ -584,10 +584,15 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         uint32_t kv_size,
         uint32_t n_stream,
         uint32_t n_rs_seq,
+        uint32_t n_rs_seq_alloc,
         const std::vector<uint32_t> & rs_idx) {
     llama_kv_cache_dsv4_context::comp_plan plan;
     plan.n_visible.resize(ubatch.n_tokens);
     plan.n_stream = dsv4_comp_graph_n_stream(ubatch, n_stream);
+
+    if (n_rs_seq > n_rs_seq_alloc) {
+        throw std::runtime_error("DSV4 active rollback depth exceeds allocated state layout");
+    }
 
     // n_stream is the persistent cache/state layout; plan.n_stream is the
     // graph view for this ubatch and can be a subset of those streams.
@@ -801,7 +806,9 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
             }
 
             const uint32_t n_seq_tokens = (uint32_t) token_idxs.size();
-            const int64_t scratch_off = (int64_t) state_rows*(1 + n_rs_seq);
+            // Snapshot execution is bounded by the active depth, but appended
+            // token rows follow every plane in the allocated state tensor.
+            const int64_t scratch_off = (int64_t) state_rows*(1 + n_rs_seq_alloc);
             for (uint32_t d = 1; d <= n_rs_seq; ++d) {
                 const int64_t dst_plane = (int64_t) d*state_rows;
 
@@ -852,12 +859,14 @@ static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans
         uint32_t kv_size,
         uint32_t n_stream,
         uint32_t n_rs_seq,
+        uint32_t n_rs_seq_alloc,
         const std::vector<uint32_t> & rs_idx) {
     std::vector<llama_kv_cache_dsv4_context::comp_plan> plans;
     plans.reserve(ubatches.size());
 
     for (const llama_ubatch & ubatch : ubatches) {
-        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, rs_idx));
+        plans.push_back(dsv4_build_comp_plan(
+                ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, n_rs_seq_alloc, rs_idx));
     }
 
     return plans;
@@ -2183,13 +2192,13 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     ubatches(std::move(ubatches)),
     plans_csa(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
-                kv->get_n_rs_seq(), kv->get_rs_idx())),
+                kv->get_n_rs_seq(), kv->get_csa_state()->get_n_rs_seq(), kv->get_rs_idx())),
     plans_hca(dsv4_build_comp_plans(this->ubatches, DSV4_HCA_RATIO, false,
                 kv->get_hca_state()->get_state_size(), kv->get_hca()->get_size(), kv->get_hca_state()->get_n_stream(),
-                kv->get_n_rs_seq(), kv->get_rs_idx())),
+                kv->get_n_rs_seq(), kv->get_hca_state()->get_n_rs_seq(), kv->get_rs_idx())),
     plans_lid(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
                 kv->get_lid_state()->get_state_size(), kv->get_lid()->get_size(), kv->get_lid_state()->get_n_stream(),
-                kv->get_n_rs_seq(), kv->get_rs_idx())),
+                kv->get_n_rs_seq(), kv->get_lid_state()->get_n_rs_seq(), kv->get_rs_idx())),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(
                 kv->get_raw(),
                 std::move(sinfos_raw_base_write),
