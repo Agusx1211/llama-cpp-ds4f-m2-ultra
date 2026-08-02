@@ -3535,7 +3535,7 @@ llama_context_params llama_context_default_params() {
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
         /*.n_batch                     =*/ 2048,
-        /*.n_ubatch                    =*/ 512,
+        /*.n_ubatch                    =*/ 2048,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,

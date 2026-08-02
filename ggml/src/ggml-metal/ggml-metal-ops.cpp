@@ -3697,6 +3697,13 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         int64_t nsg = 1;
 
+        // DSV4 decode masks all but a small fixed working set. Extra SIMDgroups
+        // only add per-group setup and reduction state when the physical SWA
+        // cache grows beyond 2048 rows; the mask-skip path can cheaply advance
+        // one SIMDgroup over those empty blocks.
+        const bool dsv4_sparse_mask = has_mask && has_sinks && ne10 == 512 && ne20 == 512 &&
+                ne01 == 1 && ne02 == 64 && ne12 == 1 && ne31 == 1 && op->src[4]->ne[0] == 64;
+
         // workgroups
         // each workgroup handles nsg*nkpsg cache values
         int32_t nwg = 1;
@@ -3708,7 +3715,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         } else {
             nwg = 32;
             nsg = 1;
-            while (2*nwg*nsg*ncpsg < ne11 && nsg < 4) {
+            while (!dsv4_sparse_mask && 2*nwg*nsg*ncpsg < ne11 && nsg < 4) {
                 nsg *= 2;
             }
         }
