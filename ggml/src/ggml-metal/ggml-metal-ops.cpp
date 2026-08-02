@@ -11,6 +11,7 @@
 #include <cassert>
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <cmath>
@@ -156,6 +157,36 @@ struct ggml_metal_op {
         // helper intentionally rejects. Validate the raw nodes as structural
         // outputs first, then prove below that neither skipped write is observable.
         static constexpr int outputs[] = { 0, 1, 2 };
+
+        const char * start_name = ggml_get_name(node(i0));
+        const bool trace_block =
+            std::strcmp(start_name, "ffn_moe_up_clamped-0") == 0 ||
+            std::strcmp(start_name, "ffn_moe_up_clamped-3") == 0;
+        if (debug_fusion > 1 && trace_block) {
+            const int raw_start = idxs[i0];
+            const int raw_begin = std::max(idx_start, raw_start - 8);
+            const int raw_end   = std::min(idx_end, raw_start + 16);
+
+            GGML_LOG_DEBUG("%s: DSV4 clamp block neighborhood name=%s raw=[%d,%d) "
+                "start=%d filtered_start=%d\n",
+                __func__, start_name, raw_begin, raw_end, raw_start, i0);
+
+            for (int raw_idx = raw_begin; raw_idx < raw_end; ++raw_idx) {
+                const auto filtered_it = std::lower_bound(idxs.begin(), idxs.end(), raw_idx);
+                const int filtered_idx = filtered_it != idxs.end() && *filtered_it == raw_idx
+                    ? (int) (filtered_it - idxs.begin()) : -1;
+                const ggml_tensor * raw_node = ggml_graph_node(gf, raw_idx);
+                const ggml_tensor * src0 = raw_node->op == GGML_OP_GLU ? raw_node->src[0] : nullptr;
+                const ggml_tensor * src1 = raw_node->op == GGML_OP_GLU ? raw_node->src[1] : nullptr;
+
+                GGML_LOG_DEBUG("%s: DSV4 clamp block raw[%d] filtered[%d] op=%s name=%s "
+                    "shape=[%lld,%lld,%lld,%lld] glu_src=%s/%s\n",
+                    __func__, raw_idx, filtered_idx, ggml_op_name(raw_node->op), ggml_get_name(raw_node),
+                    (long long) raw_node->ne[0], (long long) raw_node->ne[1],
+                    (long long) raw_node->ne[2], (long long) raw_node->ne[3],
+                    src0 ? ggml_get_name(src0) : "-", src1 ? ggml_get_name(src1) : "-");
+            }
+        }
 
         const int n_filtered = can_fuse_subgraph_raw(i0, ops, 3, outputs, 3);
         if (n_filtered != 3) {
