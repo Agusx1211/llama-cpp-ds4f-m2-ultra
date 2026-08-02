@@ -1133,8 +1133,9 @@ private:
                 auto cparams_dft = common_context_params_to_llama(params_dft);
                 if (spec_mtp) {
                     cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                } else {
+                    cparams_dft.n_rs_seq = 0;
                 }
-                cparams_dft.n_rs_seq = 0;
 
                 std::vector<ggml_backend_dev_t> devs;
                 uint32_t hp_ngl = 0;

@@ -384,7 +384,12 @@ static void test_dsv4_mtp_device(
     auto trunk_gguf = get_gguf_ctx(LLM_ARCH_DEEPSEEK4, true);
     auto trunk = get_model_and_ctx(
             trunk_gguf.get(), nullptr, seed, devices, LLAMA_SPLIT_MODE_LAYER, false, trunk_config);
+    llama_set_embeddings_nextn(trunk.second.get(), true, false);
     const std::vector<float> logits_trunk = get_logits(trunk.first.get(), trunk.second.get(), tokens);
+    const int32_t n_embd_nextn = llama_model_n_embd_nextn(trunk.first.get());
+    GGML_ASSERT(n_embd_nextn == 4*llama_model_n_embd(trunk.first.get()));
+    const float * target_h = llama_get_embeddings_nextn(trunk.second.get());
+    GGML_ASSERT(target_h);
 
     test_context_config mtp_config = trunk_config;
     mtp_config.load_mtp = true;
@@ -392,15 +397,11 @@ static void test_dsv4_mtp_device(
     auto target = get_model_and_ctx(
             mtp_gguf.get(), nullptr, seed, devices, LLAMA_SPLIT_MODE_LAYER, false, mtp_config);
 
-    llama_set_embeddings_nextn(target.second.get(), true, false);
     const std::vector<float> logits_mtp_target = get_logits(target.first.get(), target.second.get(), tokens);
     const double target_nmse = nmse(logits_trunk, logits_mtp_target);
     GGML_ASSERT(target_nmse < 1e-12 && "bundled MTP metadata changed DSV4 trunk logits");
 
-    const int32_t n_embd_nextn = llama_model_n_embd_nextn(target.first.get());
-    GGML_ASSERT(n_embd_nextn == 4*llama_model_n_embd(target.first.get()));
-    const float * target_h = llama_get_embeddings_nextn(target.second.get());
-    GGML_ASSERT(target_h);
+    GGML_ASSERT(n_embd_nextn == llama_model_n_embd_nextn(target.first.get()));
 
     llama_context_params draft_params = llama_context_default_params();
     draft_params.n_ctx = 256;

@@ -64,8 +64,11 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     hparams.set_swa_pattern(0);
 
+    // A trunk-only target still has to expose its complete four-stream state
+    // when the MTP block is supplied as a separate draft model.
+    hparams.n_embd_nextn_impl = hparams.dsv4_hc_mult*hparams.n_embd;
+
     if (hparams.n_layer_nextn > 0) {
-        hparams.n_embd_nextn_impl = hparams.dsv4_hc_mult*hparams.n_embd;
         for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
             if (hparams.dsv4_compress_ratios[il] != 0) {
                 throw std::runtime_error("DeepSeek-V4 MTP block must use uncompressed sliding-window attention");
@@ -103,11 +106,15 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, 0);
     hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
 
+    // An MTP-only GGUF contains root embedding/head tensors plus block 43,
+    // while deliberately omitting the target's blocks 0..42.
+    const bool mtp_only = hparams.n_layer_nextn > 0 && ml.get_weight("blk.0.attn_norm.weight") == nullptr;
+    const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     const int mtp_flags = ml.load_mtp ? 0 : TENSOR_SKIP;
 
     for (int i = 0; i < n_layer_all; ++i) {
         auto & layer = layers[i];
-        const int flags = i < n_layer ? 0 : mtp_flags;
+        const int flags = i < n_layer ? trunk_flags : mtp_flags;
 
         layer.attn_norm     = create_tensor(tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd}, flags);
         layer.attn_sinks    = create_tensor(tn(LLM_TENSOR_ATTN_SINKS,    "weight", i), {n_head}, flags);
@@ -171,9 +178,11 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
             layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd}, flags);
             layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd}, flags);
             layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, flags);
-            layer.nextn.hc_head_fn       = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_FN,       "weight", i), {hc_dim, hc_mult}, flags);
-            layer.nextn.hc_head_base     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_BASE,     "weight", i), {hc_mult}, flags);
-            layer.nextn.hc_head_scale    = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_SCALE,    "weight", i), {1}, flags);
+            // Bundled conversion keeps the MTP-specific mixer here. MTP-only
+            // sidecars expose the same three tensors through the root head.
+            layer.nextn.hc_head_fn       = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_FN,       "weight", i), {hc_dim, hc_mult}, flags | TENSOR_NOT_REQUIRED);
+            layer.nextn.hc_head_base     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_BASE,     "weight", i), {hc_mult}, flags | TENSOR_NOT_REQUIRED);
+            layer.nextn.hc_head_scale    = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_SCALE,    "weight", i), {1}, flags | TENSOR_NOT_REQUIRED);
         }
     }
 }
@@ -210,13 +219,53 @@ static ggml_tensor * dsv4_append_zero_row(ggml_context * ctx, ggml_tensor * t, b
     return ggml_concat(ctx, t, row, 1);
 }
 
-static ggml_tensor * dsv4_with_zero_dep(ggml_context * ctx, ggml_tensor * t, ggml_tensor * dep) {
-    if (dep == nullptr) {
-        return t;
+struct dsv4_state_tensors {
+    ggml_tensor * kv;
+    ggml_tensor * score;
+};
+
+static dsv4_state_tensors dsv4_build_state_restore(
+        ggml_context * ctx,
+        const llm_graph_input_dsv4::comp_input & inp,
+        const llama_dsv4_comp_state * state,
+        int32_t il) {
+    dsv4_state_tensors restored = {
+        state->get_kv_all(ctx, il),
+        state->get_score_all(ctx, il),
+    };
+
+    if (inp.state_restore_src_idxs == nullptr || inp.state_restore_dst_idxs == nullptr) {
+        return restored;
     }
 
-    ggml_tensor * zero = ggml_scale(ctx, ggml_sum(ctx, dep), 0.0f);
-    return ggml_add(ctx, t, zero);
+    ggml_tensor * kv_rows = ggml_get_rows(ctx, restored.kv, inp.state_restore_src_idxs);
+    restored.kv = state->cpy_kv(ctx, kv_rows, inp.state_restore_dst_idxs, il);
+
+    ggml_tensor * score_rows = ggml_get_rows(ctx, restored.score, inp.state_restore_src_idxs);
+    restored.score = state->cpy_score(ctx, score_rows, inp.state_restore_dst_idxs, il);
+
+    return restored;
+}
+
+static dsv4_state_tensors dsv4_build_state_snapshot(
+        ggml_context * ctx,
+        const llm_graph_input_dsv4::comp_input & inp,
+        const llama_dsv4_comp_state * state,
+        ggml_tensor * source_kv,
+        ggml_tensor * source_score,
+        int32_t il) {
+    if (inp.state_snapshot_src_idxs == nullptr || inp.state_snapshot_dst_idxs == nullptr ||
+            source_kv == nullptr || source_score == nullptr) {
+        return {};
+    }
+
+    ggml_tensor * kv_rows = ggml_get_rows(ctx, source_kv, inp.state_snapshot_src_idxs);
+    ggml_tensor * kv = state->cpy_kv(ctx, kv_rows, inp.state_snapshot_dst_idxs, il);
+
+    ggml_tensor * score_rows = ggml_get_rows(ctx, source_score, inp.state_snapshot_src_idxs);
+    ggml_tensor * score = state->cpy_score(ctx, score_rows, inp.state_snapshot_dst_idxs, il);
+
+    return { kv, score };
 }
 
 static constexpr int64_t DSV4_CSA_RATIO  = 4;
@@ -1084,6 +1133,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
 
     ggml_tensor * hca_state_kv    = nullptr;
     ggml_tensor * hca_state_score = nullptr;
+    ggml_tensor * hca_source_kv   = nullptr;
+    ggml_tensor * hca_source_score = nullptr;
     if (ratio == DSV4_HCA_RATIO && inp_dsv4->get_hca().state_pos) {
         hca_state_kv = build_lora_mm(layer.attn_comp_wkv, cur);
         cb(hca_state_kv, "hca_state_kv", il);
@@ -1114,10 +1165,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
 
         GGML_ASSERT(inp_dsv4->get_csa().state_write_idxs);
 
-        ggml_tensor * csa_source_kv = ggml_concat(ctx0,
-                inp_dsv4->mctx->get_csa_state()->get_kv(ctx0, il), csa_state_kv, 1);
-        ggml_tensor * csa_source_score = ggml_concat(ctx0,
-                inp_dsv4->mctx->get_csa_state()->get_score(ctx0, il), csa_state_score, 1);
+        const auto * csa_state = inp_dsv4->mctx->get_csa_state();
+        const dsv4_state_tensors csa_restored = dsv4_build_state_restore(
+                ctx0, inp_dsv4->get_csa(), csa_state, il);
+        ggml_tensor * csa_base_kv = dsv4_view_2d(
+                ctx0, csa_restored.kv, csa_restored.kv->ne[0], csa_state->get_n_rows(), 0);
+        ggml_tensor * csa_base_score = dsv4_view_2d(
+                ctx0, csa_restored.score, csa_restored.score->ne[0], csa_state->get_n_rows(), 0);
+
+        ggml_tensor * csa_source_kv = ggml_concat(ctx0, csa_base_kv, csa_state_kv, 1);
+        ggml_tensor * csa_source_score = ggml_concat(ctx0, csa_base_score, csa_state_score, 1);
 
         ggml_tensor * kv_comp_csa_state = build_overlap_compressed_kv_from_state(
                 csa_source_kv,
@@ -1138,8 +1195,19 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(ctx0,
                     kv_comp_csa_state, inp_dsv4->get_csa().state_write_idxs, il));
 
-        csa_state_kv    = dsv4_with_zero_dep(ctx0, csa_state_kv,    kv_comp_csa_state);
-        csa_state_score = dsv4_with_zero_dep(ctx0, csa_state_score, kv_comp_csa_state);
+        ggml_tensor * csa_snapshot_source_kv = ggml_concat(ctx0,
+                csa_restored.kv, csa_state_kv, 1);
+        ggml_tensor * csa_snapshot_source_score = ggml_concat(ctx0,
+                csa_restored.score, csa_state_score, 1);
+
+        const dsv4_state_tensors csa_snapshot = dsv4_build_state_snapshot(
+                ctx0, inp_dsv4->get_csa(), csa_state, csa_snapshot_source_kv, csa_snapshot_source_score, il);
+        if (csa_snapshot.kv != nullptr) {
+            ggml_build_forward_expand(gf, csa_snapshot.kv);
+        }
+        if (csa_snapshot.score != nullptr) {
+            ggml_build_forward_expand(gf, csa_snapshot.score);
+        }
 
         ggml_tensor * csa_persist_kv = ggml_get_rows(ctx0, csa_state_kv, inp_dsv4->get_csa().state_persist_src_idxs);
         ggml_tensor * csa_persist_score = ggml_get_rows(ctx0, csa_state_score, inp_dsv4->get_csa().state_persist_src_idxs);
@@ -1166,10 +1234,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
 
         GGML_ASSERT(inp_dsv4->get_lid().state_write_idxs);
 
-        ggml_tensor * lid_source_kv = ggml_concat(ctx0,
-                inp_dsv4->mctx->get_lid_state()->get_kv(ctx0, il), lid_state_kv, 1);
-        ggml_tensor * lid_source_score = ggml_concat(ctx0,
-                inp_dsv4->mctx->get_lid_state()->get_score(ctx0, il), lid_state_score, 1);
+        const auto * lid_state = inp_dsv4->mctx->get_lid_state();
+        const dsv4_state_tensors lid_restored = dsv4_build_state_restore(
+                ctx0, inp_dsv4->get_lid(), lid_state, il);
+        ggml_tensor * lid_base_kv = dsv4_view_2d(
+                ctx0, lid_restored.kv, lid_restored.kv->ne[0], lid_state->get_n_rows(), 0);
+        ggml_tensor * lid_base_score = dsv4_view_2d(
+                ctx0, lid_restored.score, lid_restored.score->ne[0], lid_state->get_n_rows(), 0);
+
+        ggml_tensor * lid_source_kv = ggml_concat(ctx0, lid_base_kv, lid_state_kv, 1);
+        ggml_tensor * lid_source_score = ggml_concat(ctx0, lid_base_score, lid_state_score, 1);
 
         ggml_tensor * kv_comp_lid_state = build_overlap_compressed_kv_from_state(
                 lid_source_kv,
@@ -1190,8 +1264,19 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(ctx0,
                     kv_comp_lid_state, inp_dsv4->get_lid().state_write_idxs, il));
 
-        lid_state_kv    = dsv4_with_zero_dep(ctx0, lid_state_kv,    kv_comp_lid_state);
-        lid_state_score = dsv4_with_zero_dep(ctx0, lid_state_score, kv_comp_lid_state);
+        ggml_tensor * lid_snapshot_source_kv = ggml_concat(ctx0,
+                lid_restored.kv, lid_state_kv, 1);
+        ggml_tensor * lid_snapshot_source_score = ggml_concat(ctx0,
+                lid_restored.score, lid_state_score, 1);
+
+        const dsv4_state_tensors lid_snapshot = dsv4_build_state_snapshot(
+                ctx0, inp_dsv4->get_lid(), lid_state, lid_snapshot_source_kv, lid_snapshot_source_score, il);
+        if (lid_snapshot.kv != nullptr) {
+            ggml_build_forward_expand(gf, lid_snapshot.kv);
+        }
+        if (lid_snapshot.score != nullptr) {
+            ggml_build_forward_expand(gf, lid_snapshot.score);
+        }
 
         ggml_tensor * lid_persist_kv = ggml_get_rows(ctx0, lid_state_kv, inp_dsv4->get_lid().state_persist_src_idxs);
         ggml_tensor * lid_persist_score = ggml_get_rows(ctx0, lid_state_score, inp_dsv4->get_lid().state_persist_src_idxs);
@@ -1205,15 +1290,21 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         ggml_build_forward_expand(gf, lid_state_score);
     }
 
-    ggml_tensor * hca_state_dep = nullptr;
+    const llama_dsv4_comp_state * hca_state = nullptr;
+    dsv4_state_tensors hca_restored = {};
     if (ratio == DSV4_HCA_RATIO && inp_dsv4->get_hca().state_write_idxs) {
         GGML_ASSERT(hca_state_kv);
         GGML_ASSERT(hca_state_score);
 
-        ggml_tensor * hca_source_kv = ggml_concat(ctx0,
-                inp_dsv4->mctx->get_hca_state()->get_kv(ctx0, il), hca_state_kv, 1);
-        ggml_tensor * hca_source_score = ggml_concat(ctx0,
-                inp_dsv4->mctx->get_hca_state()->get_score(ctx0, il), hca_state_score, 1);
+        hca_state = inp_dsv4->mctx->get_hca_state();
+        hca_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_hca(), hca_state, il);
+        ggml_tensor * hca_base_kv = dsv4_view_2d(
+                ctx0, hca_restored.kv, hca_restored.kv->ne[0], hca_state->get_n_rows(), 0);
+        ggml_tensor * hca_base_score = dsv4_view_2d(
+                ctx0, hca_restored.score, hca_restored.score->ne[0], hca_state->get_n_rows(), 0);
+
+        hca_source_kv = ggml_concat(ctx0, hca_base_kv, hca_state_kv, 1);
+        hca_source_score = ggml_concat(ctx0, hca_base_score, hca_state_score, 1);
 
         ggml_tensor * kv_comp_hca = build_hca_compressed_kv_from_state(
                 hca_source_kv,
@@ -1232,15 +1323,41 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
 
         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_hca()->cpy_k(ctx0,
                     kv_comp_hca, inp_dsv4->get_hca().state_write_idxs, il));
-        hca_state_dep = kv_comp_hca;
     }
 
     if (ratio == DSV4_HCA_RATIO && inp_dsv4->get_hca().state_pos) {
         GGML_ASSERT(hca_state_kv);
         GGML_ASSERT(hca_state_score);
 
-        hca_state_kv    = dsv4_with_zero_dep(ctx0, hca_state_kv,    hca_state_dep);
-        hca_state_score = dsv4_with_zero_dep(ctx0, hca_state_score, hca_state_dep);
+        if (hca_state == nullptr) {
+            hca_state = inp_dsv4->mctx->get_hca_state();
+        }
+        if (hca_restored.kv == nullptr) {
+            hca_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_hca(), hca_state, il);
+        }
+        if (hca_source_kv == nullptr || hca_source_score == nullptr) {
+            ggml_tensor * hca_base_kv = dsv4_view_2d(
+                    ctx0, hca_restored.kv, hca_restored.kv->ne[0], hca_state->get_n_rows(), 0);
+            ggml_tensor * hca_base_score = dsv4_view_2d(
+                    ctx0, hca_restored.score, hca_restored.score->ne[0], hca_state->get_n_rows(), 0);
+
+            hca_source_kv = ggml_concat(ctx0, hca_base_kv, hca_state_kv, 1);
+            hca_source_score = ggml_concat(ctx0, hca_base_score, hca_state_score, 1);
+        }
+
+        ggml_tensor * hca_snapshot_source_kv = ggml_concat(ctx0,
+                hca_restored.kv, hca_state_kv, 1);
+        ggml_tensor * hca_snapshot_source_score = ggml_concat(ctx0,
+                hca_restored.score, hca_state_score, 1);
+
+        const dsv4_state_tensors hca_snapshot = dsv4_build_state_snapshot(
+                ctx0, inp_dsv4->get_hca(), hca_state, hca_snapshot_source_kv, hca_snapshot_source_score, il);
+        if (hca_snapshot.kv != nullptr) {
+            ggml_build_forward_expand(gf, hca_snapshot.kv);
+        }
+        if (hca_snapshot.score != nullptr) {
+            ggml_build_forward_expand(gf, hca_snapshot.score);
+        }
 
         ggml_tensor * hca_persist_kv = ggml_get_rows(ctx0, hca_state_kv, inp_dsv4->get_hca().state_persist_src_idxs);
         ggml_tensor * hca_persist_score = ggml_get_rows(ctx0, hca_state_score, inp_dsv4->get_hca().state_persist_src_idxs);
@@ -1390,7 +1507,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cb(inpL, "l_last", il);
     }
 
-    if (hparams.n_layer_nextn > 0 && cparams.embeddings_nextn) {
+    if (cparams.embeddings_nextn) {
         ggml_tensor * h_nextn = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
         cb(h_nextn, "h_nextn", -1);
         res->t_h_nextn = h_nextn;
@@ -1434,8 +1551,20 @@ llama_model_deepseek4::graph_mtp::graph_mtp(
     GGML_ASSERT(layer.nextn.eh_proj);
     GGML_ASSERT(layer.nextn.enorm);
     GGML_ASSERT(layer.nextn.hnorm);
-    GGML_ASSERT(layer.nextn.shared_head_norm);
-    GGML_ASSERT(layer.nextn.hc_head_fn);
+    ggml_tensor * mtp_head_norm = layer.nextn.shared_head_norm
+            ? layer.nextn.shared_head_norm
+            : model.output_norm;
+    ggml_tensor * mtp_hc_head_fn = layer.nextn.hc_head_fn
+            ? layer.nextn.hc_head_fn
+            : model.hc_head_fn;
+    ggml_tensor * mtp_hc_head_base = layer.nextn.hc_head_base
+            ? layer.nextn.hc_head_base
+            : model.hc_head_base;
+    ggml_tensor * mtp_hc_head_scale = layer.nextn.hc_head_scale
+            ? layer.nextn.hc_head_scale
+            : model.hc_head_scale;
+    GGML_ASSERT(mtp_head_norm);
+    GGML_ASSERT(mtp_hc_head_fn && mtp_hc_head_base && mtp_hc_head_scale);
 
     auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd_h);
 
@@ -1555,12 +1684,12 @@ llama_model_deepseek4::graph_mtp::graph_mtp(
     }
 
     cur = build_hc_head(inpL,
-            layer.nextn.hc_head_fn,
-            layer.nextn.hc_head_scale,
-            layer.nextn.hc_head_base);
+            mtp_hc_head_fn,
+            mtp_hc_head_scale,
+            mtp_hc_head_base);
     cb(cur, "mtp_hc_head", -1);
 
-    cur = build_norm(cur, layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, -1);
+    cur = build_norm(cur, mtp_head_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "mtp_shared_head_norm", -1);
 
     cur = ggml_mul_mat(ctx0, model.output, cur);
