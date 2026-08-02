@@ -147,6 +147,7 @@ struct ggml_metal {
 
     // capture state
     int capture_compute;
+    bool capture_this_compute; // latched for the encoder workers after capture_compute advances
     bool capture_started;
 
     id<MTLCaptureScope> capture_scope;
@@ -594,6 +595,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     }
 
     res->capture_compute = 0;
+    res->capture_this_compute = false;
     res->capture_started = false;
     res->capture_scope = nil;
 
@@ -940,6 +942,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         const bool use_capture = ctx->capture_compute == 0;
+        ctx->capture_this_compute = use_capture;
         if (use_capture) {
             ctx->capture_compute = -1;
 
@@ -1204,7 +1207,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             idx_end,
             ctx->use_fusion,
             ctx->use_concurrency,
-            ctx->capture_compute,
+            ctx->capture_this_compute,
             ctx->debug_graph,
             ctx->debug_fusion);
 
