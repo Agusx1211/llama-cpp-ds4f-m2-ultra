@@ -3174,7 +3174,13 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             n_fuse = 2;
         }
 
-        auto pipeline_mm = ggml_metal_library_get_pipeline_mul_mm_id(lib, op, use_dsv4_worklist);
+        static const bool dsv4_paired_dispatch_enabled =
+            std::getenv("GGML_METAL_DSV4_GATE_UP_DISPATCH_DISABLE") == nullptr;
+        const bool use_dsv4_paired_dispatch =
+            dsv4_paired_dispatch_enabled && dsv4_map_pair != nullptr;
+
+        auto pipeline_mm = ggml_metal_library_get_pipeline_mul_mm_id(
+            lib, op, use_dsv4_worklist, use_dsv4_paired_dispatch);
         const int nr1 = pipeline_mm.nr1;
 
         // extra buffers for intermediate id mapping
@@ -3277,12 +3283,23 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                     enc, mm_tg0, (ne01 + 63)/64, mm_tg2, 128, 1, 1);
             };
 
-            dispatch(op);
-            if (dsv4_map_pair) {
-                // Both independent matrix dispatches consume the same immutable
-                // route map. Keep them barrier-free so the concurrent encoder
-                // can schedule gate and up together without sharing accumulators.
-                dispatch(dsv4_map_pair);
+            if (use_dsv4_paired_dispatch) {
+                // One z-slice per projection preserves the exact 128-thread
+                // matrix geometry while removing the second dispatch command.
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]),                1);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),                        5);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(dsv4_map_pair->src[0]),     7);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(dsv4_map_pair),             8);
+                ggml_metal_encoder_dispatch_threadgroups(
+                    enc, mm_tg0, (ne01 + 63)/64, 2, 128, 1, 1);
+            } else {
+                dispatch(op);
+                if (dsv4_map_pair) {
+                    // Both independent matrix dispatches consume the same immutable
+                    // route map. Keep them barrier-free so the concurrent encoder
+                    // can schedule gate and up together without sharing accumulators.
+                    dispatch(dsv4_map_pair);
+                }
             }
         }
     } else {
