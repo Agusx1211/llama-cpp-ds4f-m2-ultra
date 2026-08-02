@@ -3183,10 +3183,12 @@ private:
 
             slot.n_draft_total += draft.size();
 
-            // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+            const llama_pos committed_pos = ckpt.pos_max + 1;
+            const bool reuse_draft_row = !draft.empty() &&
+                    common_speculative_prepare_draft_reuse(spec.get(), slot.id, committed_pos);
 
-            if (ctx_dft) {
+            if (ctx_dft && !reuse_draft_row) {
                 if (use_ckpt_dft) {
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
@@ -3194,6 +3196,10 @@ private:
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
+            }
+
+            if (reuse_draft_row) {
+                SLT_DBG(slot, "retaining committed MTP draft row at pos %d for selective catch-up\n", committed_pos);
             }
 
             if (!draft.empty()) {

@@ -411,6 +411,7 @@ static void test_dsv4_mtp_device(
     draft_params.n_threads = 4;
     draft_params.n_threads_batch = 4;
     draft_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    draft_params.n_rs_seq = 1;
 
     llama_context_ptr draft(llama_init_from_model(target.first.get(), draft_params));
     GGML_ASSERT(draft);
@@ -435,6 +436,93 @@ static void test_dsv4_mtp_device(
         }
     }
 
+    const auto make_draft_context = [&]() {
+        llama_context_ptr result(llama_init_from_model(target.first.get(), draft_params));
+        GGML_ASSERT(result);
+        llama_set_embeddings_nextn(result.get(), true, true);
+        return result;
+    };
+
+    const auto decode_mtp_rows = [&](llama_context * ctx, size_t pos_beg, size_t pos_end, llama_token last_token = LLAMA_TOKEN_NULL) {
+        GGML_ASSERT(pos_beg < pos_end && pos_end <= tokens.size());
+
+        const size_t n_rows = pos_end - pos_beg;
+        llama_batch rows = llama_batch_init(n_rows, n_embd_nextn, 1);
+        std::vector<llama_token> row_tokens(tokens.begin() + pos_beg, tokens.begin() + pos_end);
+        if (last_token != LLAMA_TOKEN_NULL) {
+            row_tokens.back() = last_token;
+        }
+        rows.token = row_tokens.data();
+        rows.n_tokens = n_rows;
+
+        for (size_t i = 0; i < n_rows; ++i) {
+            const size_t pos = pos_beg + i;
+            rows.pos[i] = pos;
+            rows.n_seq_id[i] = 1;
+            rows.seq_id[i][0] = 0;
+            rows.logits[i] = i + 1 == n_rows;
+
+            float * h = rows.embd + i*(size_t) n_embd_nextn;
+            if (pos == 0) {
+                std::memset(h, 0, (size_t) n_embd_nextn*sizeof(float));
+            } else {
+                std::memcpy(h, target_h + (pos - 1)*(size_t) n_embd_nextn,
+                        (size_t) n_embd_nextn*sizeof(float));
+            }
+        }
+
+        GGML_ASSERT(llama_decode(ctx, rows) == 0);
+
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(target.first.get()));
+        const float * logits = llama_get_logits_ith(ctx, -1);
+        GGML_ASSERT(logits);
+        std::vector<float> result(logits, logits + n_vocab);
+
+        rows.token = nullptr;
+        llama_batch_free(rows);
+        return result;
+    };
+
+    // The production control removes the separately evaluated committed row
+    // and later catches up [P, P+1] in one batch. The optimized path retains P
+    // and catches up only P+1. Verify both accepted continuation and rejection
+    // rollback against the control geometry on the synthetic DSV4 MTP model.
+    auto accept_control = make_draft_context();
+    auto accept_reuse   = make_draft_context();
+    decode_mtp_rows(accept_control.get(), 0, 5);
+    decode_mtp_rows(accept_reuse.get(),   0, 5);
+
+    const std::vector<float> accept_control_p6 = decode_mtp_rows(accept_control.get(), 5, 7);
+    decode_mtp_rows(accept_reuse.get(), 5, 6);
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(accept_reuse.get()), 0) == 5);
+    const std::vector<float> accept_reuse_p6 = decode_mtp_rows(accept_reuse.get(), 6, 7);
+    const double retain_nmse = nmse(accept_control_p6, accept_reuse_p6);
+    GGML_ASSERT(retain_nmse < 1e-10 && "retained DSV4 MTP row changed proposal catch-up logits");
+
+    const std::vector<float> accept_control_p7 = decode_mtp_rows(accept_control.get(), 7, 8);
+    const std::vector<float> accept_reuse_p7   = decode_mtp_rows(accept_reuse.get(),   7, 8);
+    const double accept_nmse = nmse(accept_control_p7, accept_reuse_p7);
+    GGML_ASSERT(accept_nmse < 1e-10 && "retained DSV4 MTP proposal changed accepted continuation logits");
+
+    auto reject_control = make_draft_context();
+    auto reject_reuse   = make_draft_context();
+    decode_mtp_rows(reject_control.get(), 0, 5);
+    decode_mtp_rows(reject_reuse.get(),   0, 5);
+    decode_mtp_rows(reject_control.get(), 5, 7);
+    decode_mtp_rows(reject_reuse.get(),   5, 6);
+    decode_mtp_rows(reject_reuse.get(),   6, 7);
+
+    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(reject_control.get()), 0, 6, -1));
+    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(reject_reuse.get()),   0, 6, -1));
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(reject_control.get()), 0) == 5);
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(reject_reuse.get()),   0) == 5);
+
+    const llama_token replacement = (tokens[6] + 1) % 128;
+    const std::vector<float> reject_control_p6 = decode_mtp_rows(reject_control.get(), 6, 7, replacement);
+    const std::vector<float> reject_reuse_p6   = decode_mtp_rows(reject_reuse.get(),   6, 7, replacement);
+    const double reject_nmse = nmse(reject_control_p6, reject_reuse_p6);
+    GGML_ASSERT(reject_nmse < 1e-10 && "retained DSV4 MTP row changed rejection rollback logits");
+
     GGML_ASSERT(llama_decode(draft.get(), batch) == 0);
     for (size_t i = 0; i < tokens.size(); ++i) {
         const float * logits = llama_get_logits_ith(draft.get(), i);
@@ -450,8 +538,9 @@ static void test_dsv4_mtp_device(
 
     batch.token = nullptr;
     llama_batch_free(batch);
-    printf("  DSV4 MTP graph (%s): target NMSE %.3e, hidden width %d, finite draft rows %zu\n",
-            device_label, target_nmse, n_embd_nextn, tokens.size());
+    printf("  DSV4 MTP graph (%s): target NMSE %.3e, hidden width %d, finite draft rows %zu, "
+           "retain/accept/reject NMSE %.3e/%.3e/%.3e\n",
+            device_label, target_nmse, n_embd_nextn, tokens.size(), retain_nmse, accept_nmse, reject_nmse);
 }
 
 static void test_dsv4_mtp(const size_t seed) {

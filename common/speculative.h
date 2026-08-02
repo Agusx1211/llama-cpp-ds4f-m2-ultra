@@ -52,6 +52,15 @@ struct common_speculative_draft_params {
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
+// Ask the implementation that produced the latest draft to retain its
+// committed input row for the next process() call. Returns true only when the
+// implementation has proved that the row at committed_pos is safe to reuse and
+// has armed its process() path to omit the duplicate verifier row.
+bool common_speculative_prepare_draft_reuse(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        llama_pos committed_pos);
+
 // Update a draft implementation's active depth and confidence threshold.
 // Used by the M2 Ultra server to adapt DSV4 DSpark to request concurrency.
 bool common_speculative_set_draft_options(
