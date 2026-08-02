@@ -156,6 +156,7 @@ public:
 
     uint32_t get_n_rs_seq() const;
     const std::vector<uint32_t> & get_rs_idx() const;
+    bool set_rs_depth(uint32_t depth);
     bool set_rs_enabled(bool enabled);
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 

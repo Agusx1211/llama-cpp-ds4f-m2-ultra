@@ -177,6 +177,10 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_nextn() const { return false; }
+
+    // Optional runtime tuning hooks for workload-adaptive draft models.
+    virtual bool set_draft_options(int32_t /*n_max*/, float /*p_min*/) { return false; }
+    virtual bool set_enabled(bool /*enabled*/) { return false; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -936,6 +940,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
+    const int32_t n_min_configured;
+
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
 
@@ -944,6 +950,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         : common_speculative_impl(type, n_seq)
         , params(params.draft)
         , is_dspark(type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
+        , n_min_configured(params.draft.n_min)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -1256,6 +1263,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     bool need_embd() const override {
         return false;
+    }
+
+    bool set_draft_options(int32_t n_max, float p_min) override {
+        if (!is_dspark || n_max < 1 || p_min < 0.0f || p_min > 1.0f) {
+            return false;
+        }
+
+        params.n_max = std::min(n_max, block_size);
+        params.n_min = std::min(n_min_configured, params.n_max);
+        params.p_min = p_min;
+        return true;
+    }
+
+    bool set_enabled(bool enabled) override {
+        if (!is_dspark) {
+            return false;
+        }
+
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            const uint32_t lid = (uint32_t) target_layer_ids[k] + (is_dsv4_dspark ? 1u : 0u);
+            llama_set_embeddings_layer_inp(params.ctx_tgt, lid, enabled);
+        }
+        return true;
     }
 };
 
@@ -2569,6 +2599,41 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     GGML_ASSERT(seq_id < (llama_seq_id) spec->dparams.size());
 
     return spec->dparams[seq_id];
+}
+
+bool common_speculative_set_draft_options(
+        common_speculative * spec,
+        common_speculative_type type,
+        int32_t n_max,
+        float p_min) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->type == type) {
+            return impl->set_draft_options(n_max, p_min);
+        }
+    }
+
+    return false;
+}
+
+bool common_speculative_set_enabled(
+        common_speculative * spec,
+        common_speculative_type type,
+        bool enabled) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->type == type) {
+            return impl->set_enabled(enabled);
+        }
+    }
+
+    return false;
 }
 
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {

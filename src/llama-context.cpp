@@ -1229,6 +1229,13 @@ void llama_context::set_rs_rollback_enabled(bool enabled) {
     }
 }
 
+void llama_context::set_rs_rollback_depth(uint32_t depth) {
+    auto * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
+    if (dsv4 != nullptr && dsv4->set_rs_depth(depth)) {
+        sched_need_reserve = true;
+    }
+}
+
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
@@ -3815,6 +3822,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_rs_rollback_enabled(llama_context * ctx, bool enabled) {
     ctx->set_rs_rollback_enabled(enabled);
+}
+
+void llama_set_rs_rollback_depth(llama_context * ctx, uint32_t depth) {
+    ctx->set_rs_rollback_depth(depth);
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

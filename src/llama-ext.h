@@ -102,6 +102,10 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // Currently used by DSV4 to remove snapshot overhead while speculation is bypassed.
 LLAMA_API void llama_set_rs_rollback_enabled(struct llama_context * ctx, bool enabled);
 
+// Select the active DSV4 rollback depth without reallocating the preallocated
+// planes. Depth must not exceed the context's configured rollback capacity.
+LLAMA_API void llama_set_rs_rollback_depth(struct llama_context * ctx, uint32_t depth);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

@@ -1811,12 +1811,18 @@ const std::vector<uint32_t> & llama_kv_cache_dsv4::get_rs_idx() const {
 }
 
 bool llama_kv_cache_dsv4::set_rs_enabled(bool enabled) {
-    const uint32_t n_rs_seq_next = enabled ? n_rs_seq : 0;
-    if (n_rs_seq_active == n_rs_seq_next) {
+    return set_rs_depth(enabled ? n_rs_seq : 0);
+}
+
+bool llama_kv_cache_dsv4::set_rs_depth(uint32_t depth) {
+    if (depth > n_rs_seq) {
+        throw std::runtime_error("DSV4 active rollback depth exceeds allocated capacity");
+    }
+    if (n_rs_seq_active == depth) {
         return false;
     }
 
-    n_rs_seq_active = n_rs_seq_next;
+    n_rs_seq_active = depth;
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
     return true;
 }
