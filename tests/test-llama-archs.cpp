@@ -9,6 +9,7 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
 #include <algorithm>
@@ -81,7 +82,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool dsv4_mtp = false) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = arch == LLM_ARCH_DEEPSEEK4 ? 256 : 128;
@@ -115,6 +116,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_embd = 128;
         n_head = 2;
         n_ff   = 64;
+        n_layer = dsv4_mtp ? 3 : 2;
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
     } else if (arch == LLM_ARCH_CHAMELEON) {
@@ -129,6 +131,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
     ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+    if (dsv4_mtp) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    }
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -237,7 +242,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,            uint32_t(1));
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,              uint32_t(32));
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,       10000.0f);
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,               std::vector<uint32_t>({4, 128}));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,
+                dsv4_mtp ? std::vector<uint32_t>({4, 128, 0}) : std::vector<uint32_t>({4, 128}));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,                  uint32_t(4));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,    uint32_t(1));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,                1.0e-6f);
@@ -287,6 +293,8 @@ struct test_context_config {
     uint32_t n_ubatch    = 64;
     uint32_t n_seq_max   = 1;
     bool     kv_unified  = false;
+    bool     load_mtp    = false;
+    llama_context_type ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
 };
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
@@ -300,6 +308,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
+    model_params.load_mtp = config.load_mtp;
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = config.n_ctx;
@@ -308,6 +317,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     }
     ctx_params.n_seq_max = config.n_seq_max;
     ctx_params.kv_unified = config.kv_unified;
+    ctx_params.ctx_type = config.ctx_type;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
     if (!encode) {
@@ -360,6 +370,96 @@ static std::vector<float> get_logits(
     }
     llama_batch_free(batch);
     return ret;
+}
+
+static void test_dsv4_mtp_device(
+        const size_t seed, const std::vector<ggml_backend_dev_t> & devices, const char * device_label) {
+    const std::vector<llama_token> tokens = get_tokens(8, 128, seed);
+
+    test_context_config trunk_config;
+    trunk_config.n_ctx = 256;
+    trunk_config.n_batch = tokens.size();
+    trunk_config.n_ubatch = tokens.size();
+
+    auto trunk_gguf = get_gguf_ctx(LLM_ARCH_DEEPSEEK4, true);
+    auto trunk = get_model_and_ctx(
+            trunk_gguf.get(), nullptr, seed, devices, LLAMA_SPLIT_MODE_LAYER, false, trunk_config);
+    const std::vector<float> logits_trunk = get_logits(trunk.first.get(), trunk.second.get(), tokens);
+
+    test_context_config mtp_config = trunk_config;
+    mtp_config.load_mtp = true;
+    auto mtp_gguf = get_gguf_ctx(LLM_ARCH_DEEPSEEK4, true, true);
+    auto target = get_model_and_ctx(
+            mtp_gguf.get(), nullptr, seed, devices, LLAMA_SPLIT_MODE_LAYER, false, mtp_config);
+
+    llama_set_embeddings_nextn(target.second.get(), true, false);
+    const std::vector<float> logits_mtp_target = get_logits(target.first.get(), target.second.get(), tokens);
+    const double target_nmse = nmse(logits_trunk, logits_mtp_target);
+    GGML_ASSERT(target_nmse < 1e-12 && "bundled MTP metadata changed DSV4 trunk logits");
+
+    const int32_t n_embd_nextn = llama_model_n_embd_nextn(target.first.get());
+    GGML_ASSERT(n_embd_nextn == 4*llama_model_n_embd(target.first.get()));
+    const float * target_h = llama_get_embeddings_nextn(target.second.get());
+    GGML_ASSERT(target_h);
+
+    llama_context_params draft_params = llama_context_default_params();
+    draft_params.n_ctx = 256;
+    draft_params.n_batch = tokens.size();
+    draft_params.n_ubatch = tokens.size();
+    draft_params.n_seq_max = 1;
+    draft_params.n_threads = 4;
+    draft_params.n_threads_batch = 4;
+    draft_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+
+    llama_context_ptr draft(llama_init_from_model(target.first.get(), draft_params));
+    GGML_ASSERT(draft);
+    llama_set_embeddings_nextn(draft.get(), true, true);
+
+    llama_batch batch = llama_batch_init(tokens.size(), n_embd_nextn, 1);
+    std::vector<llama_token> draft_tokens(tokens);
+    batch.token = draft_tokens.data();
+    batch.n_tokens = tokens.size();
+    std::memset(batch.embd, 0, (size_t) tokens.size()*n_embd_nextn*sizeof(float));
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        batch.pos[i] = i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = 1;
+        if (i > 0) {
+            std::memcpy(
+                    batch.embd + i*(size_t) n_embd_nextn,
+                    target_h + (i - 1)*(size_t) n_embd_nextn,
+                    (size_t) n_embd_nextn*sizeof(float));
+        }
+    }
+
+    GGML_ASSERT(llama_decode(draft.get(), batch) == 0);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const float * logits = llama_get_logits_ith(draft.get(), i);
+        const float * h = llama_get_embeddings_nextn_ith(draft.get(), i);
+        GGML_ASSERT(logits && h);
+        for (int32_t j = 0; j < llama_vocab_n_tokens(llama_model_get_vocab(target.first.get())); ++j) {
+            GGML_ASSERT(std::isfinite(logits[j]));
+        }
+        for (int32_t j = 0; j < n_embd_nextn; ++j) {
+            GGML_ASSERT(std::isfinite(h[j]));
+        }
+    }
+
+    batch.token = nullptr;
+    llama_batch_free(batch);
+    printf("  DSV4 MTP graph (%s): target NMSE %.3e, hidden width %d, finite draft rows %zu\n",
+            device_label, target_nmse, n_embd_nextn, tokens.size());
+}
+
+static void test_dsv4_mtp(const size_t seed) {
+    test_dsv4_mtp_device(seed, {}, "CPU");
+
+    ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu) {
+        test_dsv4_mtp_device(seed, { gpu }, ggml_backend_dev_description(gpu));
+    }
 }
 
 static bool dsv4_test_has_elastic_pages(ggml_backend_dev_t dev, uint32_t n_seq_max) {
@@ -1238,6 +1338,7 @@ int main(int argc, char ** argv) {
             return backends_result;
         }
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_DEEPSEEK4) {
+            test_dsv4_mtp(seed);
             return test_dsv4_parallel(seed);
         }
         return 0;

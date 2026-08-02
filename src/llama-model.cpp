@@ -2256,6 +2256,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     if (arch == LLM_ARCH_DEEPSEEK4) {
                         GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
+                        if (hparams.n_layer_nextn > 0) {
+                            if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                                filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            } else {
+                                filter = [&](uint32_t il) { return il < hparams.n_layer(); };
+                            }
+                        }
+
                         res = new llama_kv_cache_dsv4(
                                 *this,
                                 params.type_k,
@@ -2422,6 +2430,10 @@ int32_t llama_model_n_embd_inp(const llama_model * model) {
 
 int32_t llama_model_n_embd_out(const llama_model * model) {
     return model->hparams.n_embd_out();
+}
+
+int32_t llama_model_n_embd_nextn(const llama_model * model) {
+    return model->hparams.n_embd_nextn();
 }
 
 int32_t llama_model_n_layer(const llama_model * model) {

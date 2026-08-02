@@ -475,10 +475,8 @@ class DeepseekV32Model(DeepseekV2Model):
 @ModelBase.register("DeepseekV4ForCausalLM")
 class DeepseekV4Model(TextModel):
     model_arch = gguf.MODEL_ARCH.DEEPSEEK4
-    _skipped_mtp_tensors = 0
 
     def __init__(self, *args, **kwargs):
-        type(self)._skipped_mtp_tensors = 0
         super().__init__(*args, **kwargs)
 
         with open(self.dir_model / "config.json", "r", encoding="utf-8") as f:
@@ -486,8 +484,46 @@ class DeepseekV4Model(TextModel):
         for key, value in raw_hparams.items():
             self.hparams.setdefault(key, value)
 
-        self.block_count = self.hparams["num_hidden_layers"]
+        self._n_trunk_layers = self.hparams["num_hidden_layers"]
+        n_nextn_config = int(self.hparams.get("num_nextn_predict_layers", 0) or 0)
+
+        # DSV4 stores each MTP block under mtp.{i}.*. Rekey it as an appended
+        # decoder block so all existing FP8 pairing and native MXFP4 expert
+        # repacking applies without a second conversion implementation.
+        mtp_indices: set[int] = set()
+        for name in list(self.model_tensors.keys()):
+            match = re.match(r"mtp\.(\d+)\.(.*)", name)
+            if match is None:
+                continue
+
+            mtp_index = int(match.group(1))
+            if mtp_index >= n_nextn_config:
+                raise ValueError(
+                    f"DeepSeek-V4 tensor {name!r} exceeds num_nextn_predict_layers={n_nextn_config}"
+                )
+            new_name = f"layers.{self._n_trunk_layers + mtp_index}.{match.group(2)}"
+            self.model_tensors[new_name] = self.model_tensors.pop(name)
+            mtp_indices.add(mtp_index)
+
+        if mtp_indices and mtp_indices != set(range(n_nextn_config)):
+            raise ValueError(
+                f"DeepSeek-V4 MTP tensor indices {sorted(mtp_indices)} do not cover "
+                f"configured layers 0..{n_nextn_config - 1}"
+            )
+
+        self._n_nextn = n_nextn_config if mtp_indices else 0
+        if n_nextn_config and not self._n_nextn:
+            logger.warning("DeepSeek-V4 config declares MTP, but the checkpoint contains no mtp.* tensors")
+        elif self._n_nextn:
+            logger.info(
+                "Keeping DeepSeek-V4 MTP tensor(s) as NextN layer(s) %d..%d",
+                self._n_trunk_layers,
+                self._n_trunk_layers + self._n_nextn - 1,
+            )
+
+        self.block_count = self._n_trunk_layers + self._n_nextn
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        self._mtp_proj: dict[int, dict[str, Tensor]] = {}
 
         self._dsv4_fp8_dequantized: set[str] = set()
         self._dsv4_bf16_tensors: set[str] = set()
@@ -495,22 +531,11 @@ class DeepseekV4Model(TextModel):
         self._dsv4_mxfp4_generated = False
         self._collect_source_dtypes()
 
-        if type(self)._skipped_mtp_tensors:
-            logger.info("Skipping %d DeepSeek-V4 MTP tensor(s) for conversion v0", type(self)._skipped_mtp_tensors)
-
         # add a default chat template; if the model has a built-in template, it will be overridden later
         template_path = Path(__file__).parent.parent / "models" / "templates" / "deepseek-ai-DeepSeek-V4.jinja"
         if template_path.is_file():
             with open(template_path, "r", encoding="utf-8") as f:
                 self.gguf_writer.add_chat_template(f.read())
-
-    @classmethod
-    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
-        name, _ = item
-        if name.startswith("mtp."):
-            cls._skipped_mtp_tensors += 1
-            return None
-        return super().filter_tensors(item)
 
     @staticmethod
     def _float8_dtypes() -> tuple[torch.dtype, ...]:
@@ -541,6 +566,9 @@ class DeepseekV4Model(TextModel):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hparams = self.hparams
+
+        if self._n_nextn:
+            self.gguf_writer.add_nextn_predict_layers(self._n_nextn)
 
         self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
         self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
@@ -737,6 +765,12 @@ class DeepseekV4Model(TextModel):
             "ffn.shared_experts.w1.weight": (gguf.MODEL_TENSOR.FFN_GATE_SHEXP, ".weight"),
             "ffn.shared_experts.w2.weight": (gguf.MODEL_TENSOR.FFN_DOWN_SHEXP, ".weight"),
             "ffn.shared_experts.w3.weight": (gguf.MODEL_TENSOR.FFN_UP_SHEXP, ".weight"),
+            "enorm.weight": (gguf.MODEL_TENSOR.NEXTN_ENORM, ".weight"),
+            "hnorm.weight": (gguf.MODEL_TENSOR.NEXTN_HNORM, ".weight"),
+            "norm.weight": (gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM, ".weight"),
+            "hc_head_fn": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_FN, ".weight"),
+            "hc_head_base": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_BASE, ".weight"),
+            "hc_head_scale": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_SCALE, ".weight"),
         }
 
         tensor_name = match.group(2)
@@ -751,6 +785,34 @@ class DeepseekV4Model(TextModel):
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if re.match(r"layers\.\d+\.ffn\.experts\.\d+\.w[123]\.(weight|scale)$", name):
             return []
+
+        # The reference front-end computes e_proj(e) + h_proj(h). A single
+        # [W_e | W_h] matrix applied to concat(e, h) is exactly equivalent and
+        # matches llama.cpp's common NextN tensor convention.
+        match = re.match(r"layers\.(\d+)\.(e_proj|h_proj)\.weight$", name)
+        if match is not None:
+            proj_bid = int(match.group(1))
+            if proj_bid < self._n_trunk_layers:
+                raise ValueError(f"Unexpected DeepSeek-V4 trunk projection {name!r}")
+
+            parts = self._mtp_proj.setdefault(proj_bid, {})
+            parts[match.group(2)] = data_torch
+            if len(parts) < 2:
+                return []
+
+            e_proj = parts["e_proj"]
+            h_proj = parts["h_proj"]
+            if e_proj.shape != h_proj.shape or e_proj.ndim != 2:
+                raise ValueError(
+                    f"DeepSeek-V4 MTP projections have incompatible shapes "
+                    f"{tuple(e_proj.shape)} and {tuple(h_proj.shape)}"
+                )
+            eh_proj = torch.cat((e_proj, h_proj), dim=1)
+            del self._mtp_proj[proj_bid]
+            return [(
+                self._format_dsv4_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ, proj_bid, ".weight"),
+                eh_proj,
+            )]
 
         tensor_key, suffix = self._map_dsv4_tensor_name(name, bid)
         if tensor_key == gguf.MODEL_TENSOR.FFN_GATE_TID2EID:
@@ -772,5 +834,11 @@ class DeepseekV4Model(TextModel):
 
     def prepare_tensors(self):
         super().prepare_tensors()
+        if self._mtp_proj:
+            missing = {
+                bid: sorted({"e_proj", "h_proj"} - set(parts))
+                for bid, parts in self._mtp_proj.items()
+            }
+            raise ValueError(f"Incomplete DeepSeek-V4 MTP projection pairs: {missing}")
         self._is_mxfp4 = True
         self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4_MOE

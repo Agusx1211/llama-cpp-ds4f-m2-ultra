@@ -19,6 +19,9 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 
+// Width of the hidden-state rows exchanged with the NextN/MTP graph.
+LLAMA_API int32_t llama_model_n_embd_nextn(const struct llama_model * model);
+
 struct quantize_state_impl;
 
 LLAMA_API quantize_state_impl * llama_quant_init(

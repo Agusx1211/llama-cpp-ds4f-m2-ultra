@@ -221,6 +221,11 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+
+    // DeepSeek-V4 MTP block's hyper-connection output mixer.
+    struct ggml_tensor * hc_head_fn            = nullptr;
+    struct ggml_tensor * hc_head_base          = nullptr;
+    struct ggml_tensor * hc_head_scale         = nullptr;
 };
 
 struct llama_layer {
