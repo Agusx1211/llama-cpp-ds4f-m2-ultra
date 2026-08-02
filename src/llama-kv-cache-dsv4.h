@@ -156,6 +156,7 @@ public:
 
     uint32_t get_n_rs_seq() const;
     const std::vector<uint32_t> & get_rs_idx() const;
+    bool set_rs_enabled(bool enabled);
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
 private:
@@ -166,6 +167,7 @@ private:
 
     const uint32_t n_seq_max;
     const uint32_t n_rs_seq;
+    uint32_t n_rs_seq_active;
 
     std::vector<uint32_t> rs_idx;
 

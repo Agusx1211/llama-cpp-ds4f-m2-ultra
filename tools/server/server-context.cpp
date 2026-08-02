@@ -14,6 +14,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "../../src/llama-ext.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -213,6 +214,7 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    bool spec_parallel_disabled = false;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -345,11 +347,13 @@ struct server_slot {
         stopping_word  = "";
         n_sent_text    = 0;
 
-        if (can_speculate()) {
+        if (spec) {
             spec_draft.clear();
+            spec_prompt.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
+        spec_parallel_disabled = false;
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
@@ -398,12 +402,12 @@ struct server_slot {
 
     bool need_embd() const {
         GGML_ASSERT(task);
-        return task->need_embd() || (spec && common_speculative_need_embd(spec));
+        return task->need_embd() || (can_speculate() && common_speculative_need_embd(spec));
     }
 
     bool need_embd_nextn() const {
         GGML_ASSERT(task);
-        return spec && common_speculative_need_embd_nextn(spec);
+        return can_speculate() && common_speculative_need_embd_nextn(spec);
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
@@ -448,7 +452,19 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return spec && !spec_parallel_disabled;
+    }
+
+    void disable_speculation_for_parallel_cohort() {
+        GGML_ASSERT(spec);
+
+        spec_parallel_disabled = true;
+        spec_is_replay = false;
+        spec_draft.clear();
+        spec_prompt.clear();
+        spec_i_batch.clear();
+        spec_ckpt.clear();
+        common_speculative_get_draft_params(spec, id).drafting = false;
     }
 
     void add_token(const completion_token_output & token) {
@@ -532,8 +548,9 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
-            // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            // A slot bypassing MTP has advanced only the target context. Clear both
+            // contexts before reuse so a later request cannot inherit stale draft state.
+            if (task->is_child() || spec_parallel_disabled) {
                 prompt_clear();
             }
 
@@ -943,6 +960,14 @@ private:
 
     common_speculative_ptr spec;
 
+    // On M2 Ultra, DSV4 MTP improves aggregate generation through four active
+    // streams, then crosses a sharp graph-geometry cliff at five. Once crossed,
+    // keep the busy cohort target-only until every slot drains; re-enabling MTP
+    // mid-request would reuse a draft context that was not advanced while bypassed.
+    static constexpr size_t DSV4_MTP_MAX_ACTIVE_REQUESTS = 4;
+    bool spec_mtp = false;
+    bool mtp_parallel_bypass = false;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1051,9 +1076,10 @@ private:
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                        params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        spec_mtp = std::find(params_base.speculative.types.begin(),
+                             params_base.speculative.types.end(),
+                             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        mtp_parallel_bypass = false;
         const bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
@@ -2805,6 +2831,10 @@ private:
             }
 
             if (all_idle) {
+                if (mtp_parallel_bypass) {
+                    SRV_INF("%s", "re-enabling DSV4 MTP after the target-only request cohort drained\n");
+                    mtp_parallel_bypass = false;
+                }
                 SRV_TRC("%s", "all slots are idle\n");
                 return; // skip further processing
 
@@ -2845,6 +2875,8 @@ private:
             }
 
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+            llama_set_embeddings_nextn(ctx_tgt, slot_batched->need_embd_nextn(), /* masked = */ false);
+            llama_set_rs_rollback_enabled(ctx_tgt, slot_batched->can_speculate());
         }
 
         llama_batch batch_view;
@@ -2889,7 +2921,43 @@ private:
         }
     }
 
+    void update_mtp_parallel_bypass() {
+        if (!spec_mtp) {
+            return;
+        }
+
+        if (!mtp_parallel_bypass) {
+            size_t n_active_requests = 0;
+            for (const auto & slot : slots) {
+                if (slot.is_processing() && slot.task && slot.task->need_sampling()) {
+                    ++n_active_requests;
+                }
+            }
+
+            if (n_active_requests <= DSV4_MTP_MAX_ACTIVE_REQUESTS) {
+                return;
+            }
+
+            mtp_parallel_bypass = true;
+            SRV_INF("disabling DSV4 MTP for the current request cohort: "
+                    "%zu active requests exceed the M2 Ultra crossover of %zu\n",
+                    n_active_requests, DSV4_MTP_MAX_ACTIVE_REQUESTS);
+        }
+
+        // New work can enter free slots while the original cohort is still busy.
+        // Keep all such work target-only until the server reaches an all-idle point.
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+
+            slot.disable_speculation_for_parallel_cohort();
+        }
+    }
+
     void pre_decode() {
+        update_mtp_parallel_bypass();
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3694,7 +3762,7 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (!common_speculative_process(spec.get(), batch_view)) {
+        if (!mtp_parallel_bypass && !common_speculative_process(spec.get(), batch_view)) {
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error

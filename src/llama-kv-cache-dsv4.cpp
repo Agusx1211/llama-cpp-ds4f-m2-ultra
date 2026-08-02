@@ -1328,6 +1328,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_lid(model.hparams),
     n_seq_max(n_seq_max),
     n_rs_seq(n_rs_seq),
+    n_rs_seq_active(n_rs_seq),
     rs_idx(n_seq_max, 0) {
 
     const layer_filter_cb filter_raw = [&](int32_t il) {
@@ -1582,12 +1583,12 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return res;
         }
 
-        if (n_rs_seq == 0) {
+        if (n_rs_seq_active == 0) {
             return false;
         }
 
         const llama_pos rollback = pos_max - (p0 - 1);
-        if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
+        if (rollback < 1 || rollback > (llama_pos) n_rs_seq_active) {
             return false;
         }
 
@@ -1802,15 +1803,26 @@ llama_dsv4_comp_state * llama_kv_cache_dsv4::get_lid_state() const {
 }
 
 uint32_t llama_kv_cache_dsv4::get_n_rs_seq() const {
-    return n_rs_seq;
+    return n_rs_seq_active;
 }
 
 const std::vector<uint32_t> & llama_kv_cache_dsv4::get_rs_idx() const {
     return rs_idx;
 }
 
+bool llama_kv_cache_dsv4::set_rs_enabled(bool enabled) {
+    const uint32_t n_rs_seq_next = enabled ? n_rs_seq : 0;
+    if (n_rs_seq_active == n_rs_seq_next) {
+        return false;
+    }
+
+    n_rs_seq_active = n_rs_seq_next;
+    std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    return true;
+}
+
 void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches) {
-    if (n_rs_seq == 0) {
+    if (n_rs_seq_active == 0) {
         return;
     }
 
