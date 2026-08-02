@@ -3760,6 +3760,99 @@ struct test_snake_fuse : public test_case {
 };
 
 
+struct test_dsv4_compress : public test_case {
+    const int64_t n_embd;
+    const int64_t n_rows;
+    const int64_t n_blocks;
+    const int32_t ratio;
+    const bool overlap;
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_embd, n_rows, n_blocks, ratio, overlap);
+    }
+
+    double max_nmse_err() override { return 1e-6; }
+
+    test_dsv4_compress(int64_t n_embd, int64_t n_rows, int64_t n_blocks, int32_t ratio, bool overlap)
+        : n_embd(n_embd), n_rows(n_rows), n_blocks(n_blocks), ratio(ratio), overlap(overlap) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_state = (overlap ? 2 : 1)*n_embd;
+        const int64_t n_read  = (overlap ? 2 : 1)*ratio*n_blocks;
+
+        ggml_tensor * kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_rows);
+        ggml_tensor * score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_rows);
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_read);
+        ggml_set_name(kv, "kv");
+        ggml_set_name(score, "score");
+        ggml_set_name(idx, "idx");
+
+        ggml_tensor * out = ggml_dsv4_compress(ctx, kv, score, idx, ratio, overlap);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    // Include the synthetic zero/-inf row sentinel used by the
+                    // production read plans without materializing that row.
+                    data[i] = (i % 11 == 0) ? (int32_t) n_rows : (int32_t) ((7*i + 3) % n_rows);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
+    }
+};
+
+struct test_dsv4_top_k_mask : public test_case {
+    const int64_t n_raw;
+    const int64_t n_comp;
+    const int64_t n_select;
+    const int64_t n_query;
+    const int64_t n_stream;
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_raw, n_comp, n_select, n_query, n_stream);
+    }
+
+    test_dsv4_top_k_mask(int64_t n_raw, int64_t n_comp, int64_t n_select, int64_t n_query, int64_t n_stream)
+        : n_raw(n_raw), n_comp(n_comp), n_select(n_select), n_query(n_query), n_stream(n_stream) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * raw  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_raw,  n_query, 1, n_stream);
+        ggml_tensor * comp = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_comp, n_query, 1, n_stream);
+        ggml_tensor * idx  = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_select, n_query, 1, n_stream);
+        ggml_set_name(raw, "raw");
+        ggml_set_name(comp, "comp");
+        ggml_set_name(idx, "idx");
+
+        ggml_tensor * out = ggml_dsv4_top_k_mask(ctx, raw, comp, idx);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t row = 0; row < n_query*n_stream; ++row) {
+                    for (int64_t i = 0; i < n_select; ++i) {
+                        data[row*n_select + i] = (int32_t) ((7*i + 11*row + 3) % n_comp);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
+    }
+};
+
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -3879,6 +3972,45 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
         ggml_set_name(weights, "weights");
 
         out = ggml_dsv4_hc_pre(ctx, x, weights);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_dsv4_hc_pre_norm : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PRE_NORM";
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, eps);
+    }
+
+    test_dsv4_hc_pre_norm(int64_t n_embd = 4096, int64_t n_tokens = 17, float eps = 1e-6f)
+        : n_embd(n_embd), n_tokens(n_tokens), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(weights, "weights");
+
+        ggml_tensor * norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(norm, "norm");
+
+        out = ggml_dsv4_hc_pre(ctx, x, weights);
+        out = ggml_rms_norm(ctx, out, eps);
+        out = ggml_mul(ctx, out, norm);
         ggml_set_name(out, "out");
         return out;
     }
@@ -4514,7 +4646,7 @@ struct test_mul_mat_id_fusion : public test_case {
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return 2 * m * k * n * n_used;
+        return 2 * m * k * n * n_used * o;
     }
 
     test_mul_mat_id_fusion(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -5866,7 +5998,7 @@ struct test_top_k : public test_case {
             int k = 4, bool ties = false)
         : type(type), ne(ne), k(k), ties(ties) {}
 
-    double max_err() override {
+    double max_nmse_err() override {
         return 0.0;
     }
 
@@ -5898,6 +6030,14 @@ struct test_top_k : public test_case {
                 for (int64_t c = 0; c < k; c++) {
                     ia[c] = (int32_t)a[r * k + c];
                     ib[c] = (int32_t)b[r * k + c];
+                    if (ia[c] < 0 || ia[c] >= cols) {
+                        diff += 1;
+                        ia[c] = 0;
+                    }
+                    if (ib[c] < 0 || ib[c] >= cols) {
+                        diff += 1;
+                        ib[c] = 0;
+                    }
                 }
                 // The src values for each row should match.
                 for (int64_t c = 0; c < k; c++) {
@@ -5965,6 +6105,43 @@ struct test_top_k : public test_case {
                 }
                 std::shuffle(data.begin(), data.end(), rng);
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+            }
+        }
+    }
+};
+
+// DSV4 sparse prefill can request top-512 before 512 compressed cache rows are
+// visible. The remaining membership comes from a large -inf tie after mostly
+// negative Lightning Indexer scores. This distribution also exercises the
+// cross-SIMDgroup rank handoff in Metal's radix-8 selector.
+struct test_top_k_dsv4_masked : public test_top_k {
+    const int64_t n_finite;
+
+    test_top_k_dsv4_masked(std::array<int64_t, 4> ne, int64_t n_finite)
+        : test_top_k(GGML_TYPE_F32, ne, 512, true), n_finite(n_finite) {
+        GGML_ASSERT(n_finite > 0 && n_finite < k);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, n_finite);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(0x44535634);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+
+            for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                std::vector<float> data(t->ne[0], -INFINITY);
+                for (int64_t i = 0; i < n_finite; ++i) {
+                    // Unique finite values spanning several negative radix
+                    // digits, as produced by the Lightning Indexer plus mask.
+                    data[i] = -32.0f + 31.0f*(float(i) + 0.5f)/float(n_finite);
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), r*t->nb[1], t->ne[0]*sizeof(float));
             }
         }
     }
@@ -6824,9 +7001,10 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_K;
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
+    const bool sinks_rows;
 
     std::string vars() override {
-        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute);
+        return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, sinks_rows);
     }
 
     double max_nmse_err() override {
@@ -6842,9 +7020,9 @@ struct test_flash_attn_ext : public test_case {
 
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
-                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3})
+                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3}, bool sinks_rows = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute) {}
+          type_K(type_K), type_V(type_V), permute(permute), sinks_rows(sinks_rows) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -6892,18 +7070,22 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, sinks_rows ? 1 : nb, 1, nr23[1]);
             ggml_set_name(m, "m");
         }
 
         ggml_tensor * s = nullptr;
         if (sinks) {
-            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, q->ne[2]);
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, sinks_rows ? q->ne[1] : q->ne[2]);
             ggml_set_name(s, "s");
         }
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
-        ggml_flash_attn_ext_add_sinks(out, s);
+        if (sinks_rows) {
+            ggml_flash_attn_ext_add_sinks_rows(out, s);
+        } else {
+            ggml_flash_attn_ext_add_sinks(out, s);
+        }
         ggml_flash_attn_ext_set_prec (out, prec);
         ggml_set_name(out, "out");
 
@@ -7350,6 +7532,476 @@ struct test_lightning_indexer : public test_case {
                 init_tensor_kq_mask(t);
             } else {
                 init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_lightning_indexer_top_k : public test_lightning_indexer {
+    const int64_t n_top_k;
+    const bool near_tie;
+
+    test_lightning_indexer_top_k(
+            int64_t kv = 517,
+            int64_t n_top_k = 512,
+            int64_t nb = 1,
+            int64_t ns = 1,
+            bool near_tie = true)
+        : test_lightning_indexer(128, 64, kv, nb, ns, ns, GGML_TYPE_F16),
+          n_top_k(n_top_k), near_tie(near_tie) {
+        GGML_ASSERT(n_top_k > 0 && n_top_k + 1 < kv);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "LIGHTNING_INDEXER_TOP_K";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(kv, n_top_k, nb, ns, near_tie);
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return 0.0;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_ASSERT(n % n_top_k == 0);
+
+        std::vector<int32_t> ia(n_top_k);
+        std::vector<int32_t> ib(n_top_k);
+        double diff = 0.0;
+
+        for (size_t ir = 0; ir < n/n_top_k; ++ir) {
+            for (int64_t i = 0; i < n_top_k; ++i) {
+                const size_t idx = ir*n_top_k + i;
+                ia[i] = (int32_t) a[idx];
+                ib[i] = (int32_t) b[idx];
+                diff += std::fabs(a[idx] - ia[i]);
+                diff += std::fabs(b[idx] - ib[i]);
+            }
+            diff += jdst(ia.data(), ib.data(), n_top_k);
+        }
+
+        return diff;
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * scores = test_lightning_indexer::build_graph(ctx);
+        ggml_tensor * out = ggml_cont(ctx, ggml_top_k(ctx, scores, n_top_k));
+        ggml_set_name(out, "top_k");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        if (!near_tie) {
+            test_lightning_indexer::initialize_tensors(ctx);
+            return;
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "q") == 0) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                for (int64_t is = 0; is < ns; ++is) {
+                    for (int64_t ib = 0; ib < nb; ++ib) {
+                        const size_t row = (is*nb + ib)*nh*hsk;
+                        for (int64_t i = 0; i < hsk/2; ++i) {
+                            data[row + i] = 1.0004f;
+                        }
+                        for (int64_t i = hsk/2; i < hsk; ++i) {
+                            data[row + i] = 0.9998f;
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else if (strcmp(t->name, "k") == 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(0.0f));
+                for (int64_t is = 0; is < ns; ++is) {
+                    const size_t stream = is*kv*hsk;
+
+                    // n_top_k - 1 rows are unambiguously selected.
+                    for (int64_t ik = 0; ik < n_top_k - 1; ++ik) {
+                        for (int64_t i = 0; i < hsk; ++i) {
+                            data[stream + ik*hsk + i] = ggml_fp32_to_fp16(2.0f);
+                        }
+                    }
+
+                    // The F32 reference ranks A above B. Rounding Q to F16 makes
+                    // every Q element exactly one and reverses the pair.
+                    const int64_t ia = n_top_k - 1;
+                    const int64_t ib = n_top_k;
+                    for (int64_t i = 0; i < hsk/2; ++i) {
+                        data[stream + ia*hsk + i] = ggml_fp32_to_fp16(2.0f);
+                    }
+                    data[stream + ia*hsk + hsk - 1] = ggml_fp32_to_fp16(-0.0009765625f);
+                    for (int64_t i = 0; i < hsk; ++i) {
+                        data[stream + ib*hsk + i] = ggml_fp32_to_fp16(1.0f);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "w") == 0) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                for (int64_t is = 0; is < ns; ++is) {
+                    for (int64_t ib = 0; ib < nb; ++ib) {
+                        data[(is*nb + ib)*nh] = 1.0f;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else {
+                ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+            }
+        }
+    }
+};
+
+// Dense DeepSeek V4 hash-router gate versus the exact six selected rows.
+struct test_dsv4_hash_router_equivalence : public test_case {
+    const int64_t n_tokens;
+
+    explicit test_dsv4_hash_router_equivalence(int64_t n_tokens) : n_tokens(n_tokens) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HASH_ROUTER_EQ";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR1(n_tokens);
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        // The dense and indexed BF16/F32 matmul paths use different workgroup
+        // shapes and can differ by a few F32 rounding steps before the shared
+        // normalization. Keep the bound tight while covering that expected
+        // reassociation noise (the measured four-token maximum is 1.19e-7).
+        return 2e-7;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double max_abs = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            max_abs = std::max(max_abs, (double) std::fabs(a[i]));
+            max_abs = std::max(max_abs, (double) std::fabs(b[i]));
+        }
+        return max_abs;
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    ggml_tensor * normalize(ggml_context * ctx, ggml_tensor * probs) const {
+        probs = ggml_reshape_2d(ctx, probs, 6, n_tokens);
+        ggml_tensor * sum = ggml_sum_rows(ctx, probs);
+        sum = ggml_clamp(ctx, sum, 6.103515625e-5f, INFINITY);
+        probs = ggml_div(ctx, probs, sum);
+        return ggml_scale(ctx, probs, 1.5f);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4096, 256);
+        ggml_set_name(gate, "gate");
+
+        ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, n_tokens);
+        ggml_set_name(inp, "inp");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 6, n_tokens);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * dense = ggml_mul_mat(ctx, gate, inp);
+        ggml_mul_mat_set_prec(dense, GGML_PREC_F32);
+        dense = ggml_sqrt(ctx, ggml_softplus(ctx, dense));
+        dense = ggml_reshape_3d(ctx, dense, 1, 256, n_tokens);
+        dense = normalize(ctx, ggml_get_rows(ctx, dense, ids));
+
+        ggml_tensor * gate_rows = ggml_reshape_3d(ctx, gate, 4096, 1, 256);
+        ggml_tensor * inp_rows = ggml_reshape_3d(ctx, inp, 4096, 1, n_tokens);
+        ggml_tensor * sparse = ggml_mul_mat_id(ctx, gate_rows, inp_rows, ids);
+        sparse = normalize(ctx, ggml_sqrt(ctx, ggml_softplus(ctx, sparse)));
+
+        ggml_tensor * out = ggml_sub(ctx, dense, sparse);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        static const int32_t expert_ids[6] = { 5, 17, 64, 129, 201, 255 };
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "ids") == 0) {
+                std::vector<int32_t> data(6*n_tokens);
+                for (int64_t it = 0; it < n_tokens; ++it) {
+                    for (int64_t ie = 0; ie < 6; ++ie) {
+                        data[it*6 + ie] = expert_ids[(ie + it) % 6];
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (!ggml_is_view_op(t->op)) {
+                init_tensor_uniform(t, -0.25f, 0.25f);
+            }
+        }
+    }
+};
+
+// The learned DeepSeek V4 router has two externally consumed results: exact
+// top-6 IDs and normalized/scaled unbiased weights. Concatenate both as F32 so
+// one backend-vs-CPU comparison covers the complete fused Metal subgraph.
+struct test_dsv4_learned_router : public test_case {
+    const int64_t n_tokens;
+    const bool ties;
+
+    test_dsv4_learned_router(int64_t n_tokens, bool ties)
+        : n_tokens(n_tokens), ties(ties) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_LEARNED_ROUTER";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_tokens, ties);
+    }
+
+    double max_nmse_err() override {
+        // Any ID mismatch is at least one after the I32-to-F32 cast. The much
+        // tighter bound below therefore requires IDs to match exactly while
+        // allowing only normal transcendental/reassociation noise in weights.
+        return 1e-5;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_ASSERT(n == (size_t) (12*n_tokens));
+
+        double max_abs = 0.0;
+        for (int64_t it = 0; it < n_tokens; ++it) {
+            for (int64_t i = 0; i < 6; ++i) {
+                max_abs = std::max(max_abs, (double) std::fabs(a[it*12 + i] - b[it*12 + i]));
+
+                const float metal_id = a[it*12 + 6 + i];
+                const float reference_id = ties ? (float) i : b[it*12 + 6 + i];
+                max_abs = std::max(max_abs, (double) std::fabs(metal_id - reference_id));
+            }
+        }
+        return max_abs;
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, n_tokens);
+        ggml_set_name(logits, "router_logits");
+
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 256);
+        ggml_set_name(bias, "router_bias");
+
+        ggml_tensor * probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
+        ggml_tensor * probs_reshaped = ggml_reshape_3d(ctx, probs, 1, 256, n_tokens);
+        ggml_tensor * selection_probs = ggml_add(ctx, probs, bias);
+        ggml_tensor * ids = ggml_argsort_top_k(ctx, selection_probs, 6);
+        ggml_set_name(ids->src[0], "router_argsort");
+        ggml_set_name(ids, "router_ids");
+
+        ggml_tensor * weights = ggml_get_rows(ctx, probs_reshaped, ids);
+        weights = ggml_reshape_2d(ctx, weights, 6, n_tokens);
+        ggml_tensor * weights_sum = ggml_sum_rows(ctx, weights);
+        weights_sum = ggml_clamp(ctx, weights_sum, 6.103515625e-5f, INFINITY);
+        weights = ggml_div(ctx, weights, weights_sum);
+        weights = ggml_reshape_3d(ctx, weights, 1, 6, n_tokens);
+        weights = ggml_scale(ctx, weights, 2.5f);
+        ggml_set_name(weights, "router_weights");
+
+        ggml_tensor * weights_2d = ggml_reshape_2d(ctx, weights, 6, n_tokens);
+        ggml_tensor * ids_f32 = ggml_cast(ctx, ids, GGML_TYPE_F32);
+        ggml_tensor * out = ggml_concat(ctx, weights_2d, ids_f32, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "router_logits") == 0) {
+                std::vector<float> data(256*n_tokens);
+                for (int64_t it = 0; it < n_tokens; ++it) {
+                    for (int64_t ie = 0; ie < 256; ++ie) {
+                        data[it*256 + ie] = ties ? 0.0f : float((ie*73 + it*19) % 257 - 128)/32.0f;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (strcmp(t->name, "router_bias") == 0) {
+                std::vector<float> data(256);
+                for (int64_t ie = 0; ie < 256; ++ie) {
+                    data[ie] = ties ? 0.0f : float((ie*29) % 31 - 15)/128.0f;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            }
+        }
+    }
+};
+
+// GGML_OP_DSV4_SPARSE_PACK
+struct test_dsv4_sparse_pack : public test_case {
+    const int64_t nb;
+    const int64_t ns;
+    const int64_t kr;
+    const int64_t nr;
+    const int64_t nc;
+    const int64_t kc;
+    const ggml_type type_K;
+
+    std::string vars() override { return VARS_TO_STR7(nb, ns, kr, nr, nc, kc, type_K); }
+
+    test_dsv4_sparse_pack(int64_t nb = 3, int64_t ns = 2, int64_t kr = 7, ggml_type type_K = GGML_TYPE_F16)
+        : test_dsv4_sparse_pack(nb, ns, kr, type_K, 11, kr == 0 ? 517 : 17, kr == 0 ? 512 : 13) {}
+
+    test_dsv4_sparse_pack(int64_t nb, int64_t ns, int64_t kr, ggml_type type_K, int64_t nr, int64_t nc, int64_t kc)
+        : nb(nb), ns(ns), kr(kr), nr(nr), nc(nc), kc(kc), type_K(type_K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t d  = 512;
+
+        ggml_tensor * raw_k = ggml_new_tensor_4d(ctx, type_K, d, 1, nr, ns);
+        ggml_tensor * cmp_k = ggml_new_tensor_4d(ctx, type_K, d, 1, nc, ns);
+        ggml_tensor * raw_m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, nr, nb, 1, ns);
+        ggml_tensor * cmp_m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, nc, nb, 1, ns);
+        ggml_tensor * cmp_i = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, kc, nb, 1, ns);
+
+        ggml_set_name(raw_k, "raw_k");
+        ggml_set_name(cmp_k, "comp_k");
+        ggml_set_name(raw_m, "raw_mask");
+        ggml_set_name(cmp_m, "comp_mask");
+        ggml_set_name(cmp_i, "comp_idx");
+
+        ggml_tensor * out = ggml_dsv4_sparse_pack(ctx, raw_k, cmp_k, raw_m, cmp_m, cmp_i, kr);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = (int32_t) ((i*7 + 3) % nc);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
+
+        ggml_tensor * raw_m = ggml_get_tensor(ctx, "raw_mask");
+        std::vector<ggml_fp16_t> mask(ggml_nelements(raw_m));
+        for (size_t i = 0; i < mask.size(); ++i) {
+            mask[i] = ggml_fp32_to_fp16((i % 5) == 0 ? -INFINITY : (float) (i % 7));
+        }
+        ggml_backend_tensor_set(raw_m, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
+    }
+};
+
+// DeepSeek V4 multi-stream decode after exact top-512 key selection. This
+// exercises the complete pack/view/concat/vector-Flash-Attention layout used by
+// the target graph, including distinct cache and mask strides for every stream.
+struct test_dsv4_sparse_attention : public test_case {
+    static constexpr int64_t d  = 512;
+    static constexpr int64_t nh = 64;
+    static constexpr int64_t nr = 128;
+    static constexpr int64_t nc = 1024;
+    static constexpr int64_t nk = 512;
+
+    const int64_t n_stream;
+
+    explicit test_dsv4_sparse_attention(int64_t n_stream) : n_stream(n_stream) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_SPARSE_ATTN";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR1(n_stream);
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, nh, n_stream, 1);
+        ggml_tensor * raw_k  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, 1, nr, n_stream);
+        ggml_tensor * comp_k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, 1, nc, n_stream);
+        ggml_tensor * raw_m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, nr, 1, 1, n_stream);
+        ggml_tensor * comp_m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, nc, 1, 1, n_stream);
+        ggml_tensor * idx    = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, nk, 1, 1, n_stream);
+        ggml_tensor * sinks  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+
+        ggml_set_name(q, "q");
+        ggml_set_name(raw_k, "raw_k");
+        ggml_set_name(comp_k, "comp_k");
+        ggml_set_name(raw_m, "raw_mask");
+        ggml_set_name(comp_m, "comp_mask");
+        ggml_set_name(idx, "comp_idx");
+        ggml_set_name(sinks, "sinks");
+
+        ggml_tensor * packed = ggml_dsv4_sparse_pack(ctx, raw_k, comp_k, raw_m, comp_m, idx, 0);
+        ggml_tensor * gathered = ggml_view_4d(ctx, packed, d, 1, nk, n_stream,
+                d*sizeof(ggml_fp16_t), d*sizeof(ggml_fp16_t), packed->nb[1], 0);
+        ggml_tensor * k_sel = ggml_concat(ctx, raw_k, gathered, 2);
+        ggml_tensor * k_fa = ggml_view_4d(ctx, k_sel, d, nr + nk, 1, n_stream,
+                k_sel->nb[2], k_sel->nb[3], k_sel->nb[3], 0);
+
+        ggml_tensor * selected_m = ggml_view_4d(ctx, packed, nk, 1, 1, n_stream,
+                nk*sizeof(ggml_fp16_t), nk*sizeof(ggml_fp16_t), packed->nb[1],
+                d*nk*sizeof(ggml_fp16_t));
+        ggml_tensor * mask = ggml_concat(ctx, raw_m, selected_m, 0);
+        ggml_tensor * q_fa = ggml_reshape_4d(ctx, q, d, 1, nh, n_stream);
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q_fa, k_fa, k_fa, mask, 1.0f/sqrtf((float) d), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(out, sinks);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        out = ggml_reshape_2d(ctx, out, d*nh, n_stream);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "comp_idx") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t is = 0; is < n_stream; ++is) {
+                    for (int64_t i = 0; i < nk; ++i) {
+                        data[is*nk + i] = (int32_t) ((7*i + 11*is + 3) % nc);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (strcmp(t->name, "raw_mask") == 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t is = 0; is < n_stream; ++is) {
+                    for (int64_t i = 0; i < nr; ++i) {
+                        const float value = -0.03125f*(float) (i % 17);
+                        data[is*nr + i] = ggml_fp32_to_fp16(value);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (strcmp(t->name, "comp_mask") == 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    const float value = i % 11 == 0 ? -INFINITY : -0.03125f*(float) (i % 17);
+                    data[i] = ggml_fp32_to_fp16(value);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (!ggml_is_view_op(t->op)) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
             }
         }
     }
@@ -8066,18 +8718,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
 
+    test_cases.emplace_back(new test_dsv4_compress(512, 17,  3,   4, true));
+    test_cases.emplace_back(new test_dsv4_compress(512, 137, 2, 128, false));
+    test_cases.emplace_back(new test_dsv4_top_k_mask(17, 137, 64, 3, 2));
+    test_cases.emplace_back(new test_dsv4_top_k_mask(128, 2500, 512, 1, 1));
+
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));
+    test_cases.emplace_back(new test_dsv4_hc_comb(17, 20));
 
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 257));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 21));
+    test_cases.emplace_back(new test_dsv4_hc_pre_norm(4096, 21));
 
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -9367,6 +10027,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2048, 2, 1, 3}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 2, 1, 3}, k));
     }
+    // DeepSeek V4 Lightning Indexer top-512 rows, including equal-score membership.
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 2, 1, 1}, 512));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2628, 1, 1, 1}, 512));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {5128, 1, 1, 1}, 512));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {5128, 512, 1, 1}, 512));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {5128, 1, 1, 1}, 512, true));
+    test_cases.emplace_back(new test_top_k_dsv4_masked({5128, 512, 1, 1}, 482));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
@@ -9591,6 +10258,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {1, 1}, 640, 64, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {1, 1}, 641, 8,  true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true));
+    for (int kv : { 640, 2628, 5128, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 1, true, true,
+                    0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
 
     // large-KV F16 cases (Qwen3.6-27B geometry and a llama-class control): the upstream matrix
     // stops at kv=1024, blind to long-context FA bugs (e.g. the oneDNN SDPA ordering race on BMG).
@@ -9728,6 +10401,47 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int kv : { 1, 7, 8, 63, 64, 65 }) {
+        for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 1, 4, 1, type_K));
+        }
+    }
+    for (int kv : { 7, 63, 65 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 9, 4, 1, GGML_TYPE_Q8_0));
+    }
+    // Representative long-context DeepSeek V4 decode scan.
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 4096, 1, 1, 1, GGML_TYPE_F16));
+
+    test_cases.emplace_back(new test_lightning_indexer_top_k(517, 512, 1, 1));
+    test_cases.emplace_back(new test_lightning_indexer_top_k(517, 512, 1, 4));
+
+    test_cases.emplace_back(new test_dsv4_hash_router_equivalence(1));
+    test_cases.emplace_back(new test_dsv4_hash_router_equivalence(4));
+
+    test_cases.emplace_back(new test_dsv4_learned_router(1, false));
+    test_cases.emplace_back(new test_dsv4_learned_router(4, false));
+    test_cases.emplace_back(new test_dsv4_learned_router(1, true));
+    test_cases.emplace_back(new test_dsv4_learned_router(4, true));
+
+    test_cases.emplace_back(new test_dsv4_sparse_pack());
+    test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 0));
+    test_cases.emplace_back(new test_dsv4_sparse_pack(3, 2, 7, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 128, GGML_TYPE_Q8_0, 128, 517, 512));
+    test_cases.emplace_back(new test_dsv4_sparse_attention(2));
+    test_cases.emplace_back(new test_dsv4_sparse_attention(4));
+
+    // Target-shape oracle for the DSV4 prompt-time expert MM path.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 2048, 224, 4096));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 224, 2048));
+    // DSV4 decode down projection with its routed-weight multiply.
+    test_cases.emplace_back(new test_mul_mat_id_fusion(
+                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 1, 2048, 1, true));
+    test_cases.emplace_back(new test_mul_mat_id_fusion(
+                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, true, 2048, 1, 4096, 2));
+    test_cases.emplace_back(new test_mul_mat_id_fusion(
+                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, true, 2048, 4, 4096, 2));
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -9737,6 +10451,41 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // DeepSeek V4 hot-path shapes.
+    test_cases.emplace_back(new test_dsv4_hc_comb(1, 4));
+    test_cases.emplace_back(new test_dsv4_hc_pre(4096, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 1));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2628, 1, 1, 1}, 512));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {5128, 1, 1, 1}, 512));
+    test_cases.emplace_back(new test_dsv4_top_k_mask(128, 2500, 512, 1, 1));
+    test_cases.emplace_back(new test_dsv4_top_k_mask(128, 5000, 512, 1, 1));
+    test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 0, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 4096, 1, 1, 1, GGML_TYPE_F16));
+    // DSV4 CSA decode after selecting 512 compressed rows plus the 128-row
+    // raw window. Compare the normal 64-head vector layout with the sparse
+    // prefill path's equivalent 64-query-row layout at one and four streams.
+    for (int n_stream : { 1, 4 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, n_stream}, 640, 1, true, true,
+                    0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {1, n_stream}, 640, 64, true, true,
+                    0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true));
+    }
+    // DeepSeek V4 BF16 vocabulary projection (129280 x 4096) at decode batch 1.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 129280, 1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 2048, 1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 4096, 1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_id_fusion(
+                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 1, 2048, 1, true));
+    for (int bs : { 1, 4, 32 }) {
+        test_cases.emplace_back(new test_mul_mat_id_fusion(
+                    GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, true, 2048, bs, 4096, 2));
+    }
+    for (int bs : { 128, 192, 224, 256, 512 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 2048, bs, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, bs, 2048));
+    }
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
@@ -9943,6 +10692,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
+    // DeepSeek V4 compressed sparse attention decode: one 512-wide KV head is
+    // shared by 64 query heads and the visibility mask is broadcast per row.
+    for (int kv : { 2628, 5128, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 1, true, true,
+                    0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {

@@ -1620,7 +1620,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const auto & speculative_types = params.speculative.types;
+    mparams.load_mtp =
+        std::find(speculative_types.begin(), speculative_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != speculative_types.end() ||
+        std::find(speculative_types.begin(), speculative_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != speculative_types.end();
 
     return mparams;
 }

@@ -2256,20 +2256,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     if (arch == LLM_ARCH_DEEPSEEK4) {
                         GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
-                        res = new llama_kv_cache_dsv4(
-                                *this,
-                                params.type_k,
-                                params.type_v,
-                                !cparams.flash_attn,
-                                cparams.offload_kqv,
-                                params.swa_full,
-                                cparams.kv_unified,
-                                cparams.n_ctx_seq,
-                                cparams.n_seq_max,
-                                cparams.n_ubatch,
-                                1,
-                                filter,
-                                reuse);
+                        if (hparams.n_layer_nextn > 0) {
+                            if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                                filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            } else {
+                                filter = [&](uint32_t il) { return il < hparams.n_layer(); };
+                            }
+                        }
+
+                        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_dspark_block_size > 0) {
+                            // Official DSV4 DSpark stages use a K-only latent
+                            // SWA cache, unlike the target trunk's compressed
+                            // DSV4 cache hierarchy.
+                            res = new llama_kv_cache_iswa(
+                                    *this,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    params.swa_full,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    cparams.n_ubatch,
+                                    1,
+                                    nullptr,
+                                    filter,
+                                    reuse,
+                                    nullptr);
+                        } else {
+                            res = new llama_kv_cache_dsv4(
+                                    *this,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    params.swa_full,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    cparams.n_ubatch,
+                                    1,
+                                    cparams.n_rs_seq,
+                                    filter,
+                                    reuse);
+                        }
                     } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
@@ -2422,6 +2453,10 @@ int32_t llama_model_n_embd_inp(const llama_model * model) {
 
 int32_t llama_model_n_embd_out(const llama_model * model) {
     return model->hparams.n_embd_out();
+}
+
+int32_t llama_model_n_embd_nextn(const llama_model * model) {
+    return model->hparams.n_embd_nextn();
 }
 
 int32_t llama_model_n_layer(const llama_model * model) {
@@ -2749,6 +2784,7 @@ bool llama_model_has_encoder(const llama_model * model) {
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_EAGLE3:
         case LLM_ARCH_DFLASH:    return true;
+        case LLM_ARCH_DEEPSEEK4: return model->hparams.n_dspark_block_size > 0;
         default:                 return false;
     }
 }

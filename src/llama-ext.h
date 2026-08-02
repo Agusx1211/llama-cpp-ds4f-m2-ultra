@@ -19,6 +19,9 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 
+// Width of the hidden-state rows exchanged with the NextN/MTP graph.
+LLAMA_API int32_t llama_model_n_embd_nextn(const struct llama_model * model);
+
 struct quantize_state_impl;
 
 LLAMA_API quantize_state_impl * llama_quant_init(
@@ -94,6 +97,14 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+
+// Enable or suppress execution of preallocated recurrent-state rollback planes.
+// Currently used by DSV4 to remove snapshot overhead while speculation is bypassed.
+LLAMA_API void llama_set_rs_rollback_enabled(struct llama_context * ctx, bool enabled);
+
+// Select the active DSV4 rollback depth without reallocating the preallocated
+// planes. Depth must not exceed the context's configured rollback capacity.
+LLAMA_API void llama_set_rs_rollback_depth(struct llama_context * ctx, uint32_t depth);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to

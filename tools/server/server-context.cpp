@@ -14,6 +14,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "../../src/llama-ext.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -213,6 +214,7 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    bool spec_parallel_disabled = false;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -345,11 +347,13 @@ struct server_slot {
         stopping_word  = "";
         n_sent_text    = 0;
 
-        if (can_speculate()) {
+        if (spec) {
             spec_draft.clear();
+            spec_prompt.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
+        spec_parallel_disabled = false;
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
@@ -398,12 +402,12 @@ struct server_slot {
 
     bool need_embd() const {
         GGML_ASSERT(task);
-        return task->need_embd() || (spec && common_speculative_need_embd(spec));
+        return task->need_embd() || (can_speculate() && common_speculative_need_embd(spec));
     }
 
     bool need_embd_nextn() const {
         GGML_ASSERT(task);
-        return spec && common_speculative_need_embd_nextn(spec);
+        return can_speculate() && common_speculative_need_embd_nextn(spec);
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
@@ -448,7 +452,19 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return spec && !spec_parallel_disabled;
+    }
+
+    void disable_speculation_for_parallel_cohort() {
+        GGML_ASSERT(spec);
+
+        spec_parallel_disabled = true;
+        spec_is_replay = false;
+        spec_draft.clear();
+        spec_prompt.clear();
+        spec_i_batch.clear();
+        spec_ckpt.clear();
+        common_speculative_get_draft_params(spec, id).drafting = false;
     }
 
     void add_token(const completion_token_output & token) {
@@ -532,8 +548,9 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
-            // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            // A slot bypassing MTP has advanced only the target context. Clear both
+            // contexts before reuse so a later request cannot inherit stale draft state.
+            if (task->is_child() || spec_parallel_disabled) {
                 prompt_clear();
             }
 
@@ -943,6 +960,22 @@ private:
 
     common_speculative_ptr spec;
 
+    // Measured M2 Ultra concurrency limits for the two DSV4 proposal engines.
+    // MTP remains useful through four streams. DSpark uses its configured
+    // single-stream mode at one stream, depth one at two or three, and is
+    // bypassed at four. Once bypassed, keep the cohort target-only until every
+    // slot drains because its draft context is no longer advanced.
+    static constexpr size_t DSV4_MTP_MAX_ACTIVE_REQUESTS = 4;
+    static constexpr size_t DSV4_DSPARK_MAX_ACTIVE_REQUESTS = 3;
+    bool spec_mtp = false;
+    bool spec_dspark = false;
+    bool spec_parallel_bypass = false;
+    int32_t dspark_n_max_single = 1;
+    int32_t dspark_n_max_active = 1;
+    float dspark_p_min_single = 0.0f;
+    float dspark_p_min_active = 0.0f;
+    uint32_t spec_rs_depth = 0;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1051,9 +1084,18 @@ private:
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                        params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        spec_mtp = std::find(params_base.speculative.types.begin(),
+                             params_base.speculative.types.end(),
+                             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        spec_dspark = std::find(params_base.speculative.types.begin(),
+                                params_base.speculative.types.end(),
+                                COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
+        spec_parallel_bypass = false;
+        dspark_n_max_single = params_base.speculative.draft.n_max;
+        dspark_n_max_active = dspark_n_max_single;
+        dspark_p_min_single = params_base.speculative.draft.p_min;
+        dspark_p_min_active = dspark_p_min_single;
+        spec_rs_depth = (uint32_t) std::max(0, common_speculative_n_max(&params_base.speculative));
         const bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
@@ -1133,8 +1175,9 @@ private:
                 auto cparams_dft = common_context_params_to_llama(params_dft);
                 if (spec_mtp) {
                     cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                } else {
+                    cparams_dft.n_rs_seq = 0;
                 }
-                cparams_dft.n_rs_seq = 0;
 
                 std::vector<ggml_backend_dev_t> devs;
                 uint32_t hp_ngl = 0;
@@ -2804,6 +2847,7 @@ private:
             }
 
             if (all_idle) {
+                reenable_speculation_after_parallel_bypass();
                 SRV_TRC("%s", "all slots are idle\n");
                 return; // skip further processing
 
@@ -2844,6 +2888,9 @@ private:
             }
 
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+            llama_set_embeddings_nextn(ctx_tgt, slot_batched->need_embd_nextn(), /* masked = */ false);
+            llama_set_rs_rollback_depth(ctx_tgt,
+                    slot_batched->can_speculate() ? spec_rs_depth : 0);
         }
 
         llama_batch batch_view;
@@ -2888,7 +2935,102 @@ private:
         }
     }
 
+    bool set_dspark_draft_options(int32_t n_max, float p_min) {
+        const bool changed = n_max != dspark_n_max_active || p_min != dspark_p_min_active;
+        if (changed) {
+            GGML_ASSERT(common_speculative_set_draft_options(
+                    spec.get(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, n_max, p_min));
+            dspark_n_max_active = n_max;
+            dspark_p_min_active = p_min;
+        }
+        spec_rs_depth = (uint32_t) n_max;
+        return changed;
+    }
+
+    void reenable_speculation_after_parallel_bypass() {
+        if (!spec_parallel_bypass) {
+            return;
+        }
+
+        SRV_INF("re-enabling DSV4 %s after the target-only request cohort drained\n",
+                spec_dspark ? "DSpark" : "MTP");
+        spec_parallel_bypass = false;
+        if (spec_dspark) {
+            GGML_ASSERT(common_speculative_set_enabled(
+                    spec.get(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, true));
+            set_dspark_draft_options(dspark_n_max_single, dspark_p_min_single);
+        }
+    }
+
+    void update_speculative_parallel_policy() {
+        if (!spec_mtp && !spec_dspark) {
+            return;
+        }
+
+        if (spec_parallel_bypass) {
+            bool has_disabled_active_request = false;
+            for (const auto & slot : slots) {
+                if (slot.is_processing() && slot.spec_parallel_disabled) {
+                    has_disabled_active_request = true;
+                    break;
+                }
+            }
+            if (!has_disabled_active_request) {
+                reenable_speculation_after_parallel_bypass();
+            }
+        }
+
+        if (!spec_parallel_bypass) {
+            size_t n_active_requests = 0;
+            for (const auto & slot : slots) {
+                if (slot.is_processing() && slot.task && slot.task->need_sampling()) {
+                    ++n_active_requests;
+                }
+            }
+
+            if (spec_dspark && n_active_requests <= DSV4_DSPARK_MAX_ACTIVE_REQUESTS) {
+                const int32_t n_max = n_active_requests <= 1 ? dspark_n_max_single : 1;
+                const float p_min = n_active_requests <= 1 ? dspark_p_min_single : 0.0f;
+                if (set_dspark_draft_options(n_max, p_min)) {
+                    SRV_INF("switching DSV4 DSpark to %s mode: n_max=%d, p_min=%.2f, active requests=%zu\n",
+                            n_active_requests <= 1 ? "single-stream" : "parallel",
+                            n_max, (double) p_min, n_active_requests);
+                }
+                return;
+            }
+
+            const size_t cutoff = spec_dspark
+                    ? DSV4_DSPARK_MAX_ACTIVE_REQUESTS
+                    : DSV4_MTP_MAX_ACTIVE_REQUESTS;
+            if (n_active_requests <= cutoff) {
+                return;
+            }
+
+            spec_parallel_bypass = true;
+            SRV_INF("disabling DSV4 %s for the current request cohort: "
+                    "%zu active requests exceed the M2 Ultra crossover of %zu\n",
+                    spec_dspark ? "DSpark" : "MTP", n_active_requests, cutoff);
+            if (spec_dspark) {
+                GGML_ASSERT(common_speculative_set_enabled(
+                        spec.get(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, false));
+                spec_rs_depth = 0;
+            }
+        }
+
+        // New work can enter free slots while the original cohort is still busy.
+        // Keep all such work target-only until the server reaches an all-idle point.
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+
+            slot.disable_speculation_for_parallel_cohort();
+        }
+    }
+
     void pre_decode() {
+        update_speculative_parallel_policy();
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3693,7 +3835,7 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (!common_speculative_process(spec.get(), batch_view)) {
+        if (!spec_parallel_bypass && !common_speculative_process(spec.get(), batch_view)) {
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error

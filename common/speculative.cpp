@@ -177,6 +177,10 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_nextn() const { return false; }
+
+    // Optional runtime tuning hooks for workload-adaptive draft models.
+    virtual bool set_draft_options(int32_t /*n_max*/, float /*p_min*/) { return false; }
+    virtual bool set_enabled(bool /*enabled*/) { return false; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -931,9 +935,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
+    bool is_dsv4_dspark = false;
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
+
+    const int32_t n_min_configured;
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
@@ -943,6 +950,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         : common_speculative_impl(type, n_seq)
         , params(params.draft)
         , is_dspark(type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
+        , n_min_configured(params.draft.n_min)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -950,6 +958,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const llama_model * model_dft = llama_get_model(ctx_dft);
         const llama_model * model_tgt = llama_get_model(ctx_tgt);
+
+        if (is_dspark) {
+            char arch[32] = {};
+            if (llama_model_meta_val_str(model_dft, "general.architecture", arch, sizeof(arch)) >= 0) {
+                is_dsv4_dspark = std::strcmp(arch, "deepseek4") == 0;
+            }
+        }
 
         target_layer_ids   = llama_model_target_layer_ids  (model_dft);
         target_layer_ids_n = llama_model_target_layer_ids_n(model_dft);
@@ -959,11 +974,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         n_embd_dec    = llama_model_n_embd(model_dft);
         n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
 
-        // read the trained block size from the dflash.block_size metadata key
+        // read the trained block size from the architecture-specific metadata key
         block_size = 16;
         {
             char buf[32] = {};
-            if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
+            const char * key = is_dsv4_dspark ? "deepseek4.block_size" : "dflash.block_size";
+            if (llama_model_meta_val_str(model_dft, key, buf, sizeof(buf)) >= 0) {
                 block_size = std::atoi(buf);
             }
         }
@@ -997,7 +1013,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // turn on extraction of the target layers' input embeddings
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+            // Official DSV4 DSpark target IDs name completed layers. The
+            // extraction API names graph inputs, so completed layer L is tap L+1.
+            const uint32_t lid = (uint32_t) target_layer_ids[k] + (is_dsv4_dspark ? 1u : 0u);
+            llama_set_embeddings_layer_inp(ctx_tgt, lid, true);
         }
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
@@ -1070,9 +1089,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // gather this chunk's target features, interleaved by extract layer
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    const uint32_t lid = (uint32_t) target_layer_ids[k] + (is_dsv4_dspark ? 1u : 0u);
+                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, lid);
                     if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                        GGML_ABORT("DFlash: target layer tap %u not extracted.", lid);
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
@@ -1244,6 +1264,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool need_embd() const override {
         return false;
     }
+
+    bool set_draft_options(int32_t n_max, float p_min) override {
+        if (!is_dspark || n_max < 1 || p_min < 0.0f || p_min > 1.0f) {
+            return false;
+        }
+
+        params.n_max = std::min(n_max, block_size);
+        params.n_min = std::min(n_min_configured, params.n_max);
+        params.p_min = p_min;
+        return true;
+    }
+
+    bool set_enabled(bool enabled) override {
+        if (!is_dspark) {
+            return false;
+        }
+
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            const uint32_t lid = (uint32_t) target_layer_ids[k] + (is_dsv4_dspark ? 1u : 0u);
+            llama_set_embeddings_layer_inp(params.ctx_tgt, lid, enabled);
+        }
+        return true;
+    }
 };
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
@@ -1290,8 +1333,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
-        n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
-        GGML_ASSERT(n_embd == llama_model_n_embd(llama_get_model(ctx_tgt)) &&
+        n_embd = llama_model_n_embd_nextn(llama_get_model(ctx_dft));
+        GGML_ASSERT(n_embd == llama_model_n_embd_nextn(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
@@ -2314,6 +2357,9 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_dspark = std::find(params.speculative.types.begin(),
+                                       params.speculative.types.end(),
+                                       COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
     GGML_ASSERT(has_draft || spec_mtp);
 
     auto mparams = common_model_params_to_llama(params);
@@ -2323,9 +2369,12 @@ common_speculative_init_result::common_speculative_init_result(
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
 
-    // note: for small models maybe we can set this to the maximum possible draft from all speculative types
-    //       the extra memory for small models is likely negligible?
-    cparams.n_rs_seq  = 0;
+    // MTP contexts share sequence truncation with the target after draft
+    // verification. Recurrent MTP models therefore need the same bounded
+    // rollback depth; ordinary draft contexts keep using checkpoints.
+    if (!spec_mtp) {
+        cparams.n_rs_seq = 0;
+    }
     cparams.ctx_other = ctx_tgt;
 
     std::string model_path;
@@ -2340,6 +2389,14 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->model.reset(model_dft);
+
+        if (spec_dspark) {
+            char arch[32] = {};
+            if (llama_model_meta_val_str(model_dft, "general.architecture", arch, sizeof(arch)) >= 0 &&
+                    std::strcmp(arch, "deepseek4") == 0) {
+                cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            }
+        }
 
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
@@ -2542,6 +2599,41 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     GGML_ASSERT(seq_id < (llama_seq_id) spec->dparams.size());
 
     return spec->dparams[seq_id];
+}
+
+bool common_speculative_set_draft_options(
+        common_speculative * spec,
+        common_speculative_type type,
+        int32_t n_max,
+        float p_min) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->type == type) {
+            return impl->set_draft_options(n_max, p_min);
+        }
+    }
+
+    return false;
+}
+
+bool common_speculative_set_enabled(
+        common_speculative * spec,
+        common_speculative_type type,
+        bool enabled) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->type == type) {
+            return impl->set_enabled(enabled);
+        }
+    }
+
+    return false;
 }
 
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {

@@ -52,6 +52,21 @@ struct common_speculative_draft_params {
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
+// Update a draft implementation's active depth and confidence threshold.
+// Used by the M2 Ultra server to adapt DSV4 DSpark to request concurrency.
+bool common_speculative_set_draft_options(
+        common_speculative * spec,
+        common_speculative_type type,
+        int32_t n_max,
+        float p_min);
+
+// Enable or disable architecture-specific target outputs needed by a draft
+// implementation. Draft state must not be reused across a disabled interval.
+bool common_speculative_set_enabled(
+        common_speculative * spec,
+        common_speculative_type type,
+        bool enabled);
+
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 

@@ -43,17 +43,22 @@ struct llama_cparams {
     bool auto_fgdn;
     bool fused_lid;          // use fused lightning indexer
     bool auto_flid;
+    bool fused_dsv4_compress;
+    bool fused_dsv4_top_k_mask;
+    bool auto_fdsv4_aux;
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
     bool auto_fhc;
+    bool fused_dsv4_sparse; // use indexed sparse attention packing for DSV4 prefill
+    bool auto_fdsv4_sparse;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
 
-    std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    std::vector<bool> embeddings_layer_inp; // [n_layer() + 1] extract layer inputs; final slot is trunk output
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;

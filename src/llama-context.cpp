@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -61,6 +62,18 @@ static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_dsv4_compress_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_COMPRESS,
+    /*.name             =*/ "fused DeepSeek V4 compressor",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_top_k_mask_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_TOP_K_MASK,
+    /*.name             =*/ "fused DeepSeek V4 top-k mask",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
     /*.name             =*/ "fused DeepSeek V4 HC pre",
@@ -77,6 +90,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_POST,
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_sparse_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_SPARSE_PACK,
+    /*.name             =*/ "fused DeepSeek V4 sparse attention packing",
+    /*.n_tokens_per_seq =*/ 512,
 };
 
 llama_context::llama_context(
@@ -120,8 +139,11 @@ llama_context::llama_context(
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
-    cparams.embeddings_layer_inp.resize(hparams.n_layer(), false);
-    embd_layer_inp.resize(hparams.n_layer());
+    // The extra slot exposes the output of the final transformer block. This
+    // is the input to the output head and is needed by draft models that train
+    // against post-layer target features.
+    cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
+    embd_layer_inp.resize(hparams.n_layer() + 1);
 
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
@@ -149,7 +171,7 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_DEEPSEEK4) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
@@ -253,10 +275,17 @@ llama_context::llama_context(
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
 
+    cparams.fused_dsv4_compress   = true;
+    cparams.fused_dsv4_top_k_mask = true;
+    cparams.auto_fdsv4_aux        = true;
+
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
+
+    cparams.fused_dsv4_sparse = true;
+    cparams.auto_fdsv4_sparse = true;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -267,6 +296,22 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+
+    // DSV4 retains one affine virtual stream per sequence. On the target M2
+    // Ultra, placement-sparse Metal buffers provide an elastic physical page
+    // pool underneath those streams. Other devices keep the safe fixed split.
+    if (model.arch == LLM_ARCH_DEEPSEEK4 && cparams.kv_unified && cparams.n_seq_max > 1) {
+        if (llama_kv_cache_dsv4_supports_elastic_metal(model, cparams.n_seq_max)) {
+            LLAMA_LOG_INFO("%s: DeepSeek V4 using elastic Metal KV pages: "
+                    "%u total cells across %u virtual streams\n",
+                    __func__, cparams.n_ctx, cparams.n_seq_max);
+        } else {
+            LLAMA_LOG_WARN("%s: DeepSeek V4 elastic Metal KV pages unavailable; "
+                    "partitioning %u context cells across %u sequences\n",
+                    __func__, cparams.n_ctx, cparams.n_seq_max);
+            cparams.kv_unified = false;
+        }
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -571,6 +616,19 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
         cparams.auto_fhc = false;
     }
+
+    if (cparams.auto_fdsv4_sparse) {
+        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 sparse attention support:\n", func);
+        resolve(llm_fused_op_dsv4_sparse_probe, cparams.fused_dsv4_sparse);
+        cparams.auto_fdsv4_sparse = false;
+    }
+
+    if (cparams.auto_fdsv4_aux) {
+        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 auxiliary ops support:\n", func);
+        resolve(llm_fused_op_dsv4_compress_probe,   cparams.fused_dsv4_compress);
+        resolve(llm_fused_op_dsv4_top_k_mask_probe, cparams.fused_dsv4_top_k_mask);
+        cparams.auto_fdsv4_aux = false;
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -588,6 +646,18 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const bool is_dsv4_dspark = model.arch == LLM_ARCH_DEEPSEEK4 &&
+        model.hparams.n_dspark_block_size > 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+
+    // Official DSV4 DSpark has two unrelated graph shapes in one context:
+    // a projection-only encoder that consumes full target-feature microbatches,
+    // and a three-stage draft decoder whose real batches cannot exceed the
+    // trained block size per sequence. Reserving the decoder at n_ubatch can
+    // waste more than a GiB on Metal while describing a workload that the
+    // speculative driver will never issue.
+    const uint32_t n_tokens_pp = is_dsv4_dspark
+        ? std::min(n_tokens, model.hparams.n_dspark_block_size*n_seqs)
+        : n_tokens;
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -621,22 +691,40 @@ void llama_context::sched_reserve() {
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
 
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    const uint32_t n_outputs_pp = std::min(n_tokens_pp, cparams.n_outputs_max);
+    std::vector<size_t> dspark_encoder_sizes;
+
+    if (is_dsv4_dspark) {
+        if (model.hparams.no_alloc) {
+            dspark_encoder_sizes.resize(backend_ptrs.size());
+        }
+        const uint32_t n_outputs_enc = std::min(n_tokens, cparams.n_outputs_max);
+        auto * gf = graph_reserve_type(n_tokens, n_seqs, n_outputs_enc, mctx.get(),
+                LLM_GRAPH_TYPE_ENCODER, model.hparams.no_alloc,
+                model.hparams.no_alloc ? dspark_encoder_sizes.data() : nullptr);
+        if (!gf) {
+            throw std::runtime_error("failed to allocate DSV4 DSpark encoder compute buffers");
+        }
+    }
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+        auto * gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
             }
+        }
+
+        for (size_t i = 0; i < dspark_encoder_sizes.size(); ++i) {
+            backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], dspark_encoder_sizes[i]);
         }
 
         n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
@@ -660,7 +748,7 @@ void llama_context::sched_reserve() {
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
         //
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
@@ -682,13 +770,13 @@ void llama_context::sched_reserve() {
     if (n_nodes_pp == n_nodes_tg) {
         LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);
     } else {
-        LLAMA_LOG_INFO("%s: graph nodes  = %d (with bs=%d), %d (with bs=1)\n", __func__, n_nodes_pp, n_tokens, n_nodes_tg);
+        LLAMA_LOG_INFO("%s: graph nodes  = %d (with bs=%d), %d (with bs=1)\n", __func__, n_nodes_pp, n_tokens_pp, n_nodes_tg);
     }
 
     if (n_splits_pp == n_splits_tg) {
         LLAMA_LOG_INFO("%s: graph splits = %d\n", __func__, n_splits_pp);
     } else {
-        LLAMA_LOG_INFO("%s: graph splits = %d (with bs=%d), %d (with bs=1)\n", __func__, n_splits_pp, n_tokens, n_splits_tg);
+        LLAMA_LOG_INFO("%s: graph splits = %d (with bs=%d), %d (with bs=1)\n", __func__, n_splits_pp, n_tokens_pp, n_splits_tg);
     }
 
     const int64_t t_end_us = ggml_time_us();
@@ -944,7 +1032,7 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
             throw std::runtime_error("no nextn embeddings");
         }
 
-        const uint32_t n_embd = model.hparams.n_embd_out();
+        const uint32_t n_embd = model.hparams.n_embd_nextn();
 
         if (!cparams.embeddings_nextn_masked) {
             // unmasked: nextn rows are stored densely, indexed by raw token position.
@@ -1157,14 +1245,31 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) {
+        sched_need_reserve = true;
+    }
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+}
+
+void llama_context::set_rs_rollback_enabled(bool enabled) {
+    auto * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
+    if (dsv4 != nullptr && dsv4->set_rs_enabled(enabled)) {
+        sched_need_reserve = true;
+    }
+}
+
+void llama_context::set_rs_rollback_depth(uint32_t depth) {
+    auto * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
+    if (dsv4 != nullptr && dsv4->set_rs_depth(depth)) {
+        sched_need_reserve = true;
+    }
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
-    GGML_ASSERT(lid < model.hparams.n_layer());
+    GGML_ASSERT(lid <= model.hparams.n_layer());
 
     cparams.embeddings_layer_inp[lid] = enable;
 
@@ -1541,7 +1646,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
         GGML_ASSERT(backend_h != nullptr);
 
-        const uint32_t n_embd = hparams.n_embd_out();
+        const uint32_t n_embd = hparams.n_embd_nextn();
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
     }
@@ -1716,7 +1821,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    const int64_t n_embd  = hparams.n_embd_inp();
+    const int64_t n_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP
+            ? hparams.n_embd_nextn()
+            : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -1999,7 +2106,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
-                const uint32_t n_embd  = hparams.n_embd_out();
+                const uint32_t n_embd  = hparams.n_embd_nextn();
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
@@ -2111,12 +2218,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
-    embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
+    const size_t n_embd_nextn = model.hparams.n_embd_nextn();
+    embd_nextn.size = has_embd_nextn ? n_embd_nextn*n_outputs_max : 0;
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = (size_t) n_embd_out * n_batch;
+        embd_nextn.size = n_embd_nextn * n_batch;
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -2368,6 +2476,13 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+    return graph_reserve_type(n_tokens, n_seqs, n_outputs, mctx,
+            ctx_type_to_graph_type(cparams.ctx_type), split_only, sizes);
+}
+
+ggml_cgraph * llama_context::graph_reserve_type(
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx,
+        llm_graph_type gtype, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -2401,7 +2516,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     res->reset();
 
@@ -3480,7 +3595,7 @@ llama_context_params llama_context_default_params() {
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
         /*.n_batch                     =*/ 2048,
-        /*.n_ubatch                    =*/ 512,
+        /*.n_ubatch                    =*/ 2048,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
@@ -3740,6 +3855,14 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_rs_rollback_enabled(llama_context * ctx, bool enabled) {
+    ctx->set_rs_rollback_enabled(enabled);
+}
+
+void llama_set_rs_rollback_depth(llama_context * ctx, uint32_t depth) {
+    ctx->set_rs_rollback_depth(depth);
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

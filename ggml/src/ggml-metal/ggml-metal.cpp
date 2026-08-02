@@ -8,6 +8,7 @@
 #include "ggml-metal-ops.h"
 
 #include <mutex>
+#include <map>
 #include <string>
 
 #define GGML_METAL_NAME "MTL"
@@ -188,6 +189,7 @@ static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
 struct ggml_backend_metal_buffer_type {
     int device;
     std::string name;
+    uint32_t sparse_divisor = 1;
 };
 
 struct ggml_backend_metal_buffer_type_deleter {
@@ -393,6 +395,197 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_private(int dev
     }
 
     return &bufts[device];
+}
+
+// DSV4 placement-sparse buffer type. The virtual allocation retains one full
+// affine cache stream per configured sequence. A heap sized for one aggregate
+// context (plus page-granularity scratch slack) backs only pages touched by
+// active sequences.
+
+static const char * ggml_backend_metal_buffer_type_dsv4_sparse_get_name(ggml_backend_buffer_type_t buft) {
+    ggml_backend_metal_buffer_type * ctx = (ggml_backend_metal_buffer_type *) buft->context;
+    return ctx->name.c_str();
+}
+
+static ggml_backend_buffer_t ggml_backend_metal_buffer_type_dsv4_sparse_alloc_buffer(
+        ggml_backend_buffer_type_t buft,
+        size_t size) {
+    ggml_backend_metal_buffer_type * ctx = (ggml_backend_metal_buffer_type *) buft->context;
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t) buft->device->context;
+
+    const size_t page = 64*1024;
+    // Each DSV4 compressed-cache family spans 20 layer tensors. A fresh
+    // virtual stream touches at least one sparse page in every tensor, even
+    // when its byte-proportional share is much smaller than a page.
+    const size_t slack = std::max<size_t>(32*1024*1024,
+            (size_t) ctx->sparse_divisor*20*page);
+    const size_t aggregate = std::min(size,
+            GGML_PAD((size + ctx->sparse_divisor - 1)/ctx->sparse_divisor, page));
+    const size_t physical = aggregate + std::min(slack, size - aggregate);
+
+    ggml_metal_buffer_t res = ggml_metal_buffer_init_sparse(ctx_dev, size, physical);
+    if (res == NULL) {
+        return NULL;
+    }
+    return ggml_backend_buffer_init(buft, ggml_backend_metal_buffer_private_i, res, size);
+}
+
+static size_t ggml_backend_metal_buffer_type_dsv4_sparse_get_alignment(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return 64*1024;
+}
+
+static size_t ggml_backend_metal_buffer_type_dsv4_sparse_get_max_size(ggml_backend_buffer_type_t buft) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t) buft->device->context;
+    return ggml_metal_device_get_props(ctx_dev)->max_buffer_size;
+}
+
+static size_t ggml_backend_metal_buffer_type_dsv4_sparse_get_alloc_size(
+        ggml_backend_buffer_type_t buft,
+        const ggml_tensor * tensor) {
+    return ggml_backend_metal_buffer_type_get_alloc_size(buft, tensor);
+}
+
+static bool ggml_backend_metal_buffer_type_dsv4_sparse_is_host(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return false;
+}
+
+struct ggml_backend_metal_sparse_buft_bundle {
+    ggml_backend_metal_buffer_type_ptr context;
+    ggml_backend_buffer_type buft;
+};
+
+static ggml_backend_buffer_type_t ggml_backend_metal_dsv4_sparse_buffer_type(
+        ggml_backend_dev_t dev,
+        uint32_t n_stream) {
+    if (dev == NULL || n_stream <= 1) {
+        return NULL;
+    }
+
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t) dev->context;
+    const ggml_metal_device_props * props = ggml_metal_device_get_props(ctx_dev);
+    if (!props->has_placement_sparse || props->device_id != GGML_METAL_DEVICE_M2_ULTRA) {
+        return NULL;
+    }
+
+    static std::mutex mutex;
+    static std::map<std::pair<int, uint32_t>, std::unique_ptr<ggml_backend_metal_sparse_buft_bundle>> bundles;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    const auto key = std::make_pair(props->device, n_stream);
+    auto it = bundles.find(key);
+    if (it != bundles.end()) {
+        return &it->second->buft;
+    }
+
+    auto bundle = std::make_unique<ggml_backend_metal_sparse_buft_bundle>();
+    bundle->context.reset(new ggml_backend_metal_buffer_type {
+        /*.device          =*/ props->device,
+        /*.name            =*/ GGML_METAL_NAME + std::to_string(props->device) + "_DSV4Sparse" + std::to_string(n_stream),
+        /*.sparse_divisor  =*/ n_stream,
+    });
+    bundle->buft = {
+        /* .iface = */ {
+            /* .get_name         = */ ggml_backend_metal_buffer_type_dsv4_sparse_get_name,
+            /* .alloc_buffer     = */ ggml_backend_metal_buffer_type_dsv4_sparse_alloc_buffer,
+            /* .get_alignment    = */ ggml_backend_metal_buffer_type_dsv4_sparse_get_alignment,
+            /* .get_max_size     = */ ggml_backend_metal_buffer_type_dsv4_sparse_get_max_size,
+            /* .get_alloc_size   = */ ggml_backend_metal_buffer_type_dsv4_sparse_get_alloc_size,
+            /* .is_host          = */ ggml_backend_metal_buffer_type_dsv4_sparse_is_host,
+        },
+        /* .device  = */ dev,
+        /* .context = */ bundle->context.get(),
+    };
+
+    ggml_backend_buffer_type_t result = &bundle->buft;
+    bundles.emplace(key, std::move(bundle));
+    return result;
+}
+
+static bool ggml_backend_metal_dsv4_sparse_map_tensor_ranges(
+        ggml_tensor * const * tensors,
+        const size_t * offsets,
+        const size_t * sizes,
+        size_t n_ranges) {
+    if (n_ranges == 0) {
+        return true;
+    }
+
+    ggml_backend_buffer_t backend_buffer = tensors[0]->buffer;
+    if (backend_buffer == NULL || !ggml_backend_buffer_is_metal(backend_buffer)) {
+        return true;
+    }
+    ggml_metal_buffer_t buffer = (ggml_metal_buffer_t) backend_buffer->context;
+    if (!ggml_metal_buffer_is_sparse(buffer)) {
+        return true;
+    }
+
+    std::vector<size_t> absolute_offsets(n_ranges);
+    for (size_t i = 0; i < n_ranges; ++i) {
+        if (tensors[i] == NULL || tensors[i]->buffer != backend_buffer) {
+            return false;
+        }
+        const ggml_metal_buffer_id bid = ggml_metal_buffer_get_id(buffer, tensors[i]);
+        if (bid.metal == NULL || offsets[i] > ggml_nbytes(tensors[i]) ||
+                sizes[i] > ggml_nbytes(tensors[i]) - offsets[i]) {
+            return false;
+        }
+        absolute_offsets[i] = bid.offs + offsets[i];
+    }
+
+    return ggml_metal_buffer_sparse_map_write(
+            buffer, absolute_offsets.data(), sizes, n_ranges);
+}
+
+// Returns 0 for a non-sparse tensor, 1 on success, and -1 on a sparse error.
+static int ggml_backend_metal_dsv4_sparse_alias_tensor_rows(
+        const ggml_tensor * src,
+        ggml_tensor * dst,
+        const size_t * offsets,
+        const size_t * sizes,
+        size_t n_ranges) {
+    if (src == NULL || dst == NULL || src->buffer == NULL || src->buffer != dst->buffer ||
+            !ggml_backend_buffer_is_metal(src->buffer)) {
+        return 0;
+    }
+
+    ggml_metal_buffer_t buffer = (ggml_metal_buffer_t) src->buffer->context;
+    if (!ggml_metal_buffer_is_sparse(buffer)) {
+        return 0;
+    }
+    if (ggml_nbytes(src) != ggml_nbytes(dst)) {
+        return -1;
+    }
+
+    const ggml_metal_buffer_id src_bid = ggml_metal_buffer_get_id(buffer, src);
+    const ggml_metal_buffer_id dst_bid = ggml_metal_buffer_get_id(buffer, dst);
+    const bool ok = ggml_metal_buffer_sparse_alias(
+            buffer, src_bid.offs, dst_bid.offs, ggml_nbytes(src),
+            offsets, sizes, n_ranges);
+    return ok ? 1 : -1;
+}
+
+// Returns 0 for a non-sparse tensor, 1 on success, and -1 on a sparse error.
+static int ggml_backend_metal_dsv4_sparse_unmap_tensor_range(
+        ggml_tensor * tensor,
+        size_t offset,
+        size_t size) {
+    if (tensor == NULL || tensor->buffer == NULL || !ggml_backend_buffer_is_metal(tensor->buffer)) {
+        return 0;
+    }
+
+    ggml_metal_buffer_t buffer = (ggml_metal_buffer_t) tensor->buffer->context;
+    if (!ggml_metal_buffer_is_sparse(buffer)) {
+        return 0;
+    }
+
+    const ggml_metal_buffer_id bid = ggml_metal_buffer_get_id(buffer, tensor);
+    if (offset > ggml_nbytes(tensor) || size > ggml_nbytes(tensor) - offset) {
+        return -1;
+    }
+    const bool ok = ggml_metal_buffer_sparse_unmap(buffer, bid.offs + offset, size);
+    return ok ? 1 : -1;
 }
 
 // mapped buffer type
@@ -738,6 +931,7 @@ static bool ggml_backend_metal_device_supports_buft(ggml_backend_dev_t dev, ggml
         buft->device == dev && (
         buft->iface.get_name == ggml_backend_metal_buffer_type_shared_get_name ||
         buft->iface.get_name == ggml_backend_metal_buffer_type_private_get_name ||
+        buft->iface.get_name == ggml_backend_metal_buffer_type_dsv4_sparse_get_name ||
         buft->iface.get_name == ggml_backend_metal_buffer_type_mapped_get_name);
 
     GGML_UNUSED(dev);
@@ -871,6 +1065,18 @@ static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_buffer_type") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_map_tensor_ranges") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_map_tensor_ranges;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_alias_tensor_rows") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_alias_tensor_rows;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_unmap_tensor_range") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_unmap_tensor_range;
     }
 
     return NULL;

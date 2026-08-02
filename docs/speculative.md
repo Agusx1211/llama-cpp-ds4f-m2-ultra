@@ -100,11 +100,31 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
-`--spec-draft-conf-min P` truncates each drafted block at the first position whose predicted
+`--spec-draft-p-min P` truncates each drafted block at the first position whose predicted
 acceptance (from the draft's confidence head, if present) falls below `P` (default 0 = disabled).
 
-Currently only drafts with a Qwen3 backbone are supported; support for other backbones
-(e.g. Gemma4) is planned.
+DeepSeek V4 Flash's native three-block DSpark sidecar is also supported in this fork. On the
+M2 Ultra, the measured long-generation single-stream setting is the trained five-token block
+with confidence 0.5:
+
+```bash
+llama-server -m DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
+    -md DeepSeek-V4-Flash-DSpark-BF16.gguf \
+    --spec-type draft-dspark --spec-draft-n-max 5 --spec-draft-n-min 1 \
+    --spec-draft-p-min 0.5 -ngl all -ngld all -fa on -b 2048 -ub 2048
+```
+
+The M2 Ultra server adapts that configuration to continuous batching: it uses the configured
+five-token/confidence mode with one active request, depth one with two or three active requests,
+and bypasses DSpark at four or more until the busy cohort drains. The cutoff also disables target
+feature extraction and recurrent rollback snapshots, so bypass is close to target-only execution.
+
+DSpark and MTP are alternative proposal engines, not a serial pipeline. The Q8_0 MTP sidecar is
+smaller and remains faster across two to four active requests; loading both sidecars or running
+both proposal graphs has no measured end-to-end benefit. Use DSpark for experiments that favor
+its long single-stream mode and MTP as the general serving default.
+
+Other DSpark backbones remain outside this fork's DeepSeek V4 Flash target.
 
 See:
 
@@ -223,7 +243,7 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
                                         HuggingFace repository for the draft model
                                         (env: LLAMA_ARG_SPEC_DRAFT_HF_REPO)
 --spec-draft-n-max                      N
-                                        number of tokens to draft for speculative decoding (default: 3)
+                                        number of tokens to draft for speculative decoding (default: 1)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MAX)
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)

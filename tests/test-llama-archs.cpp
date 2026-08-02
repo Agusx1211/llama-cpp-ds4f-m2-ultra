@@ -9,6 +9,7 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
 #include <algorithm>
@@ -81,7 +82,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool dsv4_mtp = false) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = arch == LLM_ARCH_DEEPSEEK4 ? 256 : 128;
@@ -115,6 +116,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_embd = 128;
         n_head = 2;
         n_ff   = 64;
+        n_layer = dsv4_mtp ? 3 : 2;
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
     } else if (arch == LLM_ARCH_CHAMELEON) {
@@ -129,6 +131,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
     ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+    if (dsv4_mtp) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    }
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -237,7 +242,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,            uint32_t(1));
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,              uint32_t(32));
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,       10000.0f);
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,               std::vector<uint32_t>({4, 128}));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,
+                dsv4_mtp ? std::vector<uint32_t>({4, 128, 0}) : std::vector<uint32_t>({4, 128}));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,                  uint32_t(4));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,    uint32_t(1));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,                1.0e-6f);
@@ -287,6 +293,8 @@ struct test_context_config {
     uint32_t n_ubatch    = 64;
     uint32_t n_seq_max   = 1;
     bool     kv_unified  = false;
+    bool     load_mtp    = false;
+    llama_context_type ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
 };
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
@@ -300,6 +308,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
+    model_params.load_mtp = config.load_mtp;
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = config.n_ctx;
@@ -308,6 +317,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     }
     ctx_params.n_seq_max = config.n_seq_max;
     ctx_params.kv_unified = config.kv_unified;
+    ctx_params.ctx_type = config.ctx_type;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
     if (!encode) {
@@ -362,6 +372,105 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+static void test_dsv4_mtp_device(
+        const size_t seed, const std::vector<ggml_backend_dev_t> & devices, const char * device_label) {
+    const std::vector<llama_token> tokens = get_tokens(8, 128, seed);
+
+    test_context_config trunk_config;
+    trunk_config.n_ctx = 256;
+    trunk_config.n_batch = tokens.size();
+    trunk_config.n_ubatch = tokens.size();
+
+    auto trunk_gguf = get_gguf_ctx(LLM_ARCH_DEEPSEEK4, true);
+    auto trunk = get_model_and_ctx(
+            trunk_gguf.get(), nullptr, seed, devices, LLAMA_SPLIT_MODE_LAYER, false, trunk_config);
+    llama_set_embeddings_nextn(trunk.second.get(), true, false);
+    const std::vector<float> logits_trunk = get_logits(trunk.first.get(), trunk.second.get(), tokens);
+    const int32_t n_embd_nextn = llama_model_n_embd_nextn(trunk.first.get());
+    GGML_ASSERT(n_embd_nextn == 4*llama_model_n_embd(trunk.first.get()));
+    const float * target_h = llama_get_embeddings_nextn(trunk.second.get());
+    GGML_ASSERT(target_h);
+
+    test_context_config mtp_config = trunk_config;
+    mtp_config.load_mtp = true;
+    auto mtp_gguf = get_gguf_ctx(LLM_ARCH_DEEPSEEK4, true, true);
+    auto target = get_model_and_ctx(
+            mtp_gguf.get(), nullptr, seed, devices, LLAMA_SPLIT_MODE_LAYER, false, mtp_config);
+
+    const std::vector<float> logits_mtp_target = get_logits(target.first.get(), target.second.get(), tokens);
+    const double target_nmse = nmse(logits_trunk, logits_mtp_target);
+    GGML_ASSERT(target_nmse < 1e-12 && "bundled MTP metadata changed DSV4 trunk logits");
+
+    GGML_ASSERT(n_embd_nextn == llama_model_n_embd_nextn(target.first.get()));
+
+    llama_context_params draft_params = llama_context_default_params();
+    draft_params.n_ctx = 256;
+    draft_params.n_batch = tokens.size();
+    draft_params.n_ubatch = tokens.size();
+    draft_params.n_seq_max = 1;
+    draft_params.n_threads = 4;
+    draft_params.n_threads_batch = 4;
+    draft_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+
+    llama_context_ptr draft(llama_init_from_model(target.first.get(), draft_params));
+    GGML_ASSERT(draft);
+    llama_set_embeddings_nextn(draft.get(), true, true);
+
+    llama_batch batch = llama_batch_init(tokens.size(), n_embd_nextn, 1);
+    std::vector<llama_token> draft_tokens(tokens);
+    batch.token = draft_tokens.data();
+    batch.n_tokens = tokens.size();
+    std::memset(batch.embd, 0, (size_t) tokens.size()*n_embd_nextn*sizeof(float));
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        batch.pos[i] = i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = 1;
+        if (i > 0) {
+            std::memcpy(
+                    batch.embd + i*(size_t) n_embd_nextn,
+                    target_h + (i - 1)*(size_t) n_embd_nextn,
+                    (size_t) n_embd_nextn*sizeof(float));
+        }
+    }
+
+    GGML_ASSERT(llama_decode(draft.get(), batch) == 0);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const float * logits = llama_get_logits_ith(draft.get(), i);
+        const float * h = llama_get_embeddings_nextn_ith(draft.get(), i);
+        GGML_ASSERT(logits && h);
+        for (int32_t j = 0; j < llama_vocab_n_tokens(llama_model_get_vocab(target.first.get())); ++j) {
+            GGML_ASSERT(std::isfinite(logits[j]));
+        }
+        for (int32_t j = 0; j < n_embd_nextn; ++j) {
+            GGML_ASSERT(std::isfinite(h[j]));
+        }
+    }
+
+    batch.token = nullptr;
+    llama_batch_free(batch);
+    printf("  DSV4 MTP graph (%s): target NMSE %.3e, hidden width %d, finite draft rows %zu\n",
+            device_label, target_nmse, n_embd_nextn, tokens.size());
+}
+
+static void test_dsv4_mtp(const size_t seed) {
+    test_dsv4_mtp_device(seed, {}, "CPU");
+
+    ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu) {
+        test_dsv4_mtp_device(seed, { gpu }, ggml_backend_dev_description(gpu));
+    }
+}
+
+static bool dsv4_test_has_elastic_pages(ggml_backend_dev_t dev, uint32_t n_seq_max) {
+    using sparse_buft_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, uint32_t);
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    auto * get_buft = reg ? (sparse_buft_fn) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_metal_dsv4_sparse_buffer_type") : nullptr;
+    return get_buft && get_buft(dev, n_seq_max) != nullptr;
+}
+
 struct dsv4_test_context {
     llama_model_ptr   model;
     llama_context_ptr lctx;
@@ -374,9 +483,10 @@ struct dsv4_test_context {
             uint32_t n_seq_max,
             bool kv_unified,
             uint32_t batch_capacity,
-            uint32_t max_seq_ids = 1) {
+            uint32_t max_seq_ids = 1,
+            uint32_t n_ctx_total = 0) {
         test_context_config config;
-        config.n_ctx = 256*n_seq_max;
+        config.n_ctx = n_ctx_total > 0 ? n_ctx_total : 256*n_seq_max;
         config.n_batch = batch_capacity;
         config.n_ubatch = batch_capacity;
         config.n_seq_max = n_seq_max;
@@ -388,6 +498,11 @@ struct dsv4_test_context {
 
         model = std::move(loaded.first);
         lctx = std::move(loaded.second);
+        GGML_ASSERT(llama_n_ctx(lctx.get()) == config.n_ctx);
+        const uint32_t expected_seq_ctx = kv_unified && dsv4_test_has_elastic_pages(dev, n_seq_max)
+            ? config.n_ctx
+            : config.n_ctx/n_seq_max;
+        GGML_ASSERT(llama_n_ctx_seq(lctx.get()) == expected_seq_ctx);
         n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         batch = llama_batch_init(batch_capacity, 0, max_seq_ids);
     }
@@ -699,6 +814,33 @@ static bool compare_dsv4_trace(
     return trace_nmse <= 1.0e-8 && max_abs_error <= 1.0e-5;
 }
 
+static bool test_dsv4_elastic_borrow(size_t seed, ggml_backend_dev_t dev) {
+    static constexpr uint32_t n_ctx_total = 512;
+    static constexpr uint32_t n_tokens = 300;
+
+    if (!dsv4_test_has_elastic_pages(dev, 2)) {
+        return true;
+    }
+
+    const std::vector<llama_token> tokens = get_tokens(n_tokens, 128, seed + 10);
+    const auto run = [&](uint32_t n_seq_max, bool kv_unified) {
+        dsv4_test_context test(seed, dev, n_seq_max, kv_unified, n_tokens, 1, n_ctx_total);
+        for (uint32_t pos = 0; pos < n_tokens; ++pos) {
+            test.add(tokens[pos], pos, {0});
+        }
+        test.decode("elastic borrowing");
+
+        std::vector<float> result;
+        result.reserve(test.n_vocab);
+        test.append_logits(n_tokens - 1, result);
+        return result;
+    };
+
+    const std::vector<float> isolated = run(1, false);
+    const std::vector<float> elastic  = run(2, true);
+    return compare_dsv4_trace("elastic-borrow", "A", isolated, elastic);
+}
+
 static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     static constexpr uint32_t n_vocab = 128;
     static constexpr uint32_t n_prompt = 128;
@@ -720,12 +862,13 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
 
     const parallel_case cases[] = {
         { "split-contiguous",   false, 2, 0, 1 },
-        { "unified-contiguous", true,  2, 0, 1 },
+        { "requested-unified-contiguous",          true,  2, 0, 1 },
         { "split-sparse",       false, 4, 0, 2 },
-        { "unified-sparse",     true,  4, 0, 2 },
+        { "requested-unified-sparse",              true,  4, 0, 2 },
     };
 
     bool all_ok = true;
+    all_ok = test_dsv4_elastic_borrow(seed, dev) && all_ok;
     for (const parallel_case & test_case : cases) {
         const dsv4_parallel_result parallel = run_dsv4_parallel(
                 seed, dev, tokens_a, tokens_b, n_prompt,
@@ -743,7 +886,8 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     const std::vector<float> isolated_coupled_b = run_dsv4_isolated(seed, dev, coupled_b, n_prompt);
 
     for (bool kv_unified : { false, true }) {
-        const char * mode = kv_unified ? "unified-coupled" : "split-coupled";
+        const char * mode = kv_unified ?
+            "requested-unified-coupled" : "split-coupled";
         const dsv4_parallel_result coupled = run_dsv4_shared_prefix(
                 seed, dev, coupled_a, coupled_b, n_prompt, kv_unified, dsv4_prefix_setup::COUPLED);
         all_ok = compare_dsv4_trace(mode, "A", isolated_coupled_a, coupled.seq_a) && all_ok;
@@ -751,7 +895,8 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     }
 
     for (bool kv_unified : { false, true }) {
-        const char * mode = kv_unified ? "unified-copied" : "split-copied";
+        const char * mode = kv_unified ?
+            "requested-unified-copied" : "split-copied";
         const dsv4_parallel_result copied = run_dsv4_shared_prefix(
                 seed, dev, coupled_a, coupled_b, n_prompt, kv_unified, dsv4_prefix_setup::COPIED);
         all_ok = compare_dsv4_trace(mode, "A", isolated_coupled_a, copied.seq_a) && all_ok;
@@ -759,7 +904,8 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     }
 
     for (bool kv_unified : { false, true }) {
-        const char * mode = kv_unified ? "unified-restored" : "split-restored";
+        const char * mode = kv_unified ?
+            "requested-unified-restored" : "split-restored";
         const dsv4_parallel_result restored = run_dsv4_shared_prefix(
                 seed, dev, coupled_a, coupled_b, n_prompt, kv_unified, dsv4_prefix_setup::RESTORED);
         all_ok = compare_dsv4_trace(mode, "A", isolated_coupled_a, restored.seq_a) && all_ok;
@@ -773,7 +919,8 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     const std::vector<float> isolated_asymmetric_b = run_dsv4_isolated(seed, dev, asymmetric_b, n_short_prompt);
 
     for (bool kv_unified : { false, true }) {
-        const char * mode = kv_unified ? "unified-asymmetric" : "split-asymmetric";
+        const char * mode = kv_unified ?
+            "requested-unified-asymmetric" : "split-asymmetric";
         const dsv4_parallel_result asymmetric = run_dsv4_asymmetric(
                 seed, dev, asymmetric_a, asymmetric_b, n_prompt, n_short_prompt, kv_unified);
         all_ok = compare_dsv4_trace(mode, "A", isolated_asymmetric_a, asymmetric.seq_a) && all_ok;
@@ -791,7 +938,8 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     const std::vector<float> isolated_replacement = run_dsv4_isolated(seed, dev, replacement, n_prompt);
 
     for (bool kv_unified : { false, true }) {
-        const char * mode = kv_unified ? "unified-reuse" : "split-reuse";
+        const char * mode = kv_unified ?
+            "requested-unified-reuse" : "split-reuse";
         const dsv4_parallel_result reused = run_dsv4_reused_slot(
                 seed, dev, discarded, survivor, replacement,
                 n_prompt, n_decode_before_reuse, kv_unified);
@@ -1191,6 +1339,7 @@ int main(int argc, char ** argv) {
             return backends_result;
         }
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_DEEPSEEK4) {
+            test_dsv4_mtp(seed);
             return test_dsv4_parallel(seed);
         }
         return 0;
