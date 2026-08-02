@@ -150,6 +150,52 @@ struct ggml_metal_op {
             ? n_filtered : 0;
     }
 
+    int can_fuse_dsv4_swiglu_clamp_raw(int i0) const {
+        static constexpr ggml_op ops[] = {
+            GGML_OP_CLAMP, GGML_OP_CLAMP, GGML_OP_CLAMP,
+            GGML_OP_CLAMP, GGML_OP_GLU,   GGML_OP_GLU,
+        };
+        // CLAMP is an in-place view of an external source, which the generic
+        // helper intentionally rejects. Validate the raw nodes as structural
+        // outputs first, then prove below that neither skipped write is observable.
+        static constexpr int outputs[] = { 0, 1, 2, 3, 4, 5 };
+
+        const int n_filtered = can_fuse_subgraph_raw(i0, ops, 6, outputs, 6);
+        if (n_filtered != 6) {
+            return 0;
+        }
+
+        const auto graph_use_count = [this](const ggml_tensor * tensor) -> int32_t {
+            if (tensor == nullptr) {
+                return -1;
+            }
+            const size_t hash_pos = ggml_hash_find(&gf->visited_hash_set, tensor);
+            if (hash_pos == GGML_HASHSET_FULL ||
+                    !ggml_bitset_get(gf->visited_hash_set.used, hash_pos)) {
+                return -1;
+            }
+            return gf->use_counts[hash_pos];
+        };
+
+        for (int i = 0; i < 4; ++i) {
+            const ggml_tensor * clamp = node(i0 + i);
+            const ggml_tensor * src   = clamp->src[0];
+            const bool direct_alias = src != nullptr && clamp->view_src == src;
+            const bool same_layout  = src != nullptr && ggml_are_same_layout(clamp, src);
+            const bool clamp_output = (clamp->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
+            const bool src_output   = src != nullptr && (src->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
+            const int32_t clamp_uses = graph_use_count(clamp);
+            const int32_t src_uses   = graph_use_count(src);
+
+            if (!direct_alias || clamp->view_offs != 0 || !same_layout ||
+                    clamp_output || src_output || clamp_uses != 1 || src_uses != 1) {
+                return 0;
+            }
+        }
+
+        return n_filtered;
+    }
+
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
     ggml_metal_encoder_t enc;
@@ -970,15 +1016,159 @@ static int ggml_metal_op_dsv4_router_fused(ggml_metal_op_t ctx, int idx) {
     return n_filtered;
 }
 
+struct ggml_metal_dsv4_swiglu_clamp_match {
+    ggml_tensor * gate;
+    ggml_tensor * up;
+    ggml_tensor * out;
+    float limit;
+    int64_t n_tokens;
+    bool routed;
+};
+
+static int ggml_metal_op_dsv4_swiglu_clamp_fused(ggml_metal_op_t ctx, int idx) {
+    static const bool disabled = std::getenv("GGML_METAL_DSV4_SWIGLU_CLAMP_DISABLE") != nullptr;
+
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+    if (disabled || props_dev->device_id != GGML_METAL_DEVICE_M2_ULTRA) {
+        return 0;
+    }
+
+    const int n_filtered = ctx->can_fuse_dsv4_swiglu_clamp_raw(idx);
+    if (n_filtered == 0) {
+        return 0;
+    }
+
+    ggml_tensor * clamps[] = {
+        ctx->node(idx + 0), ctx->node(idx + 1),
+        ctx->node(idx + 2), ctx->node(idx + 3),
+    };
+    ggml_metal_dsv4_swiglu_clamp_match matches[2] = {};
+    uint32_t used_clamps = 0;
+
+    const auto clamp_index = [&clamps](const ggml_tensor * clamp) {
+        for (int i = 0; i < 4; ++i) {
+            if (clamps[i] == clamp) {
+                return i;
+            }
+        }
+        return -1;
+    };
+
+    const auto match_glu = [&](ggml_tensor * glu, ggml_metal_dsv4_swiglu_clamp_match & match) {
+        if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+                ggml_get_op_params_i32(glu, 1) != 0) {
+            return false;
+        }
+
+        ggml_tensor * gate_clamp = glu->src[0];
+        ggml_tensor * up_clamp   = glu->src[1];
+        const int gate_idx = clamp_index(gate_clamp);
+        const int up_idx   = clamp_index(up_clamp);
+        if (gate_idx < 0 || up_idx < 0 || gate_idx == up_idx ||
+                (used_clamps & (1u << gate_idx)) != 0 ||
+                (used_clamps & (1u << up_idx)) != 0) {
+            return false;
+        }
+
+        ggml_tensor * gate = gate_clamp->src[0];
+        ggml_tensor * up   = up_clamp->src[0];
+        const float gate_min = ggml_get_op_params_f32(gate_clamp, 0);
+        const float limit    = ggml_get_op_params_f32(gate_clamp, 1);
+        const float up_min   = ggml_get_op_params_f32(up_clamp, 0);
+        const float up_max   = ggml_get_op_params_f32(up_clamp, 1);
+
+        const bool shared_shape =
+            glu->ne[0] == 2048 && glu->ne[1] >= 224 && glu->ne[1] <= 2048 &&
+            glu->ne[2] == 1 && glu->ne[3] == 1;
+        const bool routed_shape =
+            glu->ne[0] == 2048 && glu->ne[1] == 6 &&
+            glu->ne[2] >= 224 && glu->ne[2] <= 2048 && glu->ne[3] == 1;
+        const bool shape_ok = shared_shape != routed_shape &&
+            ggml_are_same_shape(gate, up) && ggml_are_same_shape(gate, glu);
+        const bool type_layout_ok =
+            gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous_1(gate) && ggml_is_contiguous_1(up) && ggml_is_contiguous_1(glu);
+        const bool clamp_ok =
+            std::isinf(gate_min) && gate_min < 0.0f &&
+            std::isfinite(limit) && limit > 0.0f &&
+            up_min == -limit && up_max == limit;
+        if (!shape_ok || !type_layout_ok || !clamp_ok) {
+            return false;
+        }
+
+        used_clamps |= (1u << gate_idx) | (1u << up_idx);
+        match = { gate, up, glu, limit, shared_shape ? glu->ne[1] : glu->ne[2], routed_shape };
+        return true;
+    };
+
+    if (!match_glu(ctx->node(idx + 4), matches[0]) ||
+            !match_glu(ctx->node(idx + 5), matches[1]) ||
+            used_clamps != 0x0fu || matches[0].routed == matches[1].routed ||
+            matches[0].n_tokens != matches[1].n_tokens || matches[0].limit != matches[1].limit) {
+        return 0;
+    }
+
+    for (int i = 1; i < n_filtered; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    auto pipeline = ggml_metal_library_get_pipeline_dsv4_swiglu_clamp(ctx->lib);
+    const auto encode = [&](const ggml_metal_dsv4_swiglu_clamp_match & match) {
+        ggml_metal_kargs_glu args = {
+            /*.ne00 =*/ static_cast<int32_t>(match.gate->ne[0]),
+            /*.nb01 =*/ match.gate->nb[1],
+            /*.ne10 =*/ static_cast<int32_t>(match.up->ne[0]),
+            /*.nb11 =*/ match.up->nb[1],
+            /*.ne0  =*/ static_cast<int32_t>(match.out->ne[0]),
+            /*.nb1  =*/ match.out->nb[1],
+            /*.i00  =*/ 0,
+            /*.i10  =*/ 0,
+            /*.alpha=*/ 0.0f,
+            /*.limit=*/ match.limit,
+        };
+
+        ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+        ggml_metal_encoder_set_bytes (ctx->enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(match.gate), 1);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(match.up),   2);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(match.out), 3);
+
+        const int32_t nth = std::min(
+            ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), (int) match.gate->ne[0]/2);
+        ggml_metal_encoder_dispatch_threadgroups(
+            ctx->enc, ggml_nrows(match.gate), 1, 1, nth, 1, 1);
+    };
+
+    encode(matches[0]);
+    encode(matches[1]);
+
+    if (ctx->debug_fusion > 1) {
+        GGML_LOG_DEBUG("%s: fuse: DSV4 dual clamp + SwiGLU (%lld tokens)\n",
+            __func__, (long long) matches[0].n_tokens);
+    }
+
+    return n_filtered;
+}
+
 int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
     if (ctx->use_fusion) {
+        if (op->op == GGML_OP_CLAMP) {
+            const int n_clamp_fuse = ggml_metal_op_dsv4_swiglu_clamp_fused(ctx, idx);
+            if (n_clamp_fuse > 0) {
+                return n_clamp_fuse;
+            }
+        }
+
         const int n_fuse = ggml_metal_op_dsv4_router_fused(ctx, idx);
         if (n_fuse > 0) {
             return n_fuse;
         }
     }
-
-    ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;

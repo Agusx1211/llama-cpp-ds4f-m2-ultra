@@ -1562,6 +1562,27 @@ typedef decltype(kernel_swiglu<float>) kernel_swiglu_t;
 template [[host_name("kernel_swiglu_f32")]] kernel kernel_swiglu_t kernel_swiglu<float>;
 template [[host_name("kernel_swiglu_f16")]] kernel kernel_swiglu_t kernel_swiglu<half>;
 
+kernel void kernel_dsv4_swiglu_clamp_f32(
+        constant ggml_metal_kargs_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint tgpig[[threadgroup_position_in_grid]],
+        uint tpitg[[thread_position_in_threadgroup]],
+        uint   ntg[[threads_per_threadgroup]]) {
+    device const float * src0_row = (device const float *) (src0 + tgpig*args.nb01);
+    device const float * src1_row = (device const float *) (src1 + tgpig*args.nb11);
+    device       float * dst_row  = (device       float *) (dst  + tgpig*args.nb1);
+
+    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
+        const float x0 = clamp(src0_row[i0], -INFINITY, args.limit);
+        const float x1 = clamp(src1_row[i0], -args.limit, args.limit);
+        const float silu = x0 / (1.0f + exp(-x0));
+
+        dst_row[i0] = silu*x1;
+    }
+}
+
 template<typename T>
 kernel void kernel_swiglu_oai(
         constant ggml_metal_kargs_glu & args,
