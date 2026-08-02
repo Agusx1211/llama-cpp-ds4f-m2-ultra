@@ -150,6 +150,42 @@ struct ggml_metal_op {
             ? n_filtered : 0;
     }
 
+    int can_fuse_dsv4_swiglu_clamp_raw(int i0) const {
+        static constexpr ggml_op ops[] = { GGML_OP_CLAMP, GGML_OP_CLAMP, GGML_OP_GLU };
+        // CLAMP is an in-place view of an external source, which the generic
+        // helper intentionally rejects. Validate the raw nodes as structural
+        // outputs first, then prove below that neither skipped write is observable.
+        static constexpr int outputs[] = { 0, 1, 2 };
+
+        const int n_filtered = can_fuse_subgraph_raw(i0, ops, 3, outputs, 3);
+        if (n_filtered != 3) {
+            return 0;
+        }
+
+        const auto has_one_graph_use = [this](const ggml_tensor * tensor) {
+            const size_t hash_pos = ggml_hash_find(&gf->visited_hash_set, tensor);
+            return hash_pos != GGML_HASHSET_FULL &&
+                ggml_bitset_get(gf->visited_hash_set.used, hash_pos) &&
+                gf->use_counts[hash_pos] == 1;
+        };
+
+        for (int i = 0; i < 2; ++i) {
+            const ggml_tensor * clamp = node(i0 + i);
+            const ggml_tensor * src   = clamp->src[0];
+
+            if (src == nullptr ||
+                    clamp->view_src != src || clamp->view_offs != 0 ||
+                    !ggml_are_same_layout(clamp, src) ||
+                    (clamp->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+                    (src->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+                    !has_one_graph_use(clamp) || !has_one_graph_use(src)) {
+                return 0;
+            }
+        }
+
+        return n_filtered;
+    }
+
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
     ggml_metal_encoder_t enc;
@@ -972,29 +1008,14 @@ static int ggml_metal_op_dsv4_router_fused(ggml_metal_op_t ctx, int idx) {
 
 static int ggml_metal_op_dsv4_swiglu_clamp_fused(ggml_metal_op_t ctx, int idx) {
     static const bool disabled = std::getenv("GGML_METAL_DSV4_SWIGLU_CLAMP_DISABLE") != nullptr;
-    static constexpr ggml_op ops[] = { GGML_OP_CLAMP, GGML_OP_CLAMP, GGML_OP_GLU };
-    static constexpr int outputs[] = { 2 };
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
-    if (disabled) {
-        if (ctx->debug_fusion > 1) {
-            GGML_LOG_DEBUG("%s: skip: DSV4 clamp + SwiGLU disabled\n", __func__);
-        }
-        return 0;
-    }
-    if (props_dev->device_id != GGML_METAL_DEVICE_M2_ULTRA) {
-        if (ctx->debug_fusion > 1) {
-            GGML_LOG_DEBUG("%s: skip: DSV4 clamp + SwiGLU device %d is not M2 Ultra\n",
-                __func__, (int) props_dev->device_id);
-        }
+    if (disabled || props_dev->device_id != GGML_METAL_DEVICE_M2_ULTRA) {
         return 0;
     }
 
-    const int n_filtered = ctx->can_fuse_subgraph_raw(idx, ops, 3, outputs, 1);
+    const int n_filtered = ctx->can_fuse_dsv4_swiglu_clamp_raw(idx);
     if (n_filtered == 0) {
-        if (ctx->debug_fusion > 1) {
-            GGML_LOG_DEBUG("%s: skip: DSV4 clamp + SwiGLU raw subgraph eligibility failed\n", __func__);
-        }
         return 0;
     }
 
@@ -1011,9 +1032,6 @@ static int ggml_metal_op_dsv4_swiglu_clamp_fused(ggml_metal_op_t ctx, int idx) {
         gate_clamp = clamp1;
         up_clamp   = clamp0;
     } else {
-        if (ctx->debug_fusion > 1) {
-            GGML_LOG_DEBUG("%s: skip: DSV4 clamp + SwiGLU edges do not connect both clamps to GLU\n", __func__);
-        }
         return 0;
     }
 
@@ -1041,32 +1059,6 @@ static int ggml_metal_op_dsv4_swiglu_clamp_fused(ggml_metal_op_t ctx, int idx) {
         up_min == -limit && up_max == limit;
 
     if (!edges_ok || !shape_ok || !type_layout_ok || !clamp_ok) {
-        if (ctx->debug_fusion > 1) {
-            if (!edges_ok) {
-                GGML_LOG_DEBUG("%s: skip: DSV4 clamp + SwiGLU edge params failed (op=%d swapped=%d)\n",
-                    __func__, (int) ggml_get_glu_op(glu), ggml_get_op_params_i32(glu, 1));
-            }
-            if (!shape_ok) {
-                GGML_LOG_DEBUG("%s: skip: DSV4 clamp + SwiGLU shape failed "
-                    "(out=[%lld,%lld,%lld,%lld] gate_same=%d up_same=%d)\n",
-                    __func__,
-                    (long long) glu->ne[0], (long long) glu->ne[1],
-                    (long long) glu->ne[2], (long long) glu->ne[3],
-                    (int) ggml_are_same_shape(gate, glu), (int) ggml_are_same_shape(up, glu));
-            }
-            if (!type_layout_ok) {
-                GGML_LOG_DEBUG("%s: skip: DSV4 clamp + SwiGLU type/layout failed "
-                    "(types=%d/%d/%d contiguous_1=%d/%d/%d)\n",
-                    __func__, (int) gate->type, (int) up->type, (int) glu->type,
-                    (int) ggml_is_contiguous_1(gate), (int) ggml_is_contiguous_1(up),
-                    (int) ggml_is_contiguous_1(glu));
-            }
-            if (!clamp_ok) {
-                GGML_LOG_DEBUG("%s: skip: DSV4 clamp + SwiGLU clamp params failed "
-                    "(gate=[%g,%g] up=[%g,%g])\n",
-                    __func__, (double) gate_min, (double) limit, (double) up_min, (double) up_max);
-            }
-        }
         return 0;
     }
 
