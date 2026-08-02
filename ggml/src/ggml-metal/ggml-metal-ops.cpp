@@ -30,6 +30,12 @@ static_assert(offsetof(ggml_metal_kargs_mul_mv_ext, nb10) == 64, "ggml_metal_kar
 static_assert(offsetof(ggml_metal_kargs_mul_mv_ext, r2) == 104, "ggml_metal_kargs_mul_mv_ext r2 offset changed");
 static_assert(offsetof(ggml_metal_kargs_mul_mv_ext, reserved2) == 108, "ggml_metal_kargs_mul_mv_ext reserved2 offset changed");
 
+static_assert(sizeof(ggml_metal_kargs_mul_mv_id) == 120, "ggml_metal_kargs_mul_mv_id ABI size changed");
+static_assert(offsetof(ggml_metal_kargs_mul_mv_id, reserved0) == 28, "ggml_metal_kargs_mul_mv_id reserved0 offset changed");
+static_assert(offsetof(ggml_metal_kargs_mul_mv_id, nb00) == 32, "ggml_metal_kargs_mul_mv_id nb00 offset changed");
+static_assert(offsetof(ggml_metal_kargs_mul_mv_id, nr0) == 112, "ggml_metal_kargs_mul_mv_id nr0 offset changed");
+static_assert(offsetof(ggml_metal_kargs_mul_mv_id, reserved1) == 116, "ggml_metal_kargs_mul_mv_id reserved1 offset changed");
+
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
         return { nullptr, 0 };
@@ -3188,6 +3194,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             /*.ne00 =*/ ne00,
             /*.ne01 =*/ ne01,
             /*.ne02 =*/ ne02,
+            /*.reserved0 =*/ 0,
             /*.nb00 =*/ nb00,
             /*.nb01 =*/ nb01,
             /*.nb02 =*/ nb02,
@@ -3202,6 +3209,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             /*.ne1  =*/ ne1,
             /*.nb1  =*/ nb1,
             /*.nr0  =*/ nr0,
+            /*.reserved1 =*/ 0,
         };
 
         if (ggml_is_quantized(op->src[0]->type)) {
