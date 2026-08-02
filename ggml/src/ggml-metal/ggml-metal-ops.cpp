@@ -1029,11 +1029,11 @@ static int ggml_metal_op_dsv4_swiglu_clamp_fused(ggml_metal_op_t ctx, int idx) {
     }
 
     ggml_metal_kargs_glu args = {
-        /*.ne00 =*/ gate->ne[0],
+        /*.ne00 =*/ static_cast<int32_t>(gate->ne[0]),
         /*.nb01 =*/ gate->nb[1],
-        /*.ne10 =*/ up->ne[0],
+        /*.ne10 =*/ static_cast<int32_t>(up->ne[0]),
         /*.nb11 =*/ up->nb[1],
-        /*.ne0  =*/ glu->ne[0],
+        /*.ne0  =*/ static_cast<int32_t>(glu->ne[0]),
         /*.nb1  =*/ glu->nb[1],
         /*.i00  =*/ 0,
         /*.i10  =*/ 0,
