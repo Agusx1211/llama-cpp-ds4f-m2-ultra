@@ -322,7 +322,9 @@ struct common_params_model {
 
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
-    int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
+    // DeepSeek V4 Flash on M2 Ultra is bandwidth-bound in target decode, but
+    // its full MoE MTP block and shared output head make deeper drafts slower.
+    int32_t n_max = 1; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
     float p_split = 0.1f; // speculative decoding split probability
