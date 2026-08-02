@@ -18,13 +18,17 @@
 static_assert(sizeof(ggml_metal_kargs_mul_mv) == 112, "ggml_metal_kargs_mul_mv ABI size changed");
 static_assert(offsetof(ggml_metal_kargs_mul_mv, reserved0) == 12, "ggml_metal_kargs_mul_mv reserved offset changed");
 static_assert(offsetof(ggml_metal_kargs_mul_mv, nb00) == 16, "ggml_metal_kargs_mul_mv nb00 offset changed");
+static_assert(offsetof(ggml_metal_kargs_mul_mv, reserved1) == 60, "ggml_metal_kargs_mul_mv reserved1 offset changed");
+static_assert(offsetof(ggml_metal_kargs_mul_mv, nb10) == 64, "ggml_metal_kargs_mul_mv nb10 offset changed");
 static_assert(offsetof(ggml_metal_kargs_mul_mv, r2) == 108, "ggml_metal_kargs_mul_mv r2 offset changed");
 
 static_assert(sizeof(ggml_metal_kargs_mul_mv_ext) == 112, "ggml_metal_kargs_mul_mv_ext ABI size changed");
 static_assert(offsetof(ggml_metal_kargs_mul_mv_ext, reserved0) == 12, "ggml_metal_kargs_mul_mv_ext reserved0 offset changed");
 static_assert(offsetof(ggml_metal_kargs_mul_mv_ext, nb00) == 16, "ggml_metal_kargs_mul_mv_ext nb00 offset changed");
+static_assert(offsetof(ggml_metal_kargs_mul_mv_ext, reserved1) == 60, "ggml_metal_kargs_mul_mv_ext reserved1 offset changed");
+static_assert(offsetof(ggml_metal_kargs_mul_mv_ext, nb10) == 64, "ggml_metal_kargs_mul_mv_ext nb10 offset changed");
 static_assert(offsetof(ggml_metal_kargs_mul_mv_ext, r2) == 104, "ggml_metal_kargs_mul_mv_ext r2 offset changed");
-static_assert(offsetof(ggml_metal_kargs_mul_mv_ext, reserved1) == 108, "ggml_metal_kargs_mul_mv_ext reserved1 offset changed");
+static_assert(offsetof(ggml_metal_kargs_mul_mv_ext, reserved2) == 108, "ggml_metal_kargs_mul_mv_ext reserved2 offset changed");
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
@@ -2852,6 +2856,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             /*.ne10  =*/ ne10,
             /*.ne11  =*/ ne11,
             /*.ne12  =*/ ne12,
+            /*.reserved1 =*/ 0,
             /*.nb10  =*/ nb10,
             /*.nb11  =*/ nb11,
             /*.nb12  =*/ nb12,
@@ -2860,7 +2865,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             /*.ne1   =*/ ne1,
             /*.r2    =*/ r2,
             /*.r3    =*/ r3,
-            /*.reserved1 =*/ 0,
+            /*.reserved2 =*/ 0,
         };
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -2942,6 +2947,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             /*.ne10 =*/ ne10,
             /*.ne11 =*/ ne11,
             /*.ne12 =*/ ne12,
+            /*.reserved1 =*/ 0,
             /*.nb10 =*/ nb10,
             /*.nb11 =*/ nb11,
             /*.nb12 =*/ nb12,

@@ -467,6 +467,7 @@ typedef struct {
     int32_t  ne10;
     int32_t  ne11;
     int32_t  ne12;
+    uint32_t reserved1; // explicit ABI padding; must be zero
     uint64_t nb10;
     uint64_t nb11;
     uint64_t nb12;
@@ -490,6 +491,7 @@ typedef struct {
     int32_t  ne10;
     int32_t  ne11;
     int32_t  ne12;
+    uint32_t reserved1; // explicit ABI padding; must be zero
     uint64_t nb10;
     uint64_t nb11;
     uint64_t nb12;
@@ -498,7 +500,7 @@ typedef struct {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
-    uint32_t reserved1; // explicit ABI padding; must be zero
+    uint32_t reserved2; // explicit ABI padding; must be zero
 } ggml_metal_kargs_mul_mv_ext;
 
 typedef struct {
