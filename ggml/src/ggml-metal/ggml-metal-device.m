@@ -495,6 +495,9 @@ struct ggml_metal_encoder_profile_result {
     uint64_t projected_plan_bytes;
 };
 
+void ggml_metal_encoder_profile_begin(void);
+struct ggml_metal_encoder_profile_result ggml_metal_encoder_profile_end(void);
+
 struct ggml_metal_encoder_profile_tls {
     bool enabled;
     uint64_t sequence;
