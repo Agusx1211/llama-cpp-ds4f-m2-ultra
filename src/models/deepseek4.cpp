@@ -73,9 +73,16 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     hparams.set_swa_pattern(0);
 
-    // A trunk-only target still has to expose its complete four-stream state
-    // when the MTP block is supplied as a separate draft model.
-    hparams.n_embd_nextn_impl = hparams.dsv4_hc_mult*hparams.n_embd;
+    if (hparams.n_dspark_block_size > 0) {
+        // Official DSpark fuses the mean states after three target layers and
+        // emits one standard hidden-width row from its encoder/confidence head.
+        hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size()*hparams.n_embd;
+        hparams.n_embd_nextn_impl = hparams.n_embd;
+    } else {
+        // A trunk-only target still has to expose its complete four-stream
+        // state when the MTP block is supplied as a separate draft model.
+        hparams.n_embd_nextn_impl = hparams.dsv4_hc_mult*hparams.n_embd;
+    }
 
     if (hparams.n_layer_nextn > 0) {
         for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
@@ -302,6 +309,18 @@ static dsv4_state_tensors dsv4_build_state_snapshot(
 
 static constexpr int64_t DSV4_CSA_RATIO  = 4;
 static constexpr int64_t DSV4_HCA_RATIO  = 128;
+
+static ggml_tensor * dsv4_hc_mean(ggml_context * ctx, ggml_tensor * x) {
+    const int64_t hc = x->ne[1];
+
+    ggml_tensor * result = ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], 0);
+    for (int64_t ih = 1; ih < hc; ++ih) {
+        result = ggml_add(ctx, result,
+                ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], ih*x->nb[1]));
+    }
+
+    return ggml_scale(ctx, result, 1.0f/hc);
+}
 
 static ggml_tensor * dsv4_hc_affine(
         ggml_context * ctx,
@@ -1463,6 +1482,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     cb(inpL, "hc_init", -1);
 
     for (int il = 0; il < n_layer; ++il) {
+        if (cparams.embeddings_layer_inp[il]) {
+            res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
+
         ggml_tensor * residual = inpL;
         ggml_tensor * post = nullptr;
         ggml_tensor * comb = nullptr;
@@ -1537,6 +1562,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_last", il);
+    }
+
+    if (cparams.embeddings_layer_inp[n_layer]) {
+        res->t_layer_inp[n_layer] = dsv4_hc_mean(ctx0, inpL);
+        cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
+        ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
     }
 
     if (cparams.embeddings_nextn) {
