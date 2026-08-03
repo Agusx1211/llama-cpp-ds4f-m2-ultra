@@ -951,6 +951,30 @@ extern "C" {
     // Frees a batch of tokens allocated with llama_batch_init()
     LLAMA_API void llama_batch_free(struct llama_batch batch);
 
+    // Stable, low-cardinality result codes returned by llama_decode().
+    enum llama_decode_status {
+        LLAMA_DECODE_SUCCESS              = 0,
+        LLAMA_DECODE_KV_LOGICAL_FULL      = 1,
+        LLAMA_DECODE_ABORTED              = 2,
+        LLAMA_DECODE_KV_PHYSICAL_PRESSURE = 3,
+    };
+
+    // Immutable snapshot of the most recent recoverable physical KV pressure
+    // result. The family numbers are model-memory specific; DeepSeek V4 uses
+    // raw=0, CSA=1, HCA=2, and LID=3. No string or request-derived fields are
+    // included, so callers can expose these values as low-cardinality metrics.
+    struct llama_kv_pressure_info {
+        uint32_t limiting_family;
+        uint32_t limiting_family_mask;
+        uint64_t limiting_pool_id;
+        uint64_t required_pages;
+        uint64_t new_pages;
+        uint64_t cow_pages;
+        uint64_t free_pages;
+        uint64_t reserved_pages;
+        uint64_t physical_pages;
+    };
+
     // Process a batch of tokens.
     // In contrast to llama_decode() - this call does not use KV cache.
     // For encode-decoder contexts, processes the batch using the encoder.
@@ -967,15 +991,24 @@ extern "C" {
     // Positive return values does not mean a fatal error, but rather a warning.
     // Upon fatal-error or abort, the ubatches that managed to be been processed will remain in the memory state of the context
     //   To handle this correctly, query the memory state using llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
-    // Upon other return values, the memory state is restored to the state before this call
+    // Upon return value 1, the memory state is restored to the state before this call.
+    // Return value 3 is raised before any ubatch graph is submitted and leaves the batch unchanged.
     //    0 - success
-    //    1 - could not find a KV slot for the batch (try reducing the size of the batch or increase the context)
+    //    1 - could not find a logical KV slot for the batch (try reducing the batch or increasing the context)
     //    2 - aborted     (processed ubatches will remain in the context's memory)
+    //    3 - recoverable physical KV pressure. No ubatch graph was submitted and memory is unchanged.
     //   -1 - invalid input batch
     // < -1 - fatal error (processed ubatches will remain in the context's memory)
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
+
+    // Returns true and copies the last pressure snapshot only when the most
+    // recent llama_decode() returned LLAMA_DECODE_KV_PHYSICAL_PRESSURE.
+    // The snapshot remains valid until the next llama_decode() call.
+    LLAMA_API bool llama_get_last_kv_pressure(
+            const struct llama_context * ctx,
+            struct llama_kv_pressure_info * info);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)

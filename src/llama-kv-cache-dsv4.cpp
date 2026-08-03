@@ -9,6 +9,7 @@
 #include "../ggml/src/ggml-metal/ggml-metal-device.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cinttypes>
 #include <climits>
@@ -27,6 +28,25 @@ static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
+
+static std::atomic<uint32_t> dsv4_test_pressure_count = 0;
+
+void llama_kv_cache_dsv4_test_inject_physical_pressure(uint32_t count) {
+    dsv4_test_pressure_count.store(count, std::memory_order_release);
+}
+
+static bool dsv4_test_consume_physical_pressure() {
+    uint32_t current = dsv4_test_pressure_count.load(std::memory_order_acquire);
+    while (current != 0) {
+        if (dsv4_test_pressure_count.compare_exchange_weak(
+                    current, current - 1,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 using dsv4_sparse_buft_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, uint32_t);
 
@@ -309,6 +329,23 @@ public:
             }
         }
         result.feasible = status == GGML_METAL_SPARSE_RESERVATION_OK;
+
+        // Consume the test fault only after the real backend has produced a
+        // valid quote and ticket. Returning pressure here exercises the same
+        // cancellation and propagation path as capacity exhaustion, without
+        // committing a mapping or submitting a graph.
+        if (status == GGML_METAL_SPARSE_RESERVATION_OK && ticket != nullptr &&
+                !pools.empty() && dsv4_test_consume_physical_pressure()) {
+            const auto & pool = pools.front();
+            const uint32_t family_mask = pool_family_masks.at(pool.pool_id);
+            limiting_family_mask_value = family_mask;
+            result.limiting_pool_id = pool.pool_id;
+            result.limiting_family = (llama_dsv4_memory_family) __builtin_ctz(family_mask);
+            result.families[result.limiting_family].feasible = false;
+            result.feasible = false;
+            backend_status = GGML_METAL_SPARSE_RESERVATION_PRESSURE;
+            return PRESSURE;
+        }
 
         if (status == GGML_METAL_SPARSE_RESERVATION_PRESSURE) {
             return PRESSURE;
@@ -2295,12 +2332,22 @@ bool llama_kv_cache_dsv4_raw_context::apply() {
 
 const llama_kv_cache_dsv4_raw_context::slot_info_vec_t::value_type &
 llama_kv_cache_dsv4_raw_context::get_base_write_slot() const {
-    return sinfos_base_write[i_next];
+    return get_base_write_slot(i_next);
 }
 
 const llama_kv_cache_dsv4_raw_context::slot_info_vec_t::value_type &
 llama_kv_cache_dsv4_raw_context::get_swa_write_slot() const {
-    return sinfos_write[i_next];
+    return get_swa_write_slot(i_next);
+}
+
+const llama_kv_cache_dsv4_raw_context::slot_info_vec_t::value_type &
+llama_kv_cache_dsv4_raw_context::get_base_write_slot(size_t index) const {
+    return sinfos_base_write.at(index);
+}
+
+const llama_kv_cache_dsv4_raw_context::slot_info_vec_t::value_type &
+llama_kv_cache_dsv4_raw_context::get_swa_write_slot(size_t index) const {
+    return sinfos_write.at(index);
 }
 
 llama_memory_status llama_kv_cache_dsv4_raw_context::get_status() const {
@@ -2326,11 +2373,15 @@ uint32_t llama_kv_cache_dsv4_raw_context::get_n_write() const {
 }
 
 uint64_t llama_kv_cache_dsv4_raw_context::get_n_backing_rows() const {
+    return get_n_backing_rows(i_next);
+}
+
+uint64_t llama_kv_cache_dsv4_raw_context::get_n_backing_rows(size_t index) const {
     if (ubatches_write.empty()) {
         return 0;
     }
     uint64_t result = 0;
-    for (const auto & idxs : sinfos_write[i_next].idxs) {
+    for (const auto & idxs : sinfos_write.at(index).idxs) {
         result += idxs.size();
     }
     return result;
@@ -2568,55 +2619,66 @@ bool llama_kv_cache_dsv4_context::next() {
     return true;
 }
 
-bool llama_kv_cache_dsv4_context::apply() {
-    assert(!llama_memory_status_is_fail(status));
-
-    if (!ubatches.empty()) {
-        std::vector<dsv4_sparse_range> ranges;
+bool llama_kv_cache_dsv4_context::reserve_batch_ranges() {
+    std::vector<dsv4_sparse_range> ranges;
+    for (size_t i = 0; i < ubatches.size(); ++i) {
         if (!dsv4_sparse_append_slot(
-                    kv->get_raw()->get_base(), ctx_raw->get_base_write_slot(),
+                    kv->get_raw()->get_base(), ctx_raw->get_base_write_slot(i),
                     LLAMA_DSV4_MEMORY_RAW, ranges) ||
                 !dsv4_sparse_append_slot(
-                    kv->get_raw()->get_swa(), ctx_raw->get_swa_write_slot(),
+                    kv->get_raw()->get_swa(), ctx_raw->get_swa_write_slot(i),
                     LLAMA_DSV4_MEMORY_RAW, ranges) ||
                 !dsv4_sparse_append_k_rows(
-                    kv->get_csa(), plans_csa[i_next].state_write_idxs,
+                    kv->get_csa(), plans_csa.at(i).state_write_idxs,
                     LLAMA_DSV4_MEMORY_CSA, ranges) ||
                 !dsv4_sparse_append_k_rows(
-                    kv->get_hca(), plans_hca[i_next].state_write_idxs,
+                    kv->get_hca(), plans_hca.at(i).state_write_idxs,
                     LLAMA_DSV4_MEMORY_HCA, ranges) ||
                 !dsv4_sparse_append_k_rows(
-                    kv->get_lid(), plans_lid[i_next].state_write_idxs,
+                    kv->get_lid(), plans_lid.at(i).state_write_idxs,
                     LLAMA_DSV4_MEMORY_LID, ranges)) {
             return false;
         }
 
-        last_batch_quote = {};
-        last_batch_quote.families[LLAMA_DSV4_MEMORY_RAW].logical_rows =
-                ctx_raw->get_n_backing_rows();
-        dsv4_sparse_transaction reservation;
-        const auto reserve_status = reservation.reserve_ranges(ranges, last_batch_quote);
-        if (reserve_status == dsv4_sparse_transaction::PRESSURE) {
-            const auto & limiting = last_batch_quote.families[last_batch_quote.limiting_family];
-            LLAMA_LOG_WARN("%s: DSV4 elastic Metal page pressure: family_mask=0x%x pool=%" PRIuPTR
-                    " need=%" PRIu64 " (new=%" PRIu64 ", COW=%" PRIu64
-                    ") free=%" PRIu64 " reserved=%" PRIu64 " capacity=%" PRIu64
-                    " pages sparse_ranges=%zu shared_family_pools=%zu\n",
-                    __func__, reservation.limiting_family_mask(),
-                    last_batch_quote.limiting_pool_id,
-                    limiting.required_pages, limiting.new_pages, limiting.cow_pages,
-                    limiting.free_pages, limiting.reserved_pages, limiting.physical_pages,
-                    reservation.sparse_range_count(), reservation.shared_family_pool_count());
-            return false;
-        }
-        if (reserve_status != dsv4_sparse_transaction::SUCCESS) {
-            reservation.log_failure(__func__);
-            return false;
-        }
-        if (reservation.commit_ranges() != GGML_METAL_SPARSE_RESERVATION_OK) {
-            reservation.log_failure(__func__);
-            return false;
-        }
+        last_batch_quote.families[LLAMA_DSV4_MEMORY_RAW].logical_rows +=
+                ctx_raw->get_n_backing_rows(i);
+    }
+
+    dsv4_sparse_transaction reservation;
+    const auto reserve_status = reservation.reserve_ranges(ranges, last_batch_quote);
+    if (reserve_status == dsv4_sparse_transaction::PRESSURE) {
+        status = LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE;
+        last_pressure_family_mask = reservation.limiting_family_mask();
+        const auto & limiting = last_batch_quote.families[last_batch_quote.limiting_family];
+        LLAMA_LOG_WARN("%s: DSV4 elastic Metal page pressure before batch submission: family_mask=0x%x pool=%" PRIuPTR
+                " need=%" PRIu64 " (new=%" PRIu64 ", COW=%" PRIu64
+                ") free=%" PRIu64 " reserved=%" PRIu64 " capacity=%" PRIu64
+                " pages ubatches=%zu sparse_ranges=%zu shared_family_pools=%zu\n",
+                __func__, reservation.limiting_family_mask(),
+                last_batch_quote.limiting_pool_id,
+                limiting.required_pages, limiting.new_pages, limiting.cow_pages,
+                limiting.free_pages, limiting.reserved_pages, limiting.physical_pages,
+                ubatches.size(), reservation.sparse_range_count(), reservation.shared_family_pool_count());
+        return false;
+    }
+    if (reserve_status != dsv4_sparse_transaction::SUCCESS) {
+        reservation.log_failure(__func__);
+        return false;
+    }
+    if (reservation.commit_ranges() != GGML_METAL_SPARSE_RESERVATION_OK) {
+        reservation.log_failure(__func__);
+        return false;
+    }
+
+    batch_ranges_reserved = true;
+    return true;
+}
+
+bool llama_kv_cache_dsv4_context::apply() {
+    assert(!llama_memory_status_is_fail(status));
+
+    if (!preflight()) {
+        return false;
     }
 
     bool res = true;
@@ -2638,8 +2700,39 @@ bool llama_kv_cache_dsv4_context::apply() {
     return res;
 }
 
+bool llama_kv_cache_dsv4_context::preflight() {
+    assert(!llama_memory_status_is_fail(status));
+
+    if (ubatches.empty() || batch_ranges_reserved) {
+        return true;
+    }
+
+    last_batch_quote = {};
+    return reserve_batch_ranges();
+}
+
 llama_memory_status llama_kv_cache_dsv4_context::get_status() const {
     return status;
+}
+
+bool llama_kv_cache_dsv4_context::get_kv_pressure(llama_kv_pressure_info & info) const {
+    if (status != LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE) {
+        return false;
+    }
+
+    const auto & limiting = last_batch_quote.families[last_batch_quote.limiting_family];
+    info = {
+        (uint32_t) last_batch_quote.limiting_family,
+        last_pressure_family_mask,
+        (uint64_t) last_batch_quote.limiting_pool_id,
+        limiting.required_pages,
+        limiting.new_pages,
+        limiting.cow_pages,
+        limiting.free_pages,
+        limiting.reserved_pages,
+        limiting.physical_pages,
+    };
+    return true;
 }
 
 const llama_ubatch & llama_kv_cache_dsv4_context::get_ubatch() const {
