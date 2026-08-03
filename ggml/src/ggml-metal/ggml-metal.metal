@@ -12198,6 +12198,45 @@ kernel dsv4_sparse_pack_t kernel_dsv4_sparse_pack<half4, 1, dequantize_f16_t4>;
 template [[host_name("kernel_dsv4_sparse_pack_q8_0")]]
 kernel dsv4_sparse_pack_t kernel_dsv4_sparse_pack<block_q8_0, 8, dequantize_q8_0_t4>;
 
+// Materialize the affine raw-plus-compressed K layout directly from the shared
+// 64-row segmented pool. Each threadgroup owns one output row and copies half4
+// vectors; the directory is indexed in graph-stream order.
+kernel void kernel_dsv4_indexed_concat(
+        constant ggml_metal_kargs_dsv4_indexed_concat & args,
+        device const char * raw_k,
+        device const char * k_pool,
+        device const char * segment_ids,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort3  ntg[[threads_per_threadgroup]]) {
+    const int row    = tgpig.x;
+    const int stream = tgpig.y;
+
+    device const half4 * src;
+    bool valid = true;
+    if (row < args.n_raw) {
+        src = (device const half4 *) (raw_k +
+                (uint64_t) row*args.nb_rk2 + (uint64_t) stream*args.nb_rk3);
+    } else {
+        const int logical_row = row - args.n_raw;
+        const int logical_seg = logical_row/64;
+        const int physical_seg = *(device const int *) (segment_ids +
+                (uint64_t) logical_seg*args.nb_si0 + (uint64_t) stream*args.nb_si1);
+        valid = physical_seg >= 0 && physical_seg < args.n_pool_segments;
+        const int physical_row = valid ? physical_seg*64 + logical_row%64 : 0;
+        src = (device const half4 *) (k_pool + (uint64_t) physical_row*args.nb_kp1);
+    }
+
+    device half4 * out = (device half4 *) (dst +
+            (uint64_t) row*args.nb_d2 + (uint64_t) stream*args.nb_d3);
+    for (int i4 = tiitg; i4 < args.n_embd4; i4 += ntg.x) {
+        // An invalid directory is a caller-contract violation. Emit NaNs so it
+        // cannot become a silent OOB read if host-side validation is missed.
+        out[i4] = valid ? src[i4] : half4(NAN);
+    }
+}
+
 constexpr constant short LI_N_EMBD = 128;
 constexpr constant short LI_N_HEAD = 64;
 constexpr constant short LI_N_KEY_SIMDGROUP = 8;

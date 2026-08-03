@@ -8036,6 +8036,204 @@ struct test_dsv4_sparse_pack : public test_case {
     }
 };
 
+// GGML_OP_DSV4_INDEXED_CONCAT
+struct test_dsv4_indexed_concat : public test_case {
+    const int64_t d;
+    const int64_t n_raw;
+    const int64_t n_comp;
+    const int64_t n_stream;
+    const int64_t source_tokens;
+    const int64_t ratio;
+
+    test_dsv4_indexed_concat(
+            int64_t d, int64_t n_raw, int64_t n_comp, int64_t n_stream,
+            int64_t source_tokens = -1, int64_t ratio = 0)
+        : d(d), n_raw(n_raw), n_comp(n_comp), n_stream(n_stream),
+          source_tokens(source_tokens), ratio(ratio) {}
+
+    static std::unique_ptr<test_dsv4_indexed_concat> from_source_tokens(
+            int64_t source_tokens, int64_t ratio, int64_t n_stream) {
+        GGML_ASSERT(source_tokens >= 0 && ratio > 0);
+        return std::make_unique<test_dsv4_indexed_concat>(
+                512, 3, source_tokens/ratio, n_stream, source_tokens, ratio);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(d, n_raw, n_comp, n_stream, source_tokens, ratio);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_INDEXED_CONCAT";
+    }
+
+    bool run_whole_graph() override {
+        return mode == MODE_TEST || mode == MODE_PERF;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double max_abs = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            max_abs = std::max(max_abs, (double) std::fabs(a[i]));
+            max_abs = std::max(max_abs, (double) std::fabs(a[i] - b[i]));
+        }
+        return max_abs;
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return 0.0;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_segments = (n_comp + 63)/64;
+        const int64_t pool_segments = std::max<int64_t>(4, n_segments + 3);
+
+        ggml_tensor * raw_k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, 1, n_raw, n_stream);
+        ggml_tensor * k_pool = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d, pool_segments*64);
+        ggml_tensor * segment_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_segments, n_stream);
+        ggml_set_name(raw_k, "raw_k");
+        ggml_set_name(k_pool, "k_pool");
+        ggml_set_name(segment_ids, "segment_ids");
+
+        ggml_tensor * out = ggml_dsv4_indexed_concat(ctx, raw_k, k_pool, segment_ids, n_comp);
+        if (mode == MODE_TEST) {
+            ggml_tensor * expected = raw_k;
+            if (n_comp > 0) {
+                ggml_tensor * row_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_comp*n_stream);
+                ggml_set_name(row_ids, "physical_row_ids");
+                expected = ggml_get_rows(ctx, k_pool, row_ids);
+                expected = ggml_cast(ctx, expected, GGML_TYPE_F16);
+                expected = ggml_reshape_4d(ctx, expected, d, 1, n_comp, n_stream);
+                expected = ggml_concat(ctx, raw_k, expected, 2);
+            }
+            out = ggml_sub(ctx, out, expected);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        ggml_tensor * raw_k = ggml_get_tensor(ctx, "raw_k");
+        ggml_tensor * k_pool = ggml_get_tensor(ctx, "k_pool");
+        ggml_tensor * segment_ids = ggml_get_tensor(ctx, "segment_ids");
+
+        std::vector<ggml_fp16_t> raw_data(ggml_nelements(raw_k));
+        for (size_t i = 0; i < raw_data.size(); ++i) {
+            raw_data[i] = ggml_fp32_to_fp16(
+                    (float) ((int64_t) ((i*37 + 11) % 2048) - 1024)/32.0f);
+        }
+        ggml_backend_tensor_set(raw_k, raw_data.data(), 0, raw_data.size()*sizeof(raw_data[0]));
+
+        std::vector<ggml_fp16_t> pool_data(ggml_nelements(k_pool));
+        for (size_t i = 0; i < pool_data.size(); ++i) {
+            pool_data[i] = ggml_fp32_to_fp16(
+                    (float) ((int64_t) ((i*53 + 19) % 4096) - 2048)/64.0f);
+        }
+        ggml_backend_tensor_set(k_pool, pool_data.data(), 0, pool_data.size()*sizeof(pool_data[0]));
+
+        const int64_t n_segments = segment_ids->ne[0];
+        const int64_t pool_segments = k_pool->ne[1]/64;
+        std::vector<int32_t> ids(ggml_nelements(segment_ids));
+        for (int64_t stream = 0; stream < n_stream; ++stream) {
+            for (int64_t logical = 0; logical < n_segments; ++logical) {
+                // Coprime steps create noncontiguous, stream-asymmetric directory permutations.
+                ids[stream*n_segments + logical] =
+                        (int32_t) ((logical*3 + stream*5 + 1) % pool_segments);
+            }
+        }
+        if (!ids.empty()) {
+            ggml_backend_tensor_set(segment_ids, ids.data(), 0, ids.size()*sizeof(ids[0]));
+        }
+
+        ggml_tensor * row_ids = ggml_get_tensor(ctx, "physical_row_ids");
+        if (row_ids != nullptr) {
+            std::vector<int32_t> rows(ggml_nelements(row_ids));
+            for (int64_t stream = 0; stream < n_stream; ++stream) {
+                for (int64_t row = 0; row < n_comp; ++row) {
+                    const int64_t logical_seg = row/64;
+                    const int64_t physical_seg = ids[stream*n_segments + logical_seg];
+                    rows[stream*n_comp + row] = (int32_t) (physical_seg*64 + row%64);
+                }
+            }
+            ggml_backend_tensor_set(row_ids, rows.data(), 0, rows.size()*sizeof(rows[0]));
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE && t != raw_k && t != k_pool && t != segment_ids && t != row_ids) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
+// Existing generic GGML materialization arm: gather every physical F16 row via
+// GET_ROWS (which returns F32), cast back to F16, reshape, then concatenate.
+// This intentionally measures the real generic alternative, including its
+// unavoidable conversion and per-row index materialization costs.
+struct test_dsv4_indexed_concat_materialized : public test_case {
+    const int64_t d;
+    const int64_t n_raw;
+    const int64_t n_comp;
+    const int64_t n_stream;
+
+    test_dsv4_indexed_concat_materialized(int64_t d, int64_t n_raw, int64_t n_comp, int64_t n_stream)
+        : d(d), n_raw(n_raw), n_comp(n_comp), n_stream(n_stream) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_INDEXED_CONCAT_MATERIALIZED";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(d, n_raw, n_comp, n_stream);
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_segments = (n_comp + 63)/64;
+        const int64_t pool_segments = std::max<int64_t>(4, n_segments + 3);
+        ggml_tensor * raw_k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, 1, n_raw, n_stream);
+        ggml_tensor * k_pool = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d, pool_segments*64);
+        ggml_tensor * row_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_comp*n_stream);
+        ggml_set_name(row_ids, "physical_row_ids");
+
+        ggml_tensor * gathered = ggml_get_rows(ctx, k_pool, row_ids);
+        gathered = ggml_cast(ctx, gathered, GGML_TYPE_F16);
+        gathered = ggml_reshape_4d(ctx, gathered, d, 1, n_comp, n_stream);
+        ggml_tensor * out = ggml_concat(ctx, raw_k, gathered, 2);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "physical_row_ids") == 0) {
+                const int64_t n_segments = (n_comp + 63)/64;
+                const int64_t pool_segments = std::max<int64_t>(4, n_segments + 3);
+                std::vector<int32_t> rows(ggml_nelements(t));
+                for (int64_t stream = 0; stream < n_stream; ++stream) {
+                    for (int64_t row = 0; row < n_comp; ++row) {
+                        const int64_t logical_seg = row/64;
+                        const int64_t physical_seg = (logical_seg*3 + stream*5 + 1) % pool_segments;
+                        rows[stream*n_comp + row] = (int32_t) (physical_seg*64 + row%64);
+                    }
+                }
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(rows[0]));
+            } else if (t->op == GGML_OP_NONE) {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
+    }
+};
+
 // DeepSeek V4 multi-stream decode after exact top-512 key selection. This
 // exercises the complete pack/view/concat/vector-Flash-Attention layout used by
 // the target graph, including distinct cache and mask strides for every stream.
@@ -10569,6 +10767,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_sparse_pack(3, 2, 7, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 128, GGML_TYPE_Q8_0, 128, 517, 512));
+    // Source-token counts straddle both supported compressor ratios. The
+    // resulting logical row count is floor(source_tokens/ratio).
+    for (int64_t source_tokens : { 3, 4, 5 }) {
+        test_cases.emplace_back(test_dsv4_indexed_concat::from_source_tokens(source_tokens, 4, 3));
+    }
+    for (int64_t source_tokens : { 127, 128, 129 }) {
+        test_cases.emplace_back(test_dsv4_indexed_concat::from_source_tokens(source_tokens, 128, 4));
+    }
+    for (int64_t n_comp : { 63, 64, 65 }) {
+        test_cases.emplace_back(new test_dsv4_indexed_concat(512, 17, n_comp, 3));
+    }
+    test_cases.emplace_back(new test_dsv4_indexed_concat(512, 17, 0, 4));
     test_cases.emplace_back(new test_dsv4_sparse_attention(2));
     test_cases.emplace_back(new test_dsv4_sparse_attention(4));
     // Long-context DSV4 retains a physically padded raw cache while only 128
@@ -10633,6 +10843,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_dsv4_top_k_mask(128, 5000, 512, 1, 1));
     test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_dsv4_indexed_concat(512, 128, 512, 4));
+    test_cases.emplace_back(new test_dsv4_indexed_concat_materialized(512, 128, 512, 4));
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 4096, 1, 1, 1, GGML_TYPE_F16));
     for (int n_tokens : { 224, 512, 2048 }) {
         test_cases.emplace_back(new test_dsv4_swiglu_clamp_fusion(n_tokens));

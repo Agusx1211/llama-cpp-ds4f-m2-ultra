@@ -1683,6 +1683,33 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[2]) &&
                 ggml_is_contiguous_rows(op->src[3]) &&
                 ggml_is_contiguous_rows(op->src[4]);
+        case GGML_OP_DSV4_INDEXED_CONCAT:
+            {
+                const int64_t n_comp = ggml_get_op_params_i32(op, 0);
+                return op->src[0]->type == GGML_TYPE_F16 &&
+                    op->src[1]->type == GGML_TYPE_F16 &&
+                    op->src[2]->type == GGML_TYPE_I32 &&
+                    op->type         == GGML_TYPE_F16 &&
+                    op->src[0]->ne[0] > 0 && op->src[0]->ne[0] % 4 == 0 &&
+                    op->src[0]->ne[0]/4 <= INT32_MAX &&
+                    op->src[0]->ne[1] == 1 && op->src[0]->ne[3] > 0 &&
+                    op->src[0]->ne[2] <= INT32_MAX &&
+                    op->src[1]->ne[0] == op->src[0]->ne[0] &&
+                    op->src[1]->ne[1] > 0 && op->src[1]->ne[1] % 64 == 0 &&
+                    op->src[1]->ne[1]/64 <= INT32_MAX &&
+                    op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                    n_comp >= 0 && op->src[0]->ne[2] <= INT32_MAX - n_comp &&
+                    op->src[2]->ne[0] == (n_comp + 63)/64 &&
+                    op->src[2]->ne[1] == op->src[0]->ne[3] &&
+                    op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
+                    op->ne[0] == op->src[0]->ne[0] && op->ne[1] == 1 &&
+                    op->ne[2] == op->src[0]->ne[2] + n_comp &&
+                    op->ne[3] == op->src[0]->ne[3] &&
+                    ggml_is_contiguous(op->src[0]) &&
+                    ggml_is_contiguous(op->src[1]) &&
+                    ggml_is_contiguous(op->src[2]) &&
+                    ggml_is_contiguous(op);
+            }
         case GGML_OP_LIGHTNING_INDEXER:
             return has_simdgroup_mm &&
                 op->src[0]->type == GGML_TYPE_F32 &&

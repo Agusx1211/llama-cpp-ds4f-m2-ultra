@@ -11433,6 +11433,66 @@ void ggml_compute_forward_dsv4_sparse_pack(
     }
 }
 
+// ggml_compute_forward_dsv4_indexed_concat
+
+void ggml_compute_forward_dsv4_indexed_concat(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * raw_k       = dst->src[0];
+    const ggml_tensor * k_pool      = dst->src[1];
+    const ggml_tensor * segment_ids = dst->src[2];
+
+    GGML_ASSERT(raw_k->type == GGML_TYPE_F16);
+    GGML_ASSERT(k_pool->type == GGML_TYPE_F16);
+    GGML_ASSERT(segment_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F16);
+
+    const int64_t d               = raw_k->ne[0];
+    const int64_t n_raw           = raw_k->ne[2];
+    const int64_t n_comp          = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_stream        = raw_k->ne[3];
+    const int64_t n_rows          = n_raw + n_comp;
+    const int64_t n_pool_segments = k_pool->ne[1]/64;
+
+    GGML_ASSERT(dst->ne[0] == d && dst->ne[1] == 1);
+    GGML_ASSERT(dst->ne[2] == n_rows && dst->ne[3] == n_stream);
+    GGML_ASSERT(segment_ids->ne[0] == (n_comp + 63)/64);
+    GGML_ASSERT(segment_ids->ne[1] == n_stream);
+
+    const int64_t nr  = n_rows*n_stream;
+    const int64_t dr  = (nr + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t row    = ir % n_rows;
+        const int64_t stream = ir / n_rows;
+        const char * src_row;
+
+        if (row < n_raw) {
+            src_row = (const char *) raw_k->data + row*raw_k->nb[2] + stream*raw_k->nb[3];
+        } else {
+            const int64_t logical_row = row - n_raw;
+            const int64_t logical_seg = logical_row/64;
+            const int32_t physical_seg = *(const int32_t *) ((const char *) segment_ids->data +
+                    logical_seg*segment_ids->nb[0] + stream*segment_ids->nb[1]);
+            GGML_ASSERT(physical_seg >= 0 && physical_seg < n_pool_segments);
+            const int64_t physical_row = (int64_t) physical_seg*64 + logical_row%64;
+            src_row = (const char *) k_pool->data + physical_row*k_pool->nb[1];
+        }
+
+        char * dst_row = (char *) dst->data + row*dst->nb[2] + stream*dst->nb[3];
+        const size_t src_nb0 = row < n_raw ? raw_k->nb[0] : k_pool->nb[0];
+        if (src_nb0 == sizeof(ggml_fp16_t) && dst->nb[0] == sizeof(ggml_fp16_t)) {
+            memcpy(dst_row, src_row, d*sizeof(ggml_fp16_t));
+        } else {
+            for (int64_t i = 0; i < d; ++i) {
+                *(ggml_fp16_t *) (dst_row + i*dst->nb[0]) = *(const ggml_fp16_t *) (src_row + i*src_nb0);
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

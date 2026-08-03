@@ -1086,6 +1086,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "DSV4_SPARSE_PACK",
+    "DSV4_INDEXED_CONCAT",
 
     "UNARY",
 
@@ -1103,7 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1204,6 +1205,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "dsv4_sparse_pack(raw_k, comp_k, raw_mask, comp_mask, comp_idx)",
+    "dsv4_indexed_concat(raw_k, k_pool, segment_ids)",
 
     "unary(x)",
 
@@ -1221,7 +1223,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6476,6 +6478,44 @@ struct ggml_tensor * ggml_dsv4_sparse_pack(
     result->src[4] = comp_idx;
 
     ggml_set_op_params_i32(result, 0, n_raw);
+
+    return result;
+}
+
+// ggml_dsv4_indexed_concat
+
+struct ggml_tensor * ggml_dsv4_indexed_concat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * raw_k,
+        struct ggml_tensor  * k_pool,
+        struct ggml_tensor  * segment_ids,
+        int64_t               n_comp) {
+    GGML_ASSERT(raw_k->type == GGML_TYPE_F16);
+    GGML_ASSERT(k_pool->type == GGML_TYPE_F16);
+    GGML_ASSERT(segment_ids->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(raw_k->ne[0] > 0);
+    GGML_ASSERT(raw_k->ne[1] == 1);
+    GGML_ASSERT(raw_k->ne[3] > 0);
+    GGML_ASSERT(k_pool->ne[0] == raw_k->ne[0]);
+    GGML_ASSERT(k_pool->ne[1] > 0 && k_pool->ne[1] % 64 == 0);
+    GGML_ASSERT(k_pool->ne[2] == 1 && k_pool->ne[3] == 1);
+    GGML_ASSERT(segment_ids->ne[1] == raw_k->ne[3]);
+    GGML_ASSERT(segment_ids->ne[2] == 1 && segment_ids->ne[3] == 1);
+    GGML_ASSERT(n_comp >= 0 && n_comp <= INT32_MAX);
+    GGML_ASSERT(segment_ids->ne[0] == (n_comp + 63)/64);
+    GGML_ASSERT(raw_k->ne[2] <= INT64_MAX - n_comp);
+    GGML_ASSERT(raw_k->ne[2] + n_comp > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F16,
+            raw_k->ne[0], 1, raw_k->ne[2] + n_comp, raw_k->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) n_comp);
+
+    result->op     = GGML_OP_DSV4_INDEXED_CONCAT;
+    result->src[0] = raw_k;
+    result->src[1] = k_pool;
+    result->src[2] = segment_ids;
 
     return result;
 }
