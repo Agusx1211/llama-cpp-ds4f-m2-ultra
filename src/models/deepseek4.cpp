@@ -1046,7 +1046,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         const int64_t n_raw    = std::min<int64_t>(hparams.n_swa, raw_k->ne[2]);
 
         GGML_ASSERT(q->ne[0] == raw_k->ne[0]);
-        GGML_ASSERT(raw_k->ne[1] == 1 && csa_k->ne[1] == 1);
+        GGML_ASSERT(raw_k->ne[1] == 1);
+        GGML_ASSERT(indexed || csa_k->ne[1] == 1);
         GGML_ASSERT(raw_k->ne[3] == n_stream);
         GGML_ASSERT(raw_mask->ne[1] == nq && raw_mask->ne[3] == n_stream);
         GGML_ASSERT(inp_csa.kq_mask->ne[1] == nq && inp_csa.kq_mask->ne[3] == n_stream);
