@@ -5,6 +5,7 @@
 #include <functional>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -68,6 +69,28 @@ bool server_prefix_entry::operator==(const server_prefix_entry & other) const {
 
 bool server_prefix_policy_key::operator==(const server_prefix_policy_key & other) const {
     return digest == other.digest && aligned_tokens == other.aligned_tokens;
+}
+
+bool server_prefix_session_key::operator==(const server_prefix_session_key & other) const {
+    return identity == other.identity && session_id == other.session_id;
+}
+
+bool server_prefix_session_owner::operator==(const server_prefix_session_owner & other) const {
+    return handle_id == other.handle_id && generation == other.generation;
+}
+
+bool server_prefix_session_version::operator==(const server_prefix_session_version & other) const {
+    return owner == other.owner && turn_id == other.turn_id;
+}
+
+bool server_prefix_session_anchor::operator==(const server_prefix_session_anchor & other) const {
+    return prefix == other.prefix && owner == other.owner && turn_id == other.turn_id &&
+           unique_bytes == other.unique_bytes && saved_prefill_ms == other.saved_prefill_ms &&
+           message_end_tokens == other.message_end_tokens;
+}
+
+bool server_prefix_session_record::operator==(const server_prefix_session_record & other) const {
+    return anchor == other.anchor && expires_at_tick == other.expires_at_tick;
 }
 
 struct identity_hash {
@@ -536,6 +559,205 @@ server_prefix_policy_stats server_prefix_policy::stats() const {
         } else if (item.second.segment == server_prefix_policy_segment::protected_segment) {
             ++result.protected_entries;
             result.protected_bytes += item.second.unique_bytes;
+        }
+    }
+    return result;
+}
+
+struct session_key_hash {
+    bool constant = false;
+
+    size_t operator()(const server_prefix_session_key & key) const {
+        if (constant) {
+            return 0;
+        }
+        size_t hash = identity_hash{}(key.identity);
+        return hash_mix(hash, std::hash<std::string>{}(key.session_id));
+    }
+};
+
+static bool session_key_less(const server_prefix_session_key & lhs, const server_prefix_session_key & rhs) {
+    return std::tie(lhs.identity.architecture, lhs.identity.model, lhs.identity.tokenizer, lhs.identity.chat_template,
+                    lhs.identity.runtime_build, lhs.identity.target_kv_layout, lhs.identity.draft_kv_layout,
+                    lhs.identity.rope, lhs.identity.lora, lhs.identity.context_size, lhs.identity.dsv4_state_version,
+                    lhs.session_id) < std::tie(rhs.identity.architecture, rhs.identity.model, rhs.identity.tokenizer,
+                                               rhs.identity.chat_template, rhs.identity.runtime_build,
+                                               rhs.identity.target_kv_layout, rhs.identity.draft_kv_layout,
+                                               rhs.identity.rope, rhs.identity.lora, rhs.identity.context_size,
+                                               rhs.identity.dsv4_state_version, rhs.session_id);
+}
+
+static bool valid_session_config(const server_prefix_session_config & config) {
+    return config.max_sessions != 0 && config.max_session_id_bytes != 0 && config.max_architecture_bytes != 0 &&
+           config.ttl_ticks != 0;
+}
+
+static bool valid_session_update(const server_prefix_session_update & update,
+                                 const server_prefix_session_config & config) {
+    const auto & key    = update.key;
+    const auto & anchor = update.anchor;
+    return valid_identity(key.identity) && !key.session_id.empty() &&
+           key.session_id.size() <= config.max_session_id_bytes &&
+           key.identity.architecture.size() <= config.max_architecture_bytes && valid_policy_key(anchor.prefix) &&
+           anchor.prefix.aligned_tokens == anchor.message_end_tokens &&
+           anchor.message_end_tokens <= key.identity.context_size && anchor.owner.handle_id != 0 &&
+           anchor.owner.generation != 0 && anchor.turn_id != 0 && anchor.unique_bytes != 0 &&
+           std::isfinite(anchor.saved_prefill_ms) && anchor.saved_prefill_ms > 0.0 &&
+           update.now_tick <= std::numeric_limits<uint64_t>::max() - config.ttl_ticks;
+}
+
+static server_prefix_session_version session_version(const server_prefix_session_anchor & anchor) {
+    return { anchor.owner, anchor.turn_id };
+}
+
+struct server_prefix_session_cache::impl {
+    explicit impl(server_prefix_session_config config) :
+        cfg(config),
+        sessions(0, session_key_hash{ config.force_hash_collisions }) {}
+
+    server_prefix_session_config                                                                  cfg;
+    std::unordered_map<server_prefix_session_key, server_prefix_session_record, session_key_hash> sessions;
+    size_t                                                                                        peak_entries = 0;
+    uint64_t                                                                                      insertions   = 0;
+    uint64_t                                                                                      replacements = 0;
+    uint64_t                                                                                      expirations  = 0;
+    uint64_t                                                                                      erases       = 0;
+};
+
+server_prefix_session_cache::server_prefix_session_cache(server_prefix_session_config config) {
+    if (!valid_session_config(config)) {
+        throw std::invalid_argument("invalid server prefix session configuration");
+    }
+    data = std::make_unique<impl>(config);
+}
+
+server_prefix_session_cache::~server_prefix_session_cache() = default;
+
+server_prefix_session_result server_prefix_session_cache::replace(const server_prefix_session_update & update) {
+    server_prefix_session_result result;
+    if (!valid_session_update(update, data->cfg)) {
+        return result;
+    }
+
+    const uint64_t expires_at = update.now_tick + data->cfg.ttl_ticks;
+    auto           current    = data->sessions.find(update.key);
+    if (current == data->sessions.end()) {
+        if (update.expected_current.has_value()) {
+            result.status = server_prefix_session_status::conflict;
+            return result;
+        }
+        if (data->sessions.size() >= data->cfg.max_sessions) {
+            result.status = server_prefix_session_status::capacity;
+            return result;
+        }
+        data->sessions.emplace(update.key, server_prefix_session_record{ update.anchor, expires_at });
+        ++data->insertions;
+        data->peak_entries     = std::max(data->peak_entries, data->sessions.size());
+        result.status          = server_prefix_session_status::inserted;
+        result.expires_at_tick = expires_at;
+        return result;
+    }
+
+    const server_prefix_session_record & old        = current->second;
+    const bool                           old_active = update.now_tick < old.expires_at_tick;
+    if (old_active) {
+        if (!update.expected_current.has_value()) {
+            result.status = server_prefix_session_status::conflict;
+            return result;
+        }
+        const auto & expected = update.expected_current.value();
+        if (expected.owner.handle_id == old.anchor.owner.handle_id &&
+            expected.owner.generation != old.anchor.owner.generation) {
+            result.status = server_prefix_session_status::stale_generation;
+            return result;
+        }
+        if (!(expected == session_version(old.anchor))) {
+            result.status = server_prefix_session_status::conflict;
+            return result;
+        }
+    } else if (update.expected_current.has_value()) {
+        result.status = server_prefix_session_status::conflict;
+        return result;
+    }
+
+    if (update.anchor.turn_id <= old.anchor.turn_id) {
+        result.status = server_prefix_session_status::stale_turn;
+        return result;
+    }
+    if (update.anchor.owner.handle_id == old.anchor.owner.handle_id &&
+        update.anchor.owner.generation <= old.anchor.owner.generation) {
+        result.status = server_prefix_session_status::stale_generation;
+        return result;
+    }
+
+    result.displaced       = old;
+    current->second        = { update.anchor, expires_at };
+    result.status          = server_prefix_session_status::replaced;
+    result.expires_at_tick = expires_at;
+    ++data->replacements;
+    return result;
+}
+
+std::optional<server_prefix_session_record> server_prefix_session_cache::lookup(const server_prefix_session_key & key,
+                                                                                uint64_t now_tick) const {
+    const auto found = data->sessions.find(key);
+    if (found == data->sessions.end() || now_tick >= found->second.expires_at_tick) {
+        return std::nullopt;
+    }
+    return found->second;
+}
+
+std::optional<server_prefix_session_record> server_prefix_session_cache::erase(
+    const server_prefix_session_key &     key,
+    const server_prefix_session_version & expected) {
+    const auto found = data->sessions.find(key);
+    if (found == data->sessions.end() || !(expected == session_version(found->second.anchor))) {
+        return std::nullopt;
+    }
+    const server_prefix_session_record removed = found->second;
+    data->sessions.erase(found);
+    ++data->erases;
+    return removed;
+}
+
+std::vector<server_prefix_session_expired> server_prefix_session_cache::expire(uint64_t now_tick) {
+    std::vector<server_prefix_session_expired> result;
+    for (auto it = data->sessions.begin(); it != data->sessions.end();) {
+        if (now_tick < it->second.expires_at_tick) {
+            ++it;
+            continue;
+        }
+        result.push_back({ it->first, it->second });
+        it = data->sessions.erase(it);
+    }
+    std::sort(result.begin(), result.end(),
+              [](const auto & lhs, const auto & rhs) { return session_key_less(lhs.key, rhs.key); });
+    data->expirations += result.size();
+    return result;
+}
+
+void server_prefix_session_cache::clear() {
+    data->sessions.clear();
+    data->peak_entries = 0;
+    data->insertions   = 0;
+    data->replacements = 0;
+    data->expirations  = 0;
+    data->erases       = 0;
+}
+
+server_prefix_session_stats server_prefix_session_cache::stats(uint64_t now_tick) const {
+    server_prefix_session_stats result;
+    result.entries      = data->sessions.size();
+    result.peak_entries = data->peak_entries;
+    result.insertions   = data->insertions;
+    result.replacements = data->replacements;
+    result.expirations  = data->expirations;
+    result.erases       = data->erases;
+    for (const auto & item : data->sessions) {
+        if (now_tick < item.second.expires_at_tick) {
+            ++result.active;
+        } else {
+            ++result.expired;
         }
     }
     return result;

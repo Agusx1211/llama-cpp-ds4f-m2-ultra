@@ -89,6 +89,36 @@ static server_prefix_policy_config policy_config() {
     return result;
 }
 
+static server_prefix_session_key session_key(uint8_t identity_seed, const std::string & session_id) {
+    return { identity(identity_seed), session_id };
+}
+
+static server_prefix_session_anchor session_anchor(uint64_t turn,
+                                                   uint64_t generation,
+                                                   uint64_t content_seed,
+                                                   uint32_t message_end_tokens = 128,
+                                                   uint64_t handle_id          = 100) {
+    auto prefix           = policy_key(content_seed);
+    prefix.aligned_tokens = message_end_tokens;
+    return {
+        prefix, { handle_id, generation },
+         turn, 64 * 1024, 10.0, message_end_tokens
+    };
+}
+
+static server_prefix_session_version session_version(const server_prefix_session_anchor & anchor) {
+    return { anchor.owner, anchor.turn_id };
+}
+
+static server_prefix_session_config session_config() {
+    server_prefix_session_config result;
+    result.max_sessions           = 8;
+    result.max_session_id_bytes   = 64;
+    result.max_architecture_bytes = 64;
+    result.ttl_ticks              = 100;
+    return result;
+}
+
 static void test_longest_exact_prefix_and_shared_reuse() {
     server_prefix_radix radix;
     const auto          id         = identity();
@@ -489,6 +519,197 @@ static void test_policy_invalid_input_and_clear() {
     assert(stats.sketch_cells != 0 && stats.ghost_capacity != 0);
 }
 
+static void test_latest_session_transactional_replacement_and_generation() {
+    server_prefix_session_cache cache(session_config());
+    const auto                  key    = session_key(1, "agent-session");
+    const auto                  first  = session_anchor(1, 1, 10);
+    const auto                  insert = cache.replace({ key, first, std::nullopt, 10 });
+    assert(insert.status == server_prefix_session_status::inserted && insert.expires_at_tick == 110);
+    const auto original = cache.lookup(key, 10);
+    assert(original.has_value() && original->anchor == first);
+
+    const auto missing_expected = cache.replace({ key, session_anchor(2, 2, 20), std::nullopt, 20 });
+    assert(missing_expected.status == server_prefix_session_status::conflict);
+    assert(cache.lookup(key, 20) == original);
+
+    auto stale_expected             = session_version(first);
+    stale_expected.owner.generation = 99;
+    const auto stale                = cache.replace({ key, session_anchor(2, 2, 20), stale_expected, 20 });
+    assert(stale.status == server_prefix_session_status::stale_generation);
+    assert(cache.lookup(key, 20) == original);
+
+    const auto stale_turn = cache.replace({ key, session_anchor(1, 2, 20), session_version(first), 20 });
+    assert(stale_turn.status == server_prefix_session_status::stale_turn);
+    assert(cache.lookup(key, 20) == original);
+
+    const auto reused_generation = cache.replace({ key, session_anchor(2, 1, 20), session_version(first), 20 });
+    assert(reused_generation.status == server_prefix_session_status::stale_generation);
+    assert(cache.lookup(key, 20) == original);
+
+    auto invalid_anchor               = session_anchor(2, 2, 20);
+    invalid_anchor.message_end_tokens = 256;
+    const auto invalid                = cache.replace({ key, invalid_anchor, session_version(first), 20 });
+    assert(invalid.status == server_prefix_session_status::invalid_argument);
+    assert(cache.lookup(key, 20) == original);
+
+    const auto second   = session_anchor(2, 2, 20);
+    const auto replaced = cache.replace({ key, second, session_version(first), 20 });
+    assert(replaced.status == server_prefix_session_status::replaced);
+    assert(replaced.displaced == original && replaced.expires_at_tick == 120);
+    assert(cache.lookup(key, 20)->anchor == second);
+    assert(cache.stats(20).entries == 1 && cache.stats(20).replacements == 1);
+
+    assert(!cache.erase(key, session_version(first)).has_value());
+    assert(cache.lookup(key, 20)->anchor == second);
+    const auto erased = cache.erase(key, session_version(second));
+    assert(erased.has_value() && erased->anchor == second);
+    assert(cache.stats(20).entries == 0 && cache.stats(20).erases == 1);
+}
+
+static void test_latest_session_exact_identity_and_hash_collisions() {
+    auto config                  = session_config();
+    config.force_hash_collisions = true;
+    server_prefix_session_cache cache(config);
+    const auto                  key_a = session_key(1, "same-session");
+    const auto                  key_b = session_key(2, "same-session");
+    const auto                  key_c = session_key(1, "other-session");
+    const auto                  a     = session_anchor(1, 1, 10, 128, 10);
+    const auto                  b     = session_anchor(1, 1, 20, 128, 20);
+    const auto                  c     = session_anchor(1, 1, 30, 128, 30);
+
+    assert(cache.replace({ key_a, a, std::nullopt, 0 }).status == server_prefix_session_status::inserted);
+    assert(cache.replace({ key_b, b, std::nullopt, 0 }).status == server_prefix_session_status::inserted);
+    assert(cache.replace({ key_c, c, std::nullopt, 0 }).status == server_prefix_session_status::inserted);
+    assert(cache.lookup(key_a, 0)->anchor == a);
+    assert(cache.lookup(key_b, 0)->anchor == b);
+    assert(cache.lookup(key_c, 0)->anchor == c);
+
+    const auto a2 = session_anchor(2, 2, 11, 256, 10);
+    assert(cache.replace({ key_a, a2, session_version(a), 1 }).status == server_prefix_session_status::replaced);
+    assert(cache.lookup(key_a, 1)->anchor == a2);
+    assert(cache.lookup(key_b, 1)->anchor == b);
+    assert(cache.lookup(key_c, 1)->anchor == c);
+    assert(!cache.erase(session_key(3, "same-session"), session_version(a2)).has_value());
+    assert(cache.stats(1).entries == 3);
+}
+
+static void test_latest_session_ttl_boundaries_and_deterministic_expiry() {
+    auto config      = session_config();
+    config.ttl_ticks = 10;
+    server_prefix_session_cache cache(config);
+    const auto                  key_a = session_key(1, "a");
+    const auto                  key_b = session_key(1, "b");
+    const auto                  first = session_anchor(1, 1, 10);
+
+    assert(cache.replace({ key_b, first, std::nullopt, 100 }).expires_at_tick == 110);
+    assert(cache.replace({ key_a, first, std::nullopt, 100 }).expires_at_tick == 110);
+    assert(cache.lookup(key_a, 109).has_value());
+    assert(!cache.lookup(key_a, 110).has_value());
+    assert(cache.stats(109).active == 2 && cache.stats(109).expired == 0);
+    assert(cache.stats(110).active == 0 && cache.stats(110).expired == 2);
+    assert(cache.expire(109).empty());
+
+    const auto expired = cache.expire(110);
+    assert(expired.size() == 2);
+    assert(expired[0].key == key_a && expired[1].key == key_b);
+    assert(expired[0].record.anchor == first && expired[1].record.anchor == first);
+    const auto stats = cache.stats(110);
+    assert(stats.entries == 0 && stats.expirations == 2);
+
+    assert(cache.replace({ key_a, first, std::nullopt, 120 }).status == server_prefix_session_status::inserted);
+    const auto expired_record = cache.lookup(key_a, 129);
+    assert(expired_record.has_value());
+    const auto expected_after_expiry = cache.replace({ key_a, session_anchor(2, 2, 20), session_version(first), 130 });
+    assert(expected_after_expiry.status == server_prefix_session_status::conflict);
+    assert(!cache.lookup(key_a, 130).has_value());
+    const auto renewed = cache.replace({ key_a, session_anchor(2, 2, 20), std::nullopt, 130 });
+    assert(renewed.status == server_prefix_session_status::replaced && renewed.displaced == expired_record);
+    assert(cache.lookup(key_a, 139).has_value() && !cache.lookup(key_a, 140).has_value());
+}
+
+static void test_latest_session_capacity_invalid_and_atomic_failures() {
+    auto config                 = session_config();
+    config.max_sessions         = 1;
+    config.ttl_ticks            = 5;
+    config.max_session_id_bytes = 8;
+    server_prefix_session_cache cache(config);
+    const auto                  key_a = session_key(1, "a");
+    const auto                  key_b = session_key(1, "b");
+    const auto                  first = session_anchor(1, 1, 10);
+    assert(cache.replace({ key_a, first, std::nullopt, 0 }).status == server_prefix_session_status::inserted);
+
+    assert(cache.replace({ key_b, first, std::nullopt, 1 }).status == server_prefix_session_status::capacity);
+    assert(cache.lookup(key_a, 1)->anchor == first);
+
+    auto invalid_key       = key_b;
+    invalid_key.session_id = "too-long-id";
+    assert(cache.replace({ invalid_key, first, std::nullopt, 1 }).status ==
+           server_prefix_session_status::invalid_argument);
+    auto invalid_identity          = key_b;
+    invalid_identity.identity.rope = {};
+    assert(cache.replace({ invalid_identity, first, std::nullopt, 1 }).status ==
+           server_prefix_session_status::invalid_argument);
+    auto useless             = first;
+    useless.saved_prefill_ms = 0.0;
+    assert(cache.replace({ key_a, useless, session_version(first), 1 }).status ==
+           server_prefix_session_status::invalid_argument);
+    assert(
+        cache.replace({ key_a, session_anchor(2, 2, 20), session_version(first), std::numeric_limits<uint64_t>::max() })
+            .status == server_prefix_session_status::invalid_argument);
+    assert(cache.lookup(key_a, 1)->anchor == first);
+    assert(cache.stats(1).insertions == 1 && cache.stats(1).replacements == 0);
+
+    assert(!cache.lookup(key_a, 5).has_value());
+    assert(cache.replace({ key_b, first, std::nullopt, 5 }).status == server_prefix_session_status::capacity);
+    const auto expired = cache.expire(5);
+    assert(expired.size() == 1 && expired.front().key == key_a);
+    assert(cache.replace({ key_b, first, std::nullopt, 5 }).status == server_prefix_session_status::inserted);
+
+    auto bad_config         = session_config();
+    bad_config.max_sessions = 0;
+    bool threw              = false;
+    try {
+        server_prefix_session_cache ignored(bad_config);
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    assert(threw);
+}
+
+static void test_one_million_latest_session_replacements_are_bounded() {
+    auto config         = session_config();
+    config.max_sessions = 1;
+    config.ttl_ticks    = 2000000;
+    server_prefix_session_cache cache(config);
+    const auto                  key = session_key(1, "million-replacements");
+
+    server_prefix_session_update update;
+    update.key      = key;
+    update.anchor   = session_anchor(1, 1, 1);
+    update.now_tick = 1;
+    assert(cache.replace(update).status == server_prefix_session_status::inserted);
+
+    constexpr uint64_t replacement_count = 1000000;
+    for (uint64_t replacement = 1; replacement <= replacement_count; ++replacement) {
+        update.expected_current = session_version(update.anchor);
+        const uint64_t turn     = replacement + 1;
+        const uint32_t boundary = static_cast<uint32_t>((replacement % 8192 + 1) * SERVER_PREFIX_BLOCK_TOKENS);
+        update.anchor           = session_anchor(turn, turn, turn, boundary);
+        update.now_tick         = turn;
+        const auto result       = cache.replace(update);
+        assert(result.status == server_prefix_session_status::replaced);
+        assert(result.displaced.has_value() && result.displaced->anchor.turn_id == turn - 1);
+    }
+
+    const auto stats = cache.stats(update.now_tick);
+    assert(stats.entries == 1 && stats.active == 1 && stats.expired == 0);
+    assert(stats.peak_entries == 1 && stats.insertions == 1 && stats.replacements == replacement_count);
+    const auto latest = cache.lookup(key, update.now_tick);
+    assert(latest.has_value() && latest->anchor == update.anchor);
+    std::cout << "million session replacements: entries=" << stats.entries << " peak=" << stats.peak_entries
+              << " insertions=" << stats.insertions << " replacements=" << stats.replacements << '\n';
+}
+
 int main() {
     test_longest_exact_prefix_and_shared_reuse();
     test_hash_collisions_never_authorize_reuse();
@@ -503,6 +724,11 @@ int main() {
     test_one_million_one_hit_ghosts_are_bounded();
     test_policy_trace_beats_fifo_and_lru_efficiency();
     test_policy_invalid_input_and_clear();
+    test_latest_session_transactional_replacement_and_generation();
+    test_latest_session_exact_identity_and_hash_collisions();
+    test_latest_session_ttl_boundaries_and_deterministic_expiry();
+    test_latest_session_capacity_invalid_and_atomic_failures();
+    test_one_million_latest_session_replacements_are_bounded();
     std::cout << "server prefix cache tests passed\n";
     return 0;
 }
