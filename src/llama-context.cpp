@@ -917,6 +917,7 @@ bool llama_context::memory_update(bool optimize) {
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+            return false;
         }
     }
 
@@ -3101,14 +3102,24 @@ public:
             }
             const auto & mbuf_cur = it->second;
 
-            if (!mbuf_cur.buf || mbuf_cur.n_tensors != mbuf.n_tensors || mbuf_cur.total_size != mbuf.total_size) {
+            if (!mbuf_cur.buf ||
+                    mbuf_cur.n_tensors != mbuf.n_tensors ||
+                    mbuf_cur.total_size != mbuf.total_size ||
+                    mbuf_cur.cpy.size() != mbuf.org.size()) {
                 throw std::runtime_error("device sequence state tensor layout mismatch");
+            }
+
+            for (size_t i = 0; i < mbuf.org.size(); ++i) {
+                if (mbuf_cur.cpy[i]->type != mbuf.org[i]->type ||
+                        !ggml_are_same_shape(mbuf_cur.cpy[i], mbuf.org[i])) {
+                    throw std::runtime_error("device sequence state tensor shape mismatch");
+                }
             }
         }
 
         for (auto & [buft, mbuf] : mbufs_new) {
             const auto & mbuf_cur = mbufs.at(buft);
-            for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
+            for (size_t i = 0; i < mbuf.org.size(); ++i) {
                 ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
             }
         }
@@ -3131,8 +3142,9 @@ public:
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        // save for later during destruction
-        rinfos.push_back({tensor, ptr, size, offset});
+        // The payload lives in mbufs; the host pointer intentionally does not
+        // advance for device-resident tensor data.
+        rinfos.push_back({tensor, size, offset});
     }
 
     size_t n_bytes() override {
@@ -3146,7 +3158,6 @@ private:
 
     struct read_info {
         ggml_tensor * tensor;
-        const uint8_t * ptr;
         size_t size;
         size_t offset;
     };
