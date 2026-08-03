@@ -2077,7 +2077,7 @@ int ggml_metal_op_dsv4_indexed_concat(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * k_pool      = op->src[1];
     const ggml_tensor * segment_ids = op->src[2];
 
-    const ggml_metal_kargs_dsv4_indexed_concat args = {
+    ggml_metal_kargs_dsv4_indexed_concat args = {
         /*.n_embd4         =*/ (int32_t) raw_k->ne[0]/4,
         /*.n_raw           =*/ (int32_t) raw_k->ne[2],
         /*.n_comp          =*/ ggml_get_op_params_i32(op, 0),
