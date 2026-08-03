@@ -15,6 +15,7 @@ llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_me
             }
         case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
         case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
+        case LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE:
             {
                 return s0;
             }
@@ -32,6 +33,7 @@ llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_me
             }
         case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
         case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
+        case LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE:
             {
                 return s1;
             }
@@ -50,6 +52,7 @@ bool llama_memory_status_is_fail(llama_memory_status status) {
             }
         case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
         case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
+        case LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE:
             {
                 return true;
             }

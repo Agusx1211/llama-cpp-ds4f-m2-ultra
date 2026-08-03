@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -567,6 +568,49 @@ void test_resource_vectors_and_safety_watermark() {
             "limiting pool beyond watermark rejects");
 }
 
+void test_kv_physical_pressure_policy() {
+    kv_pressure_controller pressure(2);
+
+    const auto retry_1 = pressure.on_pressure(8, 7, 3);
+    require(retry_1.action == kv_pressure_action::retry, "first pressure must retry");
+    require(retry_1.reason == reason_code::kv_physical_pressure_retry, "retry reason");
+    require(retry_1.attempt == 1 && retry_1.next_batch_size == 4, "first bounded retry shape");
+    require(retry_1.victim_sequence == -1 && retry_1.victim_span_tokens == 0, "retry has no victim");
+
+    const auto retry_2 = pressure.on_pressure(4, 7, 3);
+    require(retry_2.action == kv_pressure_action::retry, "second pressure must retry");
+    require(retry_2.attempt == 2 && retry_2.next_batch_size == 2, "second bounded retry shape");
+
+    const auto victim = pressure.on_pressure(2, 7, 3);
+    require(victim.action == kv_pressure_action::victim, "retry bound must select a victim");
+    require(victim.reason == reason_code::kv_physical_pressure_victim, "victim reason");
+    require(victim.attempt == 3 && victim.victim_sequence == 7 && victim.victim_span_tokens == 3,
+            "head sequence and full contiguous span are deterministic");
+    require(std::string(to_string(retry_1.reason)) == "kv_physical_pressure_retry", "stable retry notification");
+    require(std::string(to_string(victim.reason)) == "kv_physical_pressure_victim", "stable victim notification");
+
+    std::vector<int32_t> cohort = { 7, 7, 7, 11, 12 };
+    cohort.erase(cohort.begin(), cohort.begin() + victim.victim_span_tokens);
+    require(cohort == std::vector<int32_t>({ 11, 12 }), "victim handling must retain the rest of the cohort");
+
+    const kv_pressure_snapshot snapshot = pressure.snapshot();
+    require(snapshot == kv_pressure_snapshot({ 3, 2, 1 }), "low-cardinality pressure counters");
+
+    kv_pressure_controller replay(2);
+    require(replay.on_pressure(8, 7, 3) == retry_1, "first retry event deterministic");
+    require(replay.on_pressure(4, 7, 3) == retry_2, "second retry event deterministic");
+    require(replay.on_pressure(2, 7, 3) == victim, "victim event deterministic");
+
+    kv_pressure_controller reset(2);
+    reset.on_pressure(1, 3, 1);
+    reset.reset_attempts();
+    require(reset.on_pressure(1, 3, 1).attempt == 1, "successful decode resets only the retry window");
+
+    kv_pressure_controller no_retry(0);
+    require(no_retry.on_pressure(1, 9, 1).action == kv_pressure_action::victim,
+            "zero retry configuration is an immediate deterministic victim");
+}
+
 }  // namespace
 
 int main() {
@@ -588,6 +632,7 @@ int main() {
         { "asynchronous spill",               test_async_spill_holds_capacity_without_blocking_gpu      },
         { "capacity-wait lane policy",        test_zero_duration_capacity_waiters_preserve_lane_policy  },
         { "resource vectors",                 test_resource_vectors_and_safety_watermark                },
+        { "KV physical pressure",             test_kv_physical_pressure_policy                           },
     };
 
     for (const auto & test : tests) {

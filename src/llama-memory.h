@@ -32,6 +32,7 @@ enum llama_memory_status {
     LLAMA_MEMORY_STATUS_NO_UPDATE,
     LLAMA_MEMORY_STATUS_FAILED_PREPARE,
     LLAMA_MEMORY_STATUS_FAILED_COMPUTE,
+    LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE,
 };
 
 // helper function for combining the status of two memory contexts
@@ -47,7 +48,9 @@ bool llama_memory_status_is_fail(llama_memory_status status);
 //   - llama_kv_cache_iswa_context
 //   ...
 //
-// the only method that should mutate the memory and the memory context is llama_memory_i::apply()
+// preflight() may reserve physical resources for the complete batch, but it must
+// not update logical sequence state. apply() consumes the current ubatch and is
+// the only method that should update logical memory state.
 struct llama_memory_context_i {
     virtual ~llama_memory_context_i() = default;
 
@@ -59,11 +62,22 @@ struct llama_memory_context_i {
     // return false on failure
     virtual bool apply() = 0;
 
+    // reserve any physical resources required by the complete batch before
+    // output bookkeeping or graph submission. The default requires no work.
+    virtual bool preflight() {
+        return true;
+    }
+
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // Available only after get_status() reports physical KV pressure.
+    virtual bool get_kv_pressure(llama_kv_pressure_info & /* info */) const {
+        return false;
+    }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

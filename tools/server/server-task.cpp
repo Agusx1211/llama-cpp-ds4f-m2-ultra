@@ -1559,6 +1559,9 @@ json server_task_result_metrics::to_json() {
 
         { "n_decode_total",                  n_decode_total },
         { "n_busy_slots_total",              n_busy_slots_total },
+        { "kv_physical_pressure_total",       kv_physical_pressure_total },
+        { "kv_physical_pressure_retries",     kv_physical_pressure_retries },
+        { "kv_physical_pressure_victims",     kv_physical_pressure_victims },
 
         { "slots",                           slots_data },
     };

@@ -10,9 +10,11 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-kv-cache-dsv4-accounting.h"
 #include "../src/llama-model-saver.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
@@ -25,6 +27,11 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+static_assert(LLAMA_DECODE_SUCCESS == 0, "decode success ABI changed");
+static_assert(LLAMA_DECODE_KV_LOGICAL_FULL == 1, "logical KV-full ABI changed");
+static_assert(LLAMA_DECODE_ABORTED == 2, "decode abort ABI changed");
+static_assert(LLAMA_DECODE_KV_PHYSICAL_PRESSURE == 3, "physical pressure result must remain distinct");
 
 // normalized mean squared error = mse(a, b) / mse(a, 0)
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
@@ -297,6 +304,8 @@ struct test_context_config {
     bool     load_mtp    = false;
     enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
     llama_context_type ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
+    ggml_backend_sched_eval_callback cb_eval = nullptr;
+    void * cb_eval_user_data = nullptr;
 };
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
@@ -320,6 +329,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_seq_max = config.n_seq_max;
     ctx_params.kv_unified = config.kv_unified;
     ctx_params.ctx_type = config.ctx_type;
+    ctx_params.cb_eval = config.cb_eval;
+    ctx_params.cb_eval_user_data = config.cb_eval_user_data;
     ctx_params.flash_attn_type = config.flash_attn_type;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
@@ -629,13 +640,18 @@ struct dsv4_test_context {
             bool kv_unified,
             uint32_t batch_capacity,
             uint32_t max_seq_ids = 1,
-            uint32_t n_ctx_total = 0) {
+            uint32_t n_ctx_total = 0,
+            uint32_t n_ubatch = 0,
+            ggml_backend_sched_eval_callback cb_eval = nullptr,
+            void * cb_eval_user_data = nullptr) {
         test_context_config config;
         config.n_ctx = n_ctx_total > 0 ? n_ctx_total : 256*n_seq_max;
         config.n_batch = batch_capacity;
-        config.n_ubatch = batch_capacity;
         config.n_seq_max = n_seq_max;
         config.kv_unified = kv_unified;
+        config.n_ubatch = n_ubatch > 0 ? n_ubatch : batch_capacity;
+        config.cb_eval = cb_eval;
+        config.cb_eval_user_data = cb_eval_user_data;
 
         gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_DEEPSEEK4, true);
         auto loaded = get_model_and_ctx(
@@ -679,6 +695,145 @@ struct dsv4_test_context {
         dst.insert(dst.end(), logits, logits + n_vocab);
     }
 };
+
+static bool dsv4_count_graph_nodes(ggml_tensor * /* tensor */, bool ask, void * user_data) {
+    if (!ask) {
+        ++*static_cast<uint32_t *>(user_data);
+    }
+    return true;
+}
+
+static std::vector<uint8_t> dsv4_sequence_state(llama_context * lctx, llama_seq_id seq_id) {
+    std::vector<uint8_t> result(llama_state_seq_get_size(lctx, seq_id));
+    const size_t written = llama_state_seq_get_data(lctx, result.data(), result.size(), seq_id);
+    if (written != result.size()) {
+        throw std::runtime_error("failed to capture DSV4 sequence state");
+    }
+    return result;
+}
+
+static bool dsv4_family_usage_equal(
+        const llama_dsv4_family_usage & lhs,
+        const llama_dsv4_family_usage & rhs) {
+    if (lhs.family != rhs.family ||
+            lhs.placement_sparse != rhs.placement_sparse ||
+            lhs.logical_capacity_rows != rhs.logical_capacity_rows ||
+            lhs.logical_mapped_rows != rhs.logical_mapped_rows ||
+            lhs.sequence_mapped_rows != rhs.sequence_mapped_rows ||
+            lhs.pools.size() != rhs.pools.size() ||
+            !dsv4_sparse_usage_equal(lhs.total, rhs.total)) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.pools.size(); ++i) {
+        if (!dsv4_sparse_usage_equal(lhs.pools[i], rhs.pools[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool dsv4_usage_snapshot_equal(
+        const llama_dsv4_memory_usage_snapshot & lhs,
+        const llama_dsv4_memory_usage_snapshot & rhs) {
+    if (!dsv4_sparse_usage_equal(lhs.sparse_total, rhs.sparse_total) ||
+            lhs.limiting_family != rhs.limiting_family ||
+            lhs.limiting_family_mask != rhs.limiting_family_mask ||
+            lhs.limiting_pool_id != rhs.limiting_pool_id ||
+            lhs.limiting_available_pages != rhs.limiting_available_pages) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.families.size(); ++i) {
+        if (!dsv4_family_usage_equal(lhs.families[i], rhs.families[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool test_dsv4_physical_pressure(size_t seed, ggml_backend_dev_t dev) {
+    if (!dsv4_test_has_elastic_pages(dev, 2)) {
+        return true;
+    }
+
+    uint32_t graph_nodes = 0;
+    dsv4_test_context test(seed, dev, 2, true, 4, 1, 256, 1,
+            dsv4_count_graph_nodes, &graph_nodes);
+    GGML_ASSERT(llama_n_ubatch(test.lctx.get()) == 1);
+    auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(test.lctx.get()));
+    GGML_ASSERT(memory != nullptr);
+
+    const auto tokens = get_tokens(4, 128, seed + 20);
+    test.add(tokens[0], 0, { 0 });
+    test.add(tokens[1], 0, { 1 });
+    test.decode("physical-pressure baseline");
+
+    std::vector<float> logits_before;
+    logits_before.reserve(2*test.n_vocab);
+    test.append_logits(0, logits_before);
+    test.append_logits(1, logits_before);
+
+    const auto usage_before = memory->memory_usage_snapshot();
+    const auto seq_0_before = dsv4_sequence_state(test.lctx.get(), 0);
+    const auto seq_1_before = dsv4_sequence_state(test.lctx.get(), 1);
+    const llama_pos seq_0_min = llama_memory_seq_pos_min(llama_get_memory(test.lctx.get()), 0);
+    const llama_pos seq_0_max = llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 0);
+    const llama_pos seq_1_min = llama_memory_seq_pos_min(llama_get_memory(test.lctx.get()), 1);
+    const llama_pos seq_1_max = llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 1);
+
+    test.clear_batch();
+    test.add(tokens[2], 1, { 0 });
+    test.add(tokens[3], 2, { 0 });
+    const std::array<llama_token, 2> batch_tokens = { test.batch.token[0], test.batch.token[1] };
+    const std::array<llama_pos, 2> batch_positions = { test.batch.pos[0], test.batch.pos[1] };
+    const std::array<llama_seq_id, 2> batch_sequences = {
+        test.batch.seq_id[0][0], test.batch.seq_id[1][0]
+    };
+    const std::array<int8_t, 2> batch_outputs = { test.batch.logits[0], test.batch.logits[1] };
+
+    graph_nodes = 0;
+    llama_kv_cache_dsv4_test_inject_physical_pressure(1);
+    const int32_t pressure_result = llama_decode(test.lctx.get(), test.batch);
+    GGML_ASSERT(pressure_result == LLAMA_DECODE_KV_PHYSICAL_PRESSURE);
+    GGML_ASSERT(graph_nodes == 0 && "physical pressure reached graph submission");
+
+    llama_kv_pressure_info pressure = {};
+    GGML_ASSERT(llama_get_last_kv_pressure(test.lctx.get(), &pressure));
+    GGML_ASSERT(pressure.limiting_family < LLAMA_DSV4_MEMORY_FAMILY_COUNT);
+    GGML_ASSERT(pressure.limiting_family_mask != 0 && pressure.limiting_pool_id != 0);
+    GGML_ASSERT(pressure.reserved_pages <= pressure.free_pages);
+    GGML_ASSERT(pressure.physical_pages >= pressure.free_pages);
+
+    GGML_ASSERT(dsv4_usage_snapshot_equal(usage_before, memory->memory_usage_snapshot()));
+    GGML_ASSERT(seq_0_before == dsv4_sequence_state(test.lctx.get(), 0));
+    GGML_ASSERT(seq_1_before == dsv4_sequence_state(test.lctx.get(), 1));
+    GGML_ASSERT(llama_memory_seq_pos_min(llama_get_memory(test.lctx.get()), 0) == seq_0_min);
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 0) == seq_0_max);
+    GGML_ASSERT(llama_memory_seq_pos_min(llama_get_memory(test.lctx.get()), 1) == seq_1_min);
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 1) == seq_1_max);
+
+    const std::array<llama_token, 2> batch_tokens_after = { test.batch.token[0], test.batch.token[1] };
+    const std::array<llama_pos, 2> batch_positions_after = { test.batch.pos[0], test.batch.pos[1] };
+    const std::array<llama_seq_id, 2> batch_sequences_after = {
+        test.batch.seq_id[0][0], test.batch.seq_id[1][0]
+    };
+    const std::array<int8_t, 2> batch_outputs_after = { test.batch.logits[0], test.batch.logits[1] };
+    GGML_ASSERT(batch_tokens == batch_tokens_after);
+    GGML_ASSERT(batch_positions == batch_positions_after);
+    GGML_ASSERT(batch_sequences == batch_sequences_after);
+    GGML_ASSERT(batch_outputs == batch_outputs_after);
+
+    std::vector<float> logits_after;
+    logits_after.reserve(logits_before.size());
+    test.append_logits(0, logits_after);
+    test.append_logits(1, logits_after);
+    GGML_ASSERT(logits_before == logits_after);
+
+    GGML_ASSERT(llama_decode(test.lctx.get(), test.batch) == LLAMA_DECODE_SUCCESS);
+    GGML_ASSERT(!llama_get_last_kv_pressure(test.lctx.get(), &pressure));
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 0) == 2);
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 1) == 0);
+    return true;
+}
 
 static std::vector<float> run_dsv4_isolated(
         size_t seed,
@@ -1014,6 +1169,7 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
 
     bool all_ok = true;
     all_ok = test_dsv4_elastic_borrow(seed, dev) && all_ok;
+    all_ok = test_dsv4_physical_pressure(seed, dev) && all_ok;
     for (const parallel_case & test_case : cases) {
         const dsv4_parallel_result parallel = run_dsv4_parallel(
                 seed, dev, tokens_a, tokens_b, n_prompt,

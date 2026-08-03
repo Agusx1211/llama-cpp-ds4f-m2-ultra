@@ -15,6 +15,10 @@ bool llama_kv_cache_dsv4_supports_elastic_metal(
         const llama_model & model,
         uint32_t n_seq_max);
 
+// Test-only deterministic fault seam. Each injected failure is consumed by a
+// successful target Metal sparse reservation before it can be committed.
+void llama_kv_cache_dsv4_test_inject_physical_pressure(uint32_t count);
+
 enum llama_dsv4_memory_family {
     LLAMA_DSV4_MEMORY_RAW = 0,
     LLAMA_DSV4_MEMORY_CSA,
@@ -275,6 +279,8 @@ public:
     bool apply() override;
     const slot_info_vec_t::value_type & get_base_write_slot() const;
     const slot_info_vec_t::value_type & get_swa_write_slot() const;
+    const slot_info_vec_t::value_type & get_base_write_slot(size_t index) const;
+    const slot_info_vec_t::value_type & get_swa_write_slot(size_t index) const;
 
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -282,6 +288,7 @@ public:
     uint32_t get_n_kv() const;
     uint32_t get_n_write() const;
     uint64_t get_n_backing_rows() const;
+    uint64_t get_n_backing_rows(size_t index) const;
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
@@ -426,11 +433,13 @@ public:
     // llama_memory_context_i
     //
 
-    bool next()  override;
-    bool apply() override;
+    bool next()      override;
+    bool apply()     override;
+    bool preflight() override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    bool get_kv_pressure(llama_kv_pressure_info & info) const override;
 
     //
     // llama_kv_cache_dsv4_context specific API
@@ -454,6 +463,8 @@ public:
     const llama_dsv4_batch_quote & get_last_batch_quote() const;
 
 private:
+    bool reserve_batch_ranges();
+
     llama_kv_cache_dsv4 * kv = nullptr;
 
     size_t i_next = 0;
@@ -488,5 +499,8 @@ private:
 
     llama_dsv4_batch_quote last_batch_quote;
 
-    const llama_memory_status status;
+    uint32_t last_pressure_family_mask = 0;
+    bool batch_ranges_reserved = false;
+
+    llama_memory_status status;
 };
