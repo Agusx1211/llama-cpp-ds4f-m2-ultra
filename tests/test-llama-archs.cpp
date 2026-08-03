@@ -1236,6 +1236,7 @@ static bool test_dsv4_restore_boundaries(size_t seed, ggml_backend_dev_t dev) {
     }
 
     GGML_ASSERT(checkpoints.size() == boundaries.size());
+    bool all_ok = true;
     for (const checkpoint & saved : checkpoints) {
         GGML_ASSERT(!saved.next_logits.empty());
         const size_t restored = llama_state_seq_set_data(
@@ -1246,12 +1247,15 @@ static bool test_dsv4_restore_boundaries(size_t seed, ggml_backend_dev_t dev) {
 
         test.add(tokens[saved.n_tokens], saved.n_tokens, { 2 });
         test.decode("restore-boundary destination");
-        GGML_ASSERT(dsv4_logits_ith(test, 0) == saved.next_logits);
+        const std::string label = "restore-" + std::to_string(saved.n_tokens);
+        all_ok = compare_dsv4_trace(
+                label.c_str(), "next", saved.next_logits, dsv4_logits_ith(test, 0)) && all_ok;
         test.clear_batch();
     }
 
-    printf("DSV4 transactional restore boundaries (%s): OK\n", ggml_backend_dev_description(dev));
-    return true;
+    printf("DSV4 transactional restore boundaries (%s): %s\n",
+            ggml_backend_dev_description(dev), all_ok ? "OK" : "FAIL");
+    return all_ok;
 }
 
 static bool test_dsv4_transactional_restore(size_t seed, ggml_backend_dev_t dev) {
