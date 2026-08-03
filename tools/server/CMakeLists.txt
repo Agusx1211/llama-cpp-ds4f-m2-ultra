@@ -27,6 +27,8 @@ add_library(${TARGET} STATIC
     server-scheduler.h
     server-request-registry.cpp
     server-request-registry.h
+    server-prefix-cache.cpp
+    server-prefix-cache.h
 )
 
 if (BUILD_SHARED_LIBS)
