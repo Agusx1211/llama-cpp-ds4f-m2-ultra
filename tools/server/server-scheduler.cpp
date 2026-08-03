@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -183,6 +184,14 @@ const char * to_string(reason_code value) {
             return "replay_stalled";
         case reason_code::replay_limit_reached:
             return "replay_limit_reached";
+        case reason_code::replay_restore_start:
+            return "replay_restore_start";
+        case reason_code::replay_restore_ready:
+            return "replay_restore_ready";
+        case reason_code::replay_spill_start:
+            return "replay_spill_start";
+        case reason_code::replay_spill_done:
+            return "replay_spill_done";
     }
     return "unknown";
 }
@@ -683,7 +692,7 @@ const scheduler_config & scheduler::config() const {
 bool replay_event::operator==(const replay_event & other) const {
     return kind == other.kind && time_us == other.time_us && request_id == other.request_id &&
            priority == other.priority && reason == other.reason && lane_reason == other.lane_reason &&
-           gpu_us == other.gpu_us;
+           gpu_us == other.gpu_us && io_us == other.io_us;
 }
 
 bool replay_result::operator==(const replay_result & other) const {
@@ -695,8 +704,14 @@ replay_result simulator::replay(const replay_trace & trace) const {
     struct runtime_job {
         trace_job job;
         bool      admitted         = false;
-        bool      resident         = false;
+        bool      resources_held   = false;
+        bool      restore_started  = false;
+        bool      restore_ready    = false;
+        bool      spill_started    = false;
+        bool      spill_done       = false;
         bool      finished         = false;
+        uint64_t  restore_ready_us = 0;
+        uint64_t  spill_done_us    = 0;
         uint64_t  completed_quanta = 0;
         uint64_t  required_quanta  = 0;
     };
@@ -742,12 +757,111 @@ replay_result simulator::replay(const replay_trace & trace) const {
         job_by_id.emplace(jobs[i].job.req.id, i);
     }
 
-    size_t   next_arrival     = 0;
-    uint64_t now_us           = arrival_order.empty() ? 0 : jobs[arrival_order.front()].job.req.arrival_us;
-    auto     process_arrivals = [&]() {
+    size_t   next_arrival = 0;
+    uint64_t now_us       = arrival_order.empty() ? 0 : jobs[arrival_order.front()].job.req.arrival_us;
+
+    const auto start_restore = [&](runtime_job & runtime, uint64_t event_us) {
+        if (runtime.restore_started || runtime.resources_held ||
+            !vector_fits(result.resident, runtime.job.page_demand, trace.capacity, trace.safety_watermark)) {
+            return false;
+        }
+
+        vector_add(result.resident, runtime.job.page_demand);
+        runtime.resources_held  = true;
+        runtime.restore_started = true;
+        if (runtime.job.restore_io_us == 0) {
+            runtime.restore_ready = true;
+            return true;
+        }
+
+        runtime.restore_ready_us = saturating_add(event_us, runtime.job.restore_io_us);
+        result.events.push_back({
+            replay_event_kind::io_start,
+            event_us,
+            runtime.job.req.id,
+            runtime.job.req.priority,
+            reason_code::replay_restore_start,
+            reason_code::none,
+            0,
+            runtime.job.restore_io_us,
+        });
+        return true;
+    };
+
+    const auto start_waiting_restores = [&](uint64_t event_us) {
+        for (size_t index : arrival_order) {
+            runtime_job & runtime = jobs[index];
+            // Zero-duration restores remain scheduler candidates and reserve
+            // only when selected, preserving lane policy as capacity frees.
+            // Timed restores start FIFO because this Phase 0 simulator does
+            // not yet model the Phase 5 prioritized device queue.
+            if (runtime.admitted && !runtime.finished && !runtime.restore_started && runtime.job.restore_io_us > 0) {
+                start_restore(runtime, event_us);
+            }
+        }
+    };
+
+    const auto next_external_time = [&]() -> std::optional<uint64_t> {
+        std::optional<uint64_t> next;
+        const auto              consider = [&](uint64_t candidate) {
+            if (!next || candidate < *next) {
+                next = candidate;
+            }
+        };
+        if (next_arrival < arrival_order.size()) {
+            consider(jobs[arrival_order[next_arrival]].job.req.arrival_us);
+        }
+        for (const runtime_job & runtime : jobs) {
+            if (runtime.restore_started && !runtime.restore_ready) {
+                consider(runtime.restore_ready_us);
+            }
+            if (runtime.spill_started && !runtime.spill_done) {
+                consider(runtime.spill_done_us);
+            }
+        }
+        return next;
+    };
+
+    const auto process_external_at = [&](uint64_t event_us) {
+        // Complete I/O before same-timestamp arrivals so newly freed capacity
+        // is visible to their admission quote.
+        for (size_t index : arrival_order) {
+            runtime_job & runtime = jobs[index];
+            if (runtime.restore_started && !runtime.restore_ready && runtime.restore_ready_us == event_us) {
+                runtime.restore_ready = true;
+                result.events.push_back({
+                    replay_event_kind::io_complete,
+                    event_us,
+                    runtime.job.req.id,
+                    runtime.job.req.priority,
+                    reason_code::replay_restore_ready,
+                    reason_code::none,
+                    0,
+                    runtime.job.restore_io_us,
+                });
+            }
+            if (runtime.spill_started && !runtime.spill_done && runtime.spill_done_us == event_us) {
+                runtime.spill_done = true;
+                if (runtime.resources_held) {
+                    vector_subtract(result.resident, runtime.job.page_demand);
+                    runtime.resources_held = false;
+                }
+                result.events.push_back({
+                    replay_event_kind::io_complete,
+                    event_us,
+                    runtime.job.req.id,
+                    runtime.job.req.priority,
+                    reason_code::replay_spill_done,
+                    reason_code::none,
+                    0,
+                    runtime.job.spill_io_us,
+                });
+            }
+        }
+
         while (next_arrival < arrival_order.size()) {
             runtime_job & runtime = jobs[arrival_order[next_arrival]];
-            if (runtime.job.req.arrival_us > now_us) {
+            if (runtime.job.req.arrival_us != event_us) {
                 break;
             }
             result.events.push_back({
@@ -770,24 +884,27 @@ replay_result simulator::replay(const replay_trace & trace) const {
             }
             const admission_result admission = policy.admit(runtime.job.req, quote);
             runtime.admitted                 = admission.accepted;
-            runtime.resident                 = admission.accepted && admission.ready;
-            if (runtime.resident) {
-                vector_add(result.resident, runtime.job.page_demand);
-            }
             result.events.push_back({
                 replay_event_kind::admission,
-                now_us,
+                event_us,
                 runtime.job.req.id,
                 runtime.job.req.priority,
                 admission.reason,
             });
+            if (admission.accepted && admission.ready) {
+                start_restore(runtime, event_us);
+            }
             ++next_arrival;
         }
+
+        start_waiting_restores(event_us);
     };
 
-    while (true) {
-        process_arrivals();
+    if (next_external_time()) {
+        process_external_at(now_us);
+    }
 
+    while (true) {
         if (result.dispatches >= trace.max_dispatches) {
             result.events.push_back({
                 replay_event_kind::limit,
@@ -800,10 +917,12 @@ replay_result simulator::replay(const replay_trace & trace) const {
         }
 
         if (policy.queued_total() == 0) {
-            if (next_arrival >= arrival_order.size()) {
+            const auto next = next_external_time();
+            if (!next) {
                 break;
             }
-            now_us = std::max(now_us, jobs[arrival_order[next_arrival]].job.req.arrival_us);
+            now_us = std::max(now_us, *next);
+            process_external_at(now_us);
             continue;
         }
 
@@ -815,10 +934,12 @@ replay_result simulator::replay(const replay_trace & trace) const {
                 return value;
             }
             const runtime_job & runtime = jobs[found->second];
-            value.state = runtime.resident || vector_fits(result.resident, runtime.job.page_demand, trace.capacity,
-                                                          trace.safety_watermark) ?
-                              feasibility::feasible_now :
-                              feasibility::temporarily_blocked;
+            value.state                 = (runtime.resources_held && runtime.restore_ready) ||
+                                  (!runtime.restore_started && runtime.job.restore_io_us == 0 &&
+                                   vector_fits(result.resident, runtime.job.page_demand, trace.capacity,
+                                                               trace.safety_watermark)) ?
+                                              feasibility::feasible_now :
+                                              feasibility::temporarily_blocked;
             value.predicted_gpu_us = runtime.job.service_gpu_us;
             value.cached_prefix_us = runtime.job.cached_prefix_us;
             value.restore_cost_us  = runtime.job.restore_cost_us;
@@ -827,8 +948,10 @@ replay_result simulator::replay(const replay_trace & trace) const {
 
         const service_decision decision = policy.select_next(now_us, evaluate);
         if (!decision.selected) {
-            if (next_arrival < arrival_order.size()) {
-                now_us = std::max(now_us, jobs[arrival_order[next_arrival]].job.req.arrival_us);
+            const auto next = next_external_time();
+            if (next) {
+                now_us = std::max(now_us, *next);
+                process_external_at(now_us);
                 continue;
             }
             result.events.push_back({
@@ -843,11 +966,9 @@ replay_result simulator::replay(const replay_trace & trace) const {
         }
 
         runtime_job & runtime = jobs[job_by_id.at(decision.request_id)];
-        if (!runtime.resident) {
-            vector_add(result.resident, runtime.job.page_demand);
-            runtime.resident = true;
+        if (!runtime.resources_held && (!start_restore(runtime, now_us) || !runtime.restore_ready)) {
+            throw std::runtime_error("selected replay request could not reserve ready resources");
         }
-
         result.events.push_back({
             replay_event_kind::dispatch,
             now_us,
@@ -858,19 +979,24 @@ replay_result simulator::replay(const replay_trace & trace) const {
             runtime.job.service_gpu_us,
         });
 
+        const uint64_t completion_us = saturating_add(now_us, runtime.job.service_gpu_us);
+        while (true) {
+            const auto next = next_external_time();
+            if (!next || *next > completion_us) {
+                break;
+            }
+            now_us = std::max(now_us, *next);
+            process_external_at(now_us);
+        }
+
         ++runtime.completed_quanta;
         const bool completes = runtime.required_quanta != 0 && runtime.completed_quanta >= runtime.required_quanta;
         const service_disposition disposition =
             completes ? service_disposition::complete : service_disposition::requeue;
         const completion_result completion =
             policy.complete_service(decision.decision_id, runtime.job.service_gpu_us, disposition);
-        now_us = saturating_add(now_us, runtime.job.service_gpu_us);
+        now_us = completion_us;
         ++result.dispatches;
-        if (completes) {
-            runtime.finished = true;
-            runtime.resident = false;
-            vector_subtract(result.resident, runtime.job.page_demand);
-        }
         result.events.push_back({
             replay_event_kind::completion,
             now_us,
@@ -880,6 +1006,27 @@ replay_result simulator::replay(const replay_trace & trace) const {
             reason_code::none,
             runtime.job.service_gpu_us,
         });
+        if (completes) {
+            runtime.finished = true;
+            if (runtime.job.spill_io_us == 0) {
+                vector_subtract(result.resident, runtime.job.page_demand);
+                runtime.resources_held = false;
+            } else {
+                runtime.spill_started = true;
+                runtime.spill_done_us = saturating_add(now_us, runtime.job.spill_io_us);
+                result.events.push_back({
+                    replay_event_kind::io_start,
+                    now_us,
+                    runtime.job.req.id,
+                    runtime.job.req.priority,
+                    reason_code::replay_spill_start,
+                    reason_code::none,
+                    0,
+                    runtime.job.spill_io_us,
+                });
+            }
+            start_waiting_restores(now_us);
+        }
     }
 
     result.end_time_us = now_us;
