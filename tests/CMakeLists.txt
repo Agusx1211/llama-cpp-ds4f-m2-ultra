@@ -196,6 +196,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build_and_test(test-llama-archs.cpp)
     llama_build_and_test(test-dsv4-amx-contract.cpp)
+    llama_build_and_test(test-metal-sparse-planner.cpp)
+    target_include_directories(test-metal-sparse-planner PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if (Python3_Interpreter_FOUND)
         llama_test_cmd(

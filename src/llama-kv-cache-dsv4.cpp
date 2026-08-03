@@ -5,9 +5,11 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-model.h"
+#include "../ggml/src/ggml-metal/ggml-metal-device.h"
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
@@ -105,43 +107,14 @@ struct dsv4_sparse_range {
     ggml_tensor * tensor;
     size_t offset;
     size_t size;
+    llama_dsv4_memory_family family = LLAMA_DSV4_MEMORY_RAW;
 };
 
-static bool dsv4_sparse_map_ranges(const std::vector<dsv4_sparse_range> & ranges) {
-    struct range_group {
-        std::vector<ggml_tensor *> tensors;
-        std::vector<size_t> offsets;
-        std::vector<size_t> sizes;
-    };
-    std::map<ggml_backend_buffer_t, range_group> groups;
-
-    for (const auto & range : ranges) {
-        if (range.size == 0) {
-            continue;
-        }
-        auto & group = groups[range.tensor->buffer];
-        group.tensors.push_back(range.tensor);
-        group.offsets.push_back(range.offset);
-        group.sizes.push_back(range.size);
-    }
-
-    using map_fn = bool (*)(
-            ggml_tensor * const *, const size_t *, const size_t *, size_t);
-    for (auto & [_, group] : groups) {
-        auto * map = (map_fn) dsv4_backend_proc(
-                group.tensors[0], "ggml_backend_metal_dsv4_sparse_map_tensor_ranges");
-        if (map != nullptr && !map(
-                    group.tensors.data(), group.offsets.data(), group.sizes.data(), group.tensors.size())) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-static bool dsv4_sparse_ensure_k_rows(
+static bool dsv4_sparse_append_k_rows(
         const llama_kv_cache * kv,
-        std::vector<int64_t> rows) {
+        std::vector<int64_t> rows,
+        llama_dsv4_memory_family family,
+        std::vector<dsv4_sparse_range> & ranges) {
     if (rows.empty()) {
         return true;
     }
@@ -163,8 +136,7 @@ static bool dsv4_sparse_ensure_k_rows(
         runs.emplace_back(begin, end);
     }
 
-    std::vector<dsv4_sparse_range> ranges;
-    ranges.reserve(kv->get_layer_ids().size()*runs.size());
+    ranges.reserve(ranges.size() + kv->get_layer_ids().size()*runs.size());
     for (uint32_t il : kv->get_layer_ids()) {
         ggml_tensor * tensor = kv->get_k_storage(il);
         for (const auto & [begin, end] : runs) {
@@ -172,23 +144,164 @@ static bool dsv4_sparse_ensure_k_rows(
                 tensor,
                 (size_t) begin*tensor->nb[1],
                 (size_t) (end - begin)*tensor->nb[1],
+                family,
             });
         }
     }
-    return dsv4_sparse_map_ranges(ranges);
+    return true;
 }
 
-static bool dsv4_sparse_ensure_slot(
+static bool dsv4_sparse_append_slot(
         const llama_kv_cache * kv,
-        const llama_kv_cache::slot_info & sinfo) {
+        const llama_kv_cache::slot_info & sinfo,
+        llama_dsv4_memory_family family,
+        std::vector<dsv4_sparse_range> & ranges) {
     std::vector<int64_t> rows;
     for (size_t s = 0; s < sinfo.n_stream(); ++s) {
         for (uint32_t idx : sinfo.idxs[s]) {
             rows.push_back((int64_t) sinfo.strm[s]*kv->get_size() + idx);
         }
     }
-    return dsv4_sparse_ensure_k_rows(kv, std::move(rows));
+    return dsv4_sparse_append_k_rows(kv, std::move(rows), family, ranges);
 }
+
+class dsv4_sparse_transaction {
+public:
+    enum prepare_status {
+        SUCCESS,
+        PRESSURE,
+        ERROR,
+    };
+
+    ~dsv4_sparse_transaction() {
+        if (ticket != nullptr) {
+            cancel(ticket);
+            free_ticket(ticket);
+        }
+    }
+
+    prepare_status reserve_ranges(
+            const std::vector<dsv4_sparse_range> & ranges,
+            llama_dsv4_batch_quote & result) {
+        for (size_t i = 0; i < result.families.size(); ++i) {
+            result.families[i].family = (llama_dsv4_memory_family) i;
+        }
+        if (ranges.empty()) {
+            return SUCCESS;
+        }
+
+        using reserve_fn = ggml_metal_sparse_reservation_result (*)(
+                ggml_tensor * const *, const size_t *, const size_t *, size_t,
+                ggml_metal_sparse_pool_quote *, size_t, size_t *, size_t *, void **);
+        using commit_fn = ggml_metal_sparse_reservation_result (*)(void *);
+        using cancel_fn = bool (*)(void *);
+        using free_fn = void (*)(void *);
+        using usage_fn = int (*)(const ggml_tensor *, ggml_metal_sparse_usage *);
+
+        reserve_fn reserve = nullptr;
+        ggml_tensor * proc_tensor = nullptr;
+        for (const auto & range : ranges) {
+            reserve = (reserve_fn) dsv4_backend_proc(
+                    range.tensor, "ggml_backend_metal_dsv4_sparse_reserve_tensor_ranges");
+            if (reserve != nullptr) {
+                proc_tensor = range.tensor;
+                break;
+            }
+        }
+        if (reserve == nullptr) {
+            return SUCCESS;
+        }
+
+        commit = (commit_fn) dsv4_backend_proc(
+                proc_tensor, "ggml_backend_metal_dsv4_sparse_reservation_commit");
+        cancel = (cancel_fn) dsv4_backend_proc(
+                proc_tensor, "ggml_backend_metal_dsv4_sparse_reservation_cancel");
+        free_ticket = (free_fn) dsv4_backend_proc(
+                proc_tensor, "ggml_backend_metal_dsv4_sparse_reservation_free");
+        auto * usage = (usage_fn) dsv4_backend_proc(
+                proc_tensor, "ggml_backend_metal_dsv4_sparse_tensor_usage");
+        if (commit == nullptr || cancel == nullptr || free_ticket == nullptr || usage == nullptr) {
+            return ERROR;
+        }
+
+        std::vector<ggml_tensor *> tensors;
+        std::vector<size_t> offsets;
+        std::vector<size_t> sizes;
+        tensors.reserve(ranges.size());
+        offsets.reserve(ranges.size());
+        sizes.reserve(ranges.size());
+        std::map<uintptr_t, llama_dsv4_memory_family> pool_families;
+        for (const auto & range : ranges) {
+            tensors.push_back(range.tensor);
+            offsets.push_back(range.offset);
+            sizes.push_back(range.size);
+            ggml_metal_sparse_usage snapshot = {};
+            const int snapshot_result = usage(range.tensor, &snapshot);
+            if (snapshot_result < 0) {
+                return ERROR;
+            }
+            if (snapshot_result > 0) {
+                pool_families.emplace(snapshot.pool_id, range.family);
+            }
+        }
+
+        std::vector<ggml_metal_sparse_pool_quote> pools(ranges.size());
+        size_t n_pools = 0;
+        size_t limiting_pool = SIZE_MAX;
+        const auto status = reserve(
+                tensors.data(), offsets.data(), sizes.data(), tensors.size(),
+                pools.data(), pools.size(), &n_pools, &limiting_pool, &ticket);
+        pools.resize(n_pools);
+
+        for (const auto & pool : pools) {
+            const auto found = pool_families.find(pool.pool_id);
+            if (found == pool_families.end()) {
+                return ERROR;
+            }
+            auto & family = result.families[found->second];
+            family.target_mappings += pool.write.target_mappings;
+            family.new_pages += pool.write.new_pages;
+            family.cow_pages += pool.write.cow_pages;
+            family.required_pages += pool.write.required_pages;
+            family.physical_pages += pool.usage.physical_pages;
+            family.free_pages += pool.usage.free_pages;
+            family.reserved_pages += pool.usage.reserved_pages;
+            family.feasible = family.feasible && pool.write.feasible;
+        }
+        if (limiting_pool < pools.size()) {
+            result.limiting_pool_id = pools[limiting_pool].pool_id;
+            const auto found = pool_families.find(result.limiting_pool_id);
+            if (found != pool_families.end()) {
+                result.limiting_family = found->second;
+            }
+        }
+        result.feasible = status == GGML_METAL_SPARSE_RESERVATION_OK;
+
+        if (status == GGML_METAL_SPARSE_RESERVATION_PRESSURE) {
+            return PRESSURE;
+        }
+        if (status != GGML_METAL_SPARSE_RESERVATION_OK || ticket == nullptr) {
+            return ERROR;
+        }
+        return SUCCESS;
+    }
+
+    bool commit_ranges() {
+        if (ticket == nullptr) {
+            return true;
+        }
+        const bool ok = commit(ticket) == GGML_METAL_SPARSE_RESERVATION_OK;
+        free_ticket(ticket);
+        ticket = nullptr;
+        return ok;
+    }
+
+private:
+    void * ticket = nullptr;
+    ggml_metal_sparse_reservation_result (*commit)(void *) = nullptr;
+    bool (*cancel)(void *) = nullptr;
+    void (*free_ticket)(void *) = nullptr;
+};
 
 static uint32_t dsv4_state_n_used_k_rows(llama_pos pos_max, uint32_t ratio, uint32_t kv_size) {
     if (pos_max < 0) {
@@ -1700,6 +1813,117 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
     return mb;
 }
 
+static llama_dsv4_sparse_pool_usage dsv4_convert_sparse_usage(
+        const ggml_metal_sparse_usage & src) {
+    return {
+        src.pool_id,
+        src.page_size,
+        src.virtual_pages,
+        src.physical_pages,
+        src.free_pages,
+        src.reserved_pages,
+        src.mapped_mappings,
+        src.unique_physical_pages,
+        src.shared_physical_pages,
+        src.shared_mappings,
+        src.refcount_sum,
+        src.refcount_max,
+        src.generation,
+        src.cow_allocations,
+        src.cow_pages,
+    };
+}
+
+static void dsv4_add_sparse_usage(
+        llama_dsv4_sparse_pool_usage & dst,
+        const llama_dsv4_sparse_pool_usage & src) {
+    if (dst.page_size == 0) {
+        dst.page_size = src.page_size;
+    } else if (dst.page_size != src.page_size) {
+        dst.page_size = 0;
+    }
+    dst.virtual_pages += src.virtual_pages;
+    dst.physical_pages += src.physical_pages;
+    dst.free_pages += src.free_pages;
+    dst.reserved_pages += src.reserved_pages;
+    dst.mapped_mappings += src.mapped_mappings;
+    dst.unique_physical_pages += src.unique_physical_pages;
+    dst.shared_physical_pages += src.shared_physical_pages;
+    dst.shared_mappings += src.shared_mappings;
+    dst.refcount_sum += src.refcount_sum;
+    dst.refcount_max = std::max(dst.refcount_max, src.refcount_max);
+    dst.generation = std::max(dst.generation, src.generation);
+    dst.cow_allocations += src.cow_allocations;
+    dst.cow_pages += src.cow_pages;
+}
+
+static llama_dsv4_family_usage dsv4_family_usage(
+        const llama_kv_cache * cache,
+        llama_dsv4_memory_family family) {
+    llama_dsv4_family_usage result;
+    result.family = family;
+    result.logical_capacity_rows = (uint64_t) cache->get_size()*cache->get_n_stream();
+    result.sequence_mapped_rows.reserve(cache->get_n_stream());
+    for (uint32_t seq = 0; seq < cache->get_n_stream(); ++seq) {
+        const uint64_t used = cache->get_cells((llama_seq_id) seq).get_used();
+        result.sequence_mapped_rows.push_back(used);
+        result.logical_mapped_rows += used;
+    }
+
+    using usage_fn = int (*)(const ggml_tensor *, ggml_metal_sparse_usage *);
+    std::map<uintptr_t, llama_dsv4_sparse_pool_usage> unique;
+    for (uint32_t il : cache->get_layer_ids()) {
+        ggml_tensor * tensor = cache->get_k_storage(il);
+        auto * usage = (usage_fn) dsv4_backend_proc(
+                tensor, "ggml_backend_metal_dsv4_sparse_tensor_usage");
+        if (usage == nullptr) {
+            continue;
+        }
+        ggml_metal_sparse_usage snapshot = {};
+        const int status = usage(tensor, &snapshot);
+        if (status < 0) {
+            throw std::runtime_error("failed to read DSV4 sparse usage snapshot");
+        }
+        if (status > 0) {
+            unique.emplace(snapshot.pool_id, dsv4_convert_sparse_usage(snapshot));
+        }
+    }
+    for (const auto & [_, pool] : unique) {
+        result.pools.push_back(pool);
+        dsv4_add_sparse_usage(result.total, pool);
+    }
+    result.placement_sparse = !result.pools.empty();
+    return result;
+}
+
+llama_dsv4_memory_usage_snapshot llama_kv_cache_dsv4::memory_usage_snapshot() const {
+    llama_dsv4_memory_usage_snapshot result;
+    result.families[LLAMA_DSV4_MEMORY_RAW] =
+            dsv4_family_usage(kv_raw->get_swa(), LLAMA_DSV4_MEMORY_RAW);
+    result.families[LLAMA_DSV4_MEMORY_CSA] =
+            dsv4_family_usage(kv_csa.get(), LLAMA_DSV4_MEMORY_CSA);
+    result.families[LLAMA_DSV4_MEMORY_HCA] =
+            dsv4_family_usage(kv_hca.get(), LLAMA_DSV4_MEMORY_HCA);
+    result.families[LLAMA_DSV4_MEMORY_LID] =
+            dsv4_family_usage(kv_lid.get(), LLAMA_DSV4_MEMORY_LID);
+
+    bool have_limit = false;
+    for (const auto & family : result.families) {
+        dsv4_add_sparse_usage(result.sparse_total, family.total);
+        for (const auto & pool : family.pools) {
+            const uint64_t available = pool.reserved_pages <= pool.free_pages ?
+                    pool.free_pages - pool.reserved_pages : 0;
+            if (!have_limit || available < result.limiting_available_pages) {
+                have_limit = true;
+                result.limiting_family = family.family;
+                result.limiting_pool_id = pool.pool_id;
+                result.limiting_available_pages = available;
+            }
+        }
+    }
+    return result;
+}
+
 void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
 
@@ -1983,12 +2207,14 @@ bool llama_kv_cache_dsv4_raw_context::apply() {
     return res;
 }
 
-bool llama_kv_cache_dsv4_raw_context::ensure_backing() const {
-    if (ubatches_write.empty()) {
-        return true;
-    }
-    return dsv4_sparse_ensure_slot(kv_base, sinfos_base_write[i_next]) &&
-           dsv4_sparse_ensure_slot(kv_swa,  sinfos_write[i_next]);
+const llama_kv_cache_dsv4_raw_context::slot_info_vec_t::value_type &
+llama_kv_cache_dsv4_raw_context::get_base_write_slot() const {
+    return sinfos_base_write[i_next];
+}
+
+const llama_kv_cache_dsv4_raw_context::slot_info_vec_t::value_type &
+llama_kv_cache_dsv4_raw_context::get_swa_write_slot() const {
+    return sinfos_write[i_next];
 }
 
 llama_memory_status llama_kv_cache_dsv4_raw_context::get_status() const {
@@ -2011,6 +2237,17 @@ uint32_t llama_kv_cache_dsv4_raw_context::get_n_write() const {
     }
 
     return ubatches_write[i_next].n_tokens;
+}
+
+uint64_t llama_kv_cache_dsv4_raw_context::get_n_backing_rows() const {
+    if (ubatches_write.empty()) {
+        return 0;
+    }
+    uint64_t result = 0;
+    for (const auto & idxs : sinfos_write[i_next].idxs) {
+        result += idxs.size();
+    }
+    return result;
 }
 
 ggml_tensor * llama_kv_cache_dsv4_raw_context::get_k(ggml_context * ctx, int32_t il) const {
@@ -2249,11 +2486,43 @@ bool llama_kv_cache_dsv4_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
     if (!ubatches.empty()) {
-        if (!ctx_raw->ensure_backing() ||
-                !dsv4_sparse_ensure_k_rows(kv->get_csa(), plans_csa[i_next].state_write_idxs) ||
-                !dsv4_sparse_ensure_k_rows(kv->get_hca(), plans_hca[i_next].state_write_idxs) ||
-                !dsv4_sparse_ensure_k_rows(kv->get_lid(), plans_lid[i_next].state_write_idxs)) {
-            LLAMA_LOG_WARN("%s: DSV4 elastic Metal page pool is full\n", __func__);
+        std::vector<dsv4_sparse_range> ranges;
+        if (!dsv4_sparse_append_slot(
+                    kv->get_raw()->get_base(), ctx_raw->get_base_write_slot(),
+                    LLAMA_DSV4_MEMORY_RAW, ranges) ||
+                !dsv4_sparse_append_slot(
+                    kv->get_raw()->get_swa(), ctx_raw->get_swa_write_slot(),
+                    LLAMA_DSV4_MEMORY_RAW, ranges) ||
+                !dsv4_sparse_append_k_rows(
+                    kv->get_csa(), plans_csa[i_next].state_write_idxs,
+                    LLAMA_DSV4_MEMORY_CSA, ranges) ||
+                !dsv4_sparse_append_k_rows(
+                    kv->get_hca(), plans_hca[i_next].state_write_idxs,
+                    LLAMA_DSV4_MEMORY_HCA, ranges) ||
+                !dsv4_sparse_append_k_rows(
+                    kv->get_lid(), plans_lid[i_next].state_write_idxs,
+                    LLAMA_DSV4_MEMORY_LID, ranges)) {
+            return false;
+        }
+
+        last_batch_quote = {};
+        last_batch_quote.families[LLAMA_DSV4_MEMORY_RAW].logical_rows =
+                ctx_raw->get_n_backing_rows();
+        dsv4_sparse_transaction reservation;
+        const auto reserve_status = reservation.reserve_ranges(ranges, last_batch_quote);
+        if (reserve_status == dsv4_sparse_transaction::PRESSURE) {
+            const auto & limiting = last_batch_quote.families[last_batch_quote.limiting_family];
+            LLAMA_LOG_WARN("%s: DSV4 elastic Metal page pressure: family=%d pool=%" PRIuPTR
+                    " need=%" PRIu64 " (new=%" PRIu64 ", COW=%" PRIu64
+                    ") free=%" PRIu64 " reserved=%" PRIu64 " capacity=%" PRIu64 " pages\n",
+                    __func__, (int) last_batch_quote.limiting_family,
+                    last_batch_quote.limiting_pool_id,
+                    limiting.required_pages, limiting.new_pages, limiting.cow_pages,
+                    limiting.free_pages, limiting.reserved_pages, limiting.physical_pages);
+            return false;
+        }
+        if (reserve_status != dsv4_sparse_transaction::SUCCESS || !reservation.commit_ranges()) {
+            LLAMA_LOG_ERROR("%s: failed to commit DSV4 sparse page reservation\n", __func__);
             return false;
         }
     }
@@ -2402,4 +2671,8 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
             lid_state->get_state_size(), get_lid()->get_n_kv(), lid_state->get_n_stream(), lid_state->get_n_rs_seq());
 
     return reserve_plan_lid;
+}
+
+const llama_dsv4_batch_quote & llama_kv_cache_dsv4_context::get_last_batch_quote() const {
+    return last_batch_quote;
 }

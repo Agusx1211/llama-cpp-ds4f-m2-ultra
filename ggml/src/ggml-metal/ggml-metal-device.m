@@ -1844,6 +1844,10 @@ struct ggml_metal_buffer {
     size_t sparse_n_virtual;
     size_t sparse_n_physical;
     size_t sparse_n_free;
+    size_t sparse_n_reserved;
+    uint64_t sparse_generation;
+    uint64_t sparse_cow_allocations;
+    uint64_t sparse_cow_pages;
     uint32_t * sparse_v2p;
     uint32_t * sparse_p_ref;
     uint32_t * sparse_free;
@@ -2034,24 +2038,71 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     return res;
 }
 
-ggml_metal_buffer_t ggml_metal_buffer_init_sparse(
+static const char * ggml_metal_sparse_init_status_name(enum ggml_metal_sparse_init_status status) {
+    switch (status) {
+        case GGML_METAL_SPARSE_INIT_OK:                     return "ok";
+        case GGML_METAL_SPARSE_INIT_UNSUPPORTED:            return "placement-sparse unsupported";
+        case GGML_METAL_SPARSE_INIT_INVALID_SIZE:           return "invalid size";
+        case GGML_METAL_SPARSE_INIT_CPU_BUFFER:             return "CPU buffer wrapper";
+        case GGML_METAL_SPARSE_INIT_MTL_BUFFER:             return "MTLBuffer";
+        case GGML_METAL_SPARSE_INIT_PLACEMENT_HEAP:         return "placement heap";
+        case GGML_METAL_SPARSE_INIT_COMMAND_QUEUE:          return "MTL4 command queue";
+        case GGML_METAL_SPARSE_INIT_SHARED_EVENT:           return "shared event";
+        case GGML_METAL_SPARSE_INIT_LOCK:                   return "CPU lock";
+        case GGML_METAL_SPARSE_INIT_CPU_V2P_TABLE:          return "CPU virtual-to-physical table";
+        case GGML_METAL_SPARSE_INIT_CPU_REFCOUNT_TABLE:     return "CPU refcount table";
+        case GGML_METAL_SPARSE_INIT_CPU_FREE_TABLE:         return "CPU free-page table";
+        case GGML_METAL_SPARSE_INIT_RESIDENCY_SET:          return "residency set";
+    }
+    return "unknown";
+}
+
+ggml_metal_buffer_t ggml_metal_buffer_init_sparse_ex(
         ggml_metal_device_t dev,
         size_t virtual_size,
-        size_t physical_size) {
+        size_t physical_size,
+        struct ggml_metal_sparse_init_result * result) {
+    struct ggml_metal_sparse_init_result local = {
+        /*.status                   =*/ GGML_METAL_SPARSE_INIT_UNSUPPORTED,
+        /*.requested_virtual_bytes  =*/ virtual_size,
+        /*.requested_physical_bytes =*/ physical_size,
+        /*.aligned_virtual_bytes    =*/ 0,
+        /*.aligned_physical_bytes   =*/ 0,
+        /*.device_max_buffer_length =*/ dev != NULL ? (size_t) dev->mtl_device.maxBufferLength : 0,
+    };
+    if (result != NULL) {
+        *result = local;
+    }
+
 #if TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
     if (@available(macOS 26.4, *)) {
         const size_t page_size = 64*1024;
+        if (dev == NULL || virtual_size == 0 || physical_size == 0 ||
+                virtual_size > SIZE_MAX - (page_size - 1) ||
+                physical_size > SIZE_MAX - (page_size - 1)) {
+            local.status = GGML_METAL_SPARSE_INIT_INVALID_SIZE;
+            goto fail_without_buffer;
+        }
         virtual_size  = GGML_PAD(virtual_size,  page_size);
         physical_size = GGML_PAD(physical_size, page_size);
         physical_size = physical_size < virtual_size ? physical_size : virtual_size;
+        local.aligned_virtual_bytes = virtual_size;
+        local.aligned_physical_bytes = physical_size;
 
-        if (!dev->props.has_placement_sparse || virtual_size == 0 || physical_size == 0) {
-            return NULL;
+        if (virtual_size > SIZE_MAX - page_size) {
+            local.status = GGML_METAL_SPARSE_INIT_INVALID_SIZE;
+            goto fail_without_buffer;
+        }
+
+        if (!dev->props.has_placement_sparse) {
+            local.status = GGML_METAL_SPARSE_INIT_UNSUPPORTED;
+            goto fail_without_buffer;
         }
 
         ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
         if (res == NULL) {
-            return NULL;
+            local.status = GGML_METAL_SPARSE_INIT_CPU_BUFFER;
+            goto fail_without_buffer;
         }
 
         res->dev                  = dev;
@@ -2067,6 +2118,8 @@ ggml_metal_buffer_t ggml_metal_buffer_init_sparse(
         res->sparse_n_virtual     = virtual_size/page_size;
         res->sparse_n_physical    = physical_size/page_size;
         res->sparse_n_free        = res->sparse_n_physical;
+        res->sparse_n_reserved    = 0;
+        res->sparse_generation    = 1;
         res->sparse_event_value   = 0;
 
         res->buffers[0].data = res->all_data;
@@ -2074,6 +2127,10 @@ ggml_metal_buffer_t ggml_metal_buffer_init_sparse(
         res->buffers[0].metal = [dev->mtl_device newBufferWithLength:virtual_size
                                                              options:MTLResourceStorageModePrivate
                                              placementSparsePageSize:MTLSparsePageSize64];
+        if (res->buffers[0].metal == nil) {
+            local.status = GGML_METAL_SPARSE_INIT_MTL_BUFFER;
+            goto fail;
+        }
 
         MTLHeapDescriptor * desc = [[MTLHeapDescriptor alloc] init];
         desc.type = MTLHeapTypePlacement;
@@ -2083,31 +2140,41 @@ ggml_metal_buffer_t ggml_metal_buffer_init_sparse(
         desc.size = physical_size;
         res->sparse_heap = [dev->mtl_device newHeapWithDescriptor:desc];
         [desc release];
+        if (res->sparse_heap == nil) {
+            local.status = GGML_METAL_SPARSE_INIT_PLACEMENT_HEAP;
+            goto fail;
+        }
 
         res->sparse_queue = [dev->mtl_device newMTL4CommandQueue];
+        if (res->sparse_queue == nil) {
+            local.status = GGML_METAL_SPARSE_INIT_COMMAND_QUEUE;
+            goto fail;
+        }
         res->sparse_event = [dev->mtl_device newSharedEvent];
+        if (res->sparse_event == nil) {
+            local.status = GGML_METAL_SPARSE_INIT_SHARED_EVENT;
+            goto fail;
+        }
         res->sparse_lock  = [[NSLock alloc] init];
+        if (res->sparse_lock == nil) {
+            local.status = GGML_METAL_SPARSE_INIT_LOCK;
+            goto fail;
+        }
 
         res->sparse_v2p   = malloc(res->sparse_n_virtual  * sizeof(uint32_t));
+        if (res->sparse_v2p == NULL) {
+            local.status = GGML_METAL_SPARSE_INIT_CPU_V2P_TABLE;
+            goto fail;
+        }
         res->sparse_p_ref = calloc(res->sparse_n_physical, sizeof(uint32_t));
+        if (res->sparse_p_ref == NULL) {
+            local.status = GGML_METAL_SPARSE_INIT_CPU_REFCOUNT_TABLE;
+            goto fail;
+        }
         res->sparse_free  = malloc(res->sparse_n_physical * sizeof(uint32_t));
-
-        if (res->buffers[0].metal == nil || res->sparse_heap == nil ||
-                res->sparse_queue == nil || res->sparse_event == nil ||
-                res->sparse_lock == nil || res->sparse_v2p == NULL ||
-                res->sparse_p_ref == NULL || res->sparse_free == NULL) {
-            GGML_LOG_ERROR("%s: failed to allocate %.2f MiB / %.2f MiB sparse buffer\n",
-                    __func__, physical_size/1024.0/1024.0, virtual_size/1024.0/1024.0);
-            [res->buffers[0].metal release];
-            [res->sparse_heap release];
-            [res->sparse_queue release];
-            [res->sparse_event release];
-            [res->sparse_lock release];
-            free(res->sparse_v2p);
-            free(res->sparse_p_ref);
-            free(res->sparse_free);
-            free(res);
-            return NULL;
+        if (res->sparse_free == NULL) {
+            local.status = GGML_METAL_SPARSE_INIT_CPU_FREE_TABLE;
+            goto fail;
         }
 
         for (size_t i = 0; i < res->sparse_n_virtual; ++i) {
@@ -2120,24 +2187,54 @@ ggml_metal_buffer_t ggml_metal_buffer_init_sparse(
 
         res->use_residency_sets = dev->props.use_residency_sets;
         if (!ggml_metal_buffer_rset_init(res)) {
-            GGML_LOG_ERROR("%s: failed to initialize sparse residency set\n", __func__);
-            [res->buffers[0].metal release];
-            [res->sparse_heap release];
-            [res->sparse_queue release];
-            [res->sparse_event release];
-            [res->sparse_lock release];
-            free(res->sparse_v2p);
-            free(res->sparse_p_ref);
-            free(res->sparse_free);
-            free(res);
-            return NULL;
+            local.status = GGML_METAL_SPARSE_INIT_RESIDENCY_SET;
+            goto fail;
         }
 
         ggml_metal_device_rsets_add(dev, res->rset);
 
-        GGML_LOG_INFO("%s: DSV4 sparse buffer = %.2f MiB physical / %.2f MiB virtual, page = 64 KiB\n",
-                __func__, physical_size/1024.0/1024.0, virtual_size/1024.0/1024.0);
+        local.status = GGML_METAL_SPARSE_INIT_OK;
+        if (result != NULL) {
+            *result = local;
+        }
+        GGML_LOG_INFO("%s: DSV4 sparse buffer = %.2f MiB physical / %.2f MiB virtual, page = 64 KiB, maxBufferLength = %.2f MiB\n",
+                __func__, physical_size/1024.0/1024.0, virtual_size/1024.0/1024.0,
+                local.device_max_buffer_length/1024.0/1024.0);
         return res;
+
+fail:
+        GGML_LOG_ERROR("%s: DSV4 sparse init failed at %s: requested virtual=%zu bytes (%.2f MiB), physical=%zu bytes (%.2f MiB); aligned virtual=%zu bytes, physical=%zu bytes; device maxBufferLength=%zu bytes (%.2f MiB)\n",
+                __func__, ggml_metal_sparse_init_status_name(local.status),
+                local.requested_virtual_bytes, local.requested_virtual_bytes/1024.0/1024.0,
+                local.requested_physical_bytes, local.requested_physical_bytes/1024.0/1024.0,
+                local.aligned_virtual_bytes, local.aligned_physical_bytes,
+                local.device_max_buffer_length, local.device_max_buffer_length/1024.0/1024.0);
+        ggml_metal_buffer_rset_free(res);
+        [res->buffers[0].metal release];
+        [res->sparse_heap release];
+        [res->sparse_queue release];
+        [res->sparse_event release];
+        [res->sparse_lock release];
+        free(res->sparse_v2p);
+        free(res->sparse_p_ref);
+        free(res->sparse_free);
+        free(res);
+        if (result != NULL) {
+            *result = local;
+        }
+        return NULL;
+
+fail_without_buffer:
+        GGML_LOG_ERROR("%s: DSV4 sparse init failed at %s: requested virtual=%zu bytes (%.2f MiB), physical=%zu bytes (%.2f MiB); aligned virtual=%zu bytes, physical=%zu bytes; device maxBufferLength=%zu bytes (%.2f MiB)\n",
+                __func__, ggml_metal_sparse_init_status_name(local.status),
+                local.requested_virtual_bytes, local.requested_virtual_bytes/1024.0/1024.0,
+                local.requested_physical_bytes, local.requested_physical_bytes/1024.0/1024.0,
+                local.aligned_virtual_bytes, local.aligned_physical_bytes,
+                local.device_max_buffer_length, local.device_max_buffer_length/1024.0/1024.0);
+        if (result != NULL) {
+            *result = local;
+        }
+        return NULL;
     }
 #endif
 
@@ -2145,6 +2242,13 @@ ggml_metal_buffer_t ggml_metal_buffer_init_sparse(
     GGML_UNUSED(virtual_size);
     GGML_UNUSED(physical_size);
     return NULL;
+}
+
+ggml_metal_buffer_t ggml_metal_buffer_init_sparse(
+        ggml_metal_device_t dev,
+        size_t virtual_size,
+        size_t physical_size) {
+    return ggml_metal_buffer_init_sparse_ex(dev, virtual_size, physical_size, NULL);
 }
 
 ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size) {
@@ -2326,6 +2430,282 @@ static void ggml_metal_sparse_submit(
 
     [after commit];
 }
+
+struct ggml_metal_sparse_reservation_entry {
+    ggml_metal_buffer_t buffer;
+    struct ggml_metal_sparse_range * ranges;
+    size_t n_ranges;
+    uint8_t * marked;
+    uint32_t * marked_per_physical;
+    struct ggml_metal_sparse_quote quote;
+    struct ggml_metal_sparse_ticket_accounting accounting;
+    struct ggml_metal_sparse_write_action * writes;
+    MTL4UpdateSparseBufferMappingOperation * operations;
+};
+
+struct ggml_metal_sparse_reservation {
+    struct ggml_metal_sparse_reservation_entry * entries;
+    size_t n_entries;
+};
+
+static int ggml_metal_sparse_buffer_range_compare(const void * lhs, const void * rhs) {
+    const struct ggml_metal_sparse_buffer_range * l = lhs;
+    const struct ggml_metal_sparse_buffer_range * r = rhs;
+    const uintptr_t lb = (uintptr_t) l->buffer;
+    const uintptr_t rb = (uintptr_t) r->buffer;
+    if (lb != rb) {
+        return lb < rb ? -1 : 1;
+    }
+    if (l->offset != r->offset) {
+        return l->offset < r->offset ? -1 : 1;
+    }
+    if (l->size != r->size) {
+        return l->size < r->size ? -1 : 1;
+    }
+    return 0;
+}
+
+// Entries are grouped after sorting by stable buffer address. Every aggregate
+// quote, reserve, commit, rollback, and cancel therefore acquires pool locks in
+// the same order and releases them in reverse order.
+static void ggml_metal_sparse_lock_entries(
+        const struct ggml_metal_sparse_reservation * reservation) {
+    for (size_t i = 0; i < reservation->n_entries; ++i) {
+        [reservation->entries[i].buffer->sparse_lock lock];
+    }
+}
+
+static void ggml_metal_sparse_unlock_entries(
+        const struct ggml_metal_sparse_reservation * reservation) {
+    for (size_t i = reservation->n_entries; i-- > 0;) {
+        [reservation->entries[i].buffer->sparse_lock unlock];
+    }
+}
+
+static void ggml_metal_sparse_get_usage_locked(
+        ggml_metal_buffer_t buf,
+        struct ggml_metal_sparse_usage * usage) {
+    *usage = (struct ggml_metal_sparse_usage) {
+        /*.pool_id               =*/ (uintptr_t) buf,
+        /*.page_size             =*/ buf->sparse_page_size,
+        /*.virtual_pages         =*/ buf->sparse_n_virtual,
+        /*.physical_pages        =*/ buf->sparse_n_physical,
+        /*.free_pages            =*/ buf->sparse_n_free,
+        /*.reserved_pages        =*/ buf->sparse_n_reserved,
+        /*.mapped_mappings       =*/ 0,
+        /*.unique_physical_pages =*/ 0,
+        /*.shared_physical_pages =*/ 0,
+        /*.shared_mappings       =*/ 0,
+        /*.refcount_sum          =*/ 0,
+        /*.refcount_max          =*/ 0,
+        /*.generation            =*/ buf->sparse_generation,
+        /*.cow_allocations       =*/ buf->sparse_cow_allocations,
+        /*.cow_pages             =*/ buf->sparse_cow_pages,
+    };
+
+    for (size_t p = 0; p < buf->sparse_n_physical; ++p) {
+        const uint32_t refs = buf->sparse_p_ref[p];
+        if (refs == 0) {
+            continue;
+        }
+        ++usage->unique_physical_pages;
+        usage->mapped_mappings += refs;
+        usage->refcount_sum += refs;
+        usage->refcount_max = refs > usage->refcount_max ? refs : usage->refcount_max;
+        if (refs > 1) {
+            ++usage->shared_physical_pages;
+            usage->shared_mappings += refs;
+        }
+    }
+    GGML_ASSERT(usage->unique_physical_pages + usage->free_pages == usage->physical_pages);
+    GGML_ASSERT(usage->mapped_mappings == usage->refcount_sum);
+}
+
+static void ggml_metal_sparse_reservation_destroy(
+        ggml_metal_sparse_reservation_t reservation) {
+    if (reservation == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < reservation->n_entries; ++i) {
+        free(reservation->entries[i].ranges);
+        free(reservation->entries[i].marked);
+        free(reservation->entries[i].marked_per_physical);
+        free(reservation->entries[i].writes);
+        free(reservation->entries[i].operations);
+    }
+    free(reservation->entries);
+    free(reservation);
+}
+
+static enum ggml_metal_sparse_reservation_result ggml_metal_sparse_prepare(
+        const struct ggml_metal_sparse_buffer_range * ranges,
+        size_t n_ranges,
+        bool reserve,
+        struct ggml_metal_sparse_pool_quote * pools,
+        size_t pool_capacity,
+        size_t * n_pools,
+        size_t * limiting_pool,
+        ggml_metal_sparse_reservation_t * result) {
+    if (n_pools != NULL) {
+        *n_pools = 0;
+    }
+    if (limiting_pool != NULL) {
+        *limiting_pool = SIZE_MAX;
+    }
+    if (result != NULL) {
+        *result = NULL;
+    }
+    if (ranges == NULL || n_ranges == 0 || n_pools == NULL ||
+            (reserve && result == NULL)) {
+        return GGML_METAL_SPARSE_RESERVATION_INVALID;
+    }
+
+    struct ggml_metal_sparse_buffer_range * sorted = malloc(n_ranges*sizeof(*sorted));
+    ggml_metal_sparse_reservation_t reservation = calloc(1, sizeof(*reservation));
+    if (sorted == NULL || reservation == NULL) {
+        free(sorted);
+        free(reservation);
+        return GGML_METAL_SPARSE_RESERVATION_OOM;
+    }
+    memcpy(sorted, ranges, n_ranges*sizeof(*sorted));
+    qsort(sorted, n_ranges, sizeof(*sorted), ggml_metal_sparse_buffer_range_compare);
+
+    for (size_t i = 0; i < n_ranges; ++i) {
+        if (sorted[i].buffer == NULL || !sorted[i].buffer->is_sparse) {
+            free(sorted);
+            free(reservation);
+            return GGML_METAL_SPARSE_RESERVATION_INVALID;
+        }
+        if (i == 0 || sorted[i].buffer != sorted[i - 1].buffer) {
+            ++reservation->n_entries;
+        }
+    }
+    *n_pools = reservation->n_entries;
+    if (pools != NULL && pool_capacity < reservation->n_entries) {
+        free(sorted);
+        free(reservation);
+        return GGML_METAL_SPARSE_RESERVATION_INVALID;
+    }
+
+    reservation->entries = calloc(reservation->n_entries, sizeof(*reservation->entries));
+    if (reservation->entries == NULL) {
+        free(sorted);
+        free(reservation);
+        return GGML_METAL_SPARSE_RESERVATION_OOM;
+    }
+
+    size_t ie = 0;
+    for (size_t i = 0; i < n_ranges;) {
+        size_t end = i + 1;
+        while (end < n_ranges && sorted[end].buffer == sorted[i].buffer) {
+            ++end;
+        }
+        struct ggml_metal_sparse_reservation_entry * entry = &reservation->entries[ie++];
+        entry->buffer = sorted[i].buffer;
+        entry->n_ranges = end - i;
+        entry->ranges = malloc(entry->n_ranges*sizeof(*entry->ranges));
+        entry->marked = calloc(entry->buffer->sparse_n_virtual, sizeof(*entry->marked));
+        entry->marked_per_physical = calloc(
+                entry->buffer->sparse_n_physical, sizeof(*entry->marked_per_physical));
+        if (entry->ranges == NULL || entry->marked == NULL || entry->marked_per_physical == NULL) {
+            free(sorted);
+            ggml_metal_sparse_reservation_destroy(reservation);
+            return GGML_METAL_SPARSE_RESERVATION_OOM;
+        }
+        for (size_t j = i; j < end; ++j) {
+            entry->ranges[j - i] = (struct ggml_metal_sparse_range) {
+                sorted[j].offset,
+                sorted[j].size,
+            };
+        }
+        i = end;
+    }
+    free(sorted);
+
+    enum ggml_metal_sparse_reservation_result status = GGML_METAL_SPARSE_RESERVATION_OK;
+    size_t limiting = SIZE_MAX;
+    size_t limiting_margin = SIZE_MAX;
+    bool limiting_has_deficit = false;
+    ggml_metal_sparse_lock_entries(reservation);
+    for (size_t i = 0; i < reservation->n_entries; ++i) {
+        struct ggml_metal_sparse_reservation_entry * entry = &reservation->entries[i];
+        ggml_metal_buffer_t buf = entry->buffer;
+        entry->quote = ggml_metal_sparse_plan_write(
+                buf->sparse_page_size, buf->sparse_n_virtual, buf->sparse_n_physical,
+                buf->sparse_n_free, buf->sparse_n_reserved, buf->sparse_generation,
+                buf->sparse_v2p, buf->sparse_p_ref, entry->ranges, entry->n_ranges,
+                entry->marked, entry->marked_per_physical);
+        if (entry->quote.status != GGML_METAL_SPARSE_PLAN_OK) {
+            status = GGML_METAL_SPARSE_RESERVATION_INVALID;
+        } else if (!entry->quote.feasible && status == GGML_METAL_SPARSE_RESERVATION_OK) {
+            status = GGML_METAL_SPARSE_RESERVATION_PRESSURE;
+        }
+
+        const size_t available = buf->sparse_n_reserved <= buf->sparse_n_free ?
+                buf->sparse_n_free - buf->sparse_n_reserved : 0;
+        const bool has_deficit = entry->quote.required_pages > available;
+        const size_t margin = has_deficit ?
+                entry->quote.required_pages - available :
+                available - entry->quote.required_pages;
+        if (limiting == SIZE_MAX ||
+                (has_deficit && !limiting_has_deficit) ||
+                (has_deficit == limiting_has_deficit &&
+                 (has_deficit ? margin > limiting_margin : margin < limiting_margin))) {
+            limiting = i;
+            limiting_margin = margin;
+            limiting_has_deficit = has_deficit;
+        }
+        if (pools != NULL) {
+            pools[i].pool_id = (uintptr_t) buf;
+            ggml_metal_sparse_get_usage_locked(buf, &pools[i].usage);
+            pools[i].write = entry->quote;
+        }
+    }
+
+    if (status == GGML_METAL_SPARSE_RESERVATION_OK && reserve) {
+        for (size_t i = 0; i < reservation->n_entries; ++i) {
+            struct ggml_metal_sparse_reservation_entry * entry = &reservation->entries[i];
+            const size_t n_actions = entry->quote.required_pages;
+            if (n_actions > 0) {
+                entry->writes = calloc(n_actions, sizeof(*entry->writes));
+                entry->operations = calloc(n_actions, sizeof(*entry->operations));
+                if (entry->writes == NULL || entry->operations == NULL) {
+                    status = GGML_METAL_SPARSE_RESERVATION_OOM;
+                    break;
+                }
+            }
+        }
+    }
+    if (status == GGML_METAL_SPARSE_RESERVATION_OK && reserve) {
+        for (size_t i = 0; i < reservation->n_entries; ++i) {
+            struct ggml_metal_sparse_reservation_entry * entry = &reservation->entries[i];
+            if (!ggml_metal_sparse_accounting_try_reserve(
+                        entry->buffer->sparse_n_free, &entry->buffer->sparse_n_reserved,
+                        entry->buffer->sparse_generation, &entry->quote, &entry->accounting)) {
+                status = GGML_METAL_SPARSE_RESERVATION_STALE;
+                for (size_t j = 0; j < i; ++j) {
+                    ggml_metal_sparse_accounting_finish(
+                            &reservation->entries[j].buffer->sparse_n_reserved,
+                            &reservation->entries[j].accounting,
+                            GGML_METAL_SPARSE_TICKET_ROLLED_BACK);
+                }
+                break;
+            }
+        }
+    }
+    ggml_metal_sparse_unlock_entries(reservation);
+
+    if (limiting_pool != NULL) {
+        *limiting_pool = limiting;
+    }
+    if (status != GGML_METAL_SPARSE_RESERVATION_OK || !reserve) {
+        ggml_metal_sparse_reservation_destroy(reservation);
+        return status;
+    }
+
+    *result = reservation;
+    return GGML_METAL_SPARSE_RESERVATION_OK;
+}
 #endif
 
 bool ggml_metal_buffer_sparse_map_write(
@@ -2333,146 +2713,269 @@ bool ggml_metal_buffer_sparse_map_write(
         const size_t * offsets,
         const size_t * sizes,
         size_t n_ranges) {
-    if (!buf->is_sparse || n_ranges == 0) {
+    if (buf == NULL || !buf->is_sparse || n_ranges == 0) {
         return true;
+    }
+    if (offsets == NULL || sizes == NULL) {
+        return false;
     }
 
 #if TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
     if (@available(macOS 26.4, *)) {
-        [buf->sparse_lock lock];
-
-        uint8_t * marked = calloc(buf->sparse_n_virtual, 1);
-        if (marked == NULL) {
-            [buf->sparse_lock unlock];
+        struct ggml_metal_sparse_buffer_range * writes = malloc(n_ranges*sizeof(*writes));
+        if (writes == NULL) {
             return false;
         }
-
-        bool valid = true;
-        for (size_t r = 0; r < n_ranges; ++r) {
-            if (sizes[r] == 0) {
-                continue;
-            }
-            if (offsets[r] > buf->all_size || sizes[r] > buf->all_size - offsets[r]) {
-                valid = false;
-                break;
-            }
-
-            const size_t v0 = offsets[r]/buf->sparse_page_size;
-            const size_t v1 = (offsets[r] + sizes[r] - 1)/buf->sparse_page_size;
-            for (size_t v = v0; v <= v1; ++v) {
-                marked[v] = 1;
-            }
+        for (size_t i = 0; i < n_ranges; ++i) {
+            writes[i] = (struct ggml_metal_sparse_buffer_range) { buf, offsets[i], sizes[i] };
         }
-
-        uint32_t * marked_per_physical = calloc(buf->sparse_n_physical, sizeof(uint32_t));
-        if (marked_per_physical == NULL) {
-            free(marked);
-            [buf->sparse_lock unlock];
-            return false;
-        }
-
-        size_t n_writes = 0;
-        if (valid) {
-            for (size_t v = 0; v < buf->sparse_n_virtual; ++v) {
-                if (!marked[v]) {
-                    continue;
-                }
-                const uint32_t p = buf->sparse_v2p[v];
-                if (p == UINT32_MAX) {
-                    ++n_writes;
-                } else {
-                    ++marked_per_physical[p];
-                }
-            }
-            for (size_t p = 0; p < buf->sparse_n_physical; ++p) {
-                const size_t n_marked = marked_per_physical[p];
-                if (n_marked > 0) {
-                    n_writes += n_marked < buf->sparse_p_ref[p] ? n_marked : n_marked - 1;
-                }
-            }
-        }
-
-        if (!valid || n_writes > buf->sparse_n_free) {
-            if (n_writes > buf->sparse_n_free) {
-                GGML_LOG_WARN("%s: DSV4 sparse heap exhausted: need %zu pages, have %zu\n",
-                        __func__, n_writes, buf->sparse_n_free);
-                GGML_LOG_WARN("%s: sparse virtual=%zu physical=%zu\n",
-                        __func__, buf->sparse_n_virtual, buf->sparse_n_physical);
-            }
-            free(marked);
-            free(marked_per_physical);
-            [buf->sparse_lock unlock];
-            return false;
-        }
-
-        if (n_writes == 0) {
-            free(marked);
-            free(marked_per_physical);
-            [buf->sparse_lock unlock];
-            return true;
-        }
-
-        struct ggml_metal_sparse_write_action * writes = calloc(n_writes, sizeof(*writes));
-        MTL4UpdateSparseBufferMappingOperation * operations = calloc(n_writes, sizeof(*operations));
-        if (writes == NULL || operations == NULL) {
-            free(marked);
-            free(marked_per_physical);
-            free(writes);
-            free(operations);
-            [buf->sparse_lock unlock];
-            return false;
-        }
-
-        size_t iw = 0;
-        for (size_t v = 0; v < buf->sparse_n_virtual; ++v) {
-            if (!marked[v]) {
-                continue;
-            }
-
-            const uint32_t old_p = buf->sparse_v2p[v];
-            if (old_p != UINT32_MAX && buf->sparse_p_ref[old_p] == 1) {
-                continue;
-            }
-
-            const uint32_t new_p = buf->sparse_free[--buf->sparse_n_free];
-            uint32_t copy_src = UINT32_MAX;
-
-            if (old_p != UINT32_MAX) {
-                GGML_ASSERT(buf->sparse_p_ref[old_p] > 1);
-                copy_src = ggml_metal_sparse_find_alias(buf, old_p, (uint32_t) v);
-                GGML_ASSERT(copy_src != UINT32_MAX);
-                --buf->sparse_p_ref[old_p];
-            }
-
-            buf->sparse_v2p[v] = new_p;
-            buf->sparse_p_ref[new_p] = 1;
-
-            writes[iw] = (struct ggml_metal_sparse_write_action) {
-                /*.vtile          =*/ (uint32_t) v,
-                /*.ptile          =*/ new_p,
-                /*.copy_src_vtile =*/ copy_src,
-            };
-            operations[iw] = (MTL4UpdateSparseBufferMappingOperation) {
-                /*.mode        =*/ MTLSparseTextureMappingModeMap,
-                /*.bufferRange =*/ NSMakeRange(v, 1),
-                /*.heapOffset  =*/ new_p,
-            };
-            ++iw;
-        }
-        GGML_ASSERT(iw == n_writes);
-
-        ggml_metal_sparse_submit(buf, operations, n_writes, writes, n_writes);
-
-        free(marked);
-        free(marked_per_physical);
+        ggml_metal_sparse_reservation_t reservation = NULL;
+        size_t n_pools = 0;
+        const enum ggml_metal_sparse_reservation_result reserve_status =
+                ggml_metal_buffers_sparse_reserve(
+                        writes, n_ranges, NULL, 0, &n_pools, NULL, &reservation);
         free(writes);
-        free(operations);
-        [buf->sparse_lock unlock];
-        return true;
+        if (reserve_status != GGML_METAL_SPARSE_RESERVATION_OK) {
+            if (reserve_status == GGML_METAL_SPARSE_RESERVATION_PRESSURE) {
+                GGML_LOG_WARN("%s: DSV4 sparse heap reservation pressure\n", __func__);
+            }
+            return false;
+        }
+        const enum ggml_metal_sparse_reservation_result commit_status =
+                ggml_metal_sparse_reservation_commit(reservation);
+        ggml_metal_sparse_reservation_free(reservation);
+        return commit_status == GGML_METAL_SPARSE_RESERVATION_OK;
     }
 #endif
 
     return false;
+}
+
+bool ggml_metal_buffer_sparse_get_usage(
+        ggml_metal_buffer_t buf,
+        struct ggml_metal_sparse_usage * usage) {
+    if (buf == NULL || usage == NULL || !buf->is_sparse) {
+        return false;
+    }
+    [buf->sparse_lock lock];
+#if TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
+    ggml_metal_sparse_get_usage_locked(buf, usage);
+#else
+    memset(usage, 0, sizeof(*usage));
+#endif
+    [buf->sparse_lock unlock];
+    return true;
+}
+
+enum ggml_metal_sparse_reservation_result ggml_metal_buffers_sparse_quote(
+        const struct ggml_metal_sparse_buffer_range * ranges,
+        size_t n_ranges,
+        struct ggml_metal_sparse_pool_quote * pools,
+        size_t pool_capacity,
+        size_t * n_pools,
+        size_t * limiting_pool) {
+#if TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
+    if (@available(macOS 26.4, *)) {
+        return ggml_metal_sparse_prepare(
+                ranges, n_ranges, false, pools, pool_capacity, n_pools,
+                limiting_pool, NULL);
+    }
+#endif
+    GGML_UNUSED(ranges);
+    GGML_UNUSED(n_ranges);
+    GGML_UNUSED(pools);
+    GGML_UNUSED(pool_capacity);
+    GGML_UNUSED(n_pools);
+    GGML_UNUSED(limiting_pool);
+    return GGML_METAL_SPARSE_RESERVATION_UNSUPPORTED;
+}
+
+enum ggml_metal_sparse_reservation_result ggml_metal_buffers_sparse_reserve(
+        const struct ggml_metal_sparse_buffer_range * ranges,
+        size_t n_ranges,
+        struct ggml_metal_sparse_pool_quote * pools,
+        size_t pool_capacity,
+        size_t * n_pools,
+        size_t * limiting_pool,
+        ggml_metal_sparse_reservation_t * reservation) {
+#if TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
+    if (@available(macOS 26.4, *)) {
+        return ggml_metal_sparse_prepare(
+                ranges, n_ranges, true, pools, pool_capacity, n_pools,
+                limiting_pool, reservation);
+    }
+#endif
+    GGML_UNUSED(ranges);
+    GGML_UNUSED(n_ranges);
+    GGML_UNUSED(pools);
+    GGML_UNUSED(pool_capacity);
+    GGML_UNUSED(n_pools);
+    GGML_UNUSED(limiting_pool);
+    if (reservation != NULL) {
+        *reservation = NULL;
+    }
+    return GGML_METAL_SPARSE_RESERVATION_UNSUPPORTED;
+}
+
+enum ggml_metal_sparse_reservation_result ggml_metal_sparse_reservation_commit(
+        ggml_metal_sparse_reservation_t reservation) {
+    if (reservation == NULL) {
+        return GGML_METAL_SPARSE_RESERVATION_INVALID;
+    }
+
+#if TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
+    if (@available(macOS 26.4, *)) {
+        ggml_metal_sparse_lock_entries(reservation);
+
+        enum ggml_metal_sparse_reservation_result status = GGML_METAL_SPARSE_RESERVATION_OK;
+        for (size_t i = 0; i < reservation->n_entries; ++i) {
+            struct ggml_metal_sparse_reservation_entry * entry = &reservation->entries[i];
+            ggml_metal_buffer_t buf = entry->buffer;
+            if (!ggml_metal_sparse_accounting_is_current(
+                        buf->sparse_generation, &entry->accounting)) {
+                status = GGML_METAL_SPARSE_RESERVATION_STALE;
+                break;
+            }
+
+            const size_t other_reserved = buf->sparse_n_reserved - entry->accounting.reserved_pages;
+            const struct ggml_metal_sparse_quote current = ggml_metal_sparse_plan_write(
+                    buf->sparse_page_size, buf->sparse_n_virtual, buf->sparse_n_physical,
+                    buf->sparse_n_free, other_reserved, buf->sparse_generation,
+                    buf->sparse_v2p, buf->sparse_p_ref, entry->ranges, entry->n_ranges,
+                    entry->marked, entry->marked_per_physical);
+            if (current.status != GGML_METAL_SPARSE_PLAN_OK || !current.feasible ||
+                    current.required_pages != entry->quote.required_pages ||
+                    current.new_pages != entry->quote.new_pages ||
+                    current.cow_pages != entry->quote.cow_pages ||
+                    current.target_mappings != entry->quote.target_mappings) {
+                status = GGML_METAL_SPARSE_RESERVATION_STALE;
+                break;
+            }
+        }
+
+        if (status != GGML_METAL_SPARSE_RESERVATION_OK) {
+            for (size_t i = 0; i < reservation->n_entries; ++i) {
+                struct ggml_metal_sparse_reservation_entry * entry = &reservation->entries[i];
+                ggml_metal_sparse_accounting_finish(
+                        &entry->buffer->sparse_n_reserved, &entry->accounting,
+                        GGML_METAL_SPARSE_TICKET_ROLLED_BACK);
+            }
+            ggml_metal_sparse_unlock_entries(reservation);
+            return status;
+        }
+
+        // All generations and preallocated action arrays have been validated
+        // while every pool lock is held. No later pool can fail after an
+        // earlier pool's CPU mapping table has changed.
+        for (size_t i = 0; i < reservation->n_entries; ++i) {
+            struct ggml_metal_sparse_reservation_entry * entry = &reservation->entries[i];
+            ggml_metal_buffer_t buf = entry->buffer;
+            size_t iw = 0;
+            for (size_t v = 0; v < buf->sparse_n_virtual; ++v) {
+                if (!entry->marked[v]) {
+                    continue;
+                }
+                const uint32_t old_p = buf->sparse_v2p[v];
+                if (old_p != UINT32_MAX && buf->sparse_p_ref[old_p] == 1) {
+                    continue;
+                }
+
+                GGML_ASSERT(buf->sparse_n_free > 0);
+                const uint32_t new_p = buf->sparse_free[--buf->sparse_n_free];
+                uint32_t copy_src = UINT32_MAX;
+                if (old_p != UINT32_MAX) {
+                    GGML_ASSERT(buf->sparse_p_ref[old_p] > 1);
+                    copy_src = ggml_metal_sparse_find_alias(buf, old_p, (uint32_t) v);
+                    GGML_ASSERT(copy_src != UINT32_MAX);
+                    --buf->sparse_p_ref[old_p];
+                }
+
+                buf->sparse_v2p[v] = new_p;
+                buf->sparse_p_ref[new_p] = 1;
+                entry->writes[iw] = (struct ggml_metal_sparse_write_action) {
+                    /*.vtile          =*/ (uint32_t) v,
+                    /*.ptile          =*/ new_p,
+                    /*.copy_src_vtile =*/ copy_src,
+                };
+                entry->operations[iw] = (MTL4UpdateSparseBufferMappingOperation) {
+                    /*.mode        =*/ MTLSparseTextureMappingModeMap,
+                    /*.bufferRange =*/ NSMakeRange(v, 1),
+                    /*.heapOffset  =*/ new_p,
+                };
+                ++iw;
+            }
+            GGML_ASSERT(iw == entry->quote.required_pages);
+        }
+
+        for (size_t i = 0; i < reservation->n_entries; ++i) {
+            struct ggml_metal_sparse_reservation_entry * entry = &reservation->entries[i];
+            ggml_metal_buffer_t buf = entry->buffer;
+            if (entry->quote.required_pages > 0) {
+                ggml_metal_sparse_submit(
+                        buf, entry->operations, entry->quote.required_pages,
+                        entry->writes, entry->quote.required_pages);
+            }
+            buf->sparse_cow_allocations += entry->quote.cow_pages > 0;
+            buf->sparse_cow_pages += entry->quote.cow_pages;
+            if (entry->quote.required_pages > 0) {
+                ++buf->sparse_generation;
+            }
+            GGML_ASSERT(ggml_metal_sparse_accounting_finish(
+                    &buf->sparse_n_reserved, &entry->accounting,
+                    GGML_METAL_SPARSE_TICKET_COMMITTED));
+        }
+
+        ggml_metal_sparse_unlock_entries(reservation);
+        return GGML_METAL_SPARSE_RESERVATION_OK;
+    }
+#endif
+
+    return GGML_METAL_SPARSE_RESERVATION_UNSUPPORTED;
+}
+
+static bool ggml_metal_sparse_reservation_release(
+        ggml_metal_sparse_reservation_t reservation,
+        enum ggml_metal_sparse_ticket_state final_state) {
+    if (reservation == NULL) {
+        return false;
+    }
+#if TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
+    if (@available(macOS 26.4, *)) {
+        bool result = true;
+        ggml_metal_sparse_lock_entries(reservation);
+        for (size_t i = 0; i < reservation->n_entries; ++i) {
+            struct ggml_metal_sparse_reservation_entry * entry = &reservation->entries[i];
+            result = ggml_metal_sparse_accounting_finish(
+                    &entry->buffer->sparse_n_reserved, &entry->accounting,
+                    final_state) && result;
+        }
+        ggml_metal_sparse_unlock_entries(reservation);
+        return result;
+    }
+#endif
+    return false;
+}
+
+bool ggml_metal_sparse_reservation_rollback(ggml_metal_sparse_reservation_t reservation) {
+    return ggml_metal_sparse_reservation_release(
+            reservation, GGML_METAL_SPARSE_TICKET_ROLLED_BACK);
+}
+
+bool ggml_metal_sparse_reservation_cancel(ggml_metal_sparse_reservation_t reservation) {
+    return ggml_metal_sparse_reservation_release(
+            reservation, GGML_METAL_SPARSE_TICKET_CANCELLED);
+}
+
+void ggml_metal_sparse_reservation_free(ggml_metal_sparse_reservation_t reservation) {
+    if (reservation == NULL) {
+        return;
+    }
+#if TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
+    ggml_metal_sparse_reservation_cancel(reservation);
+    ggml_metal_sparse_reservation_destroy(reservation);
+#else
+    GGML_UNUSED(reservation);
+#endif
 }
 
 bool ggml_metal_buffer_sparse_alias(
@@ -2483,7 +2986,10 @@ bool ggml_metal_buffer_sparse_alias(
         const size_t * offsets,
         const size_t * sizes,
         size_t n_ranges) {
-    if (!buf->is_sparse) {
+    if (buf == NULL || !buf->is_sparse) {
+        return false;
+    }
+    if (n_ranges > 0 && (offsets == NULL || sizes == NULL)) {
         return false;
     }
 
@@ -2615,6 +3121,7 @@ bool ggml_metal_buffer_sparse_alias(
         GGML_ASSERT(io == n_operations);
 
         ggml_metal_sparse_submit(buf, operations, n_operations, NULL, 0);
+        ++buf->sparse_generation;
 
         free(selected);
         free(alias_p);
@@ -2631,8 +3138,8 @@ bool ggml_metal_buffer_sparse_unmap(
         ggml_metal_buffer_t buf,
         size_t offset,
         size_t size) {
-    if (!buf->is_sparse || size == 0) {
-        return buf->is_sparse;
+    if (buf == NULL || !buf->is_sparse || size == 0) {
+        return buf != NULL && buf->is_sparse;
     }
 
 #if TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
@@ -2683,6 +3190,7 @@ bool ggml_metal_buffer_sparse_unmap(
         GGML_ASSERT(io == n_operations);
 
         ggml_metal_sparse_submit(buf, operations, n_operations, NULL, 0);
+        ++buf->sparse_generation;
         free(operations);
         [buf->sparse_lock unlock];
         return true;
@@ -2727,11 +3235,11 @@ void * ggml_metal_buffer_get_base(ggml_metal_buffer_t buf) {
 }
 
 bool ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf) {
-    return buf->is_shared;
+    return buf != NULL && buf->is_shared;
 }
 
 bool ggml_metal_buffer_is_sparse(ggml_metal_buffer_t buf) {
-    return buf->is_sparse;
+    return buf != NULL && buf->is_sparse;
 }
 
 void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-metal-sparse-planner.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -312,17 +313,115 @@ const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_de
 
 typedef struct ggml_metal_buffer * ggml_metal_buffer_t;
 
+enum ggml_metal_sparse_init_status {
+    GGML_METAL_SPARSE_INIT_OK = 0,
+    GGML_METAL_SPARSE_INIT_UNSUPPORTED,
+    GGML_METAL_SPARSE_INIT_INVALID_SIZE,
+    GGML_METAL_SPARSE_INIT_CPU_BUFFER,
+    GGML_METAL_SPARSE_INIT_MTL_BUFFER,
+    GGML_METAL_SPARSE_INIT_PLACEMENT_HEAP,
+    GGML_METAL_SPARSE_INIT_COMMAND_QUEUE,
+    GGML_METAL_SPARSE_INIT_SHARED_EVENT,
+    GGML_METAL_SPARSE_INIT_LOCK,
+    GGML_METAL_SPARSE_INIT_CPU_V2P_TABLE,
+    GGML_METAL_SPARSE_INIT_CPU_REFCOUNT_TABLE,
+    GGML_METAL_SPARSE_INIT_CPU_FREE_TABLE,
+    GGML_METAL_SPARSE_INIT_RESIDENCY_SET,
+};
+
+struct ggml_metal_sparse_init_result {
+    enum ggml_metal_sparse_init_status status;
+    size_t requested_virtual_bytes;
+    size_t requested_physical_bytes;
+    size_t aligned_virtual_bytes;
+    size_t aligned_physical_bytes;
+    size_t device_max_buffer_length;
+};
+
+struct ggml_metal_sparse_usage {
+    uintptr_t pool_id;
+    size_t page_size;
+    size_t virtual_pages;
+    size_t physical_pages;
+    size_t free_pages;
+    size_t reserved_pages;
+    size_t mapped_mappings;
+    size_t unique_physical_pages;
+    size_t shared_physical_pages;
+    size_t shared_mappings;
+    size_t refcount_sum;
+    uint32_t refcount_max;
+    uint64_t generation;
+    uint64_t cow_allocations;
+    uint64_t cow_pages;
+};
+
+struct ggml_metal_sparse_buffer_range {
+    ggml_metal_buffer_t buffer;
+    size_t offset;
+    size_t size;
+};
+
+struct ggml_metal_sparse_pool_quote {
+    uintptr_t pool_id;
+    struct ggml_metal_sparse_usage usage;
+    struct ggml_metal_sparse_quote write;
+};
+
+enum ggml_metal_sparse_reservation_result {
+    GGML_METAL_SPARSE_RESERVATION_OK = 0,
+    GGML_METAL_SPARSE_RESERVATION_PRESSURE,
+    GGML_METAL_SPARSE_RESERVATION_STALE,
+    GGML_METAL_SPARSE_RESERVATION_INVALID,
+    GGML_METAL_SPARSE_RESERVATION_OOM,
+    GGML_METAL_SPARSE_RESERVATION_UNSUPPORTED,
+};
+
+typedef struct ggml_metal_sparse_reservation * ggml_metal_sparse_reservation_t;
+
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);
 ggml_metal_buffer_t ggml_metal_buffer_init_sparse(
         ggml_metal_device_t dev,
         size_t virtual_size,
         size_t physical_size);
+ggml_metal_buffer_t ggml_metal_buffer_init_sparse_ex(
+        ggml_metal_device_t dev,
+        size_t virtual_size,
+        size_t physical_size,
+        struct ggml_metal_sparse_init_result * result);
 ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size);
 
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);
 bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);
 bool   ggml_metal_buffer_is_sparse(ggml_metal_buffer_t buf);
+
+bool ggml_metal_buffer_sparse_get_usage(
+        ggml_metal_buffer_t buf,
+        struct ggml_metal_sparse_usage * usage);
+
+enum ggml_metal_sparse_reservation_result ggml_metal_buffers_sparse_quote(
+        const struct ggml_metal_sparse_buffer_range * ranges,
+        size_t n_ranges,
+        struct ggml_metal_sparse_pool_quote * pools,
+        size_t pool_capacity,
+        size_t * n_pools,
+        size_t * limiting_pool);
+
+enum ggml_metal_sparse_reservation_result ggml_metal_buffers_sparse_reserve(
+        const struct ggml_metal_sparse_buffer_range * ranges,
+        size_t n_ranges,
+        struct ggml_metal_sparse_pool_quote * pools,
+        size_t pool_capacity,
+        size_t * n_pools,
+        size_t * limiting_pool,
+        ggml_metal_sparse_reservation_t * reservation);
+
+enum ggml_metal_sparse_reservation_result ggml_metal_sparse_reservation_commit(
+        ggml_metal_sparse_reservation_t reservation);
+bool ggml_metal_sparse_reservation_rollback(ggml_metal_sparse_reservation_t reservation);
+bool ggml_metal_sparse_reservation_cancel  (ggml_metal_sparse_reservation_t reservation);
+void ggml_metal_sparse_reservation_free    (ggml_metal_sparse_reservation_t reservation);
 
 bool ggml_metal_buffer_sparse_map_write(
         ggml_metal_buffer_t buf,
