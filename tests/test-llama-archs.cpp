@@ -16,6 +16,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -378,7 +379,7 @@ static void test_dsv4_mtp_device(
 
     test_context_config trunk_config;
     trunk_config.n_ctx = 256;
-    trunk_config.n_batch = tokens.size();
+    trunk_config.n_batch = 4*tokens.size();
     trunk_config.n_ubatch = tokens.size();
 
     auto trunk_gguf = get_gguf_ctx(LLM_ARCH_DEEPSEEK4, true);
@@ -388,6 +389,19 @@ static void test_dsv4_mtp_device(
     const std::vector<float> logits_trunk = get_logits(trunk.first.get(), trunk.second.get(), tokens);
     const int32_t n_embd_nextn = llama_model_n_embd_nextn(trunk.first.get());
     GGML_ASSERT(n_embd_nextn == 4*llama_model_n_embd(trunk.first.get()));
+    const size_t target_prompt_output_bytes = llama_get_output_buffer_size(trunk.second.get());
+    const size_t legacy_prompt_output_bytes =
+            (tokens.size()*llama_vocab_n_tokens(llama_model_get_vocab(trunk.first.get())) +
+             trunk_config.n_batch*(size_t) n_embd_nextn)*sizeof(float);
+    const char * compact_disable = std::getenv("LLAMA_DSV4_NEXTN_OUTPUT_COMPACT_DISABLE");
+    const bool compact_enabled = !(compact_disable && std::strcmp(compact_disable, "1") == 0);
+    if (compact_enabled) {
+        GGML_ASSERT(target_prompt_output_bytes < legacy_prompt_output_bytes &&
+                "unmasked DSV4 NextN output retained configured batch capacity");
+    } else {
+        GGML_ASSERT(target_prompt_output_bytes >= legacy_prompt_output_bytes &&
+                "DSV4 NextN output compact control did not retain configured batch capacity");
+    }
     const float * target_h = llama_get_embeddings_nextn(trunk.second.get());
     GGML_ASSERT(target_h);
 
@@ -536,11 +550,30 @@ static void test_dsv4_mtp_device(
         }
     }
 
+    // The prompt-sized target buffer must release its VM-backed excess when
+    // generation transitions to a much smaller verifier batch.
+    llama_memory_clear(llama_get_memory(trunk.second.get()), true);
+    llama_batch one = llama_batch_init(1, 0, 1);
+    common_batch_add(one, tokens[0], 0, {0}, true);
+    GGML_ASSERT(llama_decode(trunk.second.get(), one) == 0);
+    const size_t target_decode_output_bytes = llama_get_output_buffer_size(trunk.second.get());
+    if (compact_enabled) {
+        GGML_ASSERT(target_decode_output_bytes < target_prompt_output_bytes &&
+                "DSV4 target output buffer did not shrink after prompt processing");
+    } else {
+        GGML_ASSERT(target_decode_output_bytes == target_prompt_output_bytes &&
+                "DSV4 target output compact control did not retain prompt capacity");
+    }
+    GGML_ASSERT(std::isfinite(llama_get_logits_ith(trunk.second.get(), 0)[0]));
+    GGML_ASSERT(std::isfinite(llama_get_embeddings_nextn_ith(trunk.second.get(), 0)[0]));
+    llama_batch_free(one);
+
     batch.token = nullptr;
     llama_batch_free(batch);
     printf("  DSV4 MTP graph (%s): target NMSE %.3e, hidden width %d, finite draft rows %zu, "
-           "retain/accept/reject NMSE %.3e/%.3e/%.3e\n",
-            device_label, target_nmse, n_embd_nextn, tokens.size(), retain_nmse, accept_nmse, reject_nmse);
+           "retain/accept/reject NMSE %.3e/%.3e/%.3e, target output bytes prompt/decode %zu/%zu (%s)\n",
+            device_label, target_nmse, n_embd_nextn, tokens.size(), retain_nmse, accept_nmse, reject_nmse,
+            target_prompt_output_bytes, target_decode_output_bytes, compact_enabled ? "compact" : "control");
 }
 
 static void test_dsv4_mtp(const size_t seed) {
