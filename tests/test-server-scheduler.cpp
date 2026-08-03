@@ -330,6 +330,26 @@ size_t count_events(const replay_result & result, replay_event_kind kind, reason
                       [&](const replay_event & event) { return event.kind == kind && event.reason == reason; }));
 }
 
+const replay_event & find_event(const replay_result & result,
+                                replay_event_kind     kind,
+                                reason_code           reason,
+                                uint64_t              request_id) {
+    const auto found = std::find_if(result.events.begin(), result.events.end(), [&](const replay_event & event) {
+        return event.kind == kind && event.reason == reason && event.request_id == request_id;
+    });
+    if (found == result.events.end()) {
+        throw std::runtime_error("expected replay event was not emitted");
+    }
+    return *found;
+}
+
+void require_monotonic_event_time(const replay_result & result) {
+    for (size_t i = 1; i < result.events.size(); ++i) {
+        require(result.events[i - 1].time_us <= result.events[i].time_us,
+                "replay events must be emitted in timestamp order");
+    }
+}
+
 void test_frozen_capacity_traces() {
     simulator replay;
 
@@ -437,6 +457,93 @@ void test_replay_is_explicitly_single_dispatch() {
     require(result.end_time_us == 1000, "single-dispatch replay advances by GPU service time only");
 }
 
+void test_async_restore_does_not_block_ready_gpu_work() {
+    replay_trace trace;
+    trace.capacity.units[0] = 2;
+
+    trace_job restoring     = make_trace_job(1, lane::low, 0, 1, 1, 1, 500);
+    restoring.restore_io_us = 5000;
+    trace.jobs.push_back(restoring);
+    trace.jobs.push_back(make_trace_job(2, lane::fast, 0, 1, 1, 1, 1000));
+
+    const replay_result first  = simulator().replay(trace);
+    const replay_result second = simulator().replay(trace);
+    require(first == second, "asynchronous restore replay must remain byte-for-byte deterministic");
+    require_monotonic_event_time(first);
+
+    const replay_event & restore_start =
+        find_event(first, replay_event_kind::io_start, reason_code::replay_restore_start, 1);
+    const replay_event & fast_done = find_event(first, replay_event_kind::completion, reason_code::service_complete, 2);
+    const replay_event & restore_ready =
+        find_event(first, replay_event_kind::io_complete, reason_code::replay_restore_ready, 1);
+    require(restore_start.time_us == 0 && restore_start.io_us == 5000, "restore start duration");
+    require(fast_done.time_us == 1000, "ready GPU work must complete while restore is outstanding");
+    require(restore_ready.time_us == 5000 && restore_ready.io_us == 5000, "restore readiness timestamp");
+}
+
+void test_arrivals_are_recorded_during_non_preemptive_dispatch() {
+    replay_trace trace;
+    trace.capacity.units[0] = 2;
+    trace.jobs.push_back(make_trace_job(1, lane::fast, 0, 1, 1, 1, 5000));
+    trace.jobs.push_back(make_trace_job(2, lane::low, 1000, 1, 1, 1, 250));
+
+    const replay_result result = simulator().replay(trace);
+    require_monotonic_event_time(result);
+    const replay_event & arrival = find_event(result, replay_event_kind::arrival, reason_code::replay_arrival, 2);
+    const replay_event & first_done =
+        find_event(result, replay_event_kind::completion, reason_code::service_complete, 1);
+    const replay_event & second_dispatch =
+        find_event(result, replay_event_kind::dispatch, reason_code::request_fifo, 2);
+    require(arrival.time_us == 1000, "arrival retains its real timestamp while GPU is occupied");
+    require(first_done.time_us == 5000, "non-preemptive dispatch completion timestamp");
+    require(second_dispatch.time_us == 5000, "arrival queues but cannot preempt the active dispatch");
+}
+
+void test_async_spill_holds_capacity_without_blocking_gpu() {
+    replay_trace trace;
+    trace.capacity.units[0] = 1;
+
+    trace_job spilling   = make_trace_job(1, lane::fast, 0, 1, 1, 1, 1000);
+    spilling.spill_io_us = 5000;
+    trace.jobs.push_back(spilling);
+    trace.jobs.push_back(make_trace_job(2, lane::normal, 0, 1, 0, 1, 1000));
+    trace.jobs.push_back(make_trace_job(3, lane::fast, 1500, 1, 1, 1, 250));
+
+    const replay_result result = simulator().replay(trace);
+    require_monotonic_event_time(result);
+    const replay_event & spill_start =
+        find_event(result, replay_event_kind::io_start, reason_code::replay_spill_start, 1);
+    const replay_event & unrelated_done =
+        find_event(result, replay_event_kind::completion, reason_code::service_complete, 2);
+    const replay_event & blocked =
+        find_event(result, replay_event_kind::admission, reason_code::admission_capacity_wait, 3);
+    const replay_event & spill_done =
+        find_event(result, replay_event_kind::io_complete, reason_code::replay_spill_done, 1);
+    require(spill_start.time_us == 1000 && spill_start.io_us == 5000, "spill starts at service completion");
+    require(unrelated_done.time_us == 2000, "zero-demand GPU work proceeds during spill I/O");
+    require(blocked.time_us == 1500, "spill-held pages block a capacity-consuming arrival");
+    require(spill_done.time_us == 6000 && spill_done.io_us == 5000, "spill releases pages at I/O completion");
+    const replay_event & unblocked_dispatch =
+        find_event(result, replay_event_kind::dispatch, reason_code::request_fifo, 3);
+    require(unblocked_dispatch.time_us == 6000, "capacity waiter dispatches immediately after spill release");
+}
+
+void test_zero_duration_capacity_waiters_preserve_lane_policy() {
+    replay_trace trace;
+    trace.capacity.units[0] = 1;
+    trace.jobs.push_back(make_trace_job(1, lane::normal, 0, 1, 1, 1, 1000));
+    trace.jobs.push_back(make_trace_job(2, lane::low, 0, 1, 1, 1, 250));
+    trace.jobs.push_back(make_trace_job(3, lane::fast, 0, 1, 1, 1, 250));
+
+    const replay_result result = simulator().replay(trace);
+    require(count_events(result, replay_event_kind::admission, reason_code::admission_capacity_wait) == 2,
+            "both later arrivals initially wait on the holder");
+    const replay_event & fast_dispatch = find_event(result, replay_event_kind::dispatch, reason_code::request_fifo, 3);
+    const replay_event & low_dispatch  = find_event(result, replay_event_kind::dispatch, reason_code::request_fifo, 2);
+    require(fast_dispatch.time_us == 1000, "freed capacity follows scheduler lane priority");
+    require(low_dispatch.time_us == 1250, "lower lane runs after the higher-priority waiter");
+}
+
 void test_resource_vectors_and_safety_watermark() {
     simulator    replay;
     replay_trace trace;
@@ -464,19 +571,23 @@ void test_resource_vectors_and_safety_watermark() {
 
 int main() {
     const std::vector<std::pair<const char *, void (*)()>> tests = {
-        { "default descriptors",              test_default_descriptors                           },
-        { "FIFO, virtual runtime, and ties",  test_fifo_virtual_runtime_and_ties                 },
-        { "cache lookahead and bypass bound", test_cache_lookahead_bonus_and_bypass_bound        },
-        { "infeasible head",                  test_infeasible_head_is_not_bypassed               },
-        { "aging",                            test_aging                                         },
-        { "HDRR shares",                      test_hdrr_shares_and_low_progress                  },
-        { "work conservation",                test_empty_lane_work_conservation                  },
-        { "admission reasons",                test_admission_and_queue_reason_codes              },
-        { "decode widths",                    test_decode_width_profiles                         },
-        { "capacity traces",                  test_frozen_capacity_traces                        },
-        { "deterministic mixed replay",       test_replay_determinism_and_perpetual_low_progress },
-        { "single-dispatch replay",           test_replay_is_explicitly_single_dispatch          },
-        { "resource vectors",                 test_resource_vectors_and_safety_watermark         },
+        { "default descriptors",              test_default_descriptors                                  },
+        { "FIFO, virtual runtime, and ties",  test_fifo_virtual_runtime_and_ties                        },
+        { "cache lookahead and bypass bound", test_cache_lookahead_bonus_and_bypass_bound               },
+        { "infeasible head",                  test_infeasible_head_is_not_bypassed                      },
+        { "aging",                            test_aging                                                },
+        { "HDRR shares",                      test_hdrr_shares_and_low_progress                         },
+        { "work conservation",                test_empty_lane_work_conservation                         },
+        { "admission reasons",                test_admission_and_queue_reason_codes                     },
+        { "decode widths",                    test_decode_width_profiles                                },
+        { "capacity traces",                  test_frozen_capacity_traces                               },
+        { "deterministic mixed replay",       test_replay_determinism_and_perpetual_low_progress        },
+        { "single-dispatch replay",           test_replay_is_explicitly_single_dispatch                 },
+        { "asynchronous restore",             test_async_restore_does_not_block_ready_gpu_work          },
+        { "arrival during dispatch",          test_arrivals_are_recorded_during_non_preemptive_dispatch },
+        { "asynchronous spill",               test_async_spill_holds_capacity_without_blocking_gpu      },
+        { "capacity-wait lane policy",        test_zero_duration_capacity_waiters_preserve_lane_policy  },
+        { "resource vectors",                 test_resource_vectors_and_safety_watermark                },
     };
 
     for (const auto & test : tests) {

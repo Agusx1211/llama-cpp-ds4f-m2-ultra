@@ -71,6 +71,10 @@ enum class reason_code : uint16_t {
     replay_arrival       = 700,
     replay_stalled       = 701,
     replay_limit_reached = 702,
+    replay_restore_start = 703,
+    replay_restore_ready = 704,
+    replay_spill_start   = 705,
+    replay_spill_done    = 706,
 };
 
 const char * to_string(lane value);
@@ -205,12 +209,14 @@ class scheduler {
 };
 
 enum class replay_event_kind : uint8_t {
-    arrival    = 0,
-    admission  = 1,
-    dispatch   = 2,
-    completion = 3,
-    stalled    = 4,
-    limit      = 5,
+    arrival     = 0,
+    admission   = 1,
+    dispatch    = 2,
+    completion  = 3,
+    stalled     = 4,
+    limit       = 5,
+    io_start    = 6,
+    io_complete = 7,
 };
 
 struct trace_job {
@@ -219,7 +225,9 @@ struct trace_job {
     uint64_t        observed_output_tokens = 1;
     uint64_t        service_gpu_us         = 1000;
     uint64_t        cached_prefix_us       = 0;
-    uint64_t        restore_cost_us        = 0;
+    uint64_t        restore_cost_us        = 0;  // policy estimate used for cache-affinity ranking
+    uint64_t        restore_io_us          = 0;  // observed asynchronous input duration
+    uint64_t        spill_io_us            = 0;  // observed asynchronous output duration
 };
 
 struct replay_trace {
@@ -239,6 +247,7 @@ struct replay_event {
     reason_code       reason      = reason_code::none;
     reason_code       lane_reason = reason_code::none;
     uint64_t          gpu_us      = 0;
+    uint64_t          io_us       = 0;
 
     bool operator==(const replay_event & other) const;
 };
@@ -254,11 +263,11 @@ struct replay_result {
 
 class simulator {
   public:
-    // Replay models one non-preemptive GPU dispatch at a time. Decode cohort
+    // Replay models one non-preemptive GPU dispatch at a time. Restore and
+    // spill durations are asynchronous: they hold the request's resource
+    // vector but never advance or block unrelated GPU work. Decode cohort
     // widths remain independent until a batch-feasibility interface can
-    // account for the whole cohort. I/O readiness is intentionally absent
-    // until it can be represented as asynchronous events rather than delay
-    // unrelated runnable work.
+    // account for the whole cohort.
     replay_result replay(const replay_trace & trace) const;
 };
 
