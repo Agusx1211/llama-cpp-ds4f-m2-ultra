@@ -145,6 +145,30 @@ static void test_unmapped_overlap_and_rounding() {
     assert(q.status == GGML_METAL_SPARSE_PLAN_INVALID_RANGE && !q.feasible);
 }
 
+static void test_relative_alias_range_semantics() {
+    constexpr size_t page = fixture::page;
+    uint8_t marked[2] = {};
+
+    const size_t first_offset = 0;
+    const size_t one_page = page;
+    assert(ggml_metal_sparse_mark_relative_ranges(
+            page, page, &first_offset, &one_page, 1, marked, 1) ==
+            GGML_METAL_SPARSE_PLAN_OK);
+    assert(marked[0]);
+
+    const size_t second_offset = page;
+    assert(ggml_metal_sparse_mark_relative_ranges(
+            page, 2*page, &second_offset, &one_page, 1, marked, 2) ==
+            GGML_METAL_SPARSE_PLAN_OK);
+    assert(!marked[0] && marked[1]);
+
+    // The same offset is invalid for a one-page view. Passing an absolute
+    // destination offset here was the original target-device test failure.
+    assert(ggml_metal_sparse_mark_relative_ranges(
+            page, page, &second_offset, &one_page, 1, marked, 1) ==
+            GGML_METAL_SPARSE_PLAN_INVALID_RANGE);
+}
+
 static void test_diagnostic_status_names() {
     const auto named = [](const char * actual, const char * expected) {
         assert(std::strcmp(actual, expected) == 0);
@@ -369,6 +393,7 @@ static void test_quote_equals_commit() {
 int main() {
     test_diagnostic_status_names();
     test_unmapped_overlap_and_rounding();
+    test_relative_alias_range_semantics();
     test_alias_cow_rules();
     test_stable_cow_sources();
     test_insufficient_is_immutable();

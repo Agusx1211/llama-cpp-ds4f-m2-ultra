@@ -128,10 +128,10 @@ int main() {
     const auto after_new = get_usage(buffer);
     assert_commit_delta(initial, after_new, new_quote.write);
 
-    const size_t alias_offset = page;
+    const size_t alias_relative_offset = 0;
     const size_t alias_size = page;
     assert(ggml_metal_buffer_sparse_alias(
-            buffer, 0, page, page, &alias_offset, &alias_size, 1));
+            buffer, 0, page, page, &alias_relative_offset, &alias_size, 1));
     const auto aliased = get_usage(buffer);
     assert(aliased.free_pages == after_new.free_pages);
     assert(aliased.mapped_mappings == 2 && aliased.unique_physical_pages == 1);

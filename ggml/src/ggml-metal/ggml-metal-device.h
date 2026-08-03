@@ -447,7 +447,9 @@ bool ggml_metal_buffer_sparse_alias(
         size_t src_offset,
         size_t dst_offset,
         size_t size,
-        const size_t * offsets,
+        // Selected byte ranges relative to the source/destination views, not
+        // absolute offsets within the backing buffer.
+        const size_t * relative_offsets,
         const size_t * sizes,
         size_t n_ranges);
 

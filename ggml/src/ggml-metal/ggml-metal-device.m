@@ -3049,13 +3049,13 @@ bool ggml_metal_buffer_sparse_alias(
         size_t src_offset,
         size_t dst_offset,
         size_t size,
-        const size_t * offsets,
+        const size_t * relative_offsets,
         const size_t * sizes,
         size_t n_ranges) {
     if (buf == NULL || !buf->is_sparse) {
         return false;
     }
-    if (n_ranges > 0 && (offsets == NULL || sizes == NULL)) {
+    if (n_ranges > 0 && (relative_offsets == NULL || sizes == NULL)) {
         return false;
     }
 
@@ -3065,6 +3065,10 @@ bool ggml_metal_buffer_sparse_alias(
         if (src_offset % page != 0 || dst_offset % page != 0 || size % page != 0 ||
                 src_offset > buf->all_size || size > buf->all_size - src_offset ||
                 dst_offset > buf->all_size || size > buf->all_size - dst_offset) {
+            GGML_LOG_ERROR(
+                    "%s: invalid alias views: src=%zu dst=%zu size=%zu"
+                    " buffer_size=%zu page=%zu\n",
+                    __func__, src_offset, dst_offset, size, buf->all_size, page);
             return false;
         }
         if (src_offset == dst_offset) {
@@ -3075,13 +3079,16 @@ bool ggml_metal_buffer_sparse_alias(
         // unsupported overlapping views so a destination unmap cannot recycle
         // a page that is still referenced by the source snapshot.
         if (!(src_offset + size <= dst_offset || dst_offset + size <= src_offset)) {
+            GGML_LOG_ERROR(
+                    "%s: overlapping alias views are unsupported: src=%zu dst=%zu size=%zu\n",
+                    __func__, src_offset, dst_offset, size);
             return false;
         }
 
         [buf->sparse_lock lock];
 
         const size_t n_tiles = size/page;
-        uint8_t * selected = calloc(n_tiles, 1);
+        uint8_t * selected = malloc(n_tiles*sizeof(*selected));
         uint32_t * alias_p = malloc(n_tiles*sizeof(uint32_t));
         if (selected == NULL || alias_p == NULL) {
             free(selected);
@@ -3093,21 +3100,10 @@ bool ggml_metal_buffer_sparse_alias(
             alias_p[i] = UINT32_MAX;
         }
 
-        bool valid = true;
-        for (size_t r = 0; r < n_ranges; ++r) {
-            if (sizes[r] == 0) {
-                continue;
-            }
-            if (offsets[r] > size || sizes[r] > size - offsets[r]) {
-                valid = false;
-                break;
-            }
-            const size_t t0 = offsets[r]/page;
-            const size_t t1 = (offsets[r] + sizes[r] - 1)/page;
-            for (size_t t = t0; t <= t1; ++t) {
-                selected[t] = 1;
-            }
-        }
+        const enum ggml_metal_sparse_plan_status range_status =
+                ggml_metal_sparse_mark_relative_ranges(
+                        page, size, relative_offsets, sizes, n_ranges, selected, n_tiles);
+        const bool valid = range_status == GGML_METAL_SPARSE_PLAN_OK;
 
         size_t n_unmap = 0;
         size_t n_map = 0;
@@ -3128,6 +3124,11 @@ bool ggml_metal_buffer_sparse_alias(
         }
 
         if (!valid) {
+            GGML_LOG_ERROR(
+                    "%s: invalid relative alias ranges: status=%s view_size=%zu"
+                    " page=%zu ranges=%zu\n",
+                    __func__, ggml_metal_sparse_plan_status_name(range_status),
+                    size, page, n_ranges);
             free(selected);
             free(alias_p);
             [buf->sparse_lock unlock];

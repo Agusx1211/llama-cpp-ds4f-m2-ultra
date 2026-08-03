@@ -72,6 +72,40 @@ struct ggml_metal_sparse_ticket_accounting {
     enum ggml_metal_sparse_ticket_state state;
 };
 
+// Mark page tiles selected by ranges relative to a containing view. The
+// offsets are not absolute buffer offsets; callers provide the view's total
+// byte size separately.
+static inline enum ggml_metal_sparse_plan_status ggml_metal_sparse_mark_relative_ranges(
+        size_t page_size,
+        size_t view_size,
+        const size_t * offsets,
+        const size_t * sizes,
+        size_t n_ranges,
+        uint8_t * marked,
+        size_t n_tiles) {
+    if (page_size == 0 || view_size % page_size != 0 || n_tiles != view_size/page_size ||
+            (n_ranges > 0 && (offsets == NULL || sizes == NULL)) ||
+            (n_tiles > 0 && marked == NULL)) {
+        return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+    }
+
+    memset(marked, 0, n_tiles*sizeof(*marked));
+    for (size_t r = 0; r < n_ranges; ++r) {
+        if (sizes[r] == 0) {
+            continue;
+        }
+        if (offsets[r] > view_size || sizes[r] > view_size - offsets[r]) {
+            return GGML_METAL_SPARSE_PLAN_INVALID_RANGE;
+        }
+        const size_t t0 = offsets[r]/page_size;
+        const size_t t1 = (offsets[r] + sizes[r] - 1)/page_size;
+        for (size_t t = t0; t <= t1; ++t) {
+            marked[t] = 1;
+        }
+    }
+    return GGML_METAL_SPARSE_PLAN_OK;
+}
+
 // The caller supplies zeroable scratch arrays sized n_virtual and n_physical.
 // A physical page with R aliases and M selected writes costs M COW pages when
 // M < R, but only M-1 when all aliases are written: one mapping can retain the
