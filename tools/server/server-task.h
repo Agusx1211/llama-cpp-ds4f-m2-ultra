@@ -134,6 +134,26 @@ struct task_result_state {
 };
 
 struct server_task {
+    enum class trusted_lane : uint8_t {
+        low = 0,
+        normal,
+        fast,
+    };
+
+    // Populated only by trusted server-side ingress code. Client JSON is not
+    // consulted for these fields.
+    struct scheduling_metadata {
+        trusted_lane lane = trusted_lane::normal;
+        uint64_t arrival_us = 0;  // zero asks server_queue to stamp its clock
+        uint64_t virtual_runtime_us = 0;
+        int64_t debt_us = 0;
+        uint64_t predicted_prefill_us = 0;
+        uint64_t predicted_decode_us = 0;
+        uint64_t predicted_gpu_us = 0;
+        uint64_t predicted_memory_bytes = 0;
+        uint64_t predicted_output_tokens = 0;
+    } scheduling;
+
     int id = -1; // to be filled by server_queue
 
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
@@ -234,6 +254,7 @@ struct server_task {
         copy.type      = type;
         copy.tokens    = tokens.clone();
         copy.id_slot   = -1; // child tasks cannot specify slot
+        copy.scheduling = scheduling;
 
         // use different sampling seed for each child
         // note: https://github.com/ggml-org/llama.cpp/pull/18700#discussion_r2675115723
