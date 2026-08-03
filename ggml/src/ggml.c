@@ -6435,13 +6435,14 @@ struct ggml_tensor * ggml_dsv4_top_k_mask(
 
 // ggml_dsv4_sparse_pack
 
-struct ggml_tensor * ggml_dsv4_sparse_pack(
+static struct ggml_tensor * ggml_dsv4_sparse_pack_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * raw_k,
         struct ggml_tensor  * comp_k,
         struct ggml_tensor  * raw_mask,
         struct ggml_tensor  * comp_mask,
         struct ggml_tensor  * comp_idx,
+        struct ggml_tensor  * segment_ids,
         int64_t               n_raw) {
     GGML_ASSERT(raw_k->type == comp_k->type);
     GGML_ASSERT(raw_k->type == GGML_TYPE_F16 || raw_k->type == GGML_TYPE_Q8_0);
@@ -6457,15 +6458,26 @@ struct ggml_tensor * ggml_dsv4_sparse_pack(
     GGML_ASSERT(n_raw >= 0 && n_raw <= raw_k->ne[2]);
     GGML_ASSERT(nk > 0);
     GGML_ASSERT(comp_k->ne[0] == d);
-    GGML_ASSERT(raw_k->ne[1] == 1 && comp_k->ne[1] == 1);
-    GGML_ASSERT(comp_k->ne[3] == n_stream);
+    GGML_ASSERT(raw_k->ne[1] == 1);
+    if (segment_ids != NULL) {
+        GGML_ASSERT(segment_ids->type == GGML_TYPE_I32);
+        GGML_ASSERT(comp_k->ne[1] > 0 && comp_k->ne[1] % 64 == 0);
+        GGML_ASSERT(comp_k->ne[2] == 1 && comp_k->ne[3] == 1);
+        GGML_ASSERT(segment_ids->ne[0] == (comp_mask->ne[0] + 63)/64);
+        GGML_ASSERT(segment_ids->ne[1] == n_stream);
+        GGML_ASSERT(segment_ids->ne[2] == 1 && segment_ids->ne[3] == 1);
+    } else {
+        GGML_ASSERT(comp_k->ne[1] == 1);
+        GGML_ASSERT(comp_k->ne[3] == n_stream);
+        GGML_ASSERT(comp_mask->ne[0] == comp_k->ne[2]);
+    }
     GGML_ASSERT(raw_mask->ne[0] == raw_k->ne[2]);
-    GGML_ASSERT(comp_mask->ne[0] == comp_k->ne[2]);
     GGML_ASSERT(comp_mask->ne[1] == nq);
     GGML_ASSERT(raw_mask->ne[2] == 1 && comp_mask->ne[2] == 1);
     GGML_ASSERT(raw_mask->ne[3] == n_stream && comp_mask->ne[3] == n_stream);
     GGML_ASSERT(comp_idx->ne[1] == nq && comp_idx->ne[2] == 1);
     GGML_ASSERT(comp_idx->ne[3] == n_stream);
+    GGML_ASSERT(comp_idx->ne[0] <= comp_mask->ne[0]);
 
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
             nk*(d + 1), nq*n_stream);
@@ -6476,10 +6488,37 @@ struct ggml_tensor * ggml_dsv4_sparse_pack(
     result->src[2] = raw_mask;
     result->src[3] = comp_mask;
     result->src[4] = comp_idx;
+    result->src[5] = segment_ids;
 
     ggml_set_op_params_i32(result, 0, n_raw);
 
     return result;
+}
+
+struct ggml_tensor * ggml_dsv4_sparse_pack(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * raw_k,
+        struct ggml_tensor  * comp_k,
+        struct ggml_tensor  * raw_mask,
+        struct ggml_tensor  * comp_mask,
+        struct ggml_tensor  * comp_idx,
+        int64_t               n_raw) {
+    return ggml_dsv4_sparse_pack_impl(
+            ctx, raw_k, comp_k, raw_mask, comp_mask, comp_idx, NULL, n_raw);
+}
+
+struct ggml_tensor * ggml_dsv4_indexed_sparse_pack(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * raw_k,
+        struct ggml_tensor  * comp_pool,
+        struct ggml_tensor  * raw_mask,
+        struct ggml_tensor  * comp_mask,
+        struct ggml_tensor  * comp_idx,
+        struct ggml_tensor  * segment_ids,
+        int64_t               n_raw) {
+    GGML_ASSERT(segment_ids != NULL);
+    return ggml_dsv4_sparse_pack_impl(
+            ctx, raw_k, comp_pool, raw_mask, comp_mask, comp_idx, segment_ids, n_raw);
 }
 
 // ggml_dsv4_indexed_concat

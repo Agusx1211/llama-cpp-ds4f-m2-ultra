@@ -11366,6 +11366,7 @@ void ggml_compute_forward_dsv4_sparse_pack(
     const ggml_tensor * raw_mask  = dst->src[2];
     const ggml_tensor * comp_mask = dst->src[3];
     const ggml_tensor * comp_idx  = dst->src[4];
+    const ggml_tensor * segment_ids = dst->src[5];
 
     const int64_t d      = raw_k->ne[0];
     const int64_t nq     = raw_mask->ne[1];
@@ -11381,8 +11382,7 @@ void ggml_compute_forward_dsv4_sparse_pack(
     GGML_ASSERT(raw_k->type == GGML_TYPE_F16 || k_to_float);
     float * k_row_f32 = k_to_float ? (float *) params->wdata + params->ith*d : nullptr;
 
-    const auto copy_k_row = [&](const ggml_tensor * k, int64_t idx, int64_t is, ggml_fp16_t * out) {
-        const char * row = (const char *) k->data + idx*k->nb[2] + is*k->nb[3];
+    const auto copy_k_row = [&](const char * row, ggml_fp16_t * out) {
         if (k_to_float) {
             k_to_float(row, k_row_f32, d);
             ggml_fp32_to_fp16_row(k_row_f32, out, d);
@@ -11405,7 +11405,8 @@ void ggml_compute_forward_dsv4_sparse_pack(
             if (!std::isfinite(GGML_CPU_FP16_TO_FP32(m))) {
                 continue;
             }
-            copy_k_row(raw_k, idx, is, out_k + ir*d);
+            const char * row = (const char *) raw_k->data + idx*raw_k->nb[2] + is*raw_k->nb[3];
+            copy_k_row(row, out_k + ir*d);
             out_m[ir] = m;
             ++ir;
         }
@@ -11418,12 +11419,21 @@ void ggml_compute_forward_dsv4_sparse_pack(
             const int64_t oi = nr + i;
             const int32_t idx = *(const int32_t *) ((const char *) comp_idx->data +
                     i*comp_idx->nb[0] + iq*comp_idx->nb[1] + is*comp_idx->nb[3]);
-            GGML_ASSERT(idx >= 0 && idx < comp_k->ne[2]);
+            GGML_ASSERT(idx >= 0 && idx < comp_mask->ne[0]);
             const ggml_fp16_t m = *(const ggml_fp16_t *) ((const char *) comp_mask->data +
                     idx*comp_mask->nb[0] + iq*comp_mask->nb[1] + is*comp_mask->nb[3]);
             const bool visible = std::isfinite(GGML_CPU_FP16_TO_FP32(m));
+            const char * row = nullptr;
+            if (segment_ids != nullptr) {
+                const int32_t segment = *(const int32_t *) ((const char *) segment_ids->data +
+                        (idx/64)*segment_ids->nb[0] + is*segment_ids->nb[1]);
+                GGML_ASSERT(segment >= 0 && segment < comp_k->ne[1]/64);
+                row = (const char *) comp_k->data + (segment*64 + idx%64)*comp_k->nb[1];
+            } else {
+                row = (const char *) comp_k->data + idx*comp_k->nb[2] + is*comp_k->nb[3];
+            }
             if (visible) {
-                copy_k_row(comp_k, idx, is, out_k + oi*d);
+                copy_k_row(row, out_k + oi*d);
             } else {
                 memset(out_k + oi*d, 0, d*sizeof(ggml_fp16_t));
             }

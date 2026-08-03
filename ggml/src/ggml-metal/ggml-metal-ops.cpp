@@ -2023,6 +2023,8 @@ int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * raw_mask  = op->src[2];
     const ggml_tensor * comp_mask = op->src[3];
     const ggml_tensor * comp_idx  = op->src[4];
+    const ggml_tensor * segment_ids = op->src[5];
+    const bool indexed = segment_ids != nullptr;
 
     ggml_metal_kargs_dsv4_sparse_pack args = {
         /*.n_embd  =*/ (int32_t) raw_k->ne[0],
@@ -2030,6 +2032,9 @@ int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
         /*.n_raw   =*/ ggml_get_op_params_i32(op, 0),
         /*.n_raw_k =*/ (int32_t) raw_k->ne[2],
         /*.n_comp  =*/ (int32_t) comp_idx->ne[0],
+        /*.n_comp_k =*/ (int32_t) comp_mask->ne[0],
+        /*.n_pool_segments =*/ indexed ? (int32_t) (comp_k->ne[1]/64) : 0,
+        /*.nb_ck1  =*/ comp_k->nb[1],
         /*.nb_rk2  =*/ raw_k->nb[2],
         /*.nb_rk3  =*/ raw_k->nb[3],
         /*.nb_ck2  =*/ comp_k->nb[2],
@@ -2043,18 +2048,21 @@ int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
         /*.nb_ci0  =*/ comp_idx->nb[0],
         /*.nb_ci1  =*/ comp_idx->nb[1],
         /*.nb_ci3  =*/ comp_idx->nb[3],
+        /*.nb_si0  =*/ indexed ? segment_ids->nb[0] : 0,
+        /*.nb_si1  =*/ indexed ? segment_ids->nb[1] : 0,
         /*.nb_d1   =*/ op->nb[1],
     };
 
     ggml_metal_encoder_t enc = ctx->enc;
-    auto pipeline = ggml_metal_library_get_pipeline_dsv4_sparse_pack(ctx->lib, raw_k->type);
+    auto pipeline = ggml_metal_library_get_pipeline_dsv4_sparse_pack(ctx->lib, raw_k->type, indexed);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
     for (int i = 0; i < 5; ++i) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[i]), i + 1);
     }
-    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 6);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(indexed ? segment_ids : comp_idx), 6);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 7);
 
     // One thread per half4 covers a 512-element row while keeping more packers resident.
     const int nth = std::min(128, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));

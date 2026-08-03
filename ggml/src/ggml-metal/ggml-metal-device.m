@@ -1669,20 +1669,45 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[2]) &&
                 ggml_is_contiguous_rows(op->src[3]);
         case GGML_OP_DSV4_SPARSE_PACK:
-            return (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_Q8_0) &&
-                op->src[1]->type == op->src[0]->type &&
-                op->src[2]->type == GGML_TYPE_F16 &&
-                op->src[3]->type == GGML_TYPE_F16 &&
-                op->src[4]->type == GGML_TYPE_I32 &&
-                op->type         == GGML_TYPE_F16 &&
-                op->src[0]->ne[0] == 512 &&
-                ggml_get_op_params_i32(op, 0) <= 128 &&
-                ggml_get_op_params_i32(op, 0) + op->src[4]->ne[0] <= 128 + 512 &&
-                ggml_is_contiguous_rows(op->src[0]) &&
-                ggml_is_contiguous_rows(op->src[1]) &&
-                ggml_is_contiguous_rows(op->src[2]) &&
-                ggml_is_contiguous_rows(op->src[3]) &&
-                ggml_is_contiguous_rows(op->src[4]);
+            {
+                const bool indexed = op->src[5] != NULL;
+                const bool common =
+                    (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_Q8_0) &&
+                    op->src[1]->type == op->src[0]->type &&
+                    op->src[2]->type == GGML_TYPE_F16 &&
+                    op->src[3]->type == GGML_TYPE_F16 &&
+                    op->src[4]->type == GGML_TYPE_I32 &&
+                    op->type         == GGML_TYPE_F16 &&
+                    op->src[0]->ne[0] == 512 &&
+                    op->src[0]->ne[2] <= INT32_MAX &&
+                    op->src[3]->ne[0] > 0 && op->src[3]->ne[0] <= INT32_MAX &&
+                    op->src[4]->ne[0] <= op->src[3]->ne[0] &&
+                    ggml_get_op_params_i32(op, 0) <= 128 &&
+                    ggml_get_op_params_i32(op, 0) + op->src[4]->ne[0] <= 128 + 512 &&
+                    ggml_is_contiguous_rows(op->src[0]) &&
+                    ggml_is_contiguous_rows(op->src[1]) &&
+                    ggml_is_contiguous_rows(op->src[2]) &&
+                    ggml_is_contiguous_rows(op->src[3]) &&
+                    ggml_is_contiguous_rows(op->src[4]) &&
+                    ggml_is_contiguous(op);
+                if (!common) {
+                    return false;
+                }
+                if (!indexed) {
+                    return op->src[1]->ne[1] == 1 &&
+                        op->src[1]->ne[2] == op->src[3]->ne[0] &&
+                        op->src[1]->ne[3] == op->src[0]->ne[3];
+                }
+                return op->src[5]->type == GGML_TYPE_I32 &&
+                    op->src[1]->ne[1] > 0 && op->src[1]->ne[1] % 64 == 0 &&
+                    op->src[1]->ne[1]/64 <= INT32_MAX &&
+                    op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                    op->src[5]->ne[0] == (op->src[3]->ne[0] + 63)/64 &&
+                    op->src[5]->ne[1] == op->src[0]->ne[3] &&
+                    op->src[5]->ne[2] == 1 && op->src[5]->ne[3] == 1 &&
+                    ggml_is_contiguous(op->src[1]) &&
+                    ggml_is_contiguous(op->src[5]);
+            }
         case GGML_OP_DSV4_INDEXED_CONCAT:
             {
                 const int64_t n_comp = ggml_get_op_params_i32(op, 0);
