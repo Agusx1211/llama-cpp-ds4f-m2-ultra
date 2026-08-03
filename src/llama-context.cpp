@@ -1977,6 +1977,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
+    // DSV4 reserves the physical pages for every logical ubatch here, before
+    // output_reserve() invalidates the previous decode's observable outputs.
+    // A pressure result therefore leaves outputs and logical sequence state
+    // untouched and cannot follow a partially submitted batch.
+    if (!mctx->preflight()) {
+        if (mctx->get_status() == LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE) {
+            last_kv_pressure_valid = mctx->get_kv_pressure(last_kv_pressure);
+            LLAMA_LOG_WARN("%s: physical KV pressure before output preparation and graph submission\n", __func__);
+            return LLAMA_DECODE_KV_PHYSICAL_PRESSURE;
+        }
+
+        LLAMA_LOG_ERROR("%s: memory preflight failed for batch of size %d\n", __func__, balloc->get_n_tokens());
+        return -2;
+    }
+
     // reserve output buffer
     if (output_reserve(n_outputs_all, n_tokens_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);

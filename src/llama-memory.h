@@ -48,7 +48,9 @@ bool llama_memory_status_is_fail(llama_memory_status status);
 //   - llama_kv_cache_iswa_context
 //   ...
 //
-// the only method that should mutate the memory and the memory context is llama_memory_i::apply()
+// preflight() may reserve physical resources for the complete batch, but it must
+// not update logical sequence state. apply() consumes the current ubatch and is
+// the only method that should update logical memory state.
 struct llama_memory_context_i {
     virtual ~llama_memory_context_i() = default;
 
@@ -59,6 +61,12 @@ struct llama_memory_context_i {
     // apply the memory state for the current ubatch to the memory object
     // return false on failure
     virtual bool apply() = 0;
+
+    // reserve any physical resources required by the complete batch before
+    // output bookkeeping or graph submission. The default requires no work.
+    virtual bool preflight() {
+        return true;
+    }
 
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;

@@ -782,7 +782,7 @@ static bool test_dsv4_physical_pressure(size_t seed, ggml_backend_dev_t dev) {
 
     test.clear_batch();
     test.add(tokens[2], 1, { 0 });
-    test.add(tokens[3], 1, { 1 });
+    test.add(tokens[3], 2, { 0 });
     const std::array<llama_token, 2> batch_tokens = { test.batch.token[0], test.batch.token[1] };
     const std::array<llama_pos, 2> batch_positions = { test.batch.pos[0], test.batch.pos[1] };
     const std::array<llama_seq_id, 2> batch_sequences = {
@@ -830,8 +830,8 @@ static bool test_dsv4_physical_pressure(size_t seed, ggml_backend_dev_t dev) {
 
     GGML_ASSERT(llama_decode(test.lctx.get(), test.batch) == LLAMA_DECODE_SUCCESS);
     GGML_ASSERT(!llama_get_last_kv_pressure(test.lctx.get(), &pressure));
-    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 0) == 1);
-    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 1) == 1);
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 0) == 2);
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 1) == 0);
     return true;
 }
 

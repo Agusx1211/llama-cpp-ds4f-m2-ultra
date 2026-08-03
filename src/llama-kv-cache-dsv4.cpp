@@ -2677,11 +2677,8 @@ bool llama_kv_cache_dsv4_context::reserve_batch_ranges() {
 bool llama_kv_cache_dsv4_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
-    if (!ubatches.empty() && !batch_ranges_reserved) {
-        last_batch_quote = {};
-        if (!reserve_batch_ranges()) {
-            return false;
-        }
+    if (!preflight()) {
+        return false;
     }
 
     bool res = true;
@@ -2701,6 +2698,17 @@ bool llama_kv_cache_dsv4_context::apply() {
     }
 
     return res;
+}
+
+bool llama_kv_cache_dsv4_context::preflight() {
+    assert(!llama_memory_status_is_fail(status));
+
+    if (ubatches.empty() || batch_ranges_reserved) {
+        return true;
+    }
+
+    last_batch_quote = {};
+    return reserve_batch_ranges();
 }
 
 llama_memory_status llama_kv_cache_dsv4_context::get_status() const {

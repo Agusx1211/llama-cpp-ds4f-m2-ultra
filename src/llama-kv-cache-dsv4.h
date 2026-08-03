@@ -433,8 +433,9 @@ public:
     // llama_memory_context_i
     //
 
-    bool next()  override;
-    bool apply() override;
+    bool next()      override;
+    bool apply()     override;
+    bool preflight() override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
