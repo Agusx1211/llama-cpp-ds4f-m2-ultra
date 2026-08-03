@@ -34,8 +34,8 @@ constexpr size_t  AMX_PAIR_ALIGNMENT = 128;
 
 struct options {
     int64_t tokens     = 2048;
-    int64_t panel_cols = 64;
-    int64_t k_block    = 2048;
+    int64_t panel_cols = 128;
+    int64_t k_block    = 1024;
     int     warmup     = 2;
     int     runs       = 8;
     float   clamp      = 10.0f;
