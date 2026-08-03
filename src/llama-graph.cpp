@@ -1705,7 +1705,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                         tmp = ggml_clamp(ctx0, tmp, -limit, limit);
                         cb(tmp, "ffn_up_clamped", il);
 
-                        if (arch == LLM_ARCH_DEEPSEEK4) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                             cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
                             cb(cur, "ffn_gate_clamped", il);
                             cur = ggml_swiglu_split(ctx0, cur, tmp);
@@ -2100,7 +2100,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         up = ggml_clamp(ctx0, up, -limit, limit);
                         cb(up, "ffn_moe_up_clamped", il);
 
-                        if (arch == LLM_ARCH_DEEPSEEK4) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                             cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
                             cb(cur, "ffn_moe_gate_clamped", il);
                             cur = ggml_swiglu_split(ctx0, cur, up);
@@ -3024,6 +3024,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * wo_s,
         ggml_tensor * q_cur,
         ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
         ggml_tensor * kq_b,
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
@@ -3031,6 +3032,7 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     const bool is_swa = hparams.is_swa(il);
     ggml_tensor * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
+    GGML_UNUSED(v_cur);
 
     if (k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
@@ -3039,6 +3041,8 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
+    // these nodes are added to the graph together so that they are not reordered
+    // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
     if (k_cur) {
         ggml_build_forward_expand(gf, k_cur);

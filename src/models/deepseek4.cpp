@@ -59,6 +59,8 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
     ml.get_key(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
 
+    hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
+
     uint32_t n_compress_ratios = 0;
     ml.get_arr_n(LLM_KV_ATTENTION_COMPRESS_RATIOS, n_compress_ratios);
     if (n_compress_ratios < hparams.n_layer_all) {
@@ -72,6 +74,9 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     }
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     hparams.set_swa_pattern(0);
+    for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+        hparams.is_swa_impl[il] = true;
+    }
 
     if (hparams.n_dspark_block_size > 0) {
         // Official DSpark fuses the mean states after three target layers and
@@ -197,6 +202,8 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
             layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), {2*n_embd, n_embd}, nextn_flags);
             layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd}, nextn_flags);
             layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd}, nextn_flags);
+            layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), {n_embd, n_vocab}, flags | TENSOR_NOT_REQUIRED);
+            layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), {n_embd, n_vocab}, flags | TENSOR_NOT_REQUIRED);
             layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, nextn_flags);
             // Bundled conversion keeps the MTP-specific mixer here. MTP-only
             // sidecars expose the same three tensors through the root head.
@@ -1190,8 +1197,29 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
         int il) const {
+    return build_attention_impl(model, inp_dsv4, nullptr, cur, inp_pos, il);
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_attention(
+        const llama_model & model,
+        llm_graph_input_attn_k_iswa * inp_mtp,
+        ggml_tensor * cur,
+        ggml_tensor * inp_pos,
+        int il) const {
+    return build_attention_impl(model, nullptr, inp_mtp, cur, inp_pos, il);
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+        const llama_model & model,
+        llm_graph_input_dsv4 * inp_dsv4,
+        llm_graph_input_attn_k_iswa * inp_mtp,
+        ggml_tensor * cur,
+        ggml_tensor * inp_pos,
+        int il) const {
+    GGML_ASSERT((inp_dsv4 == nullptr) != (inp_mtp == nullptr));
+
     const auto & layer = model.layers[il];
-    llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
+    llm_graph_input_dsv4_raw * inp_attn = inp_dsv4 ? inp_dsv4->get_raw() : nullptr;
 
     const int64_t n_embd_head      = hparams.n_embd_head_k();
     const int64_t n_embd_head_rope = hparams.n_rot();
@@ -1259,6 +1287,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
     cb(kv, "kv", il);
 
     const int64_t ratio = hparams.dsv4_compress_ratios[il];
+    GGML_ASSERT(inp_dsv4 || ratio == 0);
 
     ggml_tensor * hca_state_kv    = nullptr;
     ggml_tensor * hca_state_score = nullptr;
@@ -1501,7 +1530,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
     }
 
     ggml_tensor * out = nullptr;
-    if (ratio == DSV4_CSA_RATIO &&
+    if (inp_mtp) {
+        out = build_attn(inp_mtp,
+                nullptr, nullptr, nullptr,
+                q, kv, nullptr, nullptr,
+                layer.attn_sinks, nullptr,
+                1.0f/sqrtf(float(n_embd_head)), il);
+        cb(out, "attn_raw", il);
+    } else if (ratio == DSV4_CSA_RATIO &&
             inp_dsv4->get_csa().kq_mask &&
             inp_dsv4->get_lid().kq_mask &&
             inp_dsv4->get_lid().k_rot) {
@@ -1601,7 +1637,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_dspark_attention(
 
     ggml_tensor * out = build_attn(inp_attn,
             nullptr, nullptr, nullptr,
-            q, kv, nullptr, layer.attn_sinks, nullptr,
+            q, kv, nullptr, nullptr, layer.attn_sinks, nullptr,
             1.0f/sqrtf(float(n_embd_head)), il);
 
     out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
@@ -1645,7 +1681,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     cb(inpL, "hc_init", -1);
 
     for (int il = 0; il < n_layer; ++il) {
-        if (cparams.embeddings_layer_inp[il]) {
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
             cb(res->t_layer_inp[il], "layer_inp", il);
             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
@@ -1727,7 +1763,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cb(inpL, "l_last", il);
     }
 
-    if (cparams.embeddings_layer_inp[n_layer]) {
+    if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
         res->t_layer_inp[n_layer] = dsv4_hc_mean(ctx0, inpL);
         cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
@@ -1963,8 +1999,9 @@ llama_model_deepseek4::graph_mtp::graph_mtp(
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
+    ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
     ggml_tensor * tok_embd = ubatch.token
-            ? ggml_get_rows(ctx0, model.tok_embd, inp->tokens)
+            ? ggml_get_rows(ctx0, tok_embd_w, inp->tokens)
             : inp->embd;
     cb(tok_embd, "mtp_tok_embd", il);
     ggml_tensor * h = inp->h;
@@ -2074,8 +2111,11 @@ llama_model_deepseek4::graph_mtp::graph_mtp(
 
     cur = build_norm(cur, mtp_head_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "mtp_shared_head_norm", -1);
+    res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    GGML_ASSERT(head_w && "DeepSeek-V4 MTP is missing its shared LM head");
+    cur = ggml_mul_mat(ctx0, head_w, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
