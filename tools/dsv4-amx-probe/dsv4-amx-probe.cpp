@@ -921,7 +921,7 @@ int main(int argc, char ** argv) try {
         "\trss_delta_bytes=%llu\tprojected_43_layer_direct_pack_bytes=%zu\tsteady_state_excludes_pack=1\n",
         direct ? 1 : 0, direct ? direct->pack_ms() : 0.0, data.bf16_weight_bytes(),
         direct ? direct->packed_f32_bytes() : 0, static_cast<unsigned long long>(direct ? direct->pack_rss_delta() : 0),
-        direct ? direct->packed_f32_bytes() * DSV4_LAYERS : 0);
+        direct ? direct->packed_f32_bytes() * static_cast<size_t>(DSV4_LAYERS) : size_t{ 0 });
     std::printf(
         "memory\trss_start_bytes=%llu\trss_after_source_bytes=%llu\trss_after_direct_bytes=%llu"
         "\trss_after_metal_bytes=%llu\tmetal_routed_weight_bytes=%zu"
