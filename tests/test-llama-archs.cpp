@@ -1316,6 +1316,10 @@ static bool test_dsv4_restore_long_compressed_history(size_t seed, ggml_backend_
 
     const auto rows_after_restore = dsv4_page_rows(memory->memory_usage_snapshot());
     for (size_t family = 0; family < rows_after_restore.size(); ++family) {
+        if (rows_after_restore[family][dest_seq] != checkpoint_rows[family][source_seq]) {
+            fprintf(stderr, "DSV4 long restore family %zu destination rows: %" PRIu64 " != %" PRIu64 "\n",
+                    family, rows_after_restore[family][dest_seq], checkpoint_rows[family][source_seq]);
+        }
         GGML_ASSERT(rows_after_restore[family][dest_seq] == checkpoint_rows[family][source_seq]);
         GGML_ASSERT(rows_after_restore[family][source_seq] == resident_rows_after_reference[family][source_seq]);
         GGML_ASSERT(rows_after_restore[family][survivor_seq] == resident_rows_after_reference[family][survivor_seq]);
