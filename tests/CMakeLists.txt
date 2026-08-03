@@ -203,6 +203,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build_and_test(test-llama-archs.cpp)
     llama_build_and_test(test-dsv4-amx-contract.cpp)
+    llama_build_and_test(test-dsv4-comp-pool.cpp)
+    target_include_directories(test-dsv4-comp-pool PRIVATE
+        ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-dsv4-sparse-accounting.cpp)
     target_include_directories(test-dsv4-sparse-accounting PRIVATE
         ${PROJECT_SOURCE_DIR}/src)
