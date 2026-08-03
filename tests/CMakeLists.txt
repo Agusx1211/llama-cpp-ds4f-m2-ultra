@@ -137,6 +137,13 @@ llama_build_and_test(
 target_include_directories(test-server-prefix-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_compile_features(test-server-prefix-cache PRIVATE cxx_std_17)
 
+llama_build_and_test(
+    test-server-capture.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-capture.cpp
+)
+target_include_directories(test-server-capture PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-capture PRIVATE cxx_std_17)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
