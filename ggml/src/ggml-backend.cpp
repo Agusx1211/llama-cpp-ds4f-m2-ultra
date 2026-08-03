@@ -1281,6 +1281,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
+                size_t new_input_ids[GGML_MAX_SRC];
+                int n_new_inputs = 0;
+
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) {
@@ -1295,17 +1298,33 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             break;
                         }
                     }
-                    // check if the split has too many inputs
-                    // FIXME: count the number of inputs instead of only checking when full
-                    if (split->n_inputs == GGML_SCHED_MAX_SPLIT_INPUTS) {
-                        const size_t id = hash_id(src);
-                        int src_backend_id = sched->hv_tensor_backend_ids[id];
-                        bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
-                        if (src_backend_id != cur_backend_id && tensor_id_copy(id, cur_backend_id, 0) == NULL && !supported) {
-                            need_new_split = true;
-                            break;
+
+                    if (split->n_inputs + GGML_MAX_SRC <= GGML_SCHED_MAX_SPLIT_INPUTS) {
+                        continue;
+                    }
+
+                    const size_t id = hash_id(src);
+                    const int src_backend_id = sched->hv_tensor_backend_ids[id];
+                    const bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
+                    if (src_backend_id != cur_backend_id && tensor_id_copy(id, cur_backend_id, 0) == NULL && !supported) {
+                        bool already_counted = false;
+                        for (int k = 0; k < n_new_inputs; ++k) {
+                            if (new_input_ids[k] == id) {
+                                already_counted = true;
+                                break;
+                            }
+                        }
+                        if (!already_counted) {
+                            new_input_ids[n_new_inputs++] = id;
                         }
                     }
+                }
+
+                // A node may introduce multiple cross-backend inputs. Split
+                // before the node so that adding all of them cannot overflow
+                // the fixed-size input list.
+                if (!need_new_split && split->n_inputs + n_new_inputs > GGML_SCHED_MAX_SPLIT_INPUTS) {
+                    need_new_split = true;
                 }
             }
 
