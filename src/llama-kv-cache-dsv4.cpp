@@ -1666,7 +1666,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     // The aggregate layout is target-only and currently requires the F16
     // indexed concat path. Keep the affine layout for other cache formats.
-    aggregate_compressed = sparse_buft != nullptr && type_k == GGML_TYPE_F16 &&
+    aggregate_compressed = unified && n_seq_max > 1 && sparse_buft != nullptr && type_k == GGML_TYPE_F16 &&
             std::getenv("LLAMA_DSV4_AGGREGATE_POOL_DISABLE") == nullptr;
 
     uint32_t c4_storage_rows  = c4_logical_rows;

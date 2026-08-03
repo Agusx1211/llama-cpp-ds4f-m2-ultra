@@ -77,7 +77,8 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] "
+           "[--dsv4-restore-only] [--dsv4-aggregate-only]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1027,6 +1028,17 @@ static dsv4_parallel_result run_dsv4_shared_prefix(
         }
     }
 
+    auto * dsv4_memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(test.lctx.get()));
+    GGML_ASSERT(dsv4_memory != nullptr);
+    const bool validate_aggregate_cow = setup == dsv4_prefix_setup::COPIED &&
+            dsv4_memory->is_aggregate_compressed();
+    llama_dsv4_comp_memory_usage aggregate_before_divergence;
+    if (validate_aggregate_cow) {
+        aggregate_before_divergence = dsv4_memory->get_comp_pool()->memory_usage_snapshot();
+        GGML_ASSERT(aggregate_before_divergence.c4.shared_segments == 1);
+        GGML_ASSERT(aggregate_before_divergence.c4.cow_segments == 0);
+    }
+
     for (uint32_t pos = n_prompt; pos < tokens_a.size(); ++pos) {
         test.clear_batch();
         test.add(tokens_a[pos], pos, {0});
@@ -1034,6 +1046,18 @@ static dsv4_parallel_result run_dsv4_shared_prefix(
         test.decode("shared-prefix decode");
         test.append_logits(0, result.seq_a);
         test.append_logits(1, result.seq_b);
+    }
+
+    if (validate_aggregate_cow) {
+        const auto aggregate_after_divergence = dsv4_memory->get_comp_pool()->memory_usage_snapshot();
+        GGML_ASSERT(aggregate_after_divergence.c4.shared_segments == 0);
+        GGML_ASSERT(aggregate_after_divergence.c4.cow_segments == 2);
+        printf("DSV4 aggregate shared-prefix C4 COW (%s): shared %u -> %u, COW %u -> %u\n",
+                ggml_backend_dev_description(dev),
+                aggregate_before_divergence.c4.shared_segments,
+                aggregate_after_divergence.c4.shared_segments,
+                aggregate_before_divergence.c4.cow_segments,
+                aggregate_after_divergence.c4.cow_segments);
     }
 
     return result;
@@ -1682,6 +1706,61 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     return all_ok;
 }
 
+static bool test_dsv4_aggregate_device(size_t seed, ggml_backend_dev_t dev) {
+    if (!dsv4_test_has_elastic_pages(dev, 2)) {
+        return true;
+    }
+
+    {
+        dsv4_test_context single(seed, dev, 1, true, 4);
+        auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(single.lctx.get()));
+        GGML_ASSERT(memory != nullptr);
+        GGML_ASSERT(!memory->is_aggregate_compressed() &&
+                "single-slot DSV4 unexpectedly selected aggregate compressed storage");
+    }
+    {
+        dsv4_test_context multi(seed, dev, 2, true, 4);
+        auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(multi.lctx.get()));
+        GGML_ASSERT(memory != nullptr);
+        GGML_ASSERT(memory->is_aggregate_compressed() &&
+                "target unified multi-slot DSV4 did not select aggregate compressed storage");
+    }
+
+    static constexpr uint32_t n_vocab  = 128;
+    static constexpr uint32_t n_prompt = 128;
+    static constexpr uint32_t n_decode = 8;
+    std::vector<llama_token> tokens_a = get_tokens(n_prompt + n_decode, n_vocab, seed + 60);
+    std::vector<llama_token> tokens_b = tokens_a;
+    const std::vector<llama_token> suffix_b = get_tokens(n_decode, n_vocab, seed + 61);
+    std::copy(suffix_b.begin(), suffix_b.end(), tokens_b.begin() + n_prompt);
+
+    const std::vector<float> isolated_a = run_dsv4_isolated(seed, dev, tokens_a, n_prompt);
+    const std::vector<float> isolated_b = run_dsv4_isolated(seed, dev, tokens_b, n_prompt);
+    const dsv4_parallel_result copied = run_dsv4_shared_prefix(
+            seed, dev, tokens_a, tokens_b, n_prompt, true, dsv4_prefix_setup::COPIED);
+
+    bool all_ok = true;
+    all_ok = compare_dsv4_trace("aggregate-copied", "A", isolated_a, copied.seq_a) && all_ok;
+    all_ok = compare_dsv4_trace("aggregate-copied", "B", isolated_b, copied.seq_b) && all_ok;
+
+    bool full_state_rejected = false;
+    try {
+        dsv4_test_context state_test(seed, dev, 2, true, n_prompt);
+        const auto state_tokens = get_tokens(n_prompt, n_vocab, seed + 62);
+        dsv4_decode_sequence(state_test, state_tokens, 0, "aggregate full-state limitation");
+        (void) dsv4_sequence_state(state_test.lctx.get(), 0);
+    } catch (const std::runtime_error & err) {
+        full_state_rejected = std::string(err.what()).find(
+                "full DSV4 state write is not yet supported by the aggregate compressed pool") != std::string::npos;
+    }
+    GGML_ASSERT(full_state_rejected && "aggregate full-state limitation was not reported explicitly");
+
+    printf("DSV4 aggregate selection/alias matrix (%s): %s; single-slot = affine, "
+           "multi-slot = aggregate, full state = explicitly unsupported\n",
+            ggml_backend_dev_description(dev), all_ok ? "OK" : "FAIL");
+    return all_ok;
+}
+
 static int test_dsv4_parallel(size_t seed) {
     bool all_ok = true;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -1690,6 +1769,22 @@ static int test_dsv4_parallel(size_t seed) {
         all_ok = test_dsv4_parallel_device(seed, dev) && all_ok;
     }
 
+    return all_ok ? 0 : 1;
+}
+
+static int test_dsv4_aggregate(size_t seed) {
+    bool all_ok = true;
+    bool tested = false;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dsv4_test_has_elastic_pages(dev, 2)) {
+            continue;
+        }
+        tested = true;
+        printf("DSV4 aggregate lifecycle on %s\n", ggml_backend_dev_description(dev));
+        all_ok = test_dsv4_aggregate_device(seed, dev) && all_ok;
+    }
+    GGML_ASSERT(tested && "no target backend exposes DSV4 aggregate storage");
     return all_ok ? 0 : 1;
 }
 
@@ -2037,6 +2132,7 @@ int main(int argc, char ** argv) {
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
     bool dsv4_restore_only = false;
+    bool dsv4_aggregate_only = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -2076,6 +2172,10 @@ int main(int argc, char ** argv) {
             dsv4_restore_only = true;
             continue;
         }
+        if (strcmp(argv[i], "--dsv4-aggregate-only") == 0) {
+            dsv4_aggregate_only = true;
+            continue;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
@@ -2085,6 +2185,9 @@ int main(int argc, char ** argv) {
         }
         if (dsv4_restore_only) {
             return test_dsv4_restore(seed);
+        }
+        if (dsv4_aggregate_only) {
+            return test_dsv4_aggregate(seed);
         }
         const int backends_result = test_backends(arch, seed, log_level);
         if (backends_result != 0) {
