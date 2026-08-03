@@ -75,6 +75,9 @@ enum class reason_code : uint16_t {
     replay_restore_ready = 704,
     replay_spill_start   = 705,
     replay_spill_done    = 706,
+
+    kv_physical_pressure_retry  = 800,
+    kv_physical_pressure_victim = 801,
 };
 
 const char * to_string(lane value);
@@ -206,6 +209,52 @@ class scheduler {
     scheduler & operator=(scheduler && other) noexcept;
     scheduler(const scheduler &)             = delete;
     scheduler & operator=(const scheduler &) = delete;
+};
+
+enum class kv_pressure_action : uint8_t {
+    retry,
+    victim,
+};
+
+struct kv_pressure_event {
+    kv_pressure_action action             = kv_pressure_action::retry;
+    reason_code        reason             = reason_code::kv_physical_pressure_retry;
+    uint32_t           attempt            = 0;
+    uint32_t           next_batch_size    = 0;
+    int32_t            victim_sequence    = -1;
+    uint32_t           victim_span_tokens = 0;
+
+    bool operator==(const kv_pressure_event & other) const;
+};
+
+struct kv_pressure_snapshot {
+    uint64_t total   = 0;
+    uint64_t retries = 0;
+    uint64_t victims = 0;
+
+    bool operator==(const kv_pressure_snapshot & other) const;
+};
+
+// Physical pressure is transient for a bounded number of attempts. Once the
+// bound is exhausted, the sequence at the head of the failed batch is the
+// deterministic victim; the caller skips its whole contiguous token span and
+// retains every other sequence.
+class kv_pressure_controller {
+  public:
+    explicit kv_pressure_controller(uint32_t max_retries = 2);
+
+    kv_pressure_event on_pressure(
+            uint32_t current_batch_size,
+            int32_t victim_sequence,
+            uint32_t victim_span_tokens);
+
+    void reset_attempts();
+    kv_pressure_snapshot snapshot() const;
+
+  private:
+    uint32_t max_retries;
+    uint32_t attempts = 0;
+    kv_pressure_snapshot counters;
 };
 
 enum class replay_event_kind : uint8_t {

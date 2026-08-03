@@ -5,6 +5,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
+#include "server-scheduler.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -1001,6 +1002,7 @@ private:
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
+    server_scheduler::kv_pressure_controller kv_pressure;
 
     json json_ui_settings = json::object();
 
@@ -2603,6 +2605,11 @@ private:
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
 
+                    const auto pressure = kv_pressure.snapshot();
+                    res->kv_physical_pressure_total   = pressure.total;
+                    res->kv_physical_pressure_retries = pressure.retries;
+                    res->kv_physical_pressure_victims = pressure.victims;
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -2911,19 +2918,26 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch_view = batch.get_view(off, n_tokens);
-                bool ok = decode(n_batch, off, batch_view);
+                const auto outcome = decode(n_batch, off, batch_view);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
 
-                if (ok) {
+                if (outcome.action == decode_action::success) {
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;
 
                     // on successful decode, restore the original batch size
                     n_batch = llama_n_batch(ctx_tgt);
-                } else {
+                } else if (outcome.action == decode_action::retry) {
                     // try again with the updated n_batch
+                    continue;
+                } else {
+                    // The deterministic pressure victim was notified and
+                    // released. Its tokens form one contiguous slot span;
+                    // retain the rest of the cohort and continue from there.
+                    off_next = off + outcome.skip_tokens;
+                    n_batch = llama_n_batch(ctx_tgt);
                     continue;
                 }
             } catch (const std::exception & e) {
@@ -3766,9 +3780,21 @@ private:
         }
     }
 
-    // returns true = success ; false = retry with smaller batch size
-    // throw std::runtime_error on fatal error
-    bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
+    enum class decode_action {
+        success,
+        retry,
+        skip_victim,
+    };
+
+    struct decode_outcome {
+        decode_action action = decode_action::success;
+        int32_t skip_tokens = 0;
+    };
+
+    // A recoverable physical-pressure result retries a bounded number of
+    // times, then releases only the deterministic head sequence. Other
+    // errors retain the existing llama-server behavior.
+    decode_outcome decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         if (batch.size() == 0) {
@@ -3778,7 +3804,7 @@ private:
                 GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
             }
 
-            return true; // nothing to decode
+            return {}; // nothing to decode
         } else {
             n_empty_consecutive = 0;
         }
@@ -3797,6 +3823,56 @@ private:
         metrics.on_decoded(slots);
 
         if (ret != 0) {
+            if (ret == LLAMA_DECODE_KV_PHYSICAL_PRESSURE) {
+                llama_kv_pressure_info pressure = {};
+                const bool has_pressure = llama_get_last_kv_pressure(ctx_tgt, &pressure);
+
+                GGML_ASSERT(off >= 0 && off < batch.size());
+                const int32_t victim_sequence = batch.tokens[off].id_slot;
+                int32_t victim_span_tokens = 1;
+                while (off + victim_span_tokens < batch.size() &&
+                        batch.tokens[off + victim_span_tokens].id_slot == victim_sequence) {
+                    ++victim_span_tokens;
+                }
+
+                const auto event = kv_pressure.on_pressure(
+                        (uint32_t) n_batch,
+                        victim_sequence,
+                        (uint32_t) victim_span_tokens);
+
+                if (event.action == server_scheduler::kv_pressure_action::retry) {
+                    n_batch = (int32_t) event.next_batch_size;
+                    SRV_WRN("event=%s action=retry attempt=%u off=%d n_batch=%d"
+                            " family=%u family_mask=0x%x pool=%" PRIu64
+                            " required=%" PRIu64 " free=%" PRIu64 " reserved=%" PRIu64
+                            " capacity=%" PRIu64 " quote=%s\n",
+                            server_scheduler::to_string(event.reason), event.attempt,
+                            off, n_batch, pressure.limiting_family,
+                            pressure.limiting_family_mask, pressure.limiting_pool_id,
+                            pressure.required_pages, pressure.free_pages,
+                            pressure.reserved_pages, pressure.physical_pages,
+                            has_pressure ? "present" : "missing");
+                    return { decode_action::retry, 0 };
+                }
+
+                auto * victim = get_slot_by_id(event.victim_sequence);
+                if (victim != nullptr && victim->is_processing()) {
+                    SRV_WRN("event=%s action=victim attempt=%u slot=%d task=%d"
+                            " skip_tokens=%u family=%u family_mask=0x%x pool=%" PRIu64 "\n",
+                            server_scheduler::to_string(event.reason), event.attempt,
+                            victim->id, victim->task->id, event.victim_span_tokens,
+                            pressure.limiting_family, pressure.limiting_family_mask,
+                            pressure.limiting_pool_id);
+                    send_error(*victim,
+                            "KV physical pressure retry limit exceeded; request selected as deterministic victim.",
+                            ERROR_TYPE_UNAVAILABLE);
+                    victim->prompt_clear();
+                    victim->release();
+                }
+
+                return { decode_action::skip_victim, (int32_t) event.victim_span_tokens };
+            }
+
             {
                 std::string err;
 
@@ -3843,7 +3919,7 @@ private:
 
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
 
-            return false; // retry with the updated n_batch
+            return { decode_action::retry, 0 };
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
@@ -3879,7 +3955,8 @@ private:
             }
         }
 
-        return true;
+        kv_pressure.reset_attempts();
+        return {};
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
@@ -4605,6 +4682,18 @@ void server_routes::init_routes() {
                     {"name",  "n_tokens_max"},
                     {"help",  "Largest observed n_tokens."},
                     {"value",  res_task->n_tokens_max}
+            }, {
+                    {"name",  "kv_physical_pressure_total"},
+                    {"help",  "Recoverable physical KV pressure results."},
+                    {"value",  res_task->kv_physical_pressure_total}
+            }, {
+                    {"name",  "kv_physical_pressure_retries_total"},
+                    {"help",  "Decode retries caused by physical KV pressure."},
+                    {"value",  res_task->kv_physical_pressure_retries}
+            }, {
+                    {"name",  "kv_physical_pressure_victims_total"},
+                    {"help",  "Requests selected after exhausting physical KV pressure retries."},
+                    {"value",  res_task->kv_physical_pressure_victims}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},

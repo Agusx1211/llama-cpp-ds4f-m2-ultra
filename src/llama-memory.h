@@ -32,6 +32,7 @@ enum llama_memory_status {
     LLAMA_MEMORY_STATUS_NO_UPDATE,
     LLAMA_MEMORY_STATUS_FAILED_PREPARE,
     LLAMA_MEMORY_STATUS_FAILED_COMPUTE,
+    LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE,
 };
 
 // helper function for combining the status of two memory contexts
@@ -64,6 +65,11 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // Available only after get_status() reports physical KV pressure.
+    virtual bool get_kv_pressure(llama_kv_pressure_info & /* info */) const {
+        return false;
+    }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
