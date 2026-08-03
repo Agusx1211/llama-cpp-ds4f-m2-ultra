@@ -483,6 +483,8 @@ public:
             const llama_kv_cache_iswa_context * mctx) :
         cparams(cparams), mctx(mctx) {}
 
+    ~llm_graph_input_attn_k_iswa() = default;
+
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -1107,7 +1109,7 @@ struct llm_graph_context {
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
-            ggml_tensor * v,       // [n_embd_head_v, n_head_v, n_tokens] (v_trans == false)
+            ggml_tensor * v,       // [n_embd_head_v, n_head_v, n_tokens] (v_trans = false)
             ggml_tensor * kq_b,
             ggml_tensor * kq_mask,
             ggml_tensor * sinks,   // [n_head_q]
@@ -1182,26 +1184,29 @@ struct llm_graph_context {
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
 
-    llm_graph_input_attn_k_iswa * build_attn_inp_k_iswa() const;
-
-    ggml_tensor * build_attn(
-            llm_graph_input_attn_k_iswa * inp,
-            ggml_tensor * wo,
-            ggml_tensor * wo_b,
-            ggml_tensor * wo_s,
-            ggml_tensor * q_cur,
-            ggml_tensor * k_cur,
-            ggml_tensor * kq_b,
-            ggml_tensor * sinks,
-            ggml_tensor * v_mla,
-                  float   kq_scale,
-                    int   il) const;
-
     llm_graph_input_dsv4 * build_inp_dsv4() const;
 
     // note: if k_cur or v_cur are not provided, they will not be stored in the memory
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv_iswa * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens] optional
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens] optional
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks, // [n_head_q]
+            ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                  float   kq_scale,
+                    int   il) const;
+
+    llm_graph_input_attn_k_iswa * build_attn_inp_k_iswa() const;
+
+    // note: if k_cur is not provided, it will not be stored in the memory
+    // note: the K cache is used as V (MLA-style attention)
+    ggml_tensor * build_attn(
+            llm_graph_input_attn_k_iswa * inp,
             ggml_tensor * wo,
             ggml_tensor * wo_b,
             ggml_tensor * wo_s,
