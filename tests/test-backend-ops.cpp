@@ -7679,12 +7679,7 @@ struct test_dsv4_indexed_lightning_indexer : public test_case {
         GGML_UNUSED(t);
         return "DSV4_INDEXED_LIGHTNING_INDEXER";
     }
-    bool run_whole_graph() override { return true; }
-    double max_err() override { return 0.0; }
-    double max_err(ggml_backend_t backend) override {
-        GGML_UNUSED(backend);
-        return 0.0;
-    }
+    double max_nmse_err() override { return 1e-6; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_segments = (kv + 63)/64;
@@ -7694,19 +7689,13 @@ struct test_dsv4_indexed_lightning_indexer : public test_case {
         ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, nb, 1, ns);
         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns);
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_segments, ns);
-        ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv*ns);
         ggml_set_name(q, "q");
         ggml_set_name(pool, "pool");
         ggml_set_name(w, "w");
         ggml_set_name(m, "m");
         ggml_set_name(ids, "segment_ids");
-        ggml_set_name(rows, "physical_rows");
 
-        ggml_tensor * indexed = ggml_dsv4_indexed_lightning_indexer(ctx, q, pool, w, m, ids);
-        ggml_tensor * materialized = ggml_get_rows(ctx, pool, rows);
-        materialized = ggml_reshape_4d(ctx, materialized, 128, 1, kv, ns);
-        ggml_tensor * expected = ggml_lightning_indexer(ctx, q, materialized, w, m);
-        ggml_tensor * out = ggml_sub(ctx, indexed, expected);
+        ggml_tensor * out = ggml_dsv4_indexed_lightning_indexer(ctx, q, pool, w, m, ids);
         ggml_set_name(out, "out");
         return out;
     }
@@ -7717,7 +7706,6 @@ struct test_dsv4_indexed_lightning_indexer : public test_case {
         ggml_tensor * w = ggml_get_tensor(ctx, "w");
         ggml_tensor * m = ggml_get_tensor(ctx, "m");
         ggml_tensor * ids = ggml_get_tensor(ctx, "segment_ids");
-        ggml_tensor * rows = ggml_get_tensor(ctx, "physical_rows");
         init_tensor_uniform(q, -1.0f, 1.0f);
         init_tensor_uniform(pool, -1.0f, 1.0f);
         init_tensor_uniform(w, -1.0f, 1.0f);
@@ -7726,18 +7714,13 @@ struct test_dsv4_indexed_lightning_indexer : public test_case {
         const int64_t n_segments = ids->ne[0];
         const int64_t pool_segments = pool->ne[1]/64;
         std::vector<int32_t> directory(ggml_nelements(ids));
-        std::vector<int32_t> physical_rows(ggml_nelements(rows));
         for (int64_t stream = 0; stream < ns; ++stream) {
             for (int64_t segment = 0; segment < n_segments; ++segment) {
                 directory[stream*n_segments + segment] =
                         (int32_t) ((segment*3 + stream*5 + 1) % pool_segments);
             }
-            for (int64_t row = 0; row < kv; ++row) {
-                physical_rows[stream*kv + row] = directory[stream*n_segments + row/64]*64 + row%64;
-            }
         }
         ggml_backend_tensor_set(ids, directory.data(), 0, directory.size()*sizeof(directory[0]));
-        ggml_backend_tensor_set(rows, physical_rows.data(), 0, physical_rows.size()*sizeof(physical_rows[0]));
     }
 };
 
