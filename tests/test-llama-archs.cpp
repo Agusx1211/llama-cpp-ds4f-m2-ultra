@@ -1258,6 +1258,97 @@ static bool test_dsv4_restore_boundaries(size_t seed, ggml_backend_dev_t dev) {
     return all_ok;
 }
 
+static bool test_dsv4_restore_long_compressed_history(size_t seed, ggml_backend_dev_t dev) {
+    static constexpr uint32_t n_vocab          = 128;
+    static constexpr uint32_t n_history        = 2048;
+    static constexpr uint32_t n_chunk          = 128;
+    static constexpr uint32_t n_survivor       = 37;
+    static constexpr uint32_t n_ctx_seq        = 2304;
+    static constexpr uint32_t n_seq_max        = 4;
+    static constexpr uint32_t csa_ratio        = 4;
+    static constexpr uint32_t hca_ratio        = 128;
+    static constexpr llama_seq_id source_seq   = 0;
+    static constexpr llama_seq_id survivor_seq = 1;
+    static constexpr llama_seq_id dest_seq     = 2;
+
+    const bool elastic = dsv4_test_has_elastic_pages(dev, n_seq_max);
+    dsv4_test_context test(
+            seed, dev, n_seq_max, elastic, n_chunk, 1, n_seq_max*n_ctx_seq, n_chunk, nullptr, nullptr, 2);
+    auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(test.lctx.get()));
+    GGML_ASSERT(memory != nullptr);
+
+    const auto history_tokens = get_tokens(n_history + 1, n_vocab, seed + 50);
+    const auto survivor_tokens = get_tokens(n_survivor, n_vocab, seed + 51);
+    dsv4_decode_sequence(test, survivor_tokens, survivor_seq, "long-restore survivor");
+
+    for (uint32_t begin = 0; begin < n_history; begin += n_chunk) {
+        const uint32_t end = std::min(begin + n_chunk, n_history);
+        for (uint32_t pos = begin; pos < end; ++pos) {
+            test.add(history_tokens[pos], pos, { source_seq });
+        }
+        test.decode("long-restore source history");
+        test.clear_batch();
+    }
+
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, source_seq) == (llama_pos) n_history - 1);
+    const auto checkpoint_state = dsv4_sequence_state(test.lctx.get(), source_seq);
+    const auto checkpoint_rows  = dsv4_page_rows(memory->memory_usage_snapshot());
+    GGML_ASSERT(checkpoint_rows[LLAMA_DSV4_MEMORY_CSA][source_seq] == n_history/csa_ratio);
+    GGML_ASSERT(checkpoint_rows[LLAMA_DSV4_MEMORY_HCA][source_seq] == n_history/hca_ratio);
+    GGML_ASSERT(checkpoint_rows[LLAMA_DSV4_MEMORY_LID][source_seq] == n_history/csa_ratio);
+
+    const auto survivor_state = dsv4_sequence_state(test.lctx.get(), survivor_seq);
+    const llama_pos survivor_pos = llama_memory_seq_pos_max(memory, survivor_seq);
+
+    test.add(history_tokens[n_history], n_history, { source_seq });
+    test.decode("long-restore reference continuation");
+    const auto reference_logits = dsv4_logits_ith(test, 0);
+    test.clear_batch();
+
+    const auto source_state_after_reference = dsv4_sequence_state(test.lctx.get(), source_seq);
+    const llama_pos source_pos_after_reference = llama_memory_seq_pos_max(memory, source_seq);
+    const auto resident_rows_after_reference = dsv4_page_rows(memory->memory_usage_snapshot());
+
+    const size_t restored = llama_state_seq_set_data(
+            test.lctx.get(), checkpoint_state.data(), checkpoint_state.size(), dest_seq);
+    GGML_ASSERT(restored == checkpoint_state.size());
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, dest_seq) == (llama_pos) n_history - 1);
+
+    const auto rows_after_restore = dsv4_page_rows(memory->memory_usage_snapshot());
+    for (size_t family = 0; family < rows_after_restore.size(); ++family) {
+        GGML_ASSERT(rows_after_restore[family][dest_seq] == checkpoint_rows[family][source_seq]);
+        GGML_ASSERT(rows_after_restore[family][source_seq] == resident_rows_after_reference[family][source_seq]);
+        GGML_ASSERT(rows_after_restore[family][survivor_seq] == resident_rows_after_reference[family][survivor_seq]);
+    }
+    GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), source_seq) == source_state_after_reference);
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, source_seq) == source_pos_after_reference);
+    GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), survivor_seq) == survivor_state);
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, survivor_seq) == survivor_pos);
+
+    test.add(history_tokens[n_history], n_history, { dest_seq });
+    test.decode("long-restore destination continuation");
+    const auto restored_logits = dsv4_logits_ith(test, 0);
+    test.clear_batch();
+
+    const auto rows_after_continuation = dsv4_page_rows(memory->memory_usage_snapshot());
+    for (size_t family = 0; family < rows_after_continuation.size(); ++family) {
+        GGML_ASSERT(rows_after_continuation[family][dest_seq] == resident_rows_after_reference[family][source_seq]);
+        GGML_ASSERT(rows_after_continuation[family][source_seq] == resident_rows_after_reference[family][source_seq]);
+        GGML_ASSERT(rows_after_continuation[family][survivor_seq] == resident_rows_after_reference[family][survivor_seq]);
+    }
+    GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), source_seq) == source_state_after_reference);
+    GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), survivor_seq) == survivor_state);
+
+    const bool logits_ok = compare_dsv4_trace(
+            "restore-2048", "next", reference_logits, restored_logits);
+    printf("DSV4 long compressed restore (%s): %s, state = %zu bytes, rows CSA/HCA/LID = %" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
+            ggml_backend_dev_description(dev), logits_ok ? "OK" : "FAIL", checkpoint_state.size(),
+            checkpoint_rows[LLAMA_DSV4_MEMORY_CSA][source_seq],
+            checkpoint_rows[LLAMA_DSV4_MEMORY_HCA][source_seq],
+            checkpoint_rows[LLAMA_DSV4_MEMORY_LID][source_seq]);
+    return logits_ok;
+}
+
 static bool test_dsv4_transactional_restore(size_t seed, ggml_backend_dev_t dev) {
     static constexpr uint32_t n_vocab = 128;
     static constexpr llama_seq_id source_seq = 0;
@@ -1593,6 +1684,7 @@ static int test_dsv4_restore(size_t seed) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         printf("DSV4 transactional restore on %s\n", ggml_backend_dev_description(dev));
         all_ok = test_dsv4_restore_boundaries(seed, dev) && all_ok;
+        all_ok = test_dsv4_restore_long_compressed_history(seed, dev) && all_ok;
         all_ok = test_dsv4_transactional_restore(seed, dev) && all_ok;
     }
     return all_ok ? 0 : 1;
