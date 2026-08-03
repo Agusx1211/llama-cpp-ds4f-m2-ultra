@@ -843,14 +843,29 @@ class metal_candidate_join {
             throw std::runtime_error("failed to create candidate join context");
         }
 
+        routed_output_alias_ = ggml_view_tensor(context_.get(), routed_output);
+        ggml_set_name(routed_output_alias_, "candidate_routed_output_alias");
         direct_output_ = ggml_new_tensor_2d(context_.get(), GGML_TYPE_F32, DSV4_EMBD, tokens);
-        joined_output_ = ggml_add(context_.get(), routed_output, direct_output_);
-        join_graph_    = ggml_new_graph_custom(context_.get(), graph_nodes, false);
+        ggml_set_name(direct_output_, "candidate_direct_output");
+        joined_output_ = ggml_add(context_.get(), routed_output_alias_, direct_output_);
+        ggml_set_name(joined_output_, "candidate_joined_output");
+        join_graph_ = ggml_new_graph_custom(context_.get(), graph_nodes, false);
 
-        // The routed branch is computed and synchronized before this graph is
-        // submitted. Add only the join node so the routed FFN is not executed
-        // a second time while preserving its Metal tensor as an input.
-        ggml_graph_add_node(join_graph_, joined_output_);
+        // The no-op alias is a graph leaf backed by the already-computed routed
+        // Metal tensor. A normal expansion therefore installs complete graph
+        // bookkeeping for the add without traversing or recomputing the routed
+        // FFN that produced the aliased storage.
+        ggml_build_forward_expand(join_graph_, joined_output_);
+        if (routed_output_alias_->op != GGML_OP_NONE || routed_output_alias_->view_src != routed_output ||
+            routed_output_alias_->src[0] != nullptr || direct_output_->op != GGML_OP_NONE ||
+            direct_output_->view_src != nullptr || joined_output_->src[0] != routed_output_alias_ ||
+            joined_output_->src[1] != direct_output_ || ggml_graph_n_nodes(join_graph_) != 1 ||
+            ggml_graph_node(join_graph_, 0) != joined_output_ ||
+            ggml_graph_get_tensor(join_graph_, "candidate_routed_output_alias") != routed_output_alias_ ||
+            ggml_graph_get_tensor(join_graph_, "candidate_direct_output") != direct_output_ ||
+            (joined_output_->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            throw std::runtime_error("candidate join graph did not isolate one executable Metal add and two leaves");
+        }
 
         buffer_.reset(ggml_backend_alloc_ctx_tensors(context_.get(), backend_));
         if (!buffer_) {
@@ -877,21 +892,28 @@ class metal_candidate_join {
 
     void synchronize() { ggml_backend_synchronize(backend_); }
 
-    std::vector<float> get_joined_output() const {
-        std::vector<float> result(static_cast<size_t>(ggml_nelements(joined_output_)));
-        ggml_backend_tensor_get(joined_output_, result.data(), 0, result.size() * sizeof(float));
-        return result;
-    }
+    std::vector<float> get_joined_output() const { return get_tensor(joined_output_); }
+
+    std::vector<float> get_uploaded_direct_output() const { return get_tensor(direct_output_); }
+
+    std::vector<float> get_aliased_routed_output() const { return get_tensor(routed_output_alias_); }
 
     size_t allocated_tensor_bytes() const { return ggml_nbytes(direct_output_) + ggml_nbytes(joined_output_); }
 
   private:
+    static std::vector<float> get_tensor(const ggml_tensor * tensor) {
+        std::vector<float> result(static_cast<size_t>(ggml_nelements(tensor)));
+        ggml_backend_tensor_get(tensor, result.data(), 0, result.size() * sizeof(float));
+        return result;
+    }
+
     ggml_backend_t          backend_ = nullptr;
     ggml_context_ptr        context_;
     ggml_backend_buffer_ptr buffer_;
-    ggml_tensor *           direct_output_ = nullptr;
-    ggml_tensor *           joined_output_ = nullptr;
-    ggml_cgraph *           join_graph_    = nullptr;
+    ggml_tensor *           routed_output_alias_ = nullptr;
+    ggml_tensor *           direct_output_       = nullptr;
+    ggml_tensor *           joined_output_       = nullptr;
+    ggml_cgraph *           join_graph_          = nullptr;
 };
 
 static branch_timing run_prejoin(direct_amx_shared_ffn &  direct,
@@ -1068,7 +1090,9 @@ int main(int argc, char ** argv) try {
         direct ? direct->packed_f32_bytes() * static_cast<size_t>(DSV4_LAYERS) : size_t{ 0 });
     std::printf(
         "candidate_join\tallocated=%d\tmetal_tensor_bytes=%zu\tdirect_output_upload_bytes=%zu"
-        "\tgraph=single_metal_shared_plus_routed_add\troute_recomputed_by_join=0\n",
+        "\tgraph=single_metal_shared_plus_routed_add\tgraph_construction=ggml_build_forward_expand"
+        "\trouted_source=external_metal_buffer_alias\texecutable_add_nodes=1\troute_recomputed_by_join=0"
+        "\tinitial_source_readback_untimed=1\tper_arm_source_readback=0\n",
         candidate_join ? 1 : 0, candidate_join ? candidate_join->allocated_tensor_bytes() : size_t{ 0 },
         candidate_join ? static_cast<size_t>(opts.tokens * DSV4_EMBD) * sizeof(float) : size_t{ 0 });
     std::printf(
@@ -1112,9 +1136,13 @@ int main(int argc, char ** argv) try {
     std::vector<float> metal_routed = metal.get_routed_output();
     std::vector<float> metal_all    = metal.get_all_output();
     std::vector<float> candidate_joined;
+    std::vector<float> candidate_uploaded_direct;
+    std::vector<float> candidate_aliased_routed;
     std::vector<float> expected_candidate_joined;
     if (candidate_join) {
-        candidate_joined = candidate_join->get_joined_output();
+        candidate_joined          = candidate_join->get_joined_output();
+        candidate_uploaded_direct = candidate_join->get_uploaded_direct_output();
+        candidate_aliased_routed  = candidate_join->get_aliased_routed_output();
         expected_candidate_joined.resize(metal_routed.size());
         for (size_t i = 0; i < expected_candidate_joined.size(); ++i) {
             expected_candidate_joined[i] = direct->output()[i] + metal_routed[i];
@@ -1134,10 +1162,14 @@ int main(int argc, char ** argv) try {
     const output_stats routed_down_stats   = summarize(metal.get_routed_down());
     const error_stats  metal_add_error     = compare_outputs(expected_metal_all, metal_all);
     output_stats       candidate_joined_stats;
+    error_stats        candidate_upload_error;
+    error_stats        candidate_routed_alias_error;
     error_stats        candidate_recomposition_error;
     error_stats        candidate_vs_all_metal_error;
     if (candidate_join) {
         candidate_joined_stats        = summarize(candidate_joined);
+        candidate_upload_error        = compare_outputs(direct->output(), candidate_uploaded_direct);
+        candidate_routed_alias_error  = compare_outputs(metal_routed, candidate_aliased_routed);
         candidate_recomposition_error = compare_outputs(expected_candidate_joined, candidate_joined);
         candidate_vs_all_metal_error  = compare_outputs(metal_all, candidate_joined);
     }
@@ -1168,7 +1200,11 @@ int main(int argc, char ** argv) try {
         "\thidden_bit_diff=%llu\thidden_nmse=%.9e\thidden_max_abs=%.9e"
         "\tshared_bit_diff=%llu\tshared_nmse=%.9e\tshared_max_abs=%.9e"
         "\tmetal_add_bit_diff=%llu\tmetal_add_nmse=%.9e\tmetal_add_max_abs=%.9e"
-        "\tcandidate_join_checked=%d\tcandidate_join_finite=%d\tcandidate_join_checksum=%.9e"
+        "\tcandidate_join_checked=%d\tcandidate_upload_finite=%d\tcandidate_upload_bit_diff=%llu"
+        "\tcandidate_upload_nmse=%.9e\tcandidate_upload_max_abs=%.9e"
+        "\tcandidate_routed_alias_finite=%d\tcandidate_routed_alias_bit_diff=%llu"
+        "\tcandidate_routed_alias_nmse=%.9e\tcandidate_routed_alias_max_abs=%.9e"
+        "\tcandidate_join_finite=%d\tcandidate_join_checksum=%.9e"
         "\tcandidate_join_l2=%.9e\tcandidate_recomposition_finite=%d"
         "\tcandidate_recomposition_bit_diff=%llu\tcandidate_recomposition_nmse=%.9e"
         "\tcandidate_recomposition_max_abs=%.9e\tcandidate_vs_all_metal_finite=%d"
@@ -1186,7 +1222,11 @@ int main(int argc, char ** argv) try {
         static_cast<unsigned long long>(hidden_error.bit_diff), hidden_error.nmse, hidden_error.max_abs,
         static_cast<unsigned long long>(shared_error.bit_diff), shared_error.nmse, shared_error.max_abs,
         static_cast<unsigned long long>(metal_add_error.bit_diff), metal_add_error.nmse, metal_add_error.max_abs,
-        candidate_join ? 1 : 0, candidate_joined_stats.finite ? 1 : 0, candidate_joined_stats.checksum,
+        candidate_join ? 1 : 0, candidate_upload_error.finite ? 1 : 0,
+        static_cast<unsigned long long>(candidate_upload_error.bit_diff), candidate_upload_error.nmse,
+        candidate_upload_error.max_abs, candidate_routed_alias_error.finite ? 1 : 0,
+        static_cast<unsigned long long>(candidate_routed_alias_error.bit_diff), candidate_routed_alias_error.nmse,
+        candidate_routed_alias_error.max_abs, candidate_joined_stats.finite ? 1 : 0, candidate_joined_stats.checksum,
         candidate_joined_stats.l2, candidate_recomposition_error.finite ? 1 : 0,
         static_cast<unsigned long long>(candidate_recomposition_error.bit_diff), candidate_recomposition_error.nmse,
         candidate_recomposition_error.max_abs, candidate_vs_all_metal_error.finite ? 1 : 0,
@@ -1205,13 +1245,18 @@ int main(int argc, char ** argv) try {
                   hidden_error.nmse <= 1e-3 && shared_error.nmse <= 1e-3;
     }
     if (candidate_join) {
-        correct = correct && candidate_joined_stats.finite && candidate_recomposition_error.finite &&
+        correct = correct && candidate_upload_error.finite && candidate_upload_error.bit_diff == 0 &&
+                  candidate_upload_error.nmse <= 1e-12 && candidate_routed_alias_error.finite &&
+                  candidate_routed_alias_error.bit_diff == 0 && candidate_routed_alias_error.nmse <= 1e-12 &&
+                  candidate_joined_stats.finite && candidate_recomposition_error.finite &&
                   candidate_recomposition_error.bit_diff == 0 && candidate_recomposition_error.nmse <= 1e-12 &&
                   candidate_vs_all_metal_error.finite && candidate_vs_all_metal_error.nmse <= 1e-3;
     }
     std::printf(
         "correctness_gate\tpass=%d\tdirect_checked=%d\tshared_stage_nmse_limit=1e-3"
         "\tmetal_add_nmse_limit=1e-12\tcandidate_join_checked=%d"
+        "\tcandidate_upload_bit_exact_required=1\tcandidate_upload_nmse_limit=1e-12"
+        "\tcandidate_routed_alias_bit_exact_required=1\tcandidate_routed_alias_nmse_limit=1e-12"
         "\tcandidate_recomposition_bit_exact_required=1\tcandidate_recomposition_nmse_limit=1e-12"
         "\tcandidate_vs_all_metal_nmse_limit=1e-3\n",
         correct ? 1 : 0, direct ? 1 : 0, candidate_join ? 1 : 0);
@@ -1239,6 +1284,8 @@ int main(int argc, char ** argv) try {
     release_validation_copy(metal_all);
     release_validation_copy(expected_metal_all);
     release_validation_copy(candidate_joined);
+    release_validation_copy(candidate_uploaded_direct);
+    release_validation_copy(candidate_aliased_routed);
     print_resource_phase("after_validation_release");
     auto check_branch_outputs = [&](const char * phase, int iteration, const char * arm,
                                     double measured_prejoin_wall_ms) {
