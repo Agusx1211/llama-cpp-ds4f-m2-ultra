@@ -244,6 +244,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
             ARGS tests/test-dsv4-amx-full-model-gate-parser.py
         )
+        llama_test_cmd(
+            ${Python3_EXECUTABLE}
+            NAME test-m2-release-manager
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            ARGS tools/m2-deploy/tests/test_release_manager.py
+        )
     endif()
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
