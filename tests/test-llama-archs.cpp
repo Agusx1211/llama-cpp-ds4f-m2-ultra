@@ -1207,7 +1207,7 @@ static bool test_dsv4_restore_boundaries(size_t seed, ggml_backend_dev_t dev) {
         3, 4, 127, 128, 129, 255, 256, 260,
     };
     static constexpr uint32_t n_vocab = 128;
-    static constexpr uint32_t n_ctx_seq = 320;
+    static constexpr uint32_t n_ctx_seq = 512;
 
     struct checkpoint {
         uint32_t n_tokens;
@@ -1215,7 +1215,7 @@ static bool test_dsv4_restore_boundaries(size_t seed, ggml_backend_dev_t dev) {
         std::vector<float> next_logits;
     };
 
-    dsv4_test_context test(seed, dev, 3, false, 1, 1, 3*n_ctx_seq, 1);
+    dsv4_test_context test(seed, dev, 3, false, 256, 1, 3*n_ctx_seq, 1);
     const auto tokens = get_tokens(boundaries.back() + 1, n_vocab, seed + 30);
     std::vector<checkpoint> checkpoints;
     checkpoints.reserve(boundaries.size());
@@ -1446,7 +1446,7 @@ static bool test_dsv4_transactional_restore(size_t seed, ggml_backend_dev_t dev)
     // A genuinely different cache geometry must reject the snapshot before
     // changing its empty destination.
     dsv4_test_context wrong_geometry(
-            seed, dev, 5, false, 1, 1, 5*512, 1, nullptr, nullptr, 2);
+            seed, dev, 5, false, 256, 1, 5*512, 1, nullptr, nullptr, 2);
     GGML_ASSERT(llama_state_seq_set_data(
             wrong_geometry.lctx.get(), source_full.data(), source_full.size(), 0) == 0);
     GGML_ASSERT(llama_memory_seq_pos_max(
