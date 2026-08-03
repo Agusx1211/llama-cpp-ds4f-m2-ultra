@@ -116,6 +116,13 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+llama_build_and_test(
+    test-server-scheduler.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-scheduler.cpp
+)
+target_include_directories(test-server-scheduler PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-scheduler PRIVATE cxx_std_17)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
