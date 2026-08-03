@@ -10650,6 +10650,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 129280, 1, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 2048, 1, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 4096, 1, 2048, {1, 1}, {1, 1}));
+    // DeepSeek V4 shared-expert prompt projections. F32 weights represent the
+    // proposed one-time persistent CPU pack; BF16 includes the current BLAS
+    // backend's per-invocation conversion cost. Gate and up share the first
+    // geometry, while down uses the reverse geometry.
+    for (ggml_type type_a : { GGML_TYPE_BF16, GGML_TYPE_F32 }) {
+        for (int bs : { 224, 512, 1024, 2048 }) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2048, bs, 4096, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, bs, 2048, {1, 1}, {1, 1}));
+        }
+    }
     test_cases.emplace_back(new test_mul_mat_id_fusion(
                 GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 1, 2048, 1, true));
     for (int bs : { 224, 512, 2048 }) {
