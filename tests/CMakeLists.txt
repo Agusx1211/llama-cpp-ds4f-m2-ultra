@@ -130,6 +130,20 @@ llama_build_and_test(
 target_include_directories(test-server-request-registry PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_compile_features(test-server-request-registry PRIVATE cxx_std_17)
 
+llama_build_and_test(
+    test-server-request-runtime.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-request-runtime.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-request-registry.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-scheduler.cpp
+)
+target_include_directories(test-server-request-runtime PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-request-runtime PRIVATE cxx_std_17)
+
+llama_build_and_test(test-server-queue-runtime.cpp)
+target_include_directories(test-server-queue-runtime PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_link_libraries(test-server-queue-runtime PRIVATE server-context)
+target_compile_features(test-server-queue-runtime PRIVATE cxx_std_17)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 

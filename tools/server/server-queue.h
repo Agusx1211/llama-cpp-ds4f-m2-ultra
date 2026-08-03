@@ -1,9 +1,11 @@
 #pragma once
 
+#include "server-request-runtime.h"
 #include "server-task.h"
 
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <vector>
 #include <unordered_set>
@@ -21,6 +23,9 @@ private:
     // queues
     std::deque<server_task> queue_tasks;
     std::deque<server_task> queue_tasks_deferred;
+    std::map<int, server_task> queue_user_tasks;
+
+    server_request_runtime::request_runtime request_runtime;
 
     std::mutex mutex_tasks;
     std::condition_variable condition_tasks;
@@ -31,6 +36,8 @@ private:
     std::function<void(bool)>           callback_sleeping_state;
 
 public:
+    server_queue();
+
     // Add a new task to the end of the queue
     int post(server_task && task, bool front = false);
 
@@ -81,6 +88,14 @@ public:
         return queue_tasks_deferred.size();
     }
 
+    bool bind_slot(int id_task, int id_slot);
+    bool release_slot(int id_task, int id_slot);
+    bool fail_task(int id_task);
+
+    std::vector<server_request_registry::request_snapshot> request_snapshot();
+    server_request_registry::event_log_snapshot request_events();
+    server_request_registry::registry_summary request_summary();
+
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called
     //
@@ -111,6 +126,10 @@ public:
     }
 
 private:
+    static bool is_user_task(const server_task & task);
+    static uint64_t runtime_id(int id_task);
+    server_request_runtime::request_metadata make_request_metadata(server_task & task);
+    bool enqueue_user_task(server_task && task);
     void cleanup_pending_task(int id_target);
 };
 

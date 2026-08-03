@@ -3,7 +3,9 @@
 
 #include "log.h"
 
+#include <algorithm>
 #include <chrono>
+#include <limits>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define QUE_WRN(fmt, ...) LOG_WRN("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -19,6 +21,75 @@
 // server_queue
 //
 
+server_queue::server_queue() : request_runtime([] {
+    server_request_runtime::runtime_config config;
+    // Live admission must preserve the server's existing context validation
+    // until the allocator supplies a full prompt-plus-runway quote.
+    config.scheduler.context_tokens = std::numeric_limits<uint64_t>::max();
+    return config;
+}()) {
+}
+
+bool server_queue::is_user_task(const server_task & task) {
+    switch (task.type) {
+        case SERVER_TASK_TYPE_COMPLETION:
+        case SERVER_TASK_TYPE_INFILL:
+        case SERVER_TASK_TYPE_EMBEDDING:
+        case SERVER_TASK_TYPE_RERANK:
+            return true;
+        default:
+            return false;
+    }
+}
+
+uint64_t server_queue::runtime_id(int id_task) {
+    GGML_ASSERT(id_task >= 0);
+    return static_cast<uint64_t>(id_task) + 1;
+}
+
+server_request_runtime::request_metadata server_queue::make_request_metadata(server_task & task) {
+    using scheduler_lane = server_scheduler::lane;
+
+    server_request_runtime::request_metadata result;
+    result.id                 = runtime_id(task.id);
+    result.arrival_us         = task.scheduling.arrival_us == 0 ? static_cast<uint64_t>(ggml_time_us()) :
+                                                                  task.scheduling.arrival_us;
+    result.virtual_runtime_us = task.scheduling.virtual_runtime_us;
+    result.debt_us            = task.scheduling.debt_us;
+    result.counts.prompt_tokens = static_cast<uint64_t>(std::max<int32_t>(0, task.n_tokens()));
+    result.counts.requested_output_tokens = task.params.n_predict > 0 ?
+                                                static_cast<uint64_t>(task.params.n_predict) : 0;
+    result.estimates.predicted_prefill_us    = task.scheduling.predicted_prefill_us;
+    result.estimates.predicted_decode_us     = task.scheduling.predicted_decode_us;
+    result.estimates.predicted_gpu_us        = task.scheduling.predicted_gpu_us;
+    result.estimates.predicted_memory_bytes  = task.scheduling.predicted_memory_bytes;
+    result.estimates.predicted_output_tokens = task.scheduling.predicted_output_tokens;
+    switch (task.scheduling.lane) {
+        case server_task::trusted_lane::low:
+            result.lane = scheduler_lane::low;
+            break;
+        case server_task::trusted_lane::normal:
+            result.lane = scheduler_lane::normal;
+            break;
+        case server_task::trusted_lane::fast:
+            result.lane = scheduler_lane::fast;
+            break;
+    }
+    task.scheduling.arrival_us = result.arrival_us;
+    return result;
+}
+
+bool server_queue::enqueue_user_task(server_task && task) {
+    const int task_id = task.id;
+    const auto admitted = request_runtime.admit(make_request_metadata(task));
+    if (!admitted) {
+        QUE_WRN("reject task, id = %d, reason = %s\n", task_id, server_scheduler::to_string(admitted.reason));
+        return false;
+    }
+    queue_user_tasks.emplace(task_id, std::move(task));
+    return true;
+}
+
 int server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     GGML_ASSERT(task.id != -1);
@@ -28,7 +99,11 @@ int server_queue::post(server_task && task, bool front) {
     }
     const int task_id = task.id;
     QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
-    if (front) {
+    if (is_user_task(task)) {
+        if (!enqueue_user_task(std::move(task))) {
+            return -1;
+        }
+    } else if (front) {
         queue_tasks.push_front(std::move(task));
     } else {
         queue_tasks.push_back(std::move(task));
@@ -40,6 +115,8 @@ int server_queue::post(server_task && task, bool front) {
 
 int server_queue::post(std::vector<server_task> && tasks, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    std::vector<uint64_t> admitted_ids;
+    admitted_ids.reserve(tasks.size());
     for (auto & task : tasks) {
         if (task.id == -1) {
             task.id = id++;
@@ -49,7 +126,34 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
             cleanup_pending_task(task.id_target);
         }
         QUE_DBG("new task, id = %d/%d, front = %d\n", task.id, (int) tasks.size(), front);
-        if (front) {
+        if (is_user_task(task)) {
+            const int parent_id = task.id;
+            if (!enqueue_user_task(std::move(task))) {
+                for (uint64_t admitted_id : admitted_ids) {
+                    request_runtime.cancel(admitted_id, static_cast<uint64_t>(ggml_time_us()));
+                    queue_user_tasks.erase(static_cast<int>(admitted_id - 1));
+                }
+                return -1;
+            }
+            admitted_ids.push_back(runtime_id(parent_id));
+            auto & parent = queue_user_tasks.at(parent_id);
+            for (auto & child : parent.child_tasks) {
+                if (child.scheduling.arrival_us == 0) {
+                    child.scheduling.arrival_us = parent.scheduling.arrival_us;
+                }
+                const auto admitted = request_runtime.admit(make_request_metadata(child), false);
+                if (!admitted) {
+                    QUE_WRN("reject child task, id = %d, reason = %s\n", child.id,
+                            server_scheduler::to_string(admitted.reason));
+                    for (uint64_t admitted_id : admitted_ids) {
+                        request_runtime.cancel(admitted_id, static_cast<uint64_t>(ggml_time_us()));
+                        queue_user_tasks.erase(static_cast<int>(admitted_id - 1));
+                    }
+                    return -1;
+                }
+                admitted_ids.push_back(runtime_id(child.id));
+            }
+        } else if (front) {
             queue_tasks.push_front(std::move(task));
         } else {
             queue_tasks.push_back(std::move(task));
@@ -63,6 +167,12 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
 void server_queue::defer(server_task && task) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     QUE_DBG("defer task, id = %d\n", task.id);
+    if (is_user_task(task) &&
+        !request_runtime.mark_deferred(runtime_id(task.id), static_cast<uint64_t>(ggml_time_us()))) {
+        QUE_ERR("failed to mark deferred task, id = %d\n", task.id);
+        request_runtime.fail(runtime_id(task.id), static_cast<uint64_t>(ggml_time_us()));
+        return;
+    }
     queue_tasks_deferred.push_back(std::move(task));
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
@@ -82,8 +192,18 @@ void server_queue::pop_deferred_task(int id_slot) {
         for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
             if (it->id_slot == id_slot) {
                 QUE_DBG("pop deferred task (use slot %d), id_task = %d\n", id_slot, it->id);
-                queue_tasks.emplace_front(std::move(*it));
+                if (is_user_task(*it) && !request_runtime.resume(runtime_id(it->id),
+                                                                 static_cast<uint64_t>(ggml_time_us()))) {
+                    found = true;
+                    break;
+                }
+                server_task task = std::move(*it);
                 queue_tasks_deferred.erase(it);
+                if (is_user_task(task)) {
+                    queue_user_tasks.emplace(task.id, std::move(task));
+                } else {
+                    queue_tasks.emplace_front(std::move(task));
+                }
                 found = true;
                 break;
             }
@@ -91,8 +211,19 @@ void server_queue::pop_deferred_task(int id_slot) {
         // if not tasks found using the slot, just pop the first deferred task (default behavior)
         if (!found) {
             QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);
-            queue_tasks.emplace_front(std::move(queue_tasks_deferred.front()));
+            if (is_user_task(queue_tasks_deferred.front()) &&
+                !request_runtime.resume(runtime_id(queue_tasks_deferred.front().id),
+                                        static_cast<uint64_t>(ggml_time_us()))) {
+                condition_tasks.notify_one();
+                return;
+            }
+            server_task task = std::move(queue_tasks_deferred.front());
             queue_tasks_deferred.pop_front();
+            if (is_user_task(task)) {
+                queue_user_tasks.emplace(task.id, std::move(task));
+            } else {
+                queue_tasks.emplace_front(std::move(task));
+            }
         }
     }
     time_last_task = ggml_time_ms();
@@ -145,12 +276,26 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 QUE_DBG("%s", "terminate\n");
                 return;
             }
-            if (queue_tasks.empty()) {
+            if (queue_tasks.empty() && request_runtime.queued_total() == 0) {
                 lock.unlock();
                 break;
             }
-            server_task task = std::move(queue_tasks.front());
-            queue_tasks.pop_front();
+            server_task task;
+            if (!queue_tasks.empty()) {
+                task = std::move(queue_tasks.front());
+                queue_tasks.pop_front();
+            } else {
+                const auto decision = request_runtime.take_next(static_cast<uint64_t>(ggml_time_us()));
+                if (!decision.selected) {
+                    lock.unlock();
+                    break;
+                }
+                const int task_id = static_cast<int>(decision.request_id - 1);
+                auto task_it = queue_user_tasks.find(task_id);
+                GGML_ASSERT(task_it != queue_user_tasks.end());
+                task = std::move(task_it->second);
+                queue_user_tasks.erase(task_it);
+            }
             lock.unlock();
 
             QUE_DBG("processing task, id = %d\n", task.id);
@@ -170,7 +315,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         QUE_DBG("%s", "waiting for new tasks\n");
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
-            if (!running || !queue_tasks.empty()) {
+            if (!running || !queue_tasks.empty() || request_runtime.queued_total() != 0) {
                 break; // go back to process new tasks or terminate
             }
 
@@ -197,7 +342,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             } else {
                 // wait for new tasks or timeout for checking sleeping condition
                 bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
-                    return (!queue_tasks.empty() || !running);
+                    return (!queue_tasks.empty() || request_runtime.queued_total() != 0 || !running);
                 });
                 if (res) {
                     break; // new task arrived or terminate
@@ -210,6 +355,10 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
 
 void server_queue::cleanup_pending_task(int id_target) {
     // no need lock because this is called exclusively by post()
+    if (id_target >= 0) {
+        request_runtime.cancel(runtime_id(id_target), static_cast<uint64_t>(ggml_time_us()));
+        queue_user_tasks.erase(id_target);
+    }
     auto rm_func = [id_target](const server_task & task) {
         return task.id == id_target;
     };
@@ -219,6 +368,40 @@ void server_queue::cleanup_pending_task(int id_target) {
     queue_tasks_deferred.erase(
         std::remove_if(queue_tasks_deferred.begin(), queue_tasks_deferred.end(), rm_func),
         queue_tasks_deferred.end());
+}
+
+bool server_queue::bind_slot(int id_task, int id_slot) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    return id_task >= 0 && id_slot >= 0 && request_runtime.bind_slot(
+        runtime_id(id_task), static_cast<server_request_registry::slot_id>(id_slot),
+        static_cast<uint64_t>(ggml_time_us()));
+}
+
+bool server_queue::release_slot(int id_task, int id_slot) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    return id_task >= 0 && id_slot >= 0 && request_runtime.release_slot(
+        runtime_id(id_task), static_cast<server_request_registry::slot_id>(id_slot),
+        static_cast<uint64_t>(ggml_time_us()));
+}
+
+bool server_queue::fail_task(int id_task) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    return id_task >= 0 && request_runtime.fail(runtime_id(id_task), static_cast<uint64_t>(ggml_time_us()));
+}
+
+std::vector<server_request_registry::request_snapshot> server_queue::request_snapshot() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    return request_runtime.snapshot();
+}
+
+server_request_registry::event_log_snapshot server_queue::request_events() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    return request_runtime.events();
+}
+
+server_request_registry::registry_summary server_queue::request_summary() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    return request_runtime.summary();
 }
 
 //
@@ -358,7 +541,13 @@ void server_response_reader::post_task(server_task && task, bool front) {
     id_tasks.insert(task.id);
     states.push_back(task.create_state());
     queue_results.add_waiting_task_id(task.id);
-    queue_tasks.post(std::move(task), front);
+    if (queue_tasks.post(std::move(task), front) < 0) {
+        auto error = std::make_unique<server_task_result_error>();
+        error->id       = *id_tasks.begin();
+        error->err_type = ERROR_TYPE_UNAVAILABLE;
+        error->err_msg  = "request queue is full";
+        queue_results.send(std::move(error));
+    }
 }
 
 void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool front) {
@@ -377,7 +566,13 @@ void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool 
     }
     GGML_ASSERT(states.size() == id_tasks.size());
     queue_results.add_waiting_task_ids(id_tasks);
-    queue_tasks.post(std::move(tasks), front);
+    if (queue_tasks.post(std::move(tasks), front) < 0) {
+        auto error = std::make_unique<server_task_result_error>();
+        error->id       = *std::min_element(id_tasks.begin(), id_tasks.end());
+        error->err_type = ERROR_TYPE_UNAVAILABLE;
+        error->err_msg  = "request queue is full";
+        queue_results.send(std::move(error));
+    }
 }
 
 bool server_response_reader::has_next() const {
