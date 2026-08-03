@@ -191,6 +191,8 @@ struct llama_context {
 
     llama_memory_breakdown memory_breakdown() const;
 
+    size_t output_buffer_size() const;
+
     //
     // training
     //
@@ -225,7 +227,7 @@ private:
 
     // Make sure enough space is available for outputs.
     // Returns max number of outputs for which space was reserved.
-    uint32_t output_reserve(int32_t n_outputs);
+    uint32_t output_reserve(int32_t n_outputs, int32_t n_tokens);
 
     void output_reorder();
 
@@ -375,6 +377,9 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // env: LLAMA_DSV4_NEXTN_OUTPUT_COMPACT_DISABLE=1
+    bool dsv4_nextn_output_compact = false;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

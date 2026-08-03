@@ -15,6 +15,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -147,6 +148,13 @@ llama_context::llama_context(
 
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
+
+    dsv4_nextn_output_compact =
+            model.arch == LLM_ARCH_DEEPSEEK4 &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+    if (const char * value = std::getenv("LLAMA_DSV4_NEXTN_OUTPUT_COMPACT_DISABLE")) {
+        dsv4_nextn_output_compact = dsv4_nextn_output_compact && std::strcmp(value, "1") != 0;
+    }
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -412,7 +420,7 @@ llama_context::llama_context(
 
         // graph outputs buffer
         {
-            if (output_reserve(params.n_seq_max) < params.n_seq_max) {
+            if (output_reserve(params.n_seq_max, params.n_seq_max) < params.n_seq_max) {
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
 
@@ -1541,7 +1549,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens;
 
     // reserve output buffer
-    if (output_reserve(n_tokens) < n_tokens) {
+    if (output_reserve(n_tokens, n_tokens) < n_tokens) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_tokens);
         return -2;
     };
@@ -1943,7 +1951,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
+    if (output_reserve(n_outputs_all, n_tokens_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
@@ -2191,7 +2199,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 // output
 //
 
-uint32_t llama_context::output_reserve(int32_t n_outputs) {
+uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_tokens) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -2219,12 +2227,14 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
     const size_t n_embd_nextn = model.hparams.n_embd_nextn();
-    embd_nextn.size = has_embd_nextn ? n_embd_nextn*n_outputs_max : 0;
+    int64_t n_nextn_rows = has_embd_nextn ? n_outputs_max : 0;
+    embd_nextn.size = n_embd_nextn * n_nextn_rows;
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = n_embd_nextn * n_batch;
+        n_nextn_rows = dsv4_nextn_output_compact ? n_tokens : n_batch;
+        embd_nextn.size = n_embd_nextn * n_nextn_rows;
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -2250,14 +2260,27 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
         (                                                                         backend_token_count) * sizeof(llama_token);
 
-    // alloc only when more than the current capacity is required
-    // TODO: also consider shrinking the buffer
-    if (!buf_output || prev_size < new_size) {
+    // DSV4 target prompts need an unmasked NextN row for every input token, but
+    // verification only needs a handful of rows. Reclaim the prompt-sized CPU
+    // allocation once its useful capacity falls by at least 4x. On macOS this
+    // buffer is vm_allocate-backed, so replacement also releases physical pages.
+    const bool shrink =
+            dsv4_nextn_output_compact &&
+            buf_output &&
+            new_size <= prev_size / 4;
+
+    if (!buf_output || prev_size < new_size || shrink) {
         if (buf_output) {
 #ifndef NDEBUG
             // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
             LLAMA_LOG_DEBUG("%s: reallocating output buffer from size %.02f MiB to %.02f MiB\n", __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
 #endif
+            if (shrink) {
+                LLAMA_LOG_INFO("%s: shrinking DSV4 output buffer from %.02f MiB (%zu bytes) "
+                        "to %.02f MiB (%zu bytes, %" PRId64 " NextN rows)\n",
+                        __func__, prev_size / 1024.0 / 1024.0, prev_size,
+                        new_size / 1024.0 / 1024.0, new_size, n_nextn_rows);
+            }
             synchronize();
 
             // TODO: not needed?
@@ -3369,6 +3392,10 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     return ret;
 }
 
+size_t llama_context::output_buffer_size() const {
+    return buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
+}
+
 //
 // training
 //
@@ -3478,7 +3505,7 @@ void llama_context::opt_epoch_iter(
         }
 
         // reserve output buffer
-        if (output_reserve(n_outputs_all) < n_outputs_all) {
+        if (output_reserve(n_outputs_all, n_tokens_all) < n_outputs_all) {
             LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
             GGML_ABORT("TODO: handle this error");
         };
@@ -4299,6 +4326,10 @@ void llama_opt_epoch(
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+size_t llama_get_output_buffer_size(const struct llama_context * ctx) {
+    return ctx->output_buffer_size();
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
