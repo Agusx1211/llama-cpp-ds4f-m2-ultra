@@ -23,13 +23,57 @@ static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
 
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
-static constexpr uint32_t DSV4_STATE_VERSION       = 1;
+static constexpr uint32_t DSV4_STATE_VERSION       = 2;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
 
 static std::atomic<uint32_t> dsv4_test_pressure_count = 0;
+
+static uint64_t dsv4_hash_u64(uint64_t hash, uint64_t value) {
+    // FNV-1a over an explicit little-endian integer encoding. This keeps the
+    // persistent identity independent of host padding and object layout.
+    for (uint32_t i = 0; i < 8; ++i) {
+        hash ^= (value >> (8*i)) & 0xffu;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t dsv4_hash_string(uint64_t hash, const std::string & value) {
+    hash = dsv4_hash_u64(hash, value.size());
+    for (unsigned char c : value) {
+        hash ^= c;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t dsv4_hash_tensor(uint64_t hash, const ggml_tensor * tensor) {
+    hash = dsv4_hash_u64(hash, tensor->type);
+    for (uint32_t i = 0; i < GGML_MAX_DIMS; ++i) {
+        hash = dsv4_hash_u64(hash, tensor->ne[i]);
+    }
+    return hash;
+}
+
+static uint64_t dsv4_hash_cache(uint64_t hash, const llama_kv_cache * cache) {
+    hash = dsv4_hash_u64(hash, cache->get_size());
+    hash = dsv4_hash_u64(hash, cache->get_n_stream());
+    // DSV4 turns every participating cache into K-only MLA storage, so its V
+    // pointers are null and the absence of V is itself part of the schema. K
+    // types are hashed per tensor below; some raw halves legitimately have no
+    // participating layers, so generic type_k()/type_v() cannot be called.
+    hash = dsv4_hash_string(hash, "k-only");
+    const auto layer_ids = cache->get_layer_ids();
+    hash = dsv4_hash_u64(hash, layer_ids.size());
+    for (uint32_t il : layer_ids) {
+        hash = dsv4_hash_u64(hash, il);
+        hash = dsv4_hash_tensor(hash, cache->get_k_storage(il));
+    }
+    return hash;
+}
 
 void llama_kv_cache_dsv4_test_inject_physical_pressure(uint32_t count) {
     dsv4_test_pressure_count.store(count, std::memory_order_release);
@@ -1255,7 +1299,7 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*hparams.n_layer()*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(2u*(1 + n_stream*(1 + n_rs_seq))*hparams.n_layer()*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -1306,7 +1350,7 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         std::vector<ggml_tensor *> kv_stream;
         std::vector<ggml_tensor *> score_stream;
 
-        for (uint32_t s = 0; s < n_stream; ++s) {
+        for (uint32_t s = 0; s < n_planes; ++s) {
             kv_stream.push_back(ggml_view_2d(ctx, kv, n_embd_state, state_size, kv->nb[1], s*kv->nb[2]));
             score_stream.push_back(ggml_view_2d(ctx, score, n_embd_state, state_size, score->nb[1], s*score->nb[2]));
         }
@@ -1357,9 +1401,10 @@ void llama_dsv4_comp_state::clear(llama_seq_id seq_id, bool data) {
     }
 }
 
-void llama_dsv4_comp_state::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
+void llama_dsv4_comp_state::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, uint32_t src_depth) {
     GGML_ASSERT(seq_id_src >= 0 && (uint32_t) seq_id_src < n_stream);
     GGML_ASSERT(seq_id_dst >= 0 && (uint32_t) seq_id_dst < n_stream);
+    GGML_ASSERT(src_depth <= n_rs_seq);
 
     if (seq_id_src == seq_id_dst) {
         return;
@@ -1367,7 +1412,7 @@ void llama_dsv4_comp_state::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_
 
     clear(seq_id_dst, true);
 
-    sc_info.ssrc.push_back((uint32_t) seq_id_src);
+    sc_info.ssrc.push_back(src_depth*n_stream + (uint32_t) seq_id_src);
     sc_info.sdst.push_back((uint32_t) seq_id_dst);
 }
 
@@ -1401,6 +1446,22 @@ uint32_t llama_dsv4_comp_state::get_n_rs_seq() const {
 
 uint32_t llama_dsv4_comp_state::get_n_rows() const {
     return state_size*n_stream;
+}
+
+uint64_t llama_dsv4_comp_state::state_identity() const {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    hash = dsv4_hash_u64(hash, ratio);
+    hash = dsv4_hash_u64(hash, state_size);
+    hash = dsv4_hash_u64(hash, n_embd_state);
+    hash = dsv4_hash_u64(hash, n_stream);
+    hash = dsv4_hash_u64(hash, n_rs_seq);
+    hash = dsv4_hash_u64(hash, layers.size());
+    for (const auto & layer : layers) {
+        hash = dsv4_hash_u64(hash, layer.il);
+        hash = dsv4_hash_tensor(hash, layer.kv);
+        hash = dsv4_hash_tensor(hash, layer.score);
+    }
+    return hash;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_dsv4_comp_state::memory_breakdown() const {
@@ -1670,6 +1731,52 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
             2*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_csa);
 
+    // Bind sequence snapshots to the stable model metadata and every cache /
+    // compressor geometry that controls interpretation of their tensor bytes.
+    // llama.cpp does not currently expose a persistent model-content digest,
+    // so this deliberately identifies the artifact geometry, not its weights.
+    uint64_t identity = UINT64_C(14695981039346656037);
+    identity = dsv4_hash_string(identity, "llama.cpp-dsv4-sequence-state-v2");
+    identity = dsv4_hash_u64(identity, model.arch);
+    identity = dsv4_hash_u64(identity, model.size());
+    identity = dsv4_hash_u64(identity, model.n_elements());
+    identity = dsv4_hash_u64(identity, model.n_tensors());
+    identity = dsv4_hash_u64(identity, n_seq_max);
+    identity = dsv4_hash_u64(identity, n_rs_seq);
+    identity = dsv4_hash_u64(identity, hparams_raw.n_ctx_train);
+    identity = dsv4_hash_u64(identity, hparams_raw.n_embd);
+    identity = dsv4_hash_u64(identity, hparams_raw.n_layer());
+    identity = dsv4_hash_u64(identity, hparams_raw.n_swa);
+    identity = dsv4_hash_u64(identity, hparams_raw.swa_type);
+    identity = dsv4_hash_u64(identity, hparams_raw.indexer_n_head);
+    identity = dsv4_hash_u64(identity, hparams_raw.indexer_head_size);
+    identity = dsv4_hash_u64(identity, hparams_raw.indexer_top_k);
+    identity = dsv4_hash_u64(identity, hparams_raw.indexer_block_size);
+    identity = dsv4_hash_u64(identity, hparams_raw.indexer_local_blocks);
+    for (uint32_t il = 0; il < hparams_raw.n_layer(); ++il) {
+        identity = dsv4_hash_u64(identity, hparams_raw.n_head(il));
+        identity = dsv4_hash_u64(identity, hparams_raw.n_head_kv(il));
+        identity = dsv4_hash_u64(identity, hparams_raw.n_embd_k_gqa(il));
+        identity = dsv4_hash_u64(identity, hparams_raw.n_embd_v_gqa(il));
+        identity = dsv4_hash_u64(identity, hparams_raw.is_swa(il));
+        identity = dsv4_hash_u64(identity, hparams_raw.dsv4_compress_ratios[il]);
+    }
+    std::map<std::string, std::string> metadata(model.gguf_kv.begin(), model.gguf_kv.end());
+    identity = dsv4_hash_u64(identity, metadata.size());
+    for (const auto & [key, value] : metadata) {
+        identity = dsv4_hash_string(identity, key);
+        identity = dsv4_hash_string(identity, value);
+    }
+    identity = dsv4_hash_cache(identity, kv_raw->get_base());
+    identity = dsv4_hash_cache(identity, kv_raw->get_swa());
+    identity = dsv4_hash_cache(identity, kv_csa.get());
+    identity = dsv4_hash_cache(identity, kv_hca.get());
+    identity = dsv4_hash_cache(identity, kv_lid.get());
+    identity = dsv4_hash_u64(identity, csa_state->state_identity());
+    identity = dsv4_hash_u64(identity, hca_state->state_identity());
+    identity = dsv4_hash_u64(identity, lid_state->state_identity());
+    state_identity_hash = identity;
+
     // DSV4 attention reads compressed-K / compressor-state rows that the current
     // graph does not necessarily overwrite; uninitialized buffer contents would
     // otherwise leak in (instance-specific garbage) and corrupt recall. Zero all
@@ -1852,9 +1959,10 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     kv_hca->seq_cp(seq_id_src, seq_id_dst, -1, -1);
     kv_lid->seq_cp(seq_id_src, seq_id_dst, -1, -1);
 
-    csa_state->seq_cp(seq_id_src, seq_id_dst);
-    hca_state->seq_cp(seq_id_src, seq_id_dst);
-    lid_state->seq_cp(seq_id_src, seq_id_dst);
+    const uint32_t src_depth = rs_idx[seq_id_src];
+    csa_state->seq_cp(seq_id_src, seq_id_dst, src_depth);
+    hca_state->seq_cp(seq_id_src, seq_id_dst, src_depth);
+    lid_state->seq_cp(seq_id_src, seq_id_dst, src_depth);
 
     if (seq_id_src != seq_id_dst) {
         rs_idx[seq_id_dst] = 0;
@@ -2057,6 +2165,7 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     io.write(&magic,   sizeof(magic));
     io.write(&version, sizeof(version));
     io.write(&mode,    sizeof(mode));
+    io.write(&state_identity_hash, sizeof(state_identity_hash));
 
     kv_raw->state_write(io, seq_id, flags);
 
@@ -2085,6 +2194,7 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     uint32_t magic;
     uint32_t version;
     uint32_t mode = DSV4_STATE_MODE_FULL;
+    uint64_t identity;
 
     io.read(&magic,   sizeof(magic));
     io.read(&version, sizeof(version));
@@ -2106,13 +2216,24 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         throw std::runtime_error("DSV4 state flags mismatch");
     }
 
+    io.read(&identity, sizeof(identity));
+    if (identity != state_identity_hash) {
+        throw std::runtime_error("DSV4 state model/cache geometry identity mismatch");
+    }
+
+    if (!partial_only) {
+        if (seq_id >= 0) {
+            if (!seq_rm(seq_id, -1, -1)) {
+                throw std::runtime_error("failed to clear DSV4 restore destination");
+            }
+        } else {
+            clear(true);
+        }
+    }
+
     kv_raw->state_read(io, seq_id, flags);
 
     if (!partial_only) {
-        kv_csa->clear(true);
-        kv_hca->clear(true);
-        kv_lid->clear(true);
-
         dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);

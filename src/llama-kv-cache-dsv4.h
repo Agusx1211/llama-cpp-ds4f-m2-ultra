@@ -103,7 +103,7 @@ public:
         const llama_memory_i::layer_filter_cb & filter);
 
     void clear(llama_seq_id seq_id, bool data);
-    void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
+    void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, uint32_t src_depth = 0);
     void apply_copies(const stream_copy_info & sc_info) const;
 
     uint32_t get_ratio()      const;
@@ -111,6 +111,7 @@ public:
     uint32_t get_n_stream()   const;
     uint32_t get_n_rs_seq()   const;
     uint32_t get_n_rows()     const;
+    uint64_t state_identity() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -250,6 +251,8 @@ private:
     std::unique_ptr<llama_dsv4_comp_state> csa_state;
     std::unique_ptr<llama_dsv4_comp_state> hca_state;
     std::unique_ptr<llama_dsv4_comp_state> lid_state;
+
+    uint64_t state_identity_hash = 0;
 
     void clear_compressed(llama_seq_id seq_id, bool data);
 };

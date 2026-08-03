@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -300,6 +301,7 @@ struct test_context_config {
     uint32_t n_batch     = 0;
     uint32_t n_ubatch    = 64;
     uint32_t n_seq_max   = 1;
+    uint32_t n_rs_seq    = 0;
     bool     kv_unified  = false;
     bool     load_mtp    = false;
     enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
@@ -327,6 +329,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         ctx_params.n_batch = config.n_batch;
     }
     ctx_params.n_seq_max = config.n_seq_max;
+    ctx_params.n_rs_seq = config.n_rs_seq;
     ctx_params.kv_unified = config.kv_unified;
     ctx_params.ctx_type = config.ctx_type;
     ctx_params.cb_eval = config.cb_eval;
@@ -643,7 +646,8 @@ struct dsv4_test_context {
             uint32_t n_ctx_total = 0,
             uint32_t n_ubatch = 0,
             ggml_backend_sched_eval_callback cb_eval = nullptr,
-            void * cb_eval_user_data = nullptr) {
+            void * cb_eval_user_data = nullptr,
+            uint32_t n_rs_seq = 0) {
         test_context_config config;
         config.n_ctx = n_ctx_total > 0 ? n_ctx_total : 256*n_seq_max;
         config.n_batch = batch_capacity;
@@ -652,6 +656,7 @@ struct dsv4_test_context {
         config.n_ubatch = n_ubatch > 0 ? n_ubatch : batch_capacity;
         config.cb_eval = cb_eval;
         config.cb_eval_user_data = cb_eval_user_data;
+        config.n_rs_seq = n_rs_seq;
 
         gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_DEEPSEEK4, true);
         auto loaded = get_model_and_ctx(
@@ -708,6 +713,62 @@ static std::vector<uint8_t> dsv4_sequence_state(llama_context * lctx, llama_seq_
     const size_t written = llama_state_seq_get_data(lctx, result.data(), result.size(), seq_id);
     if (written != result.size()) {
         throw std::runtime_error("failed to capture DSV4 sequence state");
+    }
+    return result;
+}
+
+static std::vector<uint8_t> dsv4_sequence_state_ext(
+        llama_context * lctx,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) {
+    std::vector<uint8_t> result(llama_state_seq_get_size_ext(lctx, seq_id, flags));
+    const size_t written = llama_state_seq_get_data_ext(
+            lctx, result.data(), result.size(), seq_id, flags);
+    if (written != result.size()) {
+        throw std::runtime_error("failed to capture extended DSV4 sequence state");
+    }
+    return result;
+}
+
+static std::vector<float> dsv4_logits_ith(dsv4_test_context & test, int32_t output_idx) {
+    std::vector<float> result;
+    result.reserve(test.n_vocab);
+    test.append_logits(output_idx, result);
+    return result;
+}
+
+static void dsv4_decode_sequence(
+        dsv4_test_context & test,
+        const std::vector<llama_token> & tokens,
+        llama_seq_id seq_id,
+        const char * label) {
+    for (uint32_t pos = 0; pos < tokens.size(); ++pos) {
+        test.add(tokens[pos], pos, { seq_id });
+    }
+    test.decode(label);
+    test.clear_batch();
+}
+
+static void dsv4_assert_survivors_exact(
+        dsv4_test_context & test,
+        const std::array<llama_seq_id, 3> & seq_ids,
+        const std::array<std::vector<uint8_t>, 3> & states,
+        const std::array<llama_pos, 3> & positions,
+        const std::array<std::vector<float>, 2> & logits) {
+    auto * memory = llama_get_memory(test.lctx.get());
+    for (size_t i = 0; i < seq_ids.size(); ++i) {
+        GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), seq_ids[i]) == states[i]);
+        GGML_ASSERT(llama_memory_seq_pos_max(memory, seq_ids[i]) == positions[i]);
+    }
+    GGML_ASSERT(dsv4_logits_ith(test, 0) == logits[0]);
+    GGML_ASSERT(dsv4_logits_ith(test, 1) == logits[1]);
+}
+
+static std::array<std::vector<uint64_t>, LLAMA_DSV4_MEMORY_FAMILY_COUNT>
+dsv4_page_rows(const llama_dsv4_memory_usage_snapshot & usage) {
+    std::array<std::vector<uint64_t>, LLAMA_DSV4_MEMORY_FAMILY_COUNT> result;
+    for (size_t family = 0; family < result.size(); ++family) {
+        result[family] = usage.families[family].sequence_mapped_rows;
     }
     return result;
 }
@@ -1141,6 +1202,268 @@ static bool test_dsv4_elastic_borrow(size_t seed, ggml_backend_dev_t dev) {
     return compare_dsv4_trace("elastic-borrow", "A", isolated, elastic);
 }
 
+static bool test_dsv4_restore_boundaries(size_t seed, ggml_backend_dev_t dev) {
+    static constexpr std::array<uint32_t, 8> boundaries = {
+        3, 4, 127, 128, 129, 255, 256, 260,
+    };
+    static constexpr uint32_t n_vocab = 128;
+    static constexpr uint32_t n_ctx_seq = 512;
+
+    struct checkpoint {
+        uint32_t n_tokens;
+        std::vector<uint8_t> state;
+        std::vector<float> next_logits;
+    };
+
+    dsv4_test_context test(seed, dev, 3, false, 256, 1, 3*n_ctx_seq, 1);
+    const auto tokens = get_tokens(boundaries.back() + 1, n_vocab, seed + 30);
+    std::vector<checkpoint> checkpoints;
+    checkpoints.reserve(boundaries.size());
+
+    for (uint32_t pos = 0; pos < tokens.size(); ++pos) {
+        test.add(tokens[pos], pos, { 0 });
+        test.decode("restore-boundary source");
+        test.clear_batch();
+
+        for (checkpoint & saved : checkpoints) {
+            if (saved.n_tokens == pos && saved.next_logits.empty()) {
+                saved.next_logits = dsv4_logits_ith(test, 0);
+            }
+        }
+        if (std::find(boundaries.begin(), boundaries.end(), pos + 1) != boundaries.end()) {
+            checkpoints.push_back({ pos + 1, dsv4_sequence_state(test.lctx.get(), 0), {} });
+        }
+    }
+
+    GGML_ASSERT(checkpoints.size() == boundaries.size());
+    bool all_ok = true;
+    for (const checkpoint & saved : checkpoints) {
+        GGML_ASSERT(!saved.next_logits.empty());
+        const size_t restored = llama_state_seq_set_data(
+                test.lctx.get(), saved.state.data(), saved.state.size(), 2);
+        GGML_ASSERT(restored == saved.state.size());
+        GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 2) ==
+                (llama_pos) saved.n_tokens - 1);
+
+        test.add(tokens[saved.n_tokens], saved.n_tokens, { 2 });
+        test.decode("restore-boundary destination");
+        const std::string label = "restore-" + std::to_string(saved.n_tokens);
+        all_ok = compare_dsv4_trace(
+                label.c_str(), "next", saved.next_logits, dsv4_logits_ith(test, 0)) && all_ok;
+        test.clear_batch();
+    }
+
+    printf("DSV4 transactional restore boundaries (%s): %s\n",
+            ggml_backend_dev_description(dev), all_ok ? "OK" : "FAIL");
+    return all_ok;
+}
+
+static bool test_dsv4_transactional_restore(size_t seed, ggml_backend_dev_t dev) {
+    static constexpr uint32_t n_vocab = 128;
+    static constexpr llama_seq_id source_seq = 0;
+    static constexpr llama_seq_id survivor_a = 1;
+    static constexpr llama_seq_id survivor_b = 2;
+    static constexpr llama_seq_id survivor_c = 3;
+    static constexpr llama_seq_id dest_seq = 4;
+    static constexpr size_t outer_header_size = sizeof(uint32_t) + sizeof(llama_seq_id);
+    static constexpr size_t dsv4_identity_offset = outer_header_size + 3*sizeof(uint32_t);
+
+    const bool elastic = dsv4_test_has_elastic_pages(dev, 6);
+    dsv4_test_context test(
+            seed, dev, 6, elastic, 256, 1, 6*512, 256, nullptr, nullptr, 2);
+    auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(test.lctx.get()));
+    GGML_ASSERT(memory != nullptr);
+    GGML_ASSERT(memory->get_n_rs_seq() == 2);
+
+    const auto source_tokens = get_tokens(130, n_vocab, seed + 40);
+    const auto survivor_tokens_a = get_tokens(19, n_vocab, seed + 41);
+    const auto survivor_tokens_b = get_tokens(19, n_vocab, seed + 42);
+    const auto survivor_tokens_c = get_tokens(17, n_vocab, seed + 43);
+    const auto old_dest_tokens = get_tokens(14, n_vocab, seed + 44);
+
+    dsv4_decode_sequence(test, source_tokens, source_seq, "transaction source");
+    dsv4_decode_sequence(test,
+            std::vector<llama_token>(survivor_tokens_a.begin(), survivor_tokens_a.begin() + 17),
+            survivor_a, "transaction survivor A prefix");
+
+    const auto usage_before_alias = memory->memory_usage_snapshot();
+    llama_memory_seq_cp(memory, survivor_a, survivor_b, -1, -1);
+    test.add(survivor_tokens_a[17], 17, { survivor_a });
+    test.add(survivor_tokens_b[17], 17, { survivor_b });
+    test.decode("transaction alias COW divergence");
+    test.clear_batch();
+    const auto usage_after_alias = memory->memory_usage_snapshot();
+    if (elastic) {
+        // Depending on synthetic tensor page alignment the backend may use an
+        // exact blit instead of a page alias. In either case the copied
+        // sequences are independently writable; the distinct logits and exact
+        // survivor snapshots below are the semantic COW/divergence oracle.
+        GGML_ASSERT(usage_after_alias.sparse_total.cow_allocations >=
+                usage_before_alias.sparse_total.cow_allocations);
+    }
+
+    dsv4_decode_sequence(test, survivor_tokens_c, survivor_c, "transaction survivor C");
+    dsv4_decode_sequence(test, old_dest_tokens, dest_seq, "transaction old destination");
+
+    // Keep survivor logits live so every failed restore also proves that the
+    // context's current output view remains untouched.
+    test.add(survivor_tokens_a[18], 18, { survivor_a });
+    test.add(survivor_tokens_b[18], 18, { survivor_b });
+    test.decode("transaction survivor logits");
+    test.clear_batch();
+    const std::array<std::vector<float>, 2> survivor_logits = {
+        dsv4_logits_ith(test, 0), dsv4_logits_ith(test, 1),
+    };
+    GGML_ASSERT(survivor_logits[0] != survivor_logits[1]);
+
+    // Select rollback plane one for all compressor families. Full and partial
+    // snapshots must serialize that active plane and restore it into plane 0.
+    GGML_ASSERT(llama_memory_seq_rm(memory, source_seq, 129, -1));
+    GGML_ASSERT(memory->get_rs_idx()[source_seq] == 1);
+    const auto source_full = dsv4_sequence_state_ext(
+            test.lctx.get(), source_seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const auto source_partial = dsv4_sequence_state_ext(
+            test.lctx.get(), source_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    auto source_device = dsv4_sequence_state_ext(
+            test.lctx.get(), source_seq, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+
+    const std::array<llama_seq_id, 3> survivor_ids = {
+        survivor_a, survivor_b, survivor_c,
+    };
+    const std::array<std::vector<uint8_t>, 3> survivor_states = {
+        dsv4_sequence_state(test.lctx.get(), survivor_a),
+        dsv4_sequence_state(test.lctx.get(), survivor_b),
+        dsv4_sequence_state(test.lctx.get(), survivor_c),
+    };
+    const std::array<llama_pos, 3> survivor_positions = {
+        llama_memory_seq_pos_max(memory, survivor_a),
+        llama_memory_seq_pos_max(memory, survivor_b),
+        llama_memory_seq_pos_max(memory, survivor_c),
+    };
+    const auto survivor_page_rows = dsv4_page_rows(memory->memory_usage_snapshot());
+
+    const auto assert_survivor_pages = [&]() {
+        const auto current = dsv4_page_rows(memory->memory_usage_snapshot());
+        for (size_t family = 0; family < current.size(); ++family) {
+            for (llama_seq_id seq_id : survivor_ids) {
+                GGML_ASSERT(current[family][seq_id] == survivor_page_rows[family][seq_id]);
+            }
+        }
+    };
+    const auto assert_failed_restore = [&](const std::vector<uint8_t> & state, llama_state_seq_flags flags) {
+        const auto old_destination = dsv4_sequence_state(test.lctx.get(), dest_seq);
+        const llama_pos old_position = llama_memory_seq_pos_max(memory, dest_seq);
+        GGML_ASSERT(llama_state_seq_set_data_ext(
+                test.lctx.get(), state.data(), state.size(), dest_seq, flags) == 0);
+        GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), dest_seq) == old_destination);
+        GGML_ASSERT(llama_memory_seq_pos_max(memory, dest_seq) == old_position);
+        dsv4_assert_survivors_exact(
+                test, survivor_ids, survivor_states, survivor_positions, survivor_logits);
+        assert_survivor_pages();
+    };
+
+    auto corrupt = source_full;
+    corrupt[outer_header_size] ^= 0x80;
+    assert_failed_restore(corrupt, LLAMA_STATE_SEQ_FLAGS_NONE);
+
+    auto wrong_identity = source_full;
+    wrong_identity[dsv4_identity_offset] ^= 0x01;
+    assert_failed_restore(wrong_identity, LLAMA_STATE_SEQ_FLAGS_NONE);
+
+    auto truncated = source_full;
+    truncated.pop_back();
+    assert_failed_restore(truncated, LLAMA_STATE_SEQ_FLAGS_NONE);
+
+    auto trailing = source_full;
+    trailing.push_back(0);
+    assert_failed_restore(trailing, LLAMA_STATE_SEQ_FLAGS_NONE);
+
+    assert_failed_restore(source_full, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    assert_failed_restore(source_partial, LLAMA_STATE_SEQ_FLAGS_NONE);
+
+    source_device[dsv4_identity_offset] ^= 0x40;
+    assert_failed_restore(source_device, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+
+    // Re-capture the on-device buffer after deliberately invalidating only its
+    // scalar copy, then prove a full device restore over an occupied ID.
+    source_device = dsv4_sequence_state_ext(
+            test.lctx.get(), source_seq, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+    GGML_ASSERT(llama_state_seq_set_data_ext(
+            test.lctx.get(), source_device.data(), source_device.size(),
+            dest_seq, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == source_device.size());
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, dest_seq) ==
+            llama_memory_seq_pos_max(memory, source_seq));
+    dsv4_assert_survivors_exact(
+            test, survivor_ids, survivor_states, survivor_positions, survivor_logits);
+    assert_survivor_pages();
+
+    // Host restore over the same occupied ID exercises the staging path and
+    // proves the selected rollback plane round-trips byte-for-byte.
+    GGML_ASSERT(llama_state_seq_set_data(
+            test.lctx.get(), source_full.data(), source_full.size(), source_seq) == source_full.size());
+    GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), source_seq) == source_full);
+    GGML_ASSERT(memory->get_rs_idx()[source_seq] == 0);
+
+    GGML_ASSERT(llama_state_seq_set_data_ext(
+            test.lctx.get(), source_partial.data(), source_partial.size(),
+            source_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == source_partial.size());
+    GGML_ASSERT(dsv4_sequence_state_ext(
+            test.lctx.get(), source_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == source_partial);
+    dsv4_assert_survivors_exact(
+            test, survivor_ids, survivor_states, survivor_positions, survivor_logits);
+    assert_survivor_pages();
+
+    // Mutate and restore the different destination through the host path too.
+    test.add(source_tokens[129], 129, { dest_seq });
+    test.decode("transaction mutate destination");
+    test.clear_batch();
+    GGML_ASSERT(llama_state_seq_set_data(
+            test.lctx.get(), source_full.data(), source_full.size(), dest_seq) == source_full.size());
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, dest_seq) == 128);
+
+    // The file API is deliberately a bounded wrapper around the same oracle.
+    const auto file_path = std::filesystem::temp_directory_path() /
+            ("llama-dsv4-phase2-" + std::to_string(seed) + "-" +
+             std::to_string((uintptr_t) dev) + ".bin");
+    const std::array<llama_token, 4> file_tokens = { 1, 2, 3, 4 };
+    const size_t file_size = llama_state_seq_save_file(
+            test.lctx.get(), file_path.string().c_str(), source_seq,
+            file_tokens.data(), file_tokens.size());
+    GGML_ASSERT(file_size > 0);
+
+    const auto old_destination = dsv4_sequence_state(test.lctx.get(), dest_seq);
+    std::filesystem::resize_file(file_path, file_size - 1);
+    std::array<llama_token, 4> loaded_tokens = { -1, -1, -1, -1 };
+    size_t loaded_count = SIZE_MAX;
+    GGML_ASSERT(llama_state_seq_load_file(
+            test.lctx.get(), file_path.string().c_str(), dest_seq,
+            loaded_tokens.data(), loaded_tokens.size(), &loaded_count) == 0);
+    GGML_ASSERT(loaded_count == SIZE_MAX);
+    GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), dest_seq) == old_destination);
+
+    GGML_ASSERT(llama_state_seq_save_file(
+            test.lctx.get(), file_path.string().c_str(), source_seq,
+            file_tokens.data(), file_tokens.size()) > 0);
+    GGML_ASSERT(llama_state_seq_load_file(
+            test.lctx.get(), file_path.string().c_str(), dest_seq,
+            loaded_tokens.data(), loaded_tokens.size(), &loaded_count) > 0);
+    GGML_ASSERT(loaded_count == file_tokens.size());
+    GGML_ASSERT(loaded_tokens == file_tokens);
+    std::filesystem::remove(file_path);
+
+    // A genuinely different cache geometry must reject the snapshot before
+    // changing its empty destination.
+    dsv4_test_context wrong_geometry(
+            seed, dev, 5, false, 256, 1, 5*512, 1, nullptr, nullptr, 2);
+    GGML_ASSERT(llama_state_seq_set_data(
+            wrong_geometry.lctx.get(), source_full.data(), source_full.size(), 0) == 0);
+    GGML_ASSERT(llama_memory_seq_pos_max(
+            llama_get_memory(wrong_geometry.lctx.get()), 0) == -1);
+
+    printf("DSV4 transactional restore matrix (%s): OK\n", ggml_backend_dev_description(dev));
+    return true;
+}
+
 static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     static constexpr uint32_t n_vocab = 128;
     static constexpr uint32_t n_prompt = 128;
@@ -1168,6 +1491,8 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     };
 
     bool all_ok = true;
+    all_ok = test_dsv4_restore_boundaries(seed, dev) && all_ok;
+    all_ok = test_dsv4_transactional_restore(seed, dev) && all_ok;
     all_ok = test_dsv4_elastic_borrow(seed, dev) && all_ok;
     all_ok = test_dsv4_physical_pressure(seed, dev) && all_ok;
     for (const parallel_case & test_case : cases) {
@@ -1259,6 +1584,17 @@ static int test_dsv4_parallel(size_t seed) {
         all_ok = test_dsv4_parallel_device(seed, dev) && all_ok;
     }
 
+    return all_ok ? 0 : 1;
+}
+
+static int test_dsv4_restore(size_t seed) {
+    bool all_ok = true;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        printf("DSV4 transactional restore on %s\n", ggml_backend_dev_description(dev));
+        all_ok = test_dsv4_restore_boundaries(seed, dev) && all_ok;
+        all_ok = test_dsv4_transactional_restore(seed, dev) && all_ok;
+    }
     return all_ok ? 0 : 1;
 }
 
@@ -1593,6 +1929,7 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    bool dsv4_restore_only = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -1628,12 +1965,19 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        if (strcmp(argv[i], "--dsv4-restore-only") == 0) {
+            dsv4_restore_only = true;
+            continue;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
+        }
+        if (dsv4_restore_only) {
+            return test_dsv4_restore(seed);
         }
         const int backends_result = test_backends(arch, seed, log_level);
         if (backends_result != 0) {
