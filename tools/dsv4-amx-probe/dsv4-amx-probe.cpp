@@ -32,12 +32,14 @@ constexpr int64_t DSV4_EMBD         = 4096;
 constexpr int64_t DSV4_FF           = 2048;
 constexpr int64_t DSV4_EXPERTS      = 256;
 constexpr int64_t DSV4_EXPERTS_USED = 6;
+constexpr float   DSV4_CLAMP_LIMIT  = 10.0f;
 
 struct options {
-    int64_t     tokens = 2048;
-    int         warmup = 2;
-    int         runs   = 4;
-    std::string mode   = "all";
+    int64_t     tokens      = 2048;
+    int         warmup      = 2;
+    int         runs        = 4;
+    float       clamp_limit = DSV4_CLAMP_LIMIT;
+    std::string mode        = "all";
 };
 
 struct output_stats {
@@ -144,7 +146,7 @@ static bool env_truthy(const char * name) {
 static void usage(const char * argv0) {
     std::fprintf(stderr,
                  "usage: %s [--tokens 128|256|512|1024|2048] [--warmup N] [--runs N] "
-                 "[--mode all|candidate|sequential]\n"
+                 "[--clamp-limit F] [--mode all|candidate|sequential]\n"
                  "       LLAMA_DSV4_AMX_COEXEC_DISABLE=1 forces the sequential all-Metal control.\n",
                  argv0);
 }
@@ -177,6 +179,12 @@ static bool parse_options(int argc, char ** argv, options & opts) {
                 return false;
             }
             opts.runs = std::atoi(value);
+        } else if (std::strcmp(argv[i], "--clamp-limit") == 0) {
+            const char * value = next("--clamp-limit");
+            if (value == nullptr) {
+                return false;
+            }
+            opts.clamp_limit = std::strtof(value, nullptr);
         } else if (std::strcmp(argv[i], "--mode") == 0) {
             const char * value = next("--mode");
             if (value == nullptr) {
@@ -192,12 +200,13 @@ static bool parse_options(int argc, char ** argv, options & opts) {
     const std::vector<int64_t> valid_tokens = { 128, 256, 512, 1024, 2048 };
     const bool tokens_ok = std::find(valid_tokens.begin(), valid_tokens.end(), opts.tokens) != valid_tokens.end();
     const bool mode_ok   = opts.mode == "all" || opts.mode == "candidate" || opts.mode == "sequential";
-    return tokens_ok && mode_ok && opts.warmup >= 0 && opts.runs > 0;
+    return tokens_ok && mode_ok && opts.warmup >= 0 && opts.runs > 0 && std::isfinite(opts.clamp_limit) &&
+           opts.clamp_limit >= 0.0f;
 }
 
 class cpu_shared_ffn {
   public:
-    explicit cpu_shared_ffn(int64_t tokens) : tokens_(tokens) {
+    cpu_shared_ffn(int64_t tokens, float clamp_limit) : tokens_(tokens), clamp_limit_(clamp_limit) {
         const size_t gate_elements = DSV4_EMBD * DSV4_FF;
         const size_t down_elements = DSV4_FF * DSV4_EMBD;
 
@@ -239,8 +248,11 @@ class cpu_shared_ffn {
                     static_cast<int>(DSV4_EMBD), 0.0f, up_.data(), static_cast<int>(DSV4_FF));
 
         for (size_t i = 0; i < hidden_.size(); ++i) {
-            const float gate = gate_[i];
-            hidden_[i]       = (gate / (1.0f + std::exp(-gate))) * up_[i];
+            if (clamp_limit_ > 1e-6f) {
+                gate_[i] = std::min(gate_[i], clamp_limit_);
+                up_[i]   = std::clamp(up_[i], -clamp_limit_, clamp_limit_);
+            }
+            hidden_[i] = (gate_[i] / (1.0f + std::exp(-gate_[i]))) * up_[i];
         }
 
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, static_cast<int>(tokens_), static_cast<int>(DSV4_EMBD),
@@ -288,6 +300,7 @@ class cpu_shared_ffn {
     }
 
     int64_t                  tokens_;
+    float                    clamp_limit_;
     std::vector<ggml_bf16_t> gate_bf16_;
     std::vector<ggml_bf16_t> up_bf16_;
     std::vector<ggml_bf16_t> down_bf16_;
@@ -305,7 +318,7 @@ class cpu_shared_ffn {
 
 class metal_graphs {
   public:
-    metal_graphs(ggml_backend_t backend, const cpu_shared_ffn & cpu, int64_t tokens) :
+    metal_graphs(ggml_backend_t backend, const cpu_shared_ffn & cpu, int64_t tokens, float clamp_limit) :
         backend_(backend),
         tokens_(tokens) {
         constexpr size_t       graph_nodes   = 256;
@@ -325,19 +338,28 @@ class metal_graphs {
             throw std::runtime_error("failed to create ggml contexts");
         }
 
+        route_gate_  = ggml_new_tensor_3d(weights_.get(), GGML_TYPE_MXFP4, DSV4_EMBD, DSV4_FF, DSV4_EXPERTS);
+        route_up_    = ggml_new_tensor_3d(weights_.get(), GGML_TYPE_MXFP4, DSV4_EMBD, DSV4_FF, DSV4_EXPERTS);
         route_down_  = ggml_new_tensor_3d(weights_.get(), GGML_TYPE_MXFP4, DSV4_FF, DSV4_EMBD, DSV4_EXPERTS);
         shared_gate_ = ggml_new_tensor_2d(weights_.get(), GGML_TYPE_BF16, DSV4_EMBD, DSV4_FF);
         shared_up_   = ggml_new_tensor_2d(weights_.get(), GGML_TYPE_BF16, DSV4_EMBD, DSV4_FF);
         shared_down_ = ggml_new_tensor_2d(weights_.get(), GGML_TYPE_BF16, DSV4_FF, DSV4_EMBD);
 
-        route_input_   = ggml_new_tensor_3d(compute_.get(), GGML_TYPE_F32, DSV4_FF, DSV4_EXPERTS_USED, tokens_);
+        route_input_   = ggml_new_tensor_3d(compute_.get(), GGML_TYPE_F32, DSV4_EMBD, 1, tokens_);
         ids_base_      = ggml_new_tensor_2d(compute_.get(), GGML_TYPE_I32, DSV4_EXPERTS, tokens_);
         ids_           = ggml_view_2d(compute_.get(), ids_base_, DSV4_EXPERTS_USED, tokens_, ids_base_->nb[1], 0);
         route_weights_ = ggml_new_tensor_3d(compute_.get(), GGML_TYPE_F32, 1, DSV4_EXPERTS_USED, tokens_);
         shared_input_  = ggml_new_tensor_2d(compute_.get(), GGML_TYPE_F32, DSV4_EMBD, tokens_);
 
-        ggml_tensor * routed = ggml_mul_mat_id(compute_.get(), route_down_, route_input_, ids_);
-        routed               = ggml_mul(compute_.get(), routed, route_weights_);
+        routed_up_out_   = ggml_mul_mat_id(compute_.get(), route_up_, route_input_, ids_);
+        routed_gate_out_ = ggml_mul_mat_id(compute_.get(), route_gate_, route_input_, ids_);
+        if (clamp_limit > 1e-6f) {
+            routed_up_out_   = ggml_clamp(compute_.get(), routed_up_out_, -clamp_limit, clamp_limit);
+            routed_gate_out_ = ggml_clamp(compute_.get(), routed_gate_out_, -INFINITY, clamp_limit);
+        }
+        routed_hidden_out_   = ggml_swiglu_split(compute_.get(), routed_gate_out_, routed_up_out_);
+        routed_down_out_     = ggml_mul_mat_id(compute_.get(), route_down_, routed_hidden_out_, ids_);
+        ggml_tensor * routed = ggml_mul(compute_.get(), routed_down_out_, route_weights_);
         ggml_tensor * routed_lanes[DSV4_EXPERTS_USED];
         for (int64_t i = 0; i < DSV4_EXPERTS_USED; ++i) {
             routed_lanes[i] =
@@ -348,8 +370,12 @@ class metal_graphs {
             routed_out_ = ggml_add(compute_.get(), routed_out_, routed_lanes[i]);
         }
 
-        shared_gate_out_   = ggml_mul_mat(compute_.get(), shared_gate_, shared_input_);
-        shared_up_out_     = ggml_mul_mat(compute_.get(), shared_up_, shared_input_);
+        shared_gate_out_ = ggml_mul_mat(compute_.get(), shared_gate_, shared_input_);
+        shared_up_out_   = ggml_mul_mat(compute_.get(), shared_up_, shared_input_);
+        if (clamp_limit > 1e-6f) {
+            shared_up_out_   = ggml_clamp(compute_.get(), shared_up_out_, -clamp_limit, clamp_limit);
+            shared_gate_out_ = ggml_clamp(compute_.get(), shared_gate_out_, -INFINITY, clamp_limit);
+        }
         shared_hidden_out_ = ggml_swiglu_split(compute_.get(), shared_gate_out_, shared_up_out_);
         shared_out_        = ggml_mul_mat(compute_.get(), shared_down_, shared_hidden_out_);
         all_out_           = ggml_add(compute_.get(), routed_out_, shared_out_);
@@ -399,7 +425,19 @@ class metal_graphs {
 
     std::vector<float> get_routed_output() const { return get_tensor(routed_out_); }
 
-    size_t routed_weight_bytes() const { return ggml_nbytes(route_down_); }
+    std::vector<float> get_routed_gate() const { return get_tensor(routed_gate_out_); }
+
+    std::vector<float> get_routed_up() const { return get_tensor(routed_up_out_); }
+
+    std::vector<float> get_routed_hidden() const { return get_tensor(routed_hidden_out_); }
+
+    std::vector<float> get_routed_down() const { return get_tensor(routed_down_out_); }
+
+    std::vector<float> get_all_output() const { return get_tensor(all_out_); }
+
+    size_t routed_weight_bytes() const {
+        return ggml_nbytes(route_gate_) + ggml_nbytes(route_up_) + ggml_nbytes(route_down_);
+    }
 
   private:
     static std::vector<float> get_tensor(const ggml_tensor * tensor) {
@@ -408,11 +446,11 @@ class metal_graphs {
         return result;
     }
 
-    static void initialize_mxfp4(ggml_tensor * tensor) {
+    static void initialize_mxfp4(ggml_tensor * tensor, uint32_t seed) {
         constexpr int64_t block_elements = 32;
         float             source[block_elements];
         for (int64_t i = 0; i < block_elements; ++i) {
-            source[i] = deterministic_value(i, 0x7101U, 0.0625f);
+            source[i] = deterministic_value(i, seed, 0.0625f);
         }
 
         const size_t         block_bytes = ggml_row_size(GGML_TYPE_MXFP4, block_elements);
@@ -439,16 +477,14 @@ class metal_graphs {
     }
 
     void initialize(const cpu_shared_ffn & cpu) {
-        initialize_mxfp4(route_down_);
+        initialize_mxfp4(route_gate_, 0x7101U);
+        initialize_mxfp4(route_up_, 0x7102U);
+        initialize_mxfp4(route_down_, 0x7103U);
         ggml_backend_tensor_set(shared_gate_, cpu.gate_bf16().data(), 0, ggml_nbytes(shared_gate_));
         ggml_backend_tensor_set(shared_up_, cpu.up_bf16().data(), 0, ggml_nbytes(shared_up_));
         ggml_backend_tensor_set(shared_down_, cpu.down_bf16().data(), 0, ggml_nbytes(shared_down_));
 
-        std::vector<float> route_input(ggml_nelements(route_input_));
-        for (size_t i = 0; i < route_input.size(); ++i) {
-            route_input[i] = deterministic_value(i, 0x6111U, 0.125f);
-        }
-        ggml_backend_tensor_set(route_input_, route_input.data(), 0, ggml_nbytes(route_input_));
+        ggml_backend_tensor_set(route_input_, cpu.input().data(), 0, ggml_nbytes(route_input_));
 
         std::vector<int32_t> ids(ggml_nelements(ids_base_), 0);
         for (int64_t token = 0; token < tokens_; ++token) {
@@ -488,6 +524,8 @@ class metal_graphs {
     ggml_context_ptr        compute_;
     ggml_backend_buffer_ptr weights_buffer_;
     ggml_backend_buffer_ptr compute_buffer_;
+    ggml_tensor *           route_gate_        = nullptr;
+    ggml_tensor *           route_up_          = nullptr;
     ggml_tensor *           route_down_        = nullptr;
     ggml_tensor *           shared_gate_       = nullptr;
     ggml_tensor *           shared_up_         = nullptr;
@@ -497,6 +535,10 @@ class metal_graphs {
     ggml_tensor *           ids_               = nullptr;
     ggml_tensor *           route_weights_     = nullptr;
     ggml_tensor *           shared_input_      = nullptr;
+    ggml_tensor *           routed_gate_out_   = nullptr;
+    ggml_tensor *           routed_up_out_     = nullptr;
+    ggml_tensor *           routed_hidden_out_ = nullptr;
+    ggml_tensor *           routed_down_out_   = nullptr;
     ggml_tensor *           routed_out_        = nullptr;
     ggml_tensor *           shared_gate_out_   = nullptr;
     ggml_tensor *           shared_up_out_     = nullptr;
@@ -579,22 +621,23 @@ int main(int argc, char ** argv) try {
         return 2;
     }
 
-    cpu_shared_ffn cpu(opts.tokens);
-    metal_graphs   metal(metal_backend.get(), cpu, opts.tokens);
+    cpu_shared_ffn cpu(opts.tokens, opts.clamp_limit);
+    metal_graphs   metal(metal_backend.get(), cpu, opts.tokens, opts.clamp_limit);
 
-    std::printf("probe\tcommit=%s\tdevice=%s\ttokens=%lld\twarmup=%d\truns=%d\tmode=%s\tdisabled=%d\n", ggml_commit(),
-                ggml_backend_dev_description(metal_device), static_cast<long long>(opts.tokens), opts.warmup, opts.runs,
-                opts.mode.c_str(), disabled ? 1 : 0);
+    std::printf(
+        "probe\tcommit=%s\tdevice=%s\ttokens=%lld\twarmup=%d\truns=%d\tclamp_limit=%.9g\tmode=%s\tdisabled=%d\n",
+        ggml_commit(), ggml_backend_dev_description(metal_device), static_cast<long long>(opts.tokens), opts.warmup,
+        opts.runs, opts.clamp_limit, opts.mode.c_str(), disabled ? 1 : 0);
     std::printf(
         "shape\tcpu_shared=BF16_source_to_F32_pack:weights[4096,2048]+[4096,2048]+[2048,4096],input[4096,%lld]"
         "\tmetal_shared=BF16:weights[4096,2048]+[4096,2048]+[2048,4096],input[4096,%lld]"
-        "\tmetal_routed=MXFP4:weight[2048,4096,256],input[2048,6,%lld],ids[6,%lld]"
-        "\trouted_scope=down_projection_only\n",
+        "\tmetal_routed=MXFP4:weights[4096,2048,256]+[4096,2048,256]+[2048,4096,256],"
+        "input[4096,1,%lld],ids[6,%lld]\trouted_scope=complete_ffn\n",
         static_cast<long long>(opts.tokens), static_cast<long long>(opts.tokens), static_cast<long long>(opts.tokens),
         static_cast<long long>(opts.tokens));
     std::printf(
-        "amx_path\tapi=Accelerate_cblas_sgemm\tsteady_state_calls=3"
-        "\thardware_confirmation=profile_Apple_AMX_counters_or_disassembly\n");
+        "cpu_path\tprovider=Accelerate\tapi=cblas_sgemm\tsteady_state_calls=3"
+        "\thardware_accelerator=unverified\tverification=profile_Apple_AMX_counters_or_disassembly\n");
     std::printf(
         "pack\tone_time_ms=%.6f\tbf16_source_bytes=%zu\tf32_pack_bytes=%zu\trss_delta_bytes=%llu"
         "\tsteady_state_excludes_pack=1\n",
@@ -614,32 +657,55 @@ int main(int argc, char ** argv) try {
     }
 
     cpu.run();
-    metal.time_shared_ms();
-    metal.time_route_ms();
+    metal.time_all_ms();
     const std::vector<float> metal_gate   = metal.get_shared_gate();
     const std::vector<float> metal_up     = metal.get_shared_up();
     const std::vector<float> metal_hidden = metal.get_shared_hidden();
     const std::vector<float> metal_shared = metal.get_shared_output();
     const std::vector<float> metal_routed = metal.get_routed_output();
-    const output_stats       cpu_stats    = summarize(cpu.output());
-    const output_stats       shared_stats = summarize(metal_shared);
-    const output_stats       routed_stats = summarize(metal_routed);
-    const error_stats        gate_error   = compare_outputs(cpu.gate(), metal_gate);
-    const error_stats        up_error     = compare_outputs(cpu.up(), metal_up);
-    const error_stats        hidden_error = compare_outputs(cpu.hidden(), metal_hidden);
-    const error_stats        shared_error = compare_outputs(cpu.output(), metal_shared);
+    const std::vector<float> metal_all    = metal.get_all_output();
+    std::vector<float>       expected_all(metal_all.size());
+    for (size_t i = 0; i < expected_all.size(); ++i) {
+        expected_all[i] = metal_shared[i] + metal_routed[i];
+    }
+    const output_stats cpu_stats           = summarize(cpu.output());
+    const output_stats shared_stats        = summarize(metal_shared);
+    const output_stats routed_stats        = summarize(metal_routed);
+    const output_stats all_stats           = summarize(metal_all);
+    const output_stats routed_gate_stats   = summarize(metal.get_routed_gate());
+    const output_stats routed_up_stats     = summarize(metal.get_routed_up());
+    const output_stats routed_hidden_stats = summarize(metal.get_routed_hidden());
+    const output_stats routed_down_stats   = summarize(metal.get_routed_down());
+    const error_stats  gate_error          = compare_outputs(cpu.gate(), metal_gate);
+    const error_stats  up_error            = compare_outputs(cpu.up(), metal_up);
+    const error_stats  hidden_error        = compare_outputs(cpu.hidden(), metal_hidden);
+    const error_stats  shared_error        = compare_outputs(cpu.output(), metal_shared);
+    const error_stats  all_error           = compare_outputs(expected_all, metal_all);
     std::printf(
-        "correctness\tcpu_finite=%d\tmetal_shared_finite=%d\tmetal_routed_finite=%d"
-        "\tcpu_checksum=%.9e\tmetal_shared_checksum=%.9e\tmetal_routed_checksum=%.9e"
-        "\tcpu_l2=%.9e\tmetal_shared_l2=%.9e\tmetal_routed_l2=%.9e"
+        "correctness\tcpu_finite=%d\tmetal_shared_finite=%d\tmetal_routed_finite=%d\tmetal_all_finite=%d"
+        "\tcpu_checksum=%.9e\tmetal_shared_checksum=%.9e\tmetal_routed_checksum=%.9e\tmetal_all_checksum=%.9e"
+        "\tcpu_l2=%.9e\tmetal_shared_l2=%.9e\tmetal_routed_l2=%.9e\tmetal_all_l2=%.9e"
+        "\trouted_gate_finite=%d\trouted_gate_checksum=%.9e\trouted_gate_l2=%.9e"
+        "\trouted_up_finite=%d\trouted_up_checksum=%.9e\trouted_up_l2=%.9e"
+        "\trouted_hidden_finite=%d\trouted_hidden_checksum=%.9e\trouted_hidden_l2=%.9e"
+        "\trouted_down_finite=%d\trouted_down_checksum=%.9e\trouted_down_l2=%.9e"
         "\tgate_nmse=%.9e\tgate_max_abs=%.9e\tup_nmse=%.9e\tup_max_abs=%.9e"
-        "\thidden_nmse=%.9e\thidden_max_abs=%.9e\tshared_nmse=%.9e\tshared_max_abs=%.9e\n",
-        cpu_stats.finite ? 1 : 0, shared_stats.finite ? 1 : 0, routed_stats.finite ? 1 : 0, cpu_stats.checksum,
-        shared_stats.checksum, routed_stats.checksum, cpu_stats.l2, shared_stats.l2, routed_stats.l2, gate_error.nmse,
+        "\thidden_nmse=%.9e\thidden_max_abs=%.9e\tshared_nmse=%.9e\tshared_max_abs=%.9e"
+        "\tall_add_nmse=%.9e\tall_add_max_abs=%.9e\n",
+        cpu_stats.finite ? 1 : 0, shared_stats.finite ? 1 : 0, routed_stats.finite ? 1 : 0, all_stats.finite ? 1 : 0,
+        cpu_stats.checksum, shared_stats.checksum, routed_stats.checksum, all_stats.checksum, cpu_stats.l2,
+        shared_stats.l2, routed_stats.l2, all_stats.l2, routed_gate_stats.finite ? 1 : 0, routed_gate_stats.checksum,
+        routed_gate_stats.l2, routed_up_stats.finite ? 1 : 0, routed_up_stats.checksum, routed_up_stats.l2,
+        routed_hidden_stats.finite ? 1 : 0, routed_hidden_stats.checksum, routed_hidden_stats.l2,
+        routed_down_stats.finite ? 1 : 0, routed_down_stats.checksum, routed_down_stats.l2, gate_error.nmse,
         gate_error.max_abs, up_error.nmse, up_error.max_abs, hidden_error.nmse, hidden_error.max_abs, shared_error.nmse,
-        shared_error.max_abs);
-    if (!cpu_stats.finite || !shared_stats.finite || !routed_stats.finite || gate_error.nmse > 1e-3 ||
-        up_error.nmse > 1e-3 || hidden_error.nmse > 1e-3 || shared_error.nmse > 1e-3) {
+        shared_error.max_abs, all_error.nmse, all_error.max_abs);
+    const bool routed_valid = routed_stats.finite && routed_stats.l2 > 0.0 && routed_gate_stats.finite &&
+                              routed_gate_stats.l2 > 0.0 && routed_up_stats.finite && routed_up_stats.l2 > 0.0 &&
+                              routed_hidden_stats.finite && routed_hidden_stats.l2 > 0.0 && routed_down_stats.finite &&
+                              routed_down_stats.l2 > 0.0;
+    if (!cpu_stats.finite || !shared_stats.finite || !all_stats.finite || !routed_valid || gate_error.nmse > 1e-3 ||
+        up_error.nmse > 1e-3 || hidden_error.nmse > 1e-3 || shared_error.nmse > 1e-3 || all_error.nmse > 1e-12) {
         std::fprintf(stderr, "correctness gate failed\n");
         return 1;
     }
@@ -716,7 +782,7 @@ int main(int argc, char ** argv) try {
         const double overlap_cpu   = median(values("cpu_metal_overlap", &raw_run::cpu_ms));
         const double overlap_metal = median(values("cpu_metal_overlap", &raw_run::metal_ms));
         const double cpu_flops     = 6.0 * DSV4_EMBD * DSV4_FF * opts.tokens;
-        const double route_flops   = 2.0 * DSV4_EMBD * DSV4_FF * DSV4_EXPERTS_USED * opts.tokens;
+        const double route_flops   = 6.0 * DSV4_EMBD * DSV4_FF * DSV4_EXPERTS_USED * opts.tokens;
         std::printf(
             "summary\tcpu_shared_solo_ms=%.6f\tmetal_shared_solo_ms=%.6f"
             "\tmetal_routed_solo_ms=%.6f\tsolo_cpu_plus_routed_ms=%.6f"
