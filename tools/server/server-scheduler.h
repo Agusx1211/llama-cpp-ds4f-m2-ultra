@@ -51,11 +51,12 @@ enum class reason_code : uint16_t {
     lane_hdrr_debt        = 301,
     lane_work_conserving  = 302,
 
-    request_fifo             = 400,
-    request_virtual_runtime  = 401,
-    request_cache_affinity   = 402,
-    request_bypass_protected = 403,
-    request_aged             = 404,
+    request_fifo                    = 400,
+    request_virtual_runtime         = 401,
+    request_cache_affinity          = 402,
+    request_bypass_protected        = 403,
+    request_aged                    = 404,
+    request_feasible_behind_blocked = 405,
 
     service_complete         = 500,
     service_lease_requeue    = 501,
@@ -150,6 +151,7 @@ struct service_decision {
     uint64_t    predicted_gpu_us    = 0;
     uint64_t    affinity_bonus_us   = 0;
     uint32_t    bypass_count_before = 0;
+    uint32_t    blocked_before      = 0;
     uint32_t    limiting_dimension  = 0;
 };
 
@@ -203,12 +205,12 @@ class scheduler {
 };
 
 enum class replay_event_kind : uint8_t {
-    arrival,
-    admission,
-    dispatch,
-    completion,
-    stalled,
-    limit,
+    arrival    = 0,
+    admission  = 1,
+    dispatch   = 2,
+    completion = 3,
+    stalled    = 4,
+    limit      = 5,
 };
 
 struct trace_job {
@@ -218,7 +220,6 @@ struct trace_job {
     uint64_t        service_gpu_us         = 1000;
     uint64_t        cached_prefix_us       = 0;
     uint64_t        restore_cost_us        = 0;
-    uint64_t        io_time_us             = 0;
 };
 
 struct replay_trace {
@@ -238,8 +239,6 @@ struct replay_event {
     reason_code       reason      = reason_code::none;
     reason_code       lane_reason = reason_code::none;
     uint64_t          gpu_us      = 0;
-    uint64_t          io_us       = 0;
-    uint32_t          width       = 0;
 
     bool operator==(const replay_event & other) const;
 };
@@ -255,6 +254,11 @@ struct replay_result {
 
 class simulator {
   public:
+    // Replay models one non-preemptive GPU dispatch at a time. Decode cohort
+    // widths remain independent until a batch-feasibility interface can
+    // account for the whole cohort. I/O readiness is intentionally absent
+    // until it can be represented as asynchronous events rather than delay
+    // unrelated runnable work.
     replay_result replay(const replay_trace & trace) const;
 };
 

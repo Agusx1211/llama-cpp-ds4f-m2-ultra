@@ -137,6 +137,9 @@ void test_infeasible_head_is_not_bypassed() {
     };
     service_decision decision = policy.select_next(0, evaluate);
     require(decision.selected && decision.request_id == 2, "feasible tail should preserve work conservation");
+    require(decision.reason == reason_code::request_feasible_behind_blocked,
+            "feasible tail needs an explicit blocked-head reason");
+    require(decision.blocked_before == 1, "decision records one earlier temporarily blocked request");
     policy.complete_service(decision.decision_id, 1000, service_disposition::complete);
 
     decision = policy.select_next(0, [](const request &) { return feasible_candidate(); });
@@ -154,6 +157,8 @@ void test_infeasible_head_is_not_bypassed() {
     });
     require(decision.selected && decision.request_id == 9,
             "K=8 counts eligible candidates rather than blocked queue entries");
+    require(decision.reason == reason_code::request_feasible_behind_blocked && decision.blocked_before == 8,
+            "decision preserves the complete blocked-prefix reason context");
 }
 
 void test_aging() {
@@ -380,7 +385,6 @@ replay_trace perpetual_low_trace() {
     normal.page_demand.units[1]        = 2;
     normal.cached_prefix_us            = 2500;
     normal.restore_cost_us             = 500;
-    normal.io_time_us                  = 250;
     trace.jobs.push_back(normal);
     trace.jobs.push_back(make_trace_job(20, lane::fast, 7000, 1, 1, 20));
     trace.jobs.push_back(make_trace_job(21, lane::fast, 17000, 1, 1, 20));
@@ -406,12 +410,31 @@ void test_replay_determinism_and_perpetual_low_progress() {
             "observed generation ends normal request before requested maximum");
     require(dispatches[static_cast<size_t>(lane::fast)] == 40, "both finite fast arrivals must complete");
     require(first.dispatches == trace.max_dispatches, "infinite trace stops only at deterministic limit");
-    require(std::any_of(first.events.begin(), first.events.end(),
-                        [](const replay_event & event) {
-                            return event.kind == replay_event_kind::dispatch && event.request_id == 10 &&
-                                   event.io_us == 250;
-                        }),
-            "trace replay preserves injected I/O cost");
+}
+
+void test_replay_is_explicitly_single_dispatch() {
+    replay_trace trace;
+    trace.capacity.units[0] = 10;
+    trace.jobs.push_back(make_trace_job(1, lane::low, 0, 1, 1, 1, 700));
+    trace.jobs.push_back(make_trace_job(2, lane::fast, 0, 1, 1, 1, 300));
+
+    const replay_result result      = simulator().replay(trace);
+    bool                in_flight   = false;
+    size_t              dispatches  = 0;
+    size_t              completions = 0;
+    for (const replay_event & event : result.events) {
+        if (event.kind == replay_event_kind::dispatch) {
+            require(!in_flight, "replay cannot start a cohort or overlapping dispatch");
+            in_flight = true;
+            ++dispatches;
+        } else if (event.kind == replay_event_kind::completion) {
+            require(in_flight, "completion must correspond to the sole active dispatch");
+            in_flight = false;
+            ++completions;
+        }
+    }
+    require(!in_flight && dispatches == 2 && completions == 2, "both jobs execute as individual dispatches");
+    require(result.end_time_us == 1000, "single-dispatch replay advances by GPU service time only");
 }
 
 void test_resource_vectors_and_safety_watermark() {
@@ -452,6 +475,7 @@ int main() {
         { "decode widths",                    test_decode_width_profiles                         },
         { "capacity traces",                  test_frozen_capacity_traces                        },
         { "deterministic mixed replay",       test_replay_determinism_and_perpetual_low_progress },
+        { "single-dispatch replay",           test_replay_is_explicitly_single_dispatch          },
         { "resource vectors",                 test_resource_vectors_and_safety_watermark         },
     };
 

@@ -159,6 +159,8 @@ const char * to_string(reason_code value) {
             return "request_bypass_protected";
         case reason_code::request_aged:
             return "request_aged";
+        case reason_code::request_feasible_behind_blocked:
+            return "request_feasible_behind_blocked";
         case reason_code::service_complete:
             return "service_complete";
         case reason_code::service_lease_requeue:
@@ -202,6 +204,7 @@ struct scheduler::impl {
         uint64_t             aged_runtime_us   = 0;
         uint64_t             age_credit_us     = 0;
         uint64_t             affinity_bonus_us = 0;
+        uint32_t             blocked_before    = 0;
         candidate_evaluation evaluation;
     };
 
@@ -212,6 +215,7 @@ struct scheduler::impl {
         uint64_t             enqueue_sequence  = 0;
         uint64_t             affinity_bonus_us = 0;
         uint32_t             bypass_count      = 0;
+        uint32_t             blocked_before    = 0;
         reason_code          reason            = reason_code::none;
         candidate_evaluation evaluation;
         std::vector<size_t>  bypassed_queue_indices;
@@ -279,6 +283,7 @@ struct scheduler::impl {
         });
 
         std::vector<ranked_candidate> feasible;
+        uint32_t                      blocked_before = 0;
         for (size_t rank = 0; rank < order.size(); ++rank) {
             const size_t           queue_index = order[rank];
             const queued_request & queued      = lane_queue[queue_index];
@@ -291,6 +296,7 @@ struct scheduler::impl {
                 current.state = queued.initial_feasibility;
             }
             if (current.state != feasibility::feasible_now) {
+                blocked_before += current.state == feasibility::temporarily_blocked;
                 continue;
             }
             if (!feasible.empty() &&
@@ -307,6 +313,7 @@ struct scheduler::impl {
                 runtime,
                 age_credit(queued, now_us),
                 std::min(gross_affinity, bonus_cap),
+                blocked_before,
                 current,
             });
             if (feasible.size() == config.cache_lookahead) {
@@ -351,10 +358,13 @@ struct scheduler::impl {
         result.enqueue_sequence                   = selected_request.enqueue_sequence;
         result.affinity_bonus_us                  = selected.affinity_bonus_us;
         result.bypass_count                       = selected_request.bypass_count;
+        result.blocked_before                     = selected.blocked_before;
         result.evaluation                         = selected.evaluation;
 
         if (protected_request) {
             result.reason = reason_code::request_bypass_protected;
+        } else if (chosen == 0 && selected.blocked_before > 0) {
+            result.reason = reason_code::request_feasible_behind_blocked;
         } else if (selected.affinity_bonus_us > 0 && chosen > 0) {
             result.reason = reason_code::request_cache_affinity;
         } else if (selected.age_credit_us > 0 && selected_request.req.virtual_runtime_us != selected.aged_runtime_us) {
@@ -517,6 +527,7 @@ service_decision scheduler::select_next(uint64_t now_us, const evaluation_provid
     result.predicted_gpu_us    = selected_candidate.evaluation.predicted_gpu_us;
     result.affinity_bonus_us   = selected_candidate.affinity_bonus_us;
     result.bypass_count_before = selected_candidate.bypass_count;
+    result.blocked_before      = selected_candidate.blocked_before;
     result.limiting_dimension  = selected_candidate.evaluation.limiting_dimension;
     if (available_lanes == 1) {
         result.lane_reason = reason_code::lane_work_conserving;
@@ -672,7 +683,7 @@ const scheduler_config & scheduler::config() const {
 bool replay_event::operator==(const replay_event & other) const {
     return kind == other.kind && time_us == other.time_us && request_id == other.request_id &&
            priority == other.priority && reason == other.reason && lane_reason == other.lane_reason &&
-           gpu_us == other.gpu_us && io_us == other.io_us && width == other.width;
+           gpu_us == other.gpu_us;
 }
 
 bool replay_result::operator==(const replay_result & other) const {
@@ -810,7 +821,7 @@ replay_result simulator::replay(const replay_trace & trace) const {
                               feasibility::temporarily_blocked;
             value.predicted_gpu_us = runtime.job.service_gpu_us;
             value.cached_prefix_us = runtime.job.cached_prefix_us;
-            value.restore_cost_us  = saturating_add(runtime.job.restore_cost_us, runtime.job.io_time_us);
+            value.restore_cost_us  = runtime.job.restore_cost_us;
             return value;
         };
 
@@ -837,24 +848,6 @@ replay_result simulator::replay(const replay_trace & trace) const {
             runtime.resident = true;
         }
 
-        size_t same_lane_runnable = 0;
-        size_t total_runnable     = 0;
-        for (const runtime_job & candidate : jobs) {
-            if (!candidate.admitted || candidate.finished || candidate.job.req.id == decision.request_id ||
-                !policy.contains(candidate.job.req.id)) {
-                continue;
-            }
-            if (!candidate.resident &&
-                !vector_fits(result.resident, candidate.job.page_demand, trace.capacity, trace.safety_watermark)) {
-                continue;
-            }
-            ++total_runnable;
-            same_lane_runnable += candidate.job.req.priority == decision.selected_lane;
-        }
-        ++same_lane_runnable;
-        ++total_runnable;
-        const decode_width_decision width =
-            policy.choose_decode_width(decision.selected_lane, same_lane_runnable, total_runnable, false);
         result.events.push_back({
             replay_event_kind::dispatch,
             now_us,
@@ -863,8 +856,6 @@ replay_result simulator::replay(const replay_trace & trace) const {
             decision.reason,
             decision.lane_reason,
             runtime.job.service_gpu_us,
-            runtime.job.io_time_us,
-            width.width,
         });
 
         ++runtime.completed_quanta;
@@ -888,8 +879,6 @@ replay_result simulator::replay(const replay_trace & trace) const {
             completion.reason,
             reason_code::none,
             runtime.job.service_gpu_us,
-            runtime.job.io_time_us,
-            width.width,
         });
     }
 
