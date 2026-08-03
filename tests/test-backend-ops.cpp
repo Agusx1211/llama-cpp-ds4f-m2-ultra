@@ -8048,12 +8048,21 @@ struct test_dsv4_indexed_sparse_pack : public test_case {
     const int64_t kr;
     const int64_t nc;
     const int64_t kc;
+    const ggml_type type_K;
+    const bool materialized_oracle;
+    const bool hidden_masks;
 
     test_dsv4_indexed_sparse_pack(
-            int64_t nb, int64_t ns, int64_t nr, int64_t kr, int64_t nc, int64_t kc)
-        : nb(nb), ns(ns), nr(nr), kr(kr), nc(nc), kc(kc) {}
+            int64_t nb, int64_t ns, int64_t nr, int64_t kr, int64_t nc, int64_t kc,
+            ggml_type type_K = GGML_TYPE_F16, bool materialized_oracle = true, bool hidden_masks = false)
+        : nb(nb), ns(ns), nr(nr), kr(kr), nc(nc), kc(kc), type_K(type_K),
+          materialized_oracle(materialized_oracle), hidden_masks(hidden_masks) {
+        GGML_ASSERT(!materialized_oracle || (type_K == GGML_TYPE_F16 && !hidden_masks));
+    }
 
-    std::string vars() override { return VARS_TO_STR6(nb, ns, nr, kr, nc, kc); }
+    std::string vars() override {
+        return VARS_TO_STR9(nb, ns, nr, kr, nc, kc, type_K, materialized_oracle, hidden_masks);
+    }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -8073,8 +8082,8 @@ struct test_dsv4_indexed_sparse_pack : public test_case {
         const int64_t n_segments = (nc + 63)/64;
         const int64_t pool_segments = std::max<int64_t>(4, n_segments + 3);
 
-        ggml_tensor * raw_k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, 1, nr, ns);
-        ggml_tensor * k_pool = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d, pool_segments*64);
+        ggml_tensor * raw_k = ggml_new_tensor_4d(ctx, type_K, d, 1, nr, ns);
+        ggml_tensor * k_pool = ggml_new_tensor_2d(ctx, type_K, d, pool_segments*64);
         ggml_tensor * raw_m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, nr, nb, 1, ns);
         ggml_tensor * comp_m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, nc, nb, 1, ns);
         ggml_tensor * comp_i = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, kc, nb, 1, ns);
@@ -8088,7 +8097,7 @@ struct test_dsv4_indexed_sparse_pack : public test_case {
 
         ggml_tensor * out = ggml_dsv4_indexed_sparse_pack(
                 ctx, raw_k, k_pool, raw_m, comp_m, comp_i, segment_ids, kr);
-        if (mode == MODE_TEST) {
+        if (mode == MODE_TEST && materialized_oracle) {
             ggml_tensor * row_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nc*ns);
             ggml_set_name(row_ids, "physical_row_ids");
             ggml_tensor * affine_k = ggml_get_rows(ctx, k_pool, row_ids);
@@ -8110,21 +8119,26 @@ struct test_dsv4_indexed_sparse_pack : public test_case {
         ggml_tensor * comp_i = ggml_get_tensor(ctx, "comp_idx");
         ggml_tensor * segment_ids = ggml_get_tensor(ctx, "segment_ids");
 
-        std::vector<ggml_fp16_t> raw_data(ggml_nelements(raw_k));
-        for (size_t i = 0; i < raw_data.size(); ++i) {
-            raw_data[i] = ggml_fp32_to_fp16(
-                    (float) ((int64_t) ((i*37 + 11) % 2048) - 1024)/32.0f);
-        }
-        if (!raw_data.empty()) {
-            ggml_backend_tensor_set(raw_k, raw_data.data(), 0, raw_data.size()*sizeof(raw_data[0]));
-        }
+        if (type_K == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> raw_data(ggml_nelements(raw_k));
+            for (size_t i = 0; i < raw_data.size(); ++i) {
+                raw_data[i] = ggml_fp32_to_fp16(
+                        (float) ((int64_t) ((i*37 + 11) % 2048) - 1024)/32.0f);
+            }
+            if (!raw_data.empty()) {
+                ggml_backend_tensor_set(raw_k, raw_data.data(), 0, raw_data.size()*sizeof(raw_data[0]));
+            }
 
-        std::vector<ggml_fp16_t> pool_data(ggml_nelements(k_pool));
-        for (size_t i = 0; i < pool_data.size(); ++i) {
-            pool_data[i] = ggml_fp32_to_fp16(
-                    (float) ((int64_t) ((i*53 + 19) % 4096) - 2048)/64.0f);
+            std::vector<ggml_fp16_t> pool_data(ggml_nelements(k_pool));
+            for (size_t i = 0; i < pool_data.size(); ++i) {
+                pool_data[i] = ggml_fp32_to_fp16(
+                        (float) ((int64_t) ((i*53 + 19) % 4096) - 2048)/64.0f);
+            }
+            ggml_backend_tensor_set(k_pool, pool_data.data(), 0, pool_data.size()*sizeof(pool_data[0]));
+        } else {
+            init_tensor_uniform(raw_k, -2.0f, 2.0f);
+            init_tensor_uniform(k_pool, -2.0f, 2.0f);
         }
-        ggml_backend_tensor_set(k_pool, pool_data.data(), 0, pool_data.size()*sizeof(pool_data[0]));
 
         std::vector<ggml_fp16_t> raw_mask(ggml_nelements(raw_m));
         for (size_t i = 0; i < raw_mask.size(); ++i) {
@@ -8136,7 +8150,8 @@ struct test_dsv4_indexed_sparse_pack : public test_case {
 
         std::vector<ggml_fp16_t> comp_mask(ggml_nelements(comp_m));
         for (size_t i = 0; i < comp_mask.size(); ++i) {
-            comp_mask[i] = ggml_fp32_to_fp16((float) ((i*7) % 23));
+            comp_mask[i] = ggml_fp32_to_fp16(
+                    hidden_masks && i % 11 == 0 ? -INFINITY : (float) ((i*7) % 23));
         }
         ggml_backend_tensor_set(comp_m, comp_mask.data(), 0, comp_mask.size()*sizeof(comp_mask[0]));
 
@@ -10943,6 +10958,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_indexed_sparse_pack(2, 2, 17, 7, 63, 6));
     test_cases.emplace_back(new test_dsv4_indexed_sparse_pack(1, 3, 517, 0, 64, 64));
     test_cases.emplace_back(new test_dsv4_indexed_sparse_pack(3, 2, 128, 11, 65, 8));
+    test_cases.emplace_back(new test_dsv4_indexed_sparse_pack(
+            2, 2, 128, 7, 65, 8, GGML_TYPE_F16, false, true));
+    test_cases.emplace_back(new test_dsv4_indexed_sparse_pack(
+            2, 2, 128, 7, 65, 8, GGML_TYPE_Q8_0, false));
+    test_cases.emplace_back(new test_dsv4_indexed_sparse_pack(
+            1, 3, 517, 0, 64, 64, GGML_TYPE_Q8_0, false));
     // Source-token counts straddle both supported compressor ratios. The
     // resulting logical row count is floor(source_tokens/ratio).
     for (int64_t source_tokens : { 3, 4, 5 }) {
