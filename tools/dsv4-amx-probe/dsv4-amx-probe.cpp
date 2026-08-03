@@ -1,4 +1,4 @@
-// Measurement-only Apple M2 Ultra direct-AMX/Metal overlap probe. The AMX
+// Measurement-only Apple M2 Ultra direct-AMX/Metal overlap-and-join probe. The AMX
 // kernel was implemented independently from the public algorithm description
 // in arXiv:2606.25426 because the inspected inferc artifact has no declared
 // software license.
@@ -75,21 +75,37 @@ struct shared_timing {
     double total_ms            = 0.0;
 };
 
-struct overlap_timing {
-    double        wall_ms              = 0.0;
+struct branch_timing {
+    double        prejoin_wall_ms      = 0.0;
     double        direct_completion_ms = 0.0;
-    double        metal_ms             = 0.0;
+    double        routed_completion_ms = 0.0;
     shared_timing direct;
+};
+
+struct candidate_timing {
+    branch_timing branches;
+    double        transfer_ms             = 0.0;
+    double        join_ms                 = 0.0;
+    double        end_to_end_candidate_ms = 0.0;
 };
 
 struct raw_run {
     int           iteration = 0;
     std::string   order;
     std::string   mode;
-    double        wall_ms              = 0.0;
-    double        direct_completion_ms = 0.0;
-    double        metal_ms             = 0.0;
+    double        arm_wall_ms             = 0.0;
+    double        prejoin_wall_ms         = 0.0;
+    double        direct_completion_ms    = 0.0;
+    double        routed_completion_ms    = 0.0;
+    double        transfer_ms             = 0.0;
+    double        join_ms                 = 0.0;
+    double        end_to_end_candidate_ms = 0.0;
     shared_timing direct;
+};
+
+struct resource_snapshot {
+    uint64_t rss_bytes = 0;
+    int64_t  swaps     = 0;
 };
 
 static double elapsed_ms(clock_type::time_point begin, clock_type::time_point end) {
@@ -104,6 +120,20 @@ static uint64_t current_rss_bytes() {
         return 0;
     }
     return info.resident_size;
+}
+
+static resource_snapshot current_resources() {
+    struct rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        throw std::runtime_error("getrusage failed");
+    }
+    return { current_rss_bytes(), static_cast<int64_t>(usage.ru_nswap) };
+}
+
+static void print_resource_phase(const char * phase) {
+    const resource_snapshot resources = current_resources();
+    std::printf("memory_phase\tphase=%s\tcurrent_rss_bytes=%llu\tswaps=%lld\n", phase,
+                static_cast<unsigned long long>(resources.rss_bytes), static_cast<long long>(resources.swaps));
 }
 
 static std::string cpu_brand() {
@@ -676,6 +706,8 @@ class metal_graphs {
 
     std::vector<float> get_all_output() const { return get_tensor(all_out_); }
 
+    ggml_tensor * routed_output_tensor() const { return routed_out_; }
+
     size_t routed_weight_bytes() const {
         return ggml_nbytes(route_gate_) + ggml_nbytes(route_up_) + ggml_nbytes(route_down_);
     }
@@ -797,7 +829,74 @@ class metal_graphs {
     ggml_cgraph *           routed_down_validation_graph_ = nullptr;
 };
 
-static overlap_timing run_overlap(direct_amx_shared_ffn & direct, metal_graphs & metal) {
+class metal_candidate_join {
+  public:
+    metal_candidate_join(ggml_backend_t backend, ggml_tensor * routed_output, int64_t tokens) : backend_(backend) {
+        constexpr size_t       graph_nodes = 4;
+        const ggml_init_params params      = {
+            ggml_tensor_overhead() * 4 + ggml_graph_overhead_custom(graph_nodes, false),
+            nullptr,
+            true,
+        };
+        context_.reset(ggml_init(params));
+        if (!context_) {
+            throw std::runtime_error("failed to create candidate join context");
+        }
+
+        direct_output_ = ggml_new_tensor_2d(context_.get(), GGML_TYPE_F32, DSV4_EMBD, tokens);
+        joined_output_ = ggml_add(context_.get(), routed_output, direct_output_);
+        join_graph_    = ggml_new_graph_custom(context_.get(), graph_nodes, false);
+
+        // The routed branch is computed and synchronized before this graph is
+        // submitted. Add only the join node so the routed FFN is not executed
+        // a second time while preserving its Metal tensor as an input.
+        ggml_graph_add_node(join_graph_, joined_output_);
+
+        buffer_.reset(ggml_backend_alloc_ctx_tensors(context_.get(), backend_));
+        if (!buffer_) {
+            throw std::runtime_error("failed to allocate candidate join Metal tensors");
+        }
+        if (!ggml_backend_supports_op(backend_, joined_output_)) {
+            throw std::runtime_error("Metal does not support the candidate shared+routed add");
+        }
+    }
+
+    void upload_direct_output(const std::vector<float> & output) {
+        if (output.size() != static_cast<size_t>(ggml_nelements(direct_output_))) {
+            throw std::runtime_error("direct output size does not match candidate Metal tensor");
+        }
+        ggml_backend_tensor_set(direct_output_, output.data(), 0, ggml_nbytes(direct_output_));
+    }
+
+    void launch_join_async() {
+        const ggml_status status = ggml_backend_graph_compute_async(backend_, join_graph_);
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("Metal candidate join graph submission failed");
+        }
+    }
+
+    void synchronize() { ggml_backend_synchronize(backend_); }
+
+    std::vector<float> get_joined_output() const {
+        std::vector<float> result(static_cast<size_t>(ggml_nelements(joined_output_)));
+        ggml_backend_tensor_get(joined_output_, result.data(), 0, result.size() * sizeof(float));
+        return result;
+    }
+
+    size_t allocated_tensor_bytes() const { return ggml_nbytes(direct_output_) + ggml_nbytes(joined_output_); }
+
+  private:
+    ggml_backend_t          backend_ = nullptr;
+    ggml_context_ptr        context_;
+    ggml_backend_buffer_ptr buffer_;
+    ggml_tensor *           direct_output_ = nullptr;
+    ggml_tensor *           joined_output_ = nullptr;
+    ggml_cgraph *           join_graph_    = nullptr;
+};
+
+static branch_timing run_prejoin(direct_amx_shared_ffn &  direct,
+                                 metal_graphs &           metal,
+                                 clock_type::time_point * release_time = nullptr) {
     std::atomic<bool>      ready(false);
     std::atomic<bool>      go(false);
     clock_type::time_point direct_end;
@@ -816,6 +915,9 @@ static overlap_timing run_overlap(direct_amx_shared_ffn & direct, metal_graphs &
     }
 
     const auto begin = clock_type::now();
+    if (release_time != nullptr) {
+        *release_time = begin;
+    }
     go.store(true, std::memory_order_release);
     metal.launch_route_async();
     metal.synchronize();
@@ -825,29 +927,54 @@ static overlap_timing run_overlap(direct_amx_shared_ffn & direct, metal_graphs &
     return { elapsed_ms(begin, end), elapsed_ms(begin, direct_end), elapsed_ms(begin, metal_end), direct_timing };
 }
 
-static overlap_timing run_sequential(direct_amx_shared_ffn & direct, metal_graphs & metal, bool direct_first) {
+static candidate_timing run_candidate(direct_amx_shared_ffn & direct,
+                                      metal_graphs &          metal,
+                                      metal_candidate_join &  join) {
+    clock_type::time_point release_time;
+    const branch_timing    branches = run_prejoin(direct, metal, &release_time);
+
+    const auto transfer_begin = clock_type::now();
+    join.upload_direct_output(direct.output());
+    const auto transfer_end = clock_type::now();
+
+    const auto join_begin = clock_type::now();
+    join.launch_join_async();
+    join.synchronize();
+    const auto join_end = clock_type::now();
+
+    return { branches, elapsed_ms(transfer_begin, transfer_end), elapsed_ms(join_begin, join_end),
+             elapsed_ms(release_time, join_end) };
+}
+
+static branch_timing run_sequential_prejoin(direct_amx_shared_ffn & direct, metal_graphs & metal, bool direct_first) {
     const auto             begin = clock_type::now();
     clock_type::time_point direct_end;
+    clock_type::time_point routed_end;
     shared_timing          direct_timing;
-    double                 metal_ms;
     if (direct_first) {
         direct_timing = direct.run();
         direct_end    = clock_type::now();
-        metal_ms      = metal.time_route_ms();
+        metal.time_route_ms();
+        routed_end = clock_type::now();
     } else {
-        metal_ms      = metal.time_route_ms();
+        metal.time_route_ms();
+        routed_end    = clock_type::now();
         direct_timing = direct.run();
         direct_end    = clock_type::now();
     }
-    return { elapsed_ms(begin, clock_type::now()), elapsed_ms(begin, direct_end), metal_ms, direct_timing };
+    return { elapsed_ms(begin, std::max(direct_end, routed_end)), elapsed_ms(begin, direct_end),
+             elapsed_ms(begin, routed_end), direct_timing };
 }
 
 static void print_raw(const raw_run & run) {
     std::printf(
-        "raw\titeration=%d\torder=%s\tmode=%s\twall_ms=%.6f\tdirect_completion_ms=%.6f\tmetal_ms=%.6f"
+        "raw\titeration=%d\torder=%s\tmode=%s\tarm_wall_ms=%.6f\tprejoin_wall_ms=%.6f"
+        "\tdirect_completion_ms=%.6f\trouted_completion_ms=%.6f\ttransfer_ms=%.6f\tjoin_ms=%.6f"
+        "\tend_to_end_candidate_ms=%.6f"
         "\tdirect_total_ms=%.6f\ttranspose_input_ms=%.6f\tgate_ms=%.6f\tup_ms=%.6f"
         "\tactivation_ms=%.6f\ttranspose_hidden_ms=%.6f\tdown_ms=%.6f\n",
-        run.iteration, run.order.c_str(), run.mode.c_str(), run.wall_ms, run.direct_completion_ms, run.metal_ms,
+        run.iteration, run.order.c_str(), run.mode.c_str(), run.arm_wall_ms, run.prejoin_wall_ms,
+        run.direct_completion_ms, run.routed_completion_ms, run.transfer_ms, run.join_ms, run.end_to_end_candidate_ms,
         run.direct.total_ms, run.direct.transpose_input_ms, run.direct.gate_ms, run.direct.up_ms,
         run.direct.activation_ms, run.direct.transpose_hidden_ms, run.direct.down_ms);
 }
@@ -885,9 +1012,11 @@ int main(int argc, char ** argv) try {
         return 2;
     }
 
-    const uint64_t                         rss_start = current_rss_bytes();
-    probe_data                             data(opts.tokens);
-    const uint64_t                         rss_after_source = current_rss_bytes();
+    const uint64_t rss_start = current_rss_bytes();
+    print_resource_phase("start");
+    probe_data     data(opts.tokens);
+    const uint64_t rss_after_source = current_rss_bytes();
+    print_resource_phase("after_source_data");
     std::unique_ptr<direct_amx_shared_ffn> direct;
     const bool                             candidate_enabled = !disabled && opts.mode != "sequential";
     if (candidate_enabled) {
@@ -895,8 +1024,17 @@ int main(int argc, char ** argv) try {
             std::make_unique<direct_amx_shared_ffn>(data, opts.tokens, opts.clamp_limit, opts.panel_cols, opts.k_block);
     }
     const uint64_t rss_after_direct = current_rss_bytes();
+    print_resource_phase("after_candidate_pack");
     metal_graphs   metal(metal_backend.get(), data, opts.tokens, opts.clamp_limit);
     const uint64_t rss_after_metal = current_rss_bytes();
+    print_resource_phase("after_metal_controls");
+    std::unique_ptr<metal_candidate_join> candidate_join;
+    if (candidate_enabled) {
+        candidate_join =
+            std::make_unique<metal_candidate_join>(metal_backend.get(), metal.routed_output_tensor(), opts.tokens);
+    }
+    const uint64_t rss_after_candidate_join = current_rss_bytes();
+    print_resource_phase("after_candidate_join_allocation");
 
     std::printf(
         "probe\tcommit=%s\tdevice=%s\tcpu=%s\ttokens=%lld\tpanel_cols=%lld\tk_block=%lld"
@@ -914,8 +1052,14 @@ int main(int argc, char ** argv) try {
     std::printf(
         "direct_path\tprovider=raw_apple_amx_fma32\tsteady_state_projections=3"
         "\ttranspose_input=vDSP_mtrans\ttranspose_hidden=vDSP_mtrans\tprivate_isa=1"
-        "\tcandidate_output_join_implemented=0\toverlap_worker_start_overhead_timed=0"
-        "\tpanel_dispatch_overhead_timed=1\n");
+        "\tcandidate_output_join_implemented=1\ttransfer_api=ggml_backend_tensor_set"
+        "\tjoin_backend=Metal\toverlap_worker_start_overhead_timed=0"
+        "\tpanel_dispatch_overhead_timed=1\tcandidate_clock_starts_at_branch_release=1"
+        "\tcandidate_clock_ends_after_join_synchronize=1\n");
+    std::printf(
+        "scope\tinput_storage=separate_cpu_and_metal\tweights=deterministic_synthetic"
+        "\tscheduler_cost_included=0\tper_layer_orchestration_included=0\treal_weight_costs_included=0"
+        "\tproduction_inference_mutated=0\n");
     std::printf(
         "pack\tcandidate_allocated=%d\tone_time_ms=%.6f\tbf16_source_bytes=%zu\tdirect_f32_bytes=%zu"
         "\trss_delta_bytes=%llu\tprojected_43_layer_direct_pack_bytes=%zu\tsteady_state_excludes_pack=1\n",
@@ -923,12 +1067,18 @@ int main(int argc, char ** argv) try {
         direct ? direct->packed_f32_bytes() : 0, static_cast<unsigned long long>(direct ? direct->pack_rss_delta() : 0),
         direct ? direct->packed_f32_bytes() * static_cast<size_t>(DSV4_LAYERS) : size_t{ 0 });
     std::printf(
+        "candidate_join\tallocated=%d\tmetal_tensor_bytes=%zu\tdirect_output_upload_bytes=%zu"
+        "\tgraph=single_metal_shared_plus_routed_add\troute_recomputed_by_join=0\n",
+        candidate_join ? 1 : 0, candidate_join ? candidate_join->allocated_tensor_bytes() : size_t{ 0 },
+        candidate_join ? static_cast<size_t>(opts.tokens * DSV4_EMBD) * sizeof(float) : size_t{ 0 });
+    std::printf(
         "memory\trss_start_bytes=%llu\trss_after_source_bytes=%llu\trss_after_direct_bytes=%llu"
-        "\trss_after_metal_bytes=%llu\tmetal_routed_weight_bytes=%zu"
+        "\trss_after_metal_controls_bytes=%llu\trss_after_candidate_join_bytes=%llu"
+        "\tmetal_routed_weight_bytes=%zu"
         "\tmxfp4_init=deterministic_repeated_nonzero_blocks\n",
         static_cast<unsigned long long>(rss_start), static_cast<unsigned long long>(rss_after_source),
         static_cast<unsigned long long>(rss_after_direct), static_cast<unsigned long long>(rss_after_metal),
-        metal.routed_weight_bytes());
+        static_cast<unsigned long long>(rss_after_candidate_join), metal.routed_weight_bytes());
 
     for (int i = 0; i < opts.warmup; ++i) {
         if (direct) {
@@ -937,8 +1087,9 @@ int main(int argc, char ** argv) try {
         metal.time_route_ms();
         metal.time_shared_ms();
         metal.time_all_ms();
-        if (direct && opts.mode != "sequential") {
-            run_overlap(*direct, metal);
+        if (candidate_join) {
+            run_prejoin(*direct, metal);
+            run_candidate(*direct, metal, *candidate_join);
         }
     }
 
@@ -948,12 +1099,27 @@ int main(int argc, char ** argv) try {
     metal.time_all_ms();
     metal.materialize_routed_down_for_validation();
     std::printf("validation\tgraph=routed_down_materialization\ttimed=0\n");
+    if (candidate_join) {
+        candidate_join->upload_direct_output(direct->output());
+        candidate_join->launch_join_async();
+        candidate_join->synchronize();
+        std::printf("validation\tgraph=candidate_shared_routed_join\ttimed=0\n");
+    }
     std::vector<float> metal_gate   = metal.get_shared_gate();
     std::vector<float> metal_up     = metal.get_shared_up();
     std::vector<float> metal_hidden = metal.get_shared_hidden();
     std::vector<float> metal_shared = metal.get_shared_output();
     std::vector<float> metal_routed = metal.get_routed_output();
     std::vector<float> metal_all    = metal.get_all_output();
+    std::vector<float> candidate_joined;
+    std::vector<float> expected_candidate_joined;
+    if (candidate_join) {
+        candidate_joined = candidate_join->get_joined_output();
+        expected_candidate_joined.resize(metal_routed.size());
+        for (size_t i = 0; i < expected_candidate_joined.size(); ++i) {
+            expected_candidate_joined[i] = direct->output()[i] + metal_routed[i];
+        }
+    }
     std::vector<float> expected_metal_all(metal_all.size());
     for (size_t i = 0; i < expected_metal_all.size(); ++i) {
         expected_metal_all[i] = metal_shared[i] + metal_routed[i];
@@ -967,6 +1133,14 @@ int main(int argc, char ** argv) try {
     const output_stats routed_hidden_stats = summarize(metal.get_routed_hidden());
     const output_stats routed_down_stats   = summarize(metal.get_routed_down());
     const error_stats  metal_add_error     = compare_outputs(expected_metal_all, metal_all);
+    output_stats       candidate_joined_stats;
+    error_stats        candidate_recomposition_error;
+    error_stats        candidate_vs_all_metal_error;
+    if (candidate_join) {
+        candidate_joined_stats        = summarize(candidate_joined);
+        candidate_recomposition_error = compare_outputs(expected_candidate_joined, candidate_joined);
+        candidate_vs_all_metal_error  = compare_outputs(metal_all, candidate_joined);
+    }
 
     output_stats direct_stats;
     error_stats  gate_error;
@@ -993,7 +1167,13 @@ int main(int argc, char ** argv) try {
         "\tup_bit_diff=%llu\tup_nmse=%.9e\tup_max_abs=%.9e"
         "\thidden_bit_diff=%llu\thidden_nmse=%.9e\thidden_max_abs=%.9e"
         "\tshared_bit_diff=%llu\tshared_nmse=%.9e\tshared_max_abs=%.9e"
-        "\tmetal_add_bit_diff=%llu\tmetal_add_nmse=%.9e\tmetal_add_max_abs=%.9e\n",
+        "\tmetal_add_bit_diff=%llu\tmetal_add_nmse=%.9e\tmetal_add_max_abs=%.9e"
+        "\tcandidate_join_checked=%d\tcandidate_join_finite=%d\tcandidate_join_checksum=%.9e"
+        "\tcandidate_join_l2=%.9e\tcandidate_recomposition_finite=%d"
+        "\tcandidate_recomposition_bit_diff=%llu\tcandidate_recomposition_nmse=%.9e"
+        "\tcandidate_recomposition_max_abs=%.9e\tcandidate_vs_all_metal_finite=%d"
+        "\tcandidate_vs_all_metal_bit_diff=%llu\tcandidate_vs_all_metal_nmse=%.9e"
+        "\tcandidate_vs_all_metal_max_abs=%.9e\n",
         direct ? 1 : 0, direct_stats.finite ? 1 : 0, shared_stats.finite ? 1 : 0, routed_stats.finite ? 1 : 0,
         all_stats.finite ? 1 : 0, direct_stats.checksum, shared_stats.checksum, routed_stats.checksum,
         all_stats.checksum, direct_stats.l2, shared_stats.l2, routed_stats.l2, all_stats.l2,
@@ -1005,7 +1185,13 @@ int main(int argc, char ** argv) try {
         static_cast<unsigned long long>(up_error.bit_diff), up_error.nmse, up_error.max_abs,
         static_cast<unsigned long long>(hidden_error.bit_diff), hidden_error.nmse, hidden_error.max_abs,
         static_cast<unsigned long long>(shared_error.bit_diff), shared_error.nmse, shared_error.max_abs,
-        static_cast<unsigned long long>(metal_add_error.bit_diff), metal_add_error.nmse, metal_add_error.max_abs);
+        static_cast<unsigned long long>(metal_add_error.bit_diff), metal_add_error.nmse, metal_add_error.max_abs,
+        candidate_join ? 1 : 0, candidate_joined_stats.finite ? 1 : 0, candidate_joined_stats.checksum,
+        candidate_joined_stats.l2, candidate_recomposition_error.finite ? 1 : 0,
+        static_cast<unsigned long long>(candidate_recomposition_error.bit_diff), candidate_recomposition_error.nmse,
+        candidate_recomposition_error.max_abs, candidate_vs_all_metal_error.finite ? 1 : 0,
+        static_cast<unsigned long long>(candidate_vs_all_metal_error.bit_diff), candidate_vs_all_metal_error.nmse,
+        candidate_vs_all_metal_error.max_abs);
 
     const bool routed_valid = routed_stats.finite && routed_stats.l2 > 0.0 && routed_gate_stats.finite &&
                               routed_gate_stats.l2 > 0.0 && routed_up_stats.finite && routed_up_stats.l2 > 0.0 &&
@@ -1018,10 +1204,17 @@ int main(int argc, char ** argv) try {
                   shared_error.finite && gate_error.nmse <= 1e-3 && up_error.nmse <= 1e-3 &&
                   hidden_error.nmse <= 1e-3 && shared_error.nmse <= 1e-3;
     }
+    if (candidate_join) {
+        correct = correct && candidate_joined_stats.finite && candidate_recomposition_error.finite &&
+                  candidate_recomposition_error.bit_diff == 0 && candidate_recomposition_error.nmse <= 1e-12 &&
+                  candidate_vs_all_metal_error.finite && candidate_vs_all_metal_error.nmse <= 1e-3;
+    }
     std::printf(
         "correctness_gate\tpass=%d\tdirect_checked=%d\tshared_stage_nmse_limit=1e-3"
-        "\tmetal_add_nmse_limit=1e-12\tcandidate_join_checked=0\n",
-        correct ? 1 : 0, direct ? 1 : 0);
+        "\tmetal_add_nmse_limit=1e-12\tcandidate_join_checked=%d"
+        "\tcandidate_recomposition_bit_exact_required=1\tcandidate_recomposition_nmse_limit=1e-12"
+        "\tcandidate_vs_all_metal_nmse_limit=1e-3\n",
+        correct ? 1 : 0, direct ? 1 : 0, candidate_join ? 1 : 0);
     if (!correct) {
         std::fprintf(stderr, "correctness gate failed; performance timing suppressed\n");
         return 1;
@@ -1029,9 +1222,11 @@ int main(int argc, char ** argv) try {
 
     std::vector<float> direct_reference;
     std::vector<float> routed_reference;
-    if (direct && opts.mode != "sequential") {
-        direct_reference = direct->output();
-        routed_reference = metal_routed;
+    std::vector<float> all_metal_reference;
+    if (candidate_join) {
+        direct_reference    = direct->output();
+        routed_reference    = metal_routed;
+        all_metal_reference = metal_all;
     }
     auto release_validation_copy = [](std::vector<float> & values) {
         std::vector<float>().swap(values);
@@ -1043,81 +1238,136 @@ int main(int argc, char ** argv) try {
     release_validation_copy(metal_routed);
     release_validation_copy(metal_all);
     release_validation_copy(expected_metal_all);
-    std::printf("memory\tphase=after_validation_release\tcurrent_rss_bytes=%llu\n",
-                static_cast<unsigned long long>(current_rss_bytes()));
-    auto check_overlap_outputs = [&](const char * phase, int iteration, double measured_wall_ms) {
-        const error_stats direct_overlap_error = compare_outputs(direct_reference, direct->output());
-        const error_stats routed_overlap_error = compare_outputs(routed_reference, metal.get_routed_output());
-        const bool        pass                 = direct_overlap_error.finite && routed_overlap_error.finite &&
-                          direct_overlap_error.bit_diff == 0 && routed_overlap_error.bit_diff == 0 &&
-                          direct_overlap_error.nmse <= 1e-12 && routed_overlap_error.nmse <= 1e-12;
+    release_validation_copy(candidate_joined);
+    print_resource_phase("after_validation_release");
+    auto check_branch_outputs = [&](const char * phase, int iteration, const char * arm,
+                                    double measured_prejoin_wall_ms) {
+        const error_stats direct_error = compare_outputs(direct_reference, direct->output());
+        const error_stats routed_error = compare_outputs(routed_reference, metal.get_routed_output());
+        const bool        pass         = direct_error.finite && routed_error.finite && direct_error.bit_diff == 0 &&
+                          routed_error.bit_diff == 0 && direct_error.nmse <= 1e-12 && routed_error.nmse <= 1e-12;
         std::printf(
-            "overlap_validation\tphase=%s\titeration=%d\tpass=%d\tmeasured_wall_ms=%.6f\tdirect_bit_diff=%llu"
-            "\tdirect_nmse=%.9e\tdirect_max_abs=%.9e\trouted_bit_diff=%llu\trouted_nmse=%.9e"
-            "\trouted_max_abs=%.9e\n",
-            phase, iteration, pass ? 1 : 0, measured_wall_ms,
-            static_cast<unsigned long long>(direct_overlap_error.bit_diff), direct_overlap_error.nmse,
-            direct_overlap_error.max_abs, static_cast<unsigned long long>(routed_overlap_error.bit_diff),
-            routed_overlap_error.nmse, routed_overlap_error.max_abs);
+            "branch_reproduction\tphase=%s\titeration=%d\tarm=%s\tpass=%d\tprejoin_wall_ms=%.6f"
+            "\tdirect_bit_diff=%llu\tdirect_nmse=%.9e\tdirect_max_abs=%.9e\trouted_bit_diff=%llu"
+            "\trouted_nmse=%.9e\trouted_max_abs=%.9e\n",
+            phase, iteration, arm, pass ? 1 : 0, measured_prejoin_wall_ms,
+            static_cast<unsigned long long>(direct_error.bit_diff), direct_error.nmse, direct_error.max_abs,
+            static_cast<unsigned long long>(routed_error.bit_diff), routed_error.nmse, routed_error.max_abs);
         return pass;
     };
-    if (direct) {
-        const overlap_timing timing = run_overlap(*direct, metal);
-        if (!check_overlap_outputs("before_timing", -1, timing.wall_ms)) {
-            std::fprintf(stderr, "overlap reproducibility gate failed; performance timing suppressed\n");
+    auto check_joined_output = [&](const char * phase, int iteration, double measured_end_to_end_ms) {
+        const std::vector<float> joined_output   = candidate_join->get_joined_output();
+        const error_stats        exact_error     = compare_outputs(expected_candidate_joined, joined_output);
+        const error_stats        all_metal_error = compare_outputs(all_metal_reference, joined_output);
+        const bool               pass = exact_error.finite && exact_error.bit_diff == 0 && exact_error.nmse <= 1e-12 &&
+                          all_metal_error.finite && all_metal_error.nmse <= 1e-3;
+        std::printf(
+            "candidate_join_reproduction\tphase=%s\titeration=%d\tpass=%d\tend_to_end_candidate_ms=%.6f"
+            "\texact_finite=%d\texact_bit_diff=%llu\texact_nmse=%.9e\texact_max_abs=%.9e"
+            "\texact_bit_required=1\texact_nmse_limit=1e-12\tall_metal_finite=%d"
+            "\tall_metal_bit_diff=%llu\tall_metal_nmse=%.9e\tall_metal_max_abs=%.9e"
+            "\tall_metal_nmse_limit=1e-3\n",
+            phase, iteration, pass ? 1 : 0, measured_end_to_end_ms, exact_error.finite ? 1 : 0,
+            static_cast<unsigned long long>(exact_error.bit_diff), exact_error.nmse, exact_error.max_abs,
+            all_metal_error.finite ? 1 : 0, static_cast<unsigned long long>(all_metal_error.bit_diff),
+            all_metal_error.nmse, all_metal_error.max_abs);
+        return pass;
+    };
+    if (candidate_join) {
+        const candidate_timing timing = run_candidate(*direct, metal, *candidate_join);
+        if (!check_branch_outputs("before_timing", -1, "direct_amx_routed_metal_join_candidate",
+                                  timing.branches.prejoin_wall_ms) ||
+            !check_joined_output("before_timing", -1, timing.end_to_end_candidate_ms)) {
+            std::fprintf(stderr, "candidate reproducibility gate failed; performance timing suppressed\n");
             return 1;
         }
     }
+    print_resource_phase("before_timing");
+
+    auto measure_candidate = [&](int iteration, const std::string & order) {
+        const candidate_timing timing = run_candidate(*direct, metal, *candidate_join);
+        if (!check_branch_outputs("measured", iteration, "direct_amx_routed_metal_join_candidate",
+                                  timing.branches.prejoin_wall_ms) ||
+            !check_joined_output("measured", iteration, timing.end_to_end_candidate_ms)) {
+            throw std::runtime_error("measured joined candidate changed branch or joined output");
+        }
+        raw_run result;
+        result.iteration               = iteration;
+        result.order                   = order;
+        result.mode                    = "direct_amx_routed_metal_join_candidate";
+        result.arm_wall_ms             = timing.end_to_end_candidate_ms;
+        result.prejoin_wall_ms         = timing.branches.prejoin_wall_ms;
+        result.direct_completion_ms    = timing.branches.direct_completion_ms;
+        result.routed_completion_ms    = timing.branches.routed_completion_ms;
+        result.transfer_ms             = timing.transfer_ms;
+        result.join_ms                 = timing.join_ms;
+        result.end_to_end_candidate_ms = timing.end_to_end_candidate_ms;
+        result.direct                  = timing.branches.direct;
+        return result;
+    };
 
     std::vector<raw_run> raw;
     for (int iteration = 0; iteration < opts.runs; ++iteration) {
         // Four adjacent repetitions use the A/B/B/A order. A runs the solo
-        // and control cases before the overlap candidate; B reverses it.
+        // and prejoin controls before the joined candidate and all-Metal
+        // control; B reverses the complete arm order.
         const bool        forward = iteration % 4 == 0 || iteration % 4 == 3;
         const std::string order   = forward ? "A" : "B";
         if (opts.mode == "sequential") {
             const double all_ms = metal.time_all_ms();
-            raw.push_back({ iteration, order, "metal_all_control", all_ms, 0.0, all_ms, {} });
+            raw_run      result;
+            result.iteration   = iteration;
+            result.order       = order;
+            result.mode        = "metal_all_control";
+            result.arm_wall_ms = all_ms;
+            raw.push_back(result);
             print_raw(raw.back());
             continue;
         }
         if (opts.mode == "candidate") {
-            const overlap_timing timing = run_overlap(*direct, metal);
-            if (!check_overlap_outputs("measured", iteration, timing.wall_ms)) {
-                throw std::runtime_error("measured overlap changed direct or routed output");
-            }
-            raw.push_back({ iteration, order, "direct_amx_metal_overlap", timing.wall_ms, timing.direct_completion_ms,
-                            timing.metal_ms, timing.direct });
+            raw.push_back(measure_candidate(iteration, order));
             print_raw(raw.back());
             continue;
         }
 
         auto run_measurement = [&](const std::string & name) {
-            raw_run result = { iteration, order, name, 0.0, 0.0, 0.0, {} };
+            raw_run result;
+            result.iteration = iteration;
+            result.order     = order;
+            result.mode      = name;
             if (name == "direct_amx_shared_solo") {
-                result.direct  = direct->run();
-                result.wall_ms = result.direct_completion_ms = result.direct.total_ms;
+                result.direct               = direct->run();
+                result.arm_wall_ms          = result.direct.total_ms;
+                result.direct_completion_ms = result.direct.total_ms;
             } else if (name == "metal_routed_solo") {
-                result.wall_ms = result.metal_ms = metal.time_route_ms();
+                result.arm_wall_ms          = metal.time_route_ms();
+                result.routed_completion_ms = result.arm_wall_ms;
             } else if (name == "metal_shared_solo") {
-                result.wall_ms = result.metal_ms = metal.time_shared_ms();
+                result.arm_wall_ms = metal.time_shared_ms();
             } else if (name == "metal_all_control") {
-                result.wall_ms = result.metal_ms = metal.time_all_ms();
-            } else if (name == "direct_amx_metal_sequential") {
-                const overlap_timing timing = run_sequential(*direct, metal, forward);
-                result.wall_ms              = timing.wall_ms;
-                result.direct_completion_ms = timing.direct_completion_ms;
-                result.metal_ms             = timing.metal_ms;
-                result.direct               = timing.direct;
-            } else if (name == "direct_amx_metal_overlap") {
-                const overlap_timing timing = run_overlap(*direct, metal);
-                if (!check_overlap_outputs("measured", iteration, timing.wall_ms)) {
-                    throw std::runtime_error("measured overlap changed direct or routed output");
+                result.arm_wall_ms = metal.time_all_ms();
+            } else if (name == "direct_amx_routed_metal_sequential_prejoin") {
+                const branch_timing timing = run_sequential_prejoin(*direct, metal, forward);
+                if (!check_branch_outputs("measured", iteration, name.c_str(), timing.prejoin_wall_ms)) {
+                    throw std::runtime_error("measured sequential prejoin changed direct or routed output");
                 }
-                result.wall_ms              = timing.wall_ms;
+                result.arm_wall_ms          = timing.prejoin_wall_ms;
+                result.prejoin_wall_ms      = timing.prejoin_wall_ms;
                 result.direct_completion_ms = timing.direct_completion_ms;
-                result.metal_ms             = timing.metal_ms;
+                result.routed_completion_ms = timing.routed_completion_ms;
                 result.direct               = timing.direct;
+            } else if (name == "direct_amx_routed_metal_prejoin_control") {
+                const branch_timing timing = run_prejoin(*direct, metal);
+                if (!check_branch_outputs("measured", iteration, name.c_str(), timing.prejoin_wall_ms)) {
+                    throw std::runtime_error("measured prejoin control changed direct or routed output");
+                }
+                result.arm_wall_ms          = timing.prejoin_wall_ms;
+                result.prejoin_wall_ms      = timing.prejoin_wall_ms;
+                result.direct_completion_ms = timing.direct_completion_ms;
+                result.routed_completion_ms = timing.routed_completion_ms;
+                result.direct               = timing.direct;
+            } else if (name == "direct_amx_routed_metal_join_candidate") {
+                result = measure_candidate(iteration, order);
             } else {
                 GGML_ABORT("unknown DSV4 direct AMX probe measurement");
             }
@@ -1126,24 +1376,36 @@ int main(int argc, char ** argv) try {
         };
 
         const std::vector<std::string> sequence =
-            forward ? std::vector<std::string>{ "direct_amx_shared_solo",      "metal_routed_solo",
-                                                "metal_shared_solo",           "metal_all_control",
-                                                "direct_amx_metal_sequential", "direct_amx_metal_overlap" } :
-                      std::vector<std::string>{ "direct_amx_metal_overlap", "direct_amx_metal_sequential",
-                                                "metal_all_control",        "metal_shared_solo",
-                                                "metal_routed_solo",        "direct_amx_shared_solo" };
+            forward ? std::vector<std::string>{ "direct_amx_shared_solo",
+                                                "metal_routed_solo",
+                                                "metal_shared_solo",
+                                                "direct_amx_routed_metal_sequential_prejoin",
+                                                "direct_amx_routed_metal_prejoin_control",
+                                                "direct_amx_routed_metal_join_candidate",
+                                                "metal_all_control" } :
+                      std::vector<std::string>{ "metal_all_control",
+                                                "direct_amx_routed_metal_join_candidate",
+                                                "direct_amx_routed_metal_prejoin_control",
+                                                "direct_amx_routed_metal_sequential_prejoin",
+                                                "metal_shared_solo",
+                                                "metal_routed_solo",
+                                                "direct_amx_shared_solo" };
         for (const std::string & name : sequence) {
             run_measurement(name);
         }
     }
 
-    if (direct) {
-        const overlap_timing timing = run_overlap(*direct, metal);
-        if (!check_overlap_outputs("after_timing", -1, timing.wall_ms)) {
-            std::fprintf(stderr, "post-timing overlap reproducibility gate failed\n");
+    print_resource_phase("after_timing");
+    if (candidate_join) {
+        const candidate_timing timing = run_candidate(*direct, metal, *candidate_join);
+        if (!check_branch_outputs("after_timing", -1, "direct_amx_routed_metal_join_candidate",
+                                  timing.branches.prejoin_wall_ms) ||
+            !check_joined_output("after_timing", -1, timing.end_to_end_candidate_ms)) {
+            std::fprintf(stderr, "post-timing candidate reproducibility gate failed\n");
             return 1;
         }
     }
+    print_resource_phase("after_post_timing_validation");
 
     if (opts.mode == "all") {
         auto values = [&](const char * mode, auto member) {
@@ -1164,39 +1426,56 @@ int main(int argc, char ** argv) try {
             }
             return result;
         };
-        const double direct_solo = median(values("direct_amx_shared_solo", &raw_run::wall_ms));
-        const double route_solo  = median(values("metal_routed_solo", &raw_run::wall_ms));
-        const double shared_solo = median(values("metal_shared_solo", &raw_run::wall_ms));
-        const double metal_all   = median(values("metal_all_control", &raw_run::wall_ms));
-        const double sequential  = median(values("direct_amx_metal_sequential", &raw_run::wall_ms));
-        const double overlap     = median(values("direct_amx_metal_overlap", &raw_run::wall_ms));
-        const double overlap_direct_completion =
-            median(values("direct_amx_metal_overlap", &raw_run::direct_completion_ms));
-        const double overlap_metal = median(values("direct_amx_metal_overlap", &raw_run::metal_ms));
-        const double overlap_direct_internal =
-            median(direct_values("direct_amx_metal_overlap", &shared_timing::total_ms));
-        const double direct_flops = 6.0 * DSV4_EMBD * DSV4_FF * static_cast<double>(opts.tokens);
-        const double route_flops  = 6.0 * DSV4_EMBD * DSV4_FF * DSV4_EXPERTS_USED * static_cast<double>(opts.tokens);
+        const char * candidate_mode = "direct_amx_routed_metal_join_candidate";
+        const double direct_solo    = median(values("direct_amx_shared_solo", &raw_run::arm_wall_ms));
+        const double route_solo     = median(values("metal_routed_solo", &raw_run::arm_wall_ms));
+        const double shared_solo    = median(values("metal_shared_solo", &raw_run::arm_wall_ms));
+        const double metal_all      = median(values("metal_all_control", &raw_run::arm_wall_ms));
+        const double sequential_prejoin =
+            median(values("direct_amx_routed_metal_sequential_prejoin", &raw_run::prejoin_wall_ms));
+        const double prejoin_control =
+            median(values("direct_amx_routed_metal_prejoin_control", &raw_run::prejoin_wall_ms));
+        const double candidate_prejoin           = median(values(candidate_mode, &raw_run::prejoin_wall_ms));
+        const double candidate_transfer          = median(values(candidate_mode, &raw_run::transfer_ms));
+        const double candidate_join_ms           = median(values(candidate_mode, &raw_run::join_ms));
+        const double candidate_end_to_end        = median(values(candidate_mode, &raw_run::end_to_end_candidate_ms));
+        const double candidate_direct_completion = median(values(candidate_mode, &raw_run::direct_completion_ms));
+        const double candidate_routed_completion = median(values(candidate_mode, &raw_run::routed_completion_ms));
+        const double candidate_direct_internal   = median(direct_values(candidate_mode, &shared_timing::total_ms));
+        const double direct_flops                = 6.0 * DSV4_EMBD * DSV4_FF * static_cast<double>(opts.tokens);
+        const double route_flops = 6.0 * DSV4_EMBD * DSV4_FF * DSV4_EXPERTS_USED * static_cast<double>(opts.tokens);
         std::printf(
             "summary\tdirect_amx_shared_solo_ms=%.6f\tmetal_shared_solo_ms=%.6f"
             "\tmetal_routed_solo_ms=%.6f\tsolo_direct_plus_routed_ms=%.6f"
-            "\tdirect_amx_metal_sequential_wall_ms=%.6f\tmetal_all_control_ms=%.6f"
-            "\toverlap_wall_ms=%.6f\toverlap_direct_completion_ms=%.6f\toverlap_metal_completion_ms=%.6f"
-            "\toverlap_direct_internal_ms=%.6f\tdirect_slowdown=%.6f\tdirect_internal_slowdown=%.6f"
-            "\tmetal_slowdown=%.6f\toverlap_efficiency=%.6f\tdirect_shared_tflops=%.6f"
-            "\tmetal_routed_tflops=%.6f\tdirect_solo_transpose_input_ms=%.6f"
-            "\tdirect_solo_transpose_hidden_ms=%.6f\toverlap_transpose_input_ms=%.6f"
-            "\toverlap_transpose_hidden_ms=%.6f\tcomparison_scope=pre_join_branch_feasibility"
-            "\tend_to_end_comparable=0\tprejoin_branch_overlap_fits_under_metal_all=%d\n",
-            direct_solo, shared_solo, route_solo, direct_solo + route_solo, sequential, metal_all, overlap,
-            overlap_direct_completion, overlap_metal, overlap_direct_internal, overlap_direct_completion / direct_solo,
-            overlap_direct_internal / direct_solo, overlap_metal / route_solo, (direct_solo + route_solo) / overlap,
+            "\tsequential_prejoin_wall_ms=%.6f\tprejoin_control_wall_ms=%.6f"
+            "\tcandidate_prejoin_wall_ms=%.6f\ttransfer_ms=%.6f\tjoin_ms=%.6f"
+            "\tend_to_end_candidate_ms=%.6f\tmetal_all_control_ms=%.6f"
+            "\tpost_prejoin_candidate_overhead_ms=%.6f\ttransfer_plus_join_ms=%.6f\n",
+            direct_solo, shared_solo, route_solo, direct_solo + route_solo, sequential_prejoin, prejoin_control,
+            candidate_prejoin, candidate_transfer, candidate_join_ms, candidate_end_to_end, metal_all,
+            candidate_end_to_end - candidate_prejoin, candidate_transfer + candidate_join_ms);
+        std::printf(
+            "concurrency\tcandidate_direct_completion_ms=%.6f\tcandidate_routed_completion_ms=%.6f"
+            "\tcandidate_direct_internal_ms=%.6f\tdirect_completion_slowdown=%.6f"
+            "\tdirect_internal_slowdown=%.6f\trouted_completion_slowdown=%.6f"
+            "\tprejoin_overlap_efficiency=%.6f\tdirect_shared_tflops=%.6f\tmetal_routed_tflops=%.6f"
+            "\tdirect_solo_transpose_input_ms=%.6f\tdirect_solo_transpose_hidden_ms=%.6f"
+            "\tcandidate_transpose_input_ms=%.6f\tcandidate_transpose_hidden_ms=%.6f\n",
+            candidate_direct_completion, candidate_routed_completion, candidate_direct_internal,
+            candidate_direct_completion / direct_solo, candidate_direct_internal / direct_solo,
+            candidate_routed_completion / route_solo, (direct_solo + route_solo) / candidate_prejoin,
             direct_flops / (direct_solo * 1.0e9), route_flops / (route_solo * 1.0e9),
             median(direct_values("direct_amx_shared_solo", &shared_timing::transpose_input_ms)),
             median(direct_values("direct_amx_shared_solo", &shared_timing::transpose_hidden_ms)),
-            median(direct_values("direct_amx_metal_overlap", &shared_timing::transpose_input_ms)),
-            median(direct_values("direct_amx_metal_overlap", &shared_timing::transpose_hidden_ms)),
-            overlap < metal_all ? 1 : 0);
+            median(direct_values(candidate_mode, &shared_timing::transpose_input_ms)),
+            median(direct_values(candidate_mode, &shared_timing::transpose_hidden_ms)));
+        std::printf(
+            "decision\tmeasurement_scope=single_layer_synthetic_fork_host_transfer_metal_join"
+            "\tproduction_end_to_end_comparable=0\tcandidate_output_join_implemented=1"
+            "\tprejoin_control_fits_under_metal_all=%d\tend_to_end_candidate_fits_under_metal_all=%d"
+            "\tend_to_end_candidate_vs_all_metal_ratio=%.6f\tend_to_end_candidate_saved_ms=%.6f\n",
+            prejoin_control < metal_all ? 1 : 0, candidate_end_to_end < metal_all ? 1 : 0,
+            candidate_end_to_end / metal_all, metal_all - candidate_end_to_end);
     }
 
     struct rusage usage{};
