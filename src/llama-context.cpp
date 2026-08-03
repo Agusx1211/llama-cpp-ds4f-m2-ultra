@@ -903,6 +903,7 @@ bool llama_context::memory_update(bool optimize) {
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
             case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
+            case LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE:
                 {
                     LLAMA_LOG_ERROR("%s: failed to prepare memory update\n", __func__);
                     return false;
@@ -1445,7 +1446,11 @@ bool llama_context::set_adapter_cvec(
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
-        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+        if (mctx->get_status() == LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE) {
+            LLAMA_LOG_WARN("%s: physical KV pressure before graph submission\n", __func__);
+        } else {
+            LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+        }
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
@@ -1556,7 +1561,6 @@ int llama_context::encode(const llama_batch & batch_inp) {
         synchronize();
     }
     embd_seq.clear();
-
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
@@ -1832,6 +1836,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    last_kv_pressure = {};
+    last_kv_pressure_valid = false;
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -1906,14 +1913,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (!embd_seq.empty()) {
         synchronize();
     }
-    embd_seq.clear();
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
     n_queued_tokens += n_tokens_all;
-
-    output_swaps.clear();
 
     sched_reserve();
 
@@ -1962,9 +1966,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                     return -2;
                 }
+            case LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE:
+                {
+                    LLAMA_LOG_ERROR("%s: unexpected physical KV pressure before applying the batch\n", __func__);
+
+                    return -2;
+                }
         }
 
         break;
+    }
+
+    // DSV4 reserves the physical pages for every logical ubatch here, before
+    // output_reserve() invalidates the previous decode's observable outputs.
+    // A pressure result therefore leaves outputs and logical sequence state
+    // untouched and cannot follow a partially submitted batch.
+    if (!mctx->preflight()) {
+        if (mctx->get_status() == LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE) {
+            last_kv_pressure_valid = mctx->get_kv_pressure(last_kv_pressure);
+            LLAMA_LOG_WARN("%s: physical KV pressure before output preparation and graph submission\n", __func__);
+            return LLAMA_DECODE_KV_PHYSICAL_PRESSURE;
+        }
+
+        LLAMA_LOG_ERROR("%s: memory preflight failed for batch of size %d\n", __func__, balloc->get_n_tokens());
+        return -2;
     }
 
     // reserve output buffer
@@ -1975,6 +2000,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    const uint32_t n_outputs_before = n_outputs;
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -2000,6 +2026,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
+            if (mctx->get_status() == LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE) {
+                GGML_ASSERT(n_tokens_prev == 0 && "physical KV pressure occurred after graph submission");
+                last_kv_pressure_valid = mctx->get_kv_pressure(last_kv_pressure);
+                n_outputs = n_outputs_before;
+                return LLAMA_DECODE_KV_PHYSICAL_PRESSURE;
+            }
+
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -2028,6 +2061,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
+        }
+
+        // Preserve the previous observable outputs when memory application
+        // returns pre-graph physical pressure. Once the first ubatch actually
+        // succeeds, its outputs replace the previous decode as usual.
+        if (n_tokens_prev == 0) {
+            embd_seq.clear();
+            output_swaps.clear();
         }
 
         // plot the computation graph in dot format (for debugging purposes)
@@ -2210,6 +2251,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     //synchronize();
 
     return 0;
+}
+
+bool llama_context::get_last_kv_pressure(llama_kv_pressure_info & info) const {
+    if (!last_kv_pressure_valid) {
+        return false;
+    }
+    info = last_kv_pressure;
+    return true;
 }
 
 //
@@ -4286,11 +4335,20 @@ int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
     const int ret = ctx->decode(batch);
-    if (ret != 0 && ret != 1) {
+    if (ret < 0) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
 
     return ret;
+}
+
+bool llama_get_last_kv_pressure(
+        const llama_context * ctx,
+        llama_kv_pressure_info * info) {
+    if (ctx == nullptr || info == nullptr) {
+        return false;
+    }
+    return ctx->get_last_kv_pressure(*info);
 }
 
 //

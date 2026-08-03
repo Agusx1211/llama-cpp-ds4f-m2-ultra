@@ -145,6 +145,7 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+    bool get_last_kv_pressure(llama_kv_pressure_info & info) const;
 
     //
     // state save/load
@@ -388,6 +389,9 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+
+    llama_kv_pressure_info last_kv_pressure = {};
+    bool last_kv_pressure_valid = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

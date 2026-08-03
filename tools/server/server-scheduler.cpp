@@ -192,12 +192,78 @@ const char * to_string(reason_code value) {
             return "replay_spill_start";
         case reason_code::replay_spill_done:
             return "replay_spill_done";
+        case reason_code::kv_physical_pressure_retry:
+            return "kv_physical_pressure_retry";
+        case reason_code::kv_physical_pressure_victim:
+            return "kv_physical_pressure_victim";
     }
     return "unknown";
 }
 
 bool resource_vector::operator==(const resource_vector & other) const {
     return units == other.units;
+}
+
+bool kv_pressure_event::operator==(const kv_pressure_event & other) const {
+    return action             == other.action &&
+           reason             == other.reason &&
+           attempt            == other.attempt &&
+           next_batch_size    == other.next_batch_size &&
+           victim_sequence    == other.victim_sequence &&
+           victim_span_tokens == other.victim_span_tokens;
+}
+
+bool kv_pressure_snapshot::operator==(const kv_pressure_snapshot & other) const {
+    return total   == other.total &&
+           retries == other.retries &&
+           victims == other.victims;
+}
+
+kv_pressure_controller::kv_pressure_controller(uint32_t max_retries) : max_retries(max_retries) {
+}
+
+kv_pressure_event kv_pressure_controller::on_pressure(
+        uint32_t current_batch_size,
+        int32_t victim_sequence,
+        uint32_t victim_span_tokens) {
+    if (current_batch_size == 0 || victim_sequence < 0 || victim_span_tokens == 0) {
+        throw std::invalid_argument("physical pressure requires a non-empty batch and victim span");
+    }
+
+    ++counters.total;
+    ++attempts;
+
+    if (attempts <= max_retries) {
+        ++counters.retries;
+        return {
+            kv_pressure_action::retry,
+            reason_code::kv_physical_pressure_retry,
+            attempts,
+            std::max<uint32_t>(1, current_batch_size/2),
+            -1,
+            0,
+        };
+    }
+
+    ++counters.victims;
+    const uint32_t victim_attempt = attempts;
+    attempts = 0;
+    return {
+        kv_pressure_action::victim,
+        reason_code::kv_physical_pressure_victim,
+        victim_attempt,
+        current_batch_size,
+        victim_sequence,
+        victim_span_tokens,
+    };
+}
+
+void kv_pressure_controller::reset_attempts() {
+    attempts = 0;
+}
+
+kv_pressure_snapshot kv_pressure_controller::snapshot() const {
+    return counters;
 }
 
 struct scheduler::impl {
