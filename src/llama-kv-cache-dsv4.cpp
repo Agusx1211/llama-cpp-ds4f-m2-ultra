@@ -61,8 +61,11 @@ static uint64_t dsv4_hash_tensor(uint64_t hash, const ggml_tensor * tensor) {
 static uint64_t dsv4_hash_cache(uint64_t hash, const llama_kv_cache * cache) {
     hash = dsv4_hash_u64(hash, cache->get_size());
     hash = dsv4_hash_u64(hash, cache->get_n_stream());
-    hash = dsv4_hash_u64(hash, cache->type_k());
-    hash = dsv4_hash_u64(hash, cache->type_v());
+    // DSV4 turns every participating cache into K-only MLA storage, so its V
+    // pointers are null and the absence of V is itself part of the schema. K
+    // types are hashed per tensor below; some raw halves legitimately have no
+    // participating layers, so generic type_k()/type_v() cannot be called.
+    hash = dsv4_hash_string(hash, "k-only");
     const auto layer_ids = cache->get_layer_ids();
     hash = dsv4_hash_u64(hash, layer_ids.size());
     for (uint32_t il : layer_ids) {
@@ -1296,7 +1299,7 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*hparams.n_layer()*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(2u*(1 + n_stream*(1 + n_rs_seq))*hparams.n_layer()*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
