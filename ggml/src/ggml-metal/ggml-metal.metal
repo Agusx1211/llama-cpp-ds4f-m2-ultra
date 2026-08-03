@@ -10692,7 +10692,7 @@ template [[host_name("kernel_mul_mm_id_map0_ne20_16")]] kernel kernel_mul_mm_id_
 template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22, 32, false>;
 template [[host_name("kernel_mul_mm_id_map0_ne20_6_dsv4_n16")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<6, 16, true>;
 
-template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, short nr1_tile = 32, bool compact = false, bool paired = false>
+template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, short nr1_tile = 32, bool compact = false, bool paired = false, bool weighted = false>
 kernel void kernel_mul_mm_id(
         constant ggml_metal_kargs_mul_mm_id & args,
         device const char * src0,
@@ -10720,9 +10720,14 @@ kernel void kernel_mul_mm_id(
     static_assert(NR1 == 16 || NR1 == 32, "MUL_MAT_ID token tile must be 16 or 32 columns");
     static_assert(!compact || NR1 == 16, "compact MUL_MAT_ID is DSV4 NR1=16 only");
     static_assert(!paired || compact, "paired MUL_MAT_ID requires the compact DSV4 worklist");
+    static_assert(!weighted || (compact && !paired), "weighted MUL_MAT_ID requires one compact DSV4 projection");
 
     device const char * src0_proj = paired && tgpig.z != 0 ? src0_pair : src0;
     device       char * dst_proj  = paired && tgpig.z != 0 ? dst_pair  : dst;
+    // Paired and weighted modes are mutually exclusive. Reuse the inactive
+    // paired-source slot for weights rather than adding a binding to every
+    // existing indirect matrix pipeline.
+    device const float * weights = (device const float *) src0_pair;
 
     constexpr int NK  = 32;
     constexpr int NL0 = NK/16;
@@ -11007,6 +11012,7 @@ kernel void kernel_mul_mm_id(
 
         const short ide = id % args.ne20;
         const short idt = id / args.ne20;
+        const float route_weight = weighted ? weights[id] : 1.0f;
 
         device float  * D  = (device float  *) dst_proj + r0 + ide*args.ne0 + idt*args.ne1*args.ne0;
         device float4 * D4 = (device float4 *) D;
@@ -11016,12 +11022,12 @@ kernel void kernel_mul_mm_id(
 
         int i = tiisg;
         for (; i < nr0/4; i += 32) {
-            *(D4 + i) = *(C4 + i);
+            *(D4 + i) = *(C4 + i) * route_weight;
         }
 
         i = (4*(nr0/4)) + tiisg;
         for (; i < nr0; i += 32) {
-            *(D + i) = *(C + i);
+            *(D + i) = *(C + i) * route_weight;
         }
     }
 }
@@ -11107,6 +11113,7 @@ template [[host_name("kernel_mul_mm_id_mxfp4_f32")]]   kernel mul_mm_id kernel_m
 template [[host_name("kernel_mul_mm_id_mxfp4_f32_dsv4_n16")]] kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, float, float4x4, float, float2x4, 16>;
 template [[host_name("kernel_mul_mm_id_mxfp4_f32_dsv4_n16_compact")]] kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, float, float4x4, float, float2x4, 16, true>;
 template [[host_name("kernel_mul_mm_id_mxfp4_f32_dsv4_n16_compact_pair")]] kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, float, float4x4, float, float2x4, 16, true, true>;
+template [[host_name("kernel_mul_mm_id_mxfp4_f32_dsv4_n16_compact_weighted")]] kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, float, float4x4, float, float2x4, 16, true, false, true>;
 template [[host_name("kernel_mul_mm_id_q2_K_f32")]]    kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_K,    QK_NL, dequantize_q2_K,    float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q3_K_f32")]]    kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q3_K,    QK_NL, dequantize_q3_K,    float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q4_K_f32")]]    kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q4_K,    QK_NL, dequantize_q4_K,    float,  float4x4,  float, float2x4>;

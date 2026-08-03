@@ -1070,7 +1070,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(
         ggml_metal_library_t lib,
         const ggml_tensor * op,
         bool compact,
-        bool paired) {
+        bool paired,
+        bool weighted) {
     char base[256];
     char name[256];
 
@@ -1090,7 +1091,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(
          (op->src[0]->ne[0] == 2048 && op->src[0]->ne[1] == 4096));
 
     if (use_dsv4_tile) {
-        if (paired) {
+        if (weighted) {
+            GGML_ASSERT(compact && !paired &&
+                op->src[0]->ne[0] == 2048 && op->src[0]->ne[1] == 4096);
+            snprintf(base, 256, "kernel_mul_mm_id_mxfp4_f32_dsv4_n16_compact_weighted");
+        } else if (paired) {
             GGML_ASSERT(compact && op->src[0]->ne[0] == 4096 && op->src[0]->ne[1] == 2048);
             snprintf(base, 256, "kernel_mul_mm_id_mxfp4_f32_dsv4_n16_compact_pair");
         } else {
@@ -1099,7 +1104,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(
                     "kernel_mul_mm_id_mxfp4_f32_dsv4_n16");
         }
     } else {
-        GGML_ASSERT(!compact && !paired);
+        GGML_ASSERT(!compact && !paired && !weighted);
         snprintf(base, 256, "kernel_mul_mm_id_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
     }
     snprintf(name, 256, "%s_bci=%d", base, bc_inp);

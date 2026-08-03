@@ -4660,6 +4660,13 @@ static void init_mul_mat_id_tensors(
                 }
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
             }
+        } else if (strcmp(t->name, "route_weights") == 0) {
+            std::vector<float> data(ggml_nelements(t));
+            for (size_t i = 0; i < data.size(); ++i) {
+                const float magnitude = 0.125f + 0.125f*(i % 7);
+                data[i] = i % 2 == 0 ? magnitude : -magnitude;
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
         } else {
             init_tensor_uniform(t);
         }
@@ -4748,10 +4755,12 @@ struct test_mul_mat_id_fusion : public test_case {
     const uint32_t o; // number of outputs
     const bool mul;
     const bool subtract; // make the two-output oracle order-sensitive
+    const mul_mat_id_ids ids;
 
     std::string vars() override {
         return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, o, mul) +
-            ",subtract=" + std::to_string(subtract);
+            ",subtract=" + std::to_string(subtract) +
+            ",ids=" + mul_mat_id_ids_name(ids);
     }
 
     double max_nmse_err() override {
@@ -4766,9 +4775,10 @@ struct test_mul_mat_id_fusion : public test_case {
     test_mul_mat_id_fusion(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
             int64_t m = 32, int64_t n = 32, int64_t k = 32, uint32_t o = 1,
-            bool mul = false, bool subtract = false)
+            bool mul = false, bool subtract = false,
+            mul_mat_id_ids ids = mul_mat_id_ids::shuffled)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), o(o), mul(mul), subtract(subtract) {
+            m(m), n(n), k(k), o(o), mul(mul), subtract(subtract), ids(ids) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -4799,8 +4809,8 @@ struct test_mul_mat_id_fusion : public test_case {
 
         if (mul) {
             std::array<int64_t, 4> ne { 1, out->ne[1], out->ne[2], out->ne[3] };
-            ne[0] = 1;
             ggml_tensor * m = ggml_new_tensor(ctx, out->type, 4, ne.data());
+            ggml_set_name(m, "route_weights");
             out = ggml_mul(ctx, out, m);
         }
 
@@ -4808,13 +4818,18 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats, n_used);
+        init_mul_mat_id_tensors(ctx, n_mats, n_used, ids);
     }
 
     bool run_whole_graph() override { return true; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
+        if (type_a == GGML_TYPE_MXFP4 && type_b == GGML_TYPE_F32 &&
+                n_mats == 256 && n_used == 6 && !b &&
+                m == 4096 && k == 2048 && n >= 224 && n <= 2048 && o == 1 && mul) {
+            return "DSV4_PROMPT_DOWN_WEIGHT_FUSION";
+        }
         return "MUL_MAT_ID_FUSION";
     }
 };
@@ -10575,6 +10590,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // DSV4 decode down projection with its routed-weight multiply.
     test_cases.emplace_back(new test_mul_mat_id_fusion(
                 GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 1, 2048, 1, true));
+    // DSV4 prompt down projection with signed route weights. These whole-graph
+    // cases cover both production route distributions and every target ubatch.
+    test_cases.emplace_back(new test_mul_mat_id_fusion(
+                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 224, 2048, 1, true,
+                false, mul_mat_id_ids::shuffled));
+    test_cases.emplace_back(new test_mul_mat_id_fusion(
+                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 512, 2048, 1, true,
+                false, mul_mat_id_ids::concentrated));
+    test_cases.emplace_back(new test_mul_mat_id_fusion(
+                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 2048, 2048, 1, true,
+                false, mul_mat_id_ids::shuffled));
     test_cases.emplace_back(new test_mul_mat_id_fusion(
                 GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, true, 2048, 1, 4096, 2));
     test_cases.emplace_back(new test_mul_mat_id_fusion(
@@ -10626,6 +10652,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 4096, 1, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_id_fusion(
                 GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 1, 2048, 1, true));
+    for (int bs : { 224, 512, 2048 }) {
+        test_cases.emplace_back(new test_mul_mat_id_fusion(
+                    GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, bs, 2048, 1, true));
+    }
     for (int bs : { 1, 4, 32 }) {
         test_cases.emplace_back(new test_mul_mat_id_fusion(
                     GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, true, 2048, bs, 4096, 2));
