@@ -1,8 +1,10 @@
 #include "server-prefix-cache.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <stdexcept>
 #include <vector>
 
 using namespace server_prefix_cache;
@@ -51,6 +53,40 @@ static std::vector<int32_t> tokens(size_t count, int32_t seed = 0) {
 
 static server_prefix_entry entry(uint64_t handle, uint64_t generation = 1) {
     return { handle, generation, 64 * 1024, 12.5 };
+}
+
+static server_prefix_policy_key policy_key(uint64_t seed) {
+    server_prefix_policy_key result;
+    for (size_t offset = 0; offset < result.digest.size(); offset += sizeof(seed)) {
+        const uint64_t value = seed ^ (0x9e3779b97f4a7c15ULL * (offset / sizeof(seed) + 1));
+        for (size_t byte = 0; byte < sizeof(value); ++byte) {
+            result.digest[offset + byte] = static_cast<uint8_t>(value >> (byte * 8));
+        }
+    }
+    result.aligned_tokens = 128;
+    return result;
+}
+
+static server_prefix_policy_candidate policy_candidate(uint64_t seed,
+                                                       uint64_t unique_bytes = 100,
+                                                       double   prefill_ms   = 10.0,
+                                                       bool     pin          = false) {
+    return { policy_key(seed), unique_bytes, prefill_ms, 0.0, pin };
+}
+
+static server_prefix_policy_config policy_config() {
+    server_prefix_policy_config result;
+    result.max_resident_entries = 8;
+    result.max_resident_bytes   = 800;
+    result.max_protected_bytes  = 400;
+    result.max_pinned_entries   = 2;
+    result.max_pinned_bytes     = 200;
+    result.ghost_buckets        = 32;
+    result.ghost_ways           = 4;
+    result.sketch_width         = 128;
+    result.decay_interval       = 1024;
+    result.hysteresis_fraction  = 0.10;
+    return result;
 }
 
 static void test_longest_exact_prefix_and_shared_reuse() {
@@ -201,6 +237,258 @@ static void test_one_million_token_anchor_is_bounded() {
     assert(radix.stats().nodes == 0 && radix.stats().identities == 0);
 }
 
+static void test_policy_second_hit_and_decay_window() {
+    auto config           = policy_config();
+    config.decay_interval = 4;
+    server_prefix_policy policy(config);
+    const auto           hot = policy_candidate(1);
+
+    assert(policy.observe(hot).status == server_prefix_policy_status::first_sighting);
+    assert(policy.observe(hot).status == server_prefix_policy_status::admitted_probation);
+    assert(policy.resident(hot.key)->segment == server_prefix_policy_segment::probation);
+    assert(policy.observe(hot).status == server_prefix_policy_status::resident_hit);
+    assert(policy.resident(hot.key)->segment == server_prefix_policy_segment::protected_segment);
+
+    const auto stale = policy_candidate(2);
+    assert(policy.observe(stale).status == server_prefix_policy_status::first_sighting);
+    for (uint64_t seed = 100; seed < 105; ++seed) {
+        assert(policy.observe(policy_candidate(seed)).status == server_prefix_policy_status::first_sighting);
+    }
+    assert(policy.observe(stale).status == server_prefix_policy_status::first_sighting);
+    assert(!policy.resident(stale.key).has_value());
+    assert(policy.stats().decays >= 1);
+}
+
+static void test_policy_collisions_keep_exact_authority() {
+    auto config                  = policy_config();
+    config.force_hash_collisions = true;
+    config.ghost_buckets         = 1;
+    config.decay_interval        = 1000000;
+    server_prefix_policy policy(config);
+    const auto           a = policy_candidate(10);
+    const auto           b = policy_candidate(20);
+
+    assert(policy.observe(a).status == server_prefix_policy_status::first_sighting);
+    assert(policy.observe(b).status == server_prefix_policy_status::first_sighting);
+    assert(policy.observe(a).status == server_prefix_policy_status::admitted_probation);
+    assert(policy.resident(a.key).has_value());
+    assert(!policy.resident(b.key).has_value());
+    assert(!policy.erase(policy_key(999)));
+    assert(policy.resident(a.key).has_value());
+    assert(policy.observe(b).status == server_prefix_policy_status::admitted_probation);
+    assert(policy.resident(b.key).has_value());
+
+    server_prefix_policy_result saturated;
+    for (uint64_t seed = 1000; seed < 71000; ++seed) {
+        saturated = policy.observe(policy_candidate(seed));
+        assert(saturated.status == server_prefix_policy_status::first_sighting);
+    }
+    assert(saturated.estimated_frequency == std::numeric_limits<uint16_t>::max());
+    assert(policy.stats().resident_entries == 2);
+}
+
+static void test_policy_probation_protection_and_pin_quota() {
+    auto config                 = policy_config();
+    config.max_resident_entries = 3;
+    config.max_resident_bytes   = 300;
+    config.max_protected_bytes  = 100;
+    config.max_pinned_entries   = 1;
+    config.max_pinned_bytes     = 100;
+    server_prefix_policy policy(config);
+    const auto           hot    = policy_candidate(1, 100, 5.0);
+    const auto           cold   = policy_candidate(2, 100, 50.0);
+    const auto           pinned = policy_candidate(3, 100, 1.0, true);
+
+    assert(policy.observe(hot).status == server_prefix_policy_status::first_sighting);
+    assert(policy.observe(hot).status == server_prefix_policy_status::admitted_probation);
+    assert(policy.observe(hot).status == server_prefix_policy_status::resident_hit);
+    assert(policy.resident(hot.key)->segment == server_prefix_policy_segment::protected_segment);
+    assert(policy.observe(cold).status == server_prefix_policy_status::first_sighting);
+    assert(policy.observe(cold).status == server_prefix_policy_status::admitted_probation);
+    assert(policy.observe(pinned).status == server_prefix_policy_status::admitted_pinned);
+
+    const auto pin_over_quota = policy.observe(policy_candidate(4, 100, 100.0, true));
+    assert(pin_over_quota.status == server_prefix_policy_status::rejected_pin_quota);
+    assert(!policy.resident(policy_key(4)).has_value());
+
+    const auto challenger = policy_candidate(5, 100, 100.0);
+    assert(policy.observe(challenger).status == server_prefix_policy_status::first_sighting);
+    const auto admission = policy.observe(challenger);
+    assert(admission.status == server_prefix_policy_status::admitted_probation);
+    assert(admission.evicted.size() == 1 && admission.evicted.front() == cold.key);
+    assert(policy.resident(hot.key)->segment == server_prefix_policy_segment::protected_segment);
+    assert(policy.resident(pinned.key)->segment == server_prefix_policy_segment::pinned);
+    assert(!policy.resident(cold.key).has_value());
+
+    const auto stats = policy.stats();
+    assert(stats.resident_entries == 3 && stats.resident_bytes == 300);
+    assert(stats.protected_entries == 1 && stats.protected_bytes == 100);
+    assert(stats.probation_entries == 1 && stats.probation_bytes == 100);
+    assert(stats.pinned_entries == 1 && stats.pinned_bytes == 100);
+}
+
+static void test_policy_cost_size_hysteresis() {
+    auto config                 = policy_config();
+    config.max_resident_entries = 1;
+    config.max_resident_bytes   = 100;
+    config.max_protected_bytes  = 0;
+    config.max_pinned_entries   = 0;
+    config.max_pinned_bytes     = 0;
+    server_prefix_policy policy(config);
+    const auto           incumbent = policy_candidate(1, 100, 10.0);
+    assert(policy.observe(incumbent).status == server_prefix_policy_status::first_sighting);
+    assert(policy.observe(incumbent).status == server_prefix_policy_status::admitted_probation);
+
+    const auto marginal = policy_candidate(2, 100, 10.5);
+    assert(policy.observe(marginal).status == server_prefix_policy_status::first_sighting);
+    assert(policy.observe(marginal).status == server_prefix_policy_status::rejected_hysteresis);
+    assert(policy.resident(incumbent.key).has_value());
+
+    const auto efficient = policy_candidate(3, 50, 8.0);
+    assert(policy.observe(efficient).status == server_prefix_policy_status::first_sighting);
+    const auto admission = policy.observe(efficient);
+    assert(admission.status == server_prefix_policy_status::admitted_probation);
+    assert(admission.evicted.size() == 1 && admission.evicted.front() == incumbent.key);
+    assert(policy.resident(efficient.key).has_value());
+}
+
+static void test_one_million_one_hit_ghosts_are_bounded() {
+    auto config                 = policy_config();
+    config.max_resident_entries = 64;
+    config.max_resident_bytes   = 64 * 1024;
+    config.max_protected_bytes  = 32 * 1024;
+    config.max_pinned_entries   = 0;
+    config.max_pinned_bytes     = 0;
+    config.ghost_buckets        = 1024;
+    config.ghost_ways           = 4;
+    config.sketch_width         = 2048;
+    config.decay_interval       = 65536;
+    server_prefix_policy policy(config);
+
+    constexpr uint64_t candidate_count = 1000000;
+    for (uint64_t seed = 1; seed <= candidate_count; ++seed) {
+        assert(policy.observe(policy_candidate(seed, 1024, 1.0)).status == server_prefix_policy_status::first_sighting);
+    }
+    const auto stats = policy.stats();
+    assert(stats.observations == candidate_count);
+    assert(stats.resident_entries == 0 && stats.resident_bytes == 0);
+    assert(stats.ghost_entries <= stats.ghost_capacity);
+    assert(stats.ghost_capacity == config.ghost_buckets * config.ghost_ways);
+    assert(stats.sketch_cells == config.sketch_width * 4);
+    assert(stats.fixed_metadata_bytes ==
+           stats.ghost_bytes + stats.sketch_bytes + config.ghost_buckets * sizeof(size_t));
+    assert(stats.decays == 15);
+    std::cout << "million one-hit candidates: ghosts=" << stats.ghost_entries << '/' << stats.ghost_capacity
+              << " ghost_bytes=" << stats.ghost_bytes << " sketch_bytes=" << stats.sketch_bytes
+              << " fixed_metadata_bytes=" << stats.fixed_metadata_bytes << " decays=" << stats.decays << '\n';
+}
+
+struct trace_cache {
+    explicit trace_cache(bool lru) : lru(lru) {}
+
+    bool access(uint64_t key) {
+        const auto found = std::find(order.begin(), order.end(), key);
+        if (found != order.end()) {
+            if (lru) {
+                order.erase(found);
+                order.push_back(key);
+            }
+            return true;
+        }
+        if (order.size() == capacity) {
+            order.erase(order.begin());
+        }
+        order.push_back(key);
+        return false;
+    }
+
+    static constexpr size_t capacity = 4;
+    bool                    lru;
+    std::vector<uint64_t>   order;
+};
+
+static void test_policy_trace_beats_fifo_and_lru_efficiency() {
+    constexpr uint64_t object_bytes = 1024 * 1024;
+    auto               config       = policy_config();
+    config.max_resident_entries     = 4;
+    config.max_resident_bytes       = 4 * object_bytes;
+    config.max_protected_bytes      = 2 * object_bytes;
+    config.max_pinned_entries       = 0;
+    config.max_pinned_bytes         = 0;
+    config.ghost_buckets            = 4096;
+    config.sketch_width             = 4096;
+    config.decay_interval           = 1ULL << 20;
+    server_prefix_policy policy(config);
+    trace_cache          fifo(false);
+    trace_cache          lru(true);
+    double               policy_saved = 0.0;
+    double               fifo_saved   = 0.0;
+    double               lru_saved    = 0.0;
+
+    const auto access = [&](uint64_t key, double saved_ms) {
+        const auto candidate = policy_candidate(key, object_bytes, saved_ms);
+        if (policy.resident(candidate.key).has_value()) {
+            policy_saved += saved_ms;
+        }
+        policy.observe(candidate);
+        if (fifo.access(key)) {
+            fifo_saved += saved_ms;
+        }
+        if (lru.access(key)) {
+            lru_saved += saved_ms;
+        }
+    };
+
+    access(1, 100.0);
+    access(1, 100.0);
+    access(1, 100.0);
+    uint64_t cold_key = 2;
+    for (size_t round = 0; round < 200; ++round) {
+        for (size_t cold = 0; cold < 8; ++cold) {
+            access(cold_key++, 2.0);
+        }
+        access(1, 100.0);
+    }
+
+    const auto   stats             = policy.stats();
+    const double gib               = 1024.0 * 1024.0 * 1024.0;
+    const double policy_efficiency = policy_saved / (static_cast<double>(stats.resident_bytes) / gib);
+    const double fifo_efficiency   = fifo_saved / (static_cast<double>(fifo.order.size() * object_bytes) / gib);
+    const double lru_efficiency    = lru_saved / (static_cast<double>(lru.order.size() * object_bytes) / gib);
+    assert(policy_saved > fifo_saved && policy_saved > lru_saved);
+    assert(policy_efficiency > fifo_efficiency && policy_efficiency > lru_efficiency);
+    assert(stats.resident_entries == 1 && policy.resident(policy_key(1)).has_value());
+    std::cout << "synthetic trace saved_ms/GiB: policy=" << policy_efficiency << " fifo=" << fifo_efficiency
+              << " lru=" << lru_efficiency << " saved_ms=" << policy_saved << '/' << fifo_saved << '/' << lru_saved
+              << '\n';
+}
+
+static void test_policy_invalid_input_and_clear() {
+    auto bad_config          = policy_config();
+    bad_config.ghost_buckets = 0;
+    bool threw               = false;
+    try {
+        server_prefix_policy ignored(bad_config);
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    assert(threw);
+
+    server_prefix_policy policy(policy_config());
+    auto                 invalid = policy_candidate(1);
+    invalid.key.digest           = {};
+    assert(policy.observe(invalid).status == server_prefix_policy_status::rejected_invalid);
+    invalid              = policy_candidate(1);
+    invalid.unique_bytes = 0;
+    assert(policy.observe(invalid).status == server_prefix_policy_status::rejected_invalid);
+    assert(policy.stats().observations == 0);
+    assert(policy.observe(policy_candidate(2, 100, 1.0, true)).status == server_prefix_policy_status::admitted_pinned);
+    policy.clear();
+    const auto stats = policy.stats();
+    assert(stats.observations == 0 && stats.resident_entries == 0 && stats.ghost_entries == 0);
+    assert(stats.sketch_cells != 0 && stats.ghost_capacity != 0);
+}
+
 int main() {
     test_longest_exact_prefix_and_shared_reuse();
     test_hash_collisions_never_authorize_reuse();
@@ -208,6 +496,13 @@ int main() {
     test_capacity_preflight_is_atomic_and_erase_prunes();
     test_invalid_inputs_do_not_allocate();
     test_one_million_token_anchor_is_bounded();
-    std::cout << "server prefix radix tests passed\n";
+    test_policy_second_hit_and_decay_window();
+    test_policy_collisions_keep_exact_authority();
+    test_policy_probation_protection_and_pin_quota();
+    test_policy_cost_size_hysteresis();
+    test_one_million_one_hit_ghosts_are_bounded();
+    test_policy_trace_beats_fifo_and_lru_efficiency();
+    test_policy_invalid_input_and_clear();
+    std::cout << "server prefix cache tests passed\n";
     return 0;
 }
