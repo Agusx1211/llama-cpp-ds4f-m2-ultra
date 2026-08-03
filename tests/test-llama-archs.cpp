@@ -1262,9 +1262,10 @@ static bool test_dsv4_restore_long_compressed_history(size_t seed, ggml_backend_
     static constexpr uint32_t n_vocab          = 128;
     static constexpr uint32_t n_history        = 2048;
     static constexpr uint32_t n_chunk          = 128;
-    static constexpr uint32_t n_survivor       = 37;
+    static constexpr uint32_t n_survivor       = 128;
     static constexpr uint32_t n_ctx_seq        = 2304;
     static constexpr uint32_t n_seq_max        = 4;
+    static constexpr uint32_t n_swa            = 32;
     static constexpr uint32_t csa_ratio        = 4;
     static constexpr uint32_t hca_ratio        = 128;
     static constexpr llama_seq_id source_seq   = 0;
@@ -1308,6 +1309,18 @@ static bool test_dsv4_restore_long_compressed_history(size_t seed, ggml_backend_
     const auto source_state_after_reference = dsv4_sequence_state(test.lctx.get(), source_seq);
     const llama_pos source_pos_after_reference = llama_memory_seq_pos_max(memory, source_seq);
     const auto resident_rows_after_reference = dsv4_page_rows(memory->memory_usage_snapshot());
+    GGML_ASSERT(resident_rows_after_reference[LLAMA_DSV4_MEMORY_HCA][survivor_seq] == 1);
+
+    const auto assert_residents_unchanged = [&](const auto & rows) {
+        for (size_t family = 0; family < rows.size(); ++family) {
+            GGML_ASSERT(rows[family][source_seq] == resident_rows_after_reference[family][source_seq]);
+            GGML_ASSERT(rows[family][survivor_seq] == resident_rows_after_reference[family][survivor_seq]);
+        }
+        GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), source_seq) == source_state_after_reference);
+        GGML_ASSERT(llama_memory_seq_pos_max(memory, source_seq) == source_pos_after_reference);
+        GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), survivor_seq) == survivor_state);
+        GGML_ASSERT(llama_memory_seq_pos_max(memory, survivor_seq) == survivor_pos);
+    };
 
     const size_t restored = llama_state_seq_set_data(
             test.lctx.get(), checkpoint_state.data(), checkpoint_state.size(), dest_seq);
@@ -1321,17 +1334,8 @@ static bool test_dsv4_restore_long_compressed_history(size_t seed, ggml_backend_
     // A running full-size ISWA cache retains historical raw bookkeeping, while
     // restore reconstructs only its semantically live sliding-attention rows.
     // Continuation logits are the oracle for the intentionally compact layout.
-    GGML_ASSERT(rows_after_restore[LLAMA_DSV4_MEMORY_RAW][dest_seq] > 0);
-    GGML_ASSERT(rows_after_restore[LLAMA_DSV4_MEMORY_RAW][dest_seq] <=
-            checkpoint_rows[LLAMA_DSV4_MEMORY_RAW][source_seq]);
-    for (size_t family = 0; family < rows_after_restore.size(); ++family) {
-        GGML_ASSERT(rows_after_restore[family][source_seq] == resident_rows_after_reference[family][source_seq]);
-        GGML_ASSERT(rows_after_restore[family][survivor_seq] == resident_rows_after_reference[family][survivor_seq]);
-    }
-    GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), source_seq) == source_state_after_reference);
-    GGML_ASSERT(llama_memory_seq_pos_max(memory, source_seq) == source_pos_after_reference);
-    GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), survivor_seq) == survivor_state);
-    GGML_ASSERT(llama_memory_seq_pos_max(memory, survivor_seq) == survivor_pos);
+    GGML_ASSERT(rows_after_restore[LLAMA_DSV4_MEMORY_RAW][dest_seq] == n_swa);
+    assert_residents_unchanged(rows_after_restore);
 
     test.add(history_tokens[n_history], n_history, { dest_seq });
     test.decode("long-restore destination continuation");
@@ -1342,15 +1346,8 @@ static bool test_dsv4_restore_long_compressed_history(size_t seed, ggml_backend_
     for (size_t family = LLAMA_DSV4_MEMORY_CSA; family < rows_after_continuation.size(); ++family) {
         GGML_ASSERT(rows_after_continuation[family][dest_seq] == resident_rows_after_reference[family][source_seq]);
     }
-    GGML_ASSERT(rows_after_continuation[LLAMA_DSV4_MEMORY_RAW][dest_seq] > 0);
-    GGML_ASSERT(rows_after_continuation[LLAMA_DSV4_MEMORY_RAW][dest_seq] <=
-            resident_rows_after_reference[LLAMA_DSV4_MEMORY_RAW][source_seq]);
-    for (size_t family = 0; family < rows_after_continuation.size(); ++family) {
-        GGML_ASSERT(rows_after_continuation[family][source_seq] == resident_rows_after_reference[family][source_seq]);
-        GGML_ASSERT(rows_after_continuation[family][survivor_seq] == resident_rows_after_reference[family][survivor_seq]);
-    }
-    GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), source_seq) == source_state_after_reference);
-    GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), survivor_seq) == survivor_state);
+    GGML_ASSERT(rows_after_continuation[LLAMA_DSV4_MEMORY_RAW][dest_seq] == n_swa + 1);
+    assert_residents_unchanged(rows_after_continuation);
 
     const bool logits_ok = compare_dsv4_trace(
             "restore-2048", "next", reference_logits, restored_logits);
