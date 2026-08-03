@@ -545,8 +545,10 @@ bool llm_graph_input_attn_kv_msa::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
-    res &= self_k_idxs    ->ne[0] == params.ubatch.n_tokens;
-    res &= self_k_idxs_idx->ne[0] == params.ubatch.n_tokens;
+    res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+    if (self_k_idxs_idx) {
+        res &= self_k_idxs_idx->ne[0] == params.ubatch.n_tokens;
+    }
 
     res &= can_reuse_kq_mask(self_kq_mask, this->mctx, params.ubatch, params.cparams);
 
@@ -3197,7 +3199,7 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
     return (llm_graph_input_attn_k_dsa *) res->add_input(std::move(inp));
 }
 
-llm_graph_input_attn_kv_msa * llm_graph_context::build_attn_inp_kv_msa() const {
+llm_graph_input_attn_kv_msa * llm_graph_context::build_attn_inp_kv_msa(bool msa_enabled) const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_msa_context *>(mctx);
 
     auto inp = std::make_unique<llm_graph_input_attn_kv_msa>(hparams, cparams, mctx_cur);
@@ -3218,7 +3220,9 @@ llm_graph_input_attn_kv_msa * llm_graph_context::build_attn_inp_kv_msa() const {
     inp->self_k_rot = mctx_base->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_base->build_input_v_rot(ctx0);
 
-    inp->self_k_idxs_idx = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+    if (msa_enabled) {
+        inp->self_k_idxs_idx = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+    }
 
     return (llm_graph_input_attn_kv_msa *) res->add_input(std::move(inp));
 }

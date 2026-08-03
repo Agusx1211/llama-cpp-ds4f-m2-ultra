@@ -335,13 +335,15 @@ static bool run_case(const boundary_case & test) {
 
 int main() {
     // Public custom ops expose at most nine sources. The 20+10 and 21+10
-    // capacity cases therefore use two five-input nodes while preserving the
-    // exact aggregate boundary. The 29+2 case is the shape that triggered the
-    // original overflow: one node introduces both inputs when one slot remains.
+    // capacity cases therefore use two five-input nodes. The cases that cross
+    // the initial capacity exercise dynamic growth without introducing an
+    // otherwise unnecessary split; a node encountered after the capacity is
+    // already full still starts a new split so imported weight storage can be
+    // reused.
     const std::vector<boundary_case> cases = {
-        { "prior-crash-29-plus-2", 29, { { { 29, 30 } } },                                         2 },
+        { "grow-29-plus-2",        29, { { { 29, 30 } } },                                         1 },
         { "capacity-20-plus-10",   20, { { { 20, 21, 22, 23, 24 } }, { { 25, 26, 27, 28, 29 } } }, 1 },
-        { "capacity-21-plus-10",   21, { { { 21, 22, 23, 24, 25 } }, { { 26, 27, 28, 29, 30 } } }, 2 },
+        { "grow-21-plus-10",       21, { { { 21, 22, 23, 24, 25 } }, { { 26, 27, 28, 29, 30 } } }, 1 },
         { "full-30-plus-1",        30, { { { 30 } } },                                             2 },
         { "duplicate-29-plus-1",   29, { { { 29, 29 } } },                                         1 },
     };
