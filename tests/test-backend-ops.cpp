@@ -11042,6 +11042,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_dsv4_sparse_pack(1, 1, 0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_dsv4_indexed_sparse_pack(1, 4, 128, 128, 512, 512));
     test_cases.emplace_back(new test_dsv4_indexed_sparse_pack_materialized(1, 4, 128, 128, 512, 512));
+    test_cases.emplace_back(new test_dsv4_indexed_sparse_pack(1, 4, 128, 128, 5000, 512));
+    test_cases.emplace_back(new test_dsv4_indexed_sparse_pack_materialized(1, 4, 128, 128, 5000, 512));
     test_cases.emplace_back(new test_dsv4_indexed_concat(512, 128, 512, 4));
     test_cases.emplace_back(new test_dsv4_indexed_concat_materialized(512, 128, 512, 4));
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 4096, 1, 1, 1, GGML_TYPE_F16));
