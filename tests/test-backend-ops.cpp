@@ -8068,7 +8068,7 @@ struct test_dsv4_indexed_concat : public test_case {
     }
 
     bool run_whole_graph() override {
-        return mode == MODE_TEST;
+        return mode == MODE_TEST || mode == MODE_PERF;
     }
 
     double err(const float * a, const float * b, size_t n) override {
