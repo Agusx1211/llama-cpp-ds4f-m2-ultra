@@ -180,8 +180,9 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_private_i = {
 };
 
 static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
-    return buffer->iface.free_buffer == ggml_backend_metal_buffer_shared_free_buffer ||
-           buffer->iface.free_buffer == ggml_backend_metal_buffer_private_free_buffer;
+    return buffer != nullptr &&
+          (buffer->iface.free_buffer == ggml_backend_metal_buffer_shared_free_buffer ||
+           buffer->iface.free_buffer == ggml_backend_metal_buffer_private_free_buffer);
 }
 
 // Target-specific unified-memory escape hatch for the production DSV4 AMX
@@ -227,6 +228,13 @@ typedef std::unique_ptr<ggml_backend_metal_buffer_type, ggml_backend_metal_buffe
 static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size, bool shared) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)buft->device->context;
     ggml_metal_buffer_t res = ggml_metal_buffer_init(ctx_dev, size, shared);
+    if (res == nullptr) {
+        const auto * props = ggml_metal_device_get_props(ctx_dev);
+        GGML_LOG_ERROR("%s: Metal %s buffer allocation failed: requested=%zu bytes (%.2f MiB), maxBufferLength=%zu bytes (%.2f MiB)\n",
+                __func__, shared ? "shared" : "private", size, size/1024.0/1024.0,
+                props->max_buffer_size, props->max_buffer_size/1024.0/1024.0);
+        return nullptr;
+    }
 
     ggml_backend_buffer_i buf_i = ggml_metal_buffer_is_shared(res)
         ? ggml_backend_metal_buffer_shared_i
@@ -560,6 +568,140 @@ static bool ggml_backend_metal_dsv4_sparse_map_tensor_ranges(
 
     return ggml_metal_buffer_sparse_map_write(
             buffer, absolute_offsets.data(), sizes, n_ranges);
+}
+
+// Returns 0 for a non-sparse tensor, 1 on success, and -1 on an error.
+static int ggml_backend_metal_dsv4_sparse_tensor_usage(
+        const ggml_tensor * tensor,
+        ggml_metal_sparse_usage * usage) {
+    if (tensor == nullptr || tensor->buffer == nullptr || usage == nullptr ||
+            !ggml_backend_buffer_is_metal(tensor->buffer)) {
+        return 0;
+    }
+    ggml_metal_buffer_t buffer = (ggml_metal_buffer_t) tensor->buffer->context;
+    if (!ggml_metal_buffer_is_sparse(buffer)) {
+        return 0;
+    }
+    return ggml_metal_buffer_sparse_get_usage(buffer, usage) ? 1 : -1;
+}
+
+static ggml_metal_sparse_reservation_result ggml_backend_metal_dsv4_sparse_prepare_tensor_ranges(
+        ggml_tensor * const * tensors,
+        const size_t * offsets,
+        const size_t * sizes,
+        size_t n_ranges,
+        ggml_metal_sparse_pool_quote * pools,
+        size_t pool_capacity,
+        size_t * n_pools,
+        size_t * limiting_pool,
+        ggml_metal_sparse_reservation_t * reservation) {
+    if (tensors == nullptr || offsets == nullptr || sizes == nullptr || n_ranges == 0) {
+        return GGML_METAL_SPARSE_RESERVATION_INVALID;
+    }
+
+    std::vector<ggml_metal_sparse_buffer_range> absolute;
+    absolute.reserve(n_ranges);
+    for (size_t i = 0; i < n_ranges; ++i) {
+        ggml_tensor * tensor = tensors[i];
+        if (tensor == nullptr || tensor->buffer == nullptr ||
+                offsets[i] > ggml_nbytes(tensor) ||
+                sizes[i] > ggml_nbytes(tensor) - offsets[i]) {
+            return GGML_METAL_SPARSE_RESERVATION_INVALID;
+        }
+        if (!ggml_backend_buffer_is_metal(tensor->buffer)) {
+            continue;
+        }
+        ggml_metal_buffer_t buffer = (ggml_metal_buffer_t) tensor->buffer->context;
+        if (!ggml_metal_buffer_is_sparse(buffer)) {
+            continue;
+        }
+        const ggml_metal_buffer_id bid = ggml_metal_buffer_get_id(buffer, tensor);
+        if (bid.metal == nullptr) {
+            return GGML_METAL_SPARSE_RESERVATION_INVALID;
+        }
+        absolute.push_back({ buffer, bid.offs + offsets[i], sizes[i] });
+    }
+    if (absolute.empty()) {
+        // Registry procedures are available to ordinary Metal buffers too.
+        // A range set containing no placement-sparse storage needs no ticket
+        // and is a successful no-op, including reserve calls.
+        if (n_pools != nullptr) {
+            *n_pools = 0;
+        }
+        if (limiting_pool != nullptr) {
+            *limiting_pool = SIZE_MAX;
+        }
+        if (reservation != nullptr) {
+            *reservation = nullptr;
+        }
+        return GGML_METAL_SPARSE_RESERVATION_OK;
+    }
+
+    if (reservation != nullptr) {
+        return ggml_metal_buffers_sparse_reserve(
+                absolute.data(), absolute.size(), pools, pool_capacity,
+                n_pools, limiting_pool, reservation);
+    }
+    return ggml_metal_buffers_sparse_quote(
+            absolute.data(), absolute.size(), pools, pool_capacity,
+            n_pools, limiting_pool);
+}
+
+static ggml_metal_sparse_reservation_result ggml_backend_metal_dsv4_sparse_quote_tensor_ranges(
+        ggml_tensor * const * tensors,
+        const size_t * offsets,
+        const size_t * sizes,
+        size_t n_ranges,
+        ggml_metal_sparse_pool_quote * pools,
+        size_t pool_capacity,
+        size_t * n_pools,
+        size_t * limiting_pool) {
+    return ggml_backend_metal_dsv4_sparse_prepare_tensor_ranges(
+            tensors, offsets, sizes, n_ranges, pools, pool_capacity,
+            n_pools, limiting_pool, nullptr);
+}
+
+static ggml_metal_sparse_reservation_result ggml_backend_metal_dsv4_sparse_reserve_tensor_ranges(
+        ggml_tensor * const * tensors,
+        const size_t * offsets,
+        const size_t * sizes,
+        size_t n_ranges,
+        ggml_metal_sparse_pool_quote * pools,
+        size_t pool_capacity,
+        size_t * n_pools,
+        size_t * limiting_pool,
+        void ** reservation) {
+    ggml_metal_sparse_reservation_t ticket = nullptr;
+    const auto result = ggml_backend_metal_dsv4_sparse_prepare_tensor_ranges(
+            tensors, offsets, sizes, n_ranges, pools, pool_capacity,
+            n_pools, limiting_pool, &ticket);
+    if (reservation != nullptr) {
+        *reservation = ticket;
+    } else if (ticket != nullptr) {
+        ggml_metal_sparse_reservation_free(ticket);
+        return GGML_METAL_SPARSE_RESERVATION_INVALID;
+    }
+    return result;
+}
+
+static ggml_metal_sparse_reservation_result ggml_backend_metal_dsv4_sparse_reservation_commit(
+        void * reservation) {
+    return ggml_metal_sparse_reservation_commit(
+            (ggml_metal_sparse_reservation_t) reservation);
+}
+
+static bool ggml_backend_metal_dsv4_sparse_reservation_rollback(void * reservation) {
+    return ggml_metal_sparse_reservation_rollback(
+            (ggml_metal_sparse_reservation_t) reservation);
+}
+
+static bool ggml_backend_metal_dsv4_sparse_reservation_cancel(void * reservation) {
+    return ggml_metal_sparse_reservation_cancel(
+            (ggml_metal_sparse_reservation_t) reservation);
+}
+
+static void ggml_backend_metal_dsv4_sparse_reservation_free(void * reservation) {
+    ggml_metal_sparse_reservation_free((ggml_metal_sparse_reservation_t) reservation);
 }
 
 // Returns 0 for a non-sparse tensor, 1 on success, and -1 on a sparse error.
@@ -1095,6 +1237,27 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_dsv4_sparse_map_tensor_ranges") == 0) {
         return (void *)ggml_backend_metal_dsv4_sparse_map_tensor_ranges;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_tensor_usage") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_tensor_usage;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_quote_tensor_ranges") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_quote_tensor_ranges;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_reserve_tensor_ranges") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_reserve_tensor_ranges;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_reservation_commit") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_reservation_commit;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_reservation_rollback") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_reservation_rollback;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_reservation_cancel") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_reservation_cancel;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_reservation_free") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_reservation_free;
     }
     if (strcmp(name, "ggml_backend_metal_dsv4_sparse_alias_tensor_rows") == 0) {
         return (void *)ggml_backend_metal_dsv4_sparse_alias_tensor_rows;

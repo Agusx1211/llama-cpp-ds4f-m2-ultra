@@ -1,0 +1,361 @@
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Pure-host accounting shared by the Metal allocator and its Linux tests.
+// Mapping submission remains in ggml-metal-device.m; this header only plans
+// exact page effects and manages reservation counters.
+
+enum ggml_metal_sparse_plan_status {
+    GGML_METAL_SPARSE_PLAN_OK = 0,
+    GGML_METAL_SPARSE_PLAN_INVALID_RANGE,
+    GGML_METAL_SPARSE_PLAN_INVALID_STATE,
+};
+
+static inline const char * ggml_metal_sparse_plan_status_name(
+        enum ggml_metal_sparse_plan_status status) {
+    switch (status) {
+        case GGML_METAL_SPARSE_PLAN_OK:            return "ok";
+        case GGML_METAL_SPARSE_PLAN_INVALID_RANGE: return "invalid-range";
+        case GGML_METAL_SPARSE_PLAN_INVALID_STATE: return "invalid-state";
+    }
+    return "unknown";
+}
+
+struct ggml_metal_sparse_range {
+    size_t offset;
+    size_t size;
+};
+
+struct ggml_metal_sparse_quote {
+    enum ggml_metal_sparse_plan_status status;
+    uint64_t generation;
+    size_t target_mappings;
+    size_t new_pages;
+    size_t cow_pages;
+    size_t required_pages;
+    size_t free_pages;
+    size_t reserved_pages;
+    bool feasible;
+};
+
+enum ggml_metal_sparse_ticket_state {
+    GGML_METAL_SPARSE_TICKET_EMPTY = 0,
+    GGML_METAL_SPARSE_TICKET_RESERVED,
+    GGML_METAL_SPARSE_TICKET_COMMITTED,
+    GGML_METAL_SPARSE_TICKET_ROLLED_BACK,
+    GGML_METAL_SPARSE_TICKET_CANCELLED,
+};
+
+static inline const char * ggml_metal_sparse_ticket_state_name(
+        enum ggml_metal_sparse_ticket_state state) {
+    switch (state) {
+        case GGML_METAL_SPARSE_TICKET_EMPTY:       return "empty";
+        case GGML_METAL_SPARSE_TICKET_RESERVED:    return "reserved";
+        case GGML_METAL_SPARSE_TICKET_COMMITTED:   return "committed";
+        case GGML_METAL_SPARSE_TICKET_ROLLED_BACK: return "rolled-back";
+        case GGML_METAL_SPARSE_TICKET_CANCELLED:   return "cancelled";
+    }
+    return "unknown";
+}
+
+struct ggml_metal_sparse_ticket_accounting {
+    uint64_t generation;
+    size_t reserved_pages;
+    enum ggml_metal_sparse_ticket_state state;
+};
+
+// Mark page tiles selected by ranges relative to a containing view. The
+// offsets are not absolute buffer offsets; callers provide the view's total
+// byte size separately.
+static inline enum ggml_metal_sparse_plan_status ggml_metal_sparse_mark_relative_ranges(
+        size_t page_size,
+        size_t view_size,
+        const size_t * offsets,
+        const size_t * sizes,
+        size_t n_ranges,
+        uint8_t * marked,
+        size_t n_tiles) {
+    if (page_size == 0 || view_size % page_size != 0 || n_tiles != view_size/page_size ||
+            (n_ranges > 0 && (offsets == NULL || sizes == NULL)) ||
+            (n_tiles > 0 && marked == NULL)) {
+        return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+    }
+
+    memset(marked, 0, n_tiles*sizeof(*marked));
+    for (size_t r = 0; r < n_ranges; ++r) {
+        if (sizes[r] == 0) {
+            continue;
+        }
+        if (offsets[r] > view_size || sizes[r] > view_size - offsets[r]) {
+            return GGML_METAL_SPARSE_PLAN_INVALID_RANGE;
+        }
+        const size_t t0 = offsets[r]/page_size;
+        const size_t t1 = (offsets[r] + sizes[r] - 1)/page_size;
+        for (size_t t = t0; t <= t1; ++t) {
+            marked[t] = 1;
+        }
+    }
+    return GGML_METAL_SPARSE_PLAN_OK;
+}
+
+// The caller supplies zeroable scratch arrays sized n_virtual and n_physical.
+// A physical page with R aliases and M selected writes costs M COW pages when
+// M < R, but only M-1 when all aliases are written: one mapping can retain the
+// original page. This is the same n-1 rule used by the commit path.
+static inline struct ggml_metal_sparse_quote ggml_metal_sparse_plan_write(
+        size_t page_size,
+        size_t n_virtual,
+        size_t n_physical,
+        size_t n_free,
+        size_t n_reserved,
+        uint64_t generation,
+        const uint32_t * v2p,
+        const uint32_t * p_ref,
+        const struct ggml_metal_sparse_range * ranges,
+        size_t n_ranges,
+        uint8_t * marked,
+        uint32_t * marked_per_physical) {
+    struct ggml_metal_sparse_quote result = {
+        GGML_METAL_SPARSE_PLAN_OK,
+        generation,
+        0,
+        0,
+        0,
+        0,
+        n_free,
+        n_reserved,
+        false,
+    };
+
+    if (page_size == 0 || n_virtual > UINT32_MAX || n_physical > UINT32_MAX ||
+            n_virtual > SIZE_MAX/page_size ||
+            (n_ranges > 0 && ranges == NULL) ||
+            (n_virtual > 0 && (v2p == NULL || marked == NULL)) ||
+            (n_physical > 0 && (p_ref == NULL || marked_per_physical == NULL))) {
+        result.status = GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+        return result;
+    }
+
+    memset(marked, 0, n_virtual*sizeof(*marked));
+    memset(marked_per_physical, 0, n_physical*sizeof(*marked_per_physical));
+
+    const size_t virtual_size = n_virtual*page_size;
+    for (size_t r = 0; r < n_ranges; ++r) {
+        const size_t offset = ranges[r].offset;
+        const size_t size = ranges[r].size;
+        if (size == 0) {
+            continue;
+        }
+        if (offset > virtual_size || size > virtual_size - offset) {
+            result.status = GGML_METAL_SPARSE_PLAN_INVALID_RANGE;
+            return result;
+        }
+
+        const size_t v0 = offset/page_size;
+        const size_t v1 = (offset + size - 1)/page_size;
+        for (size_t v = v0; v <= v1; ++v) {
+            marked[v] = 1;
+        }
+    }
+
+    for (size_t v = 0; v < n_virtual; ++v) {
+        if (!marked[v]) {
+            continue;
+        }
+        ++result.target_mappings;
+        const uint32_t p = v2p[v];
+        if (p == UINT32_MAX) {
+            ++result.new_pages;
+            continue;
+        }
+        if (p >= n_physical || p_ref[p] == 0) {
+            result.status = GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+            return result;
+        }
+        ++marked_per_physical[p];
+    }
+
+    for (size_t p = 0; p < n_physical; ++p) {
+        const size_t selected = marked_per_physical[p];
+        if (selected == 0) {
+            continue;
+        }
+        if (selected > p_ref[p]) {
+            result.status = GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+            return result;
+        }
+        result.cow_pages += selected < p_ref[p] ? selected : selected - 1;
+    }
+
+    result.required_pages = result.new_pages + result.cow_pages;
+    result.feasible = result.status == GGML_METAL_SPARSE_PLAN_OK &&
+            n_reserved <= n_free && result.required_pages <= n_free - n_reserved;
+    return result;
+}
+
+// Select one stable source virtual mapping for every physical page touched by
+// COW. If an unselected alias exists it remains the source. If all aliases are
+// selected, the lowest selected virtual page is deliberately retained on the
+// original physical page. Every remapped alias copies directly from that
+// retained mapping; no action depends on another newly mapped destination.
+// The caller supplies retained_by_physical[n_physical] and
+// copy_source_by_virtual[n_virtual]. UINT32_MAX means no retained source or no
+// COW copy respectively.
+static inline enum ggml_metal_sparse_plan_status ggml_metal_sparse_select_cow_sources(
+        size_t n_virtual,
+        size_t n_physical,
+        const uint32_t * v2p,
+        const uint32_t * p_ref,
+        const uint8_t * marked,
+        const uint32_t * marked_per_physical,
+        uint32_t * retained_by_physical,
+        uint32_t * copy_source_by_virtual) {
+    if (n_virtual > UINT32_MAX || n_physical > UINT32_MAX ||
+            (n_virtual > 0 && (v2p == NULL || marked == NULL || copy_source_by_virtual == NULL)) ||
+            (n_physical > 0 && (p_ref == NULL || marked_per_physical == NULL ||
+                                retained_by_physical == NULL))) {
+        return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+    }
+
+    for (size_t p = 0; p < n_physical; ++p) {
+        retained_by_physical[p] = UINT32_MAX;
+    }
+    for (size_t v = 0; v < n_virtual; ++v) {
+        copy_source_by_virtual[v] = UINT32_MAX;
+    }
+
+    for (size_t p = 0; p < n_physical; ++p) {
+        const uint32_t selected = marked_per_physical[p];
+        if (selected == 0) {
+            continue;
+        }
+        if (p_ref[p] == 0 || selected > p_ref[p]) {
+            return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+        }
+    }
+
+    // One virtual-table pass selects the lowest eligible source for every
+    // physical page; avoid a physical x virtual scan on 1M-context buffers.
+    for (size_t v = 0; v < n_virtual; ++v) {
+        const uint32_t p = v2p[v];
+        if (p == UINT32_MAX) {
+            continue;
+        }
+        if (p >= n_physical || p_ref[p] == 0) {
+            return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+        }
+        const uint32_t selected = marked_per_physical[p];
+        if (selected == 0 || retained_by_physical[p] != UINT32_MAX) {
+            continue;
+        }
+        const bool retain_unselected = selected < p_ref[p];
+        if (retain_unselected ? !marked[v] : marked[v]) {
+            retained_by_physical[p] = (uint32_t) v;
+        }
+    }
+
+    for (size_t p = 0; p < n_physical; ++p) {
+        if (marked_per_physical[p] == 0) {
+            continue;
+        }
+        if (retained_by_physical[p] == UINT32_MAX) {
+            return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+        }
+    }
+
+    for (size_t v = 0; v < n_virtual; ++v) {
+        if (!marked[v] || v2p[v] == UINT32_MAX) {
+            continue;
+        }
+        const uint32_t p = v2p[v];
+        if (p >= n_physical || retained_by_physical[p] == UINT32_MAX) {
+            return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+        }
+        if (retained_by_physical[p] != v) {
+            copy_source_by_virtual[v] = retained_by_physical[p];
+        }
+    }
+
+    return GGML_METAL_SPARSE_PLAN_OK;
+}
+
+static inline bool ggml_metal_sparse_accounting_try_reserve(
+        size_t n_free,
+        size_t * n_reserved,
+        uint64_t generation,
+        const struct ggml_metal_sparse_quote * quote,
+        struct ggml_metal_sparse_ticket_accounting * ticket) {
+    if (n_reserved == NULL || quote == NULL || ticket == NULL ||
+            quote->status != GGML_METAL_SPARSE_PLAN_OK ||
+            quote->generation != generation || *n_reserved > n_free ||
+            quote->required_pages > n_free - *n_reserved) {
+        return false;
+    }
+
+    *n_reserved += quote->required_pages;
+    ticket->generation = generation;
+    ticket->reserved_pages = quote->required_pages;
+    ticket->state = GGML_METAL_SPARSE_TICKET_RESERVED;
+    return true;
+}
+
+static inline bool ggml_metal_sparse_accounting_is_current(
+        uint64_t generation,
+        const struct ggml_metal_sparse_ticket_accounting * ticket) {
+    return ticket != NULL && ticket->state == GGML_METAL_SPARSE_TICKET_RESERVED &&
+            ticket->generation == generation;
+}
+
+// Commit may proceed only when a fresh plan has the same mapping effect as
+// the reserved quote. Generation and ticket state are checked separately.
+// This deliberately accepts zero-page writes: they are valid transactions
+// whose mapping effect is empty.
+static inline bool ggml_metal_sparse_quote_commit_compatible(
+        const struct ggml_metal_sparse_quote * reserved,
+        const struct ggml_metal_sparse_quote * current) {
+    return reserved != NULL && current != NULL &&
+            reserved->status == GGML_METAL_SPARSE_PLAN_OK && reserved->feasible &&
+            current->status == GGML_METAL_SPARSE_PLAN_OK && current->feasible &&
+            current->required_pages == reserved->required_pages &&
+            current->new_pages == reserved->new_pages &&
+            current->cow_pages == reserved->cow_pages &&
+            current->target_mappings == reserved->target_mappings;
+}
+
+static inline bool ggml_metal_sparse_accounting_finish(
+        size_t * n_reserved,
+        struct ggml_metal_sparse_ticket_accounting * ticket,
+        enum ggml_metal_sparse_ticket_state final_state) {
+    if (n_reserved == NULL || ticket == NULL ||
+            (final_state != GGML_METAL_SPARSE_TICKET_COMMITTED &&
+             final_state != GGML_METAL_SPARSE_TICKET_ROLLED_BACK &&
+             final_state != GGML_METAL_SPARSE_TICKET_CANCELLED)) {
+        return false;
+    }
+    if (ticket->state != GGML_METAL_SPARSE_TICKET_RESERVED) {
+        return ticket->state == final_state ||
+                (final_state == GGML_METAL_SPARSE_TICKET_CANCELLED &&
+                 (ticket->state == GGML_METAL_SPARSE_TICKET_ROLLED_BACK ||
+                  ticket->state == GGML_METAL_SPARSE_TICKET_CANCELLED));
+    }
+    if (*n_reserved < ticket->reserved_pages) {
+        return false;
+    }
+
+    *n_reserved -= ticket->reserved_pages;
+    ticket->reserved_pages = 0;
+    ticket->state = final_state;
+    return true;
+}
+
+#ifdef __cplusplus
+}
+#endif

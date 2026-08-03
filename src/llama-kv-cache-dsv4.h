@@ -4,6 +4,7 @@
 #include "llama-kv-cache-iswa.h"
 
 #include <map>
+#include <array>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -13,6 +14,71 @@
 bool llama_kv_cache_dsv4_supports_elastic_metal(
         const llama_model & model,
         uint32_t n_seq_max);
+
+enum llama_dsv4_memory_family {
+    LLAMA_DSV4_MEMORY_RAW = 0,
+    LLAMA_DSV4_MEMORY_CSA,
+    LLAMA_DSV4_MEMORY_HCA,
+    LLAMA_DSV4_MEMORY_LID,
+    LLAMA_DSV4_MEMORY_FAMILY_COUNT,
+};
+
+struct llama_dsv4_sparse_pool_usage {
+    uintptr_t pool_id = 0;
+    uint64_t page_size = 0;
+    uint64_t virtual_pages = 0;
+    uint64_t physical_pages = 0;
+    uint64_t free_pages = 0;
+    uint64_t reserved_pages = 0;
+    uint64_t mapped_mappings = 0;
+    uint64_t unique_physical_pages = 0;
+    uint64_t shared_physical_pages = 0;
+    uint64_t shared_mappings = 0;
+    uint64_t refcount_sum = 0;
+    uint32_t refcount_max = 0;
+    uint64_t generation = 0;
+    uint64_t cow_allocations = 0;
+    uint64_t cow_pages = 0;
+};
+
+struct llama_dsv4_family_usage {
+    llama_dsv4_memory_family family = LLAMA_DSV4_MEMORY_RAW;
+    bool placement_sparse = false;
+    uint64_t logical_capacity_rows = 0;
+    uint64_t logical_mapped_rows = 0;
+    std::vector<uint64_t> sequence_mapped_rows;
+    std::vector<llama_dsv4_sparse_pool_usage> pools;
+    llama_dsv4_sparse_pool_usage total;
+};
+
+struct llama_dsv4_memory_usage_snapshot {
+    std::array<llama_dsv4_family_usage, LLAMA_DSV4_MEMORY_FAMILY_COUNT> families;
+    llama_dsv4_sparse_pool_usage sparse_total;
+    llama_dsv4_memory_family limiting_family = LLAMA_DSV4_MEMORY_RAW;
+    uint32_t limiting_family_mask = 0;
+    uintptr_t limiting_pool_id = 0;
+    uint64_t limiting_available_pages = 0;
+};
+
+struct llama_dsv4_family_quote {
+    llama_dsv4_memory_family family = LLAMA_DSV4_MEMORY_RAW;
+    uint64_t target_mappings = 0;
+    uint64_t new_pages = 0;
+    uint64_t cow_pages = 0;
+    uint64_t required_pages = 0;
+    uint64_t physical_pages = 0;
+    uint64_t free_pages = 0;
+    uint64_t reserved_pages = 0;
+    uint64_t logical_rows = 0;
+    bool feasible = true;
+};
+
+struct llama_dsv4_batch_quote {
+    std::array<llama_dsv4_family_quote, LLAMA_DSV4_MEMORY_FAMILY_COUNT> families;
+    llama_dsv4_memory_family limiting_family = LLAMA_DSV4_MEMORY_RAW;
+    uintptr_t limiting_pool_id = 0;
+    bool feasible = true;
+};
 
 class llama_dsv4_comp_state {
 public:
@@ -159,6 +225,7 @@ public:
     bool set_rs_depth(uint32_t depth);
     bool set_rs_enabled(bool enabled);
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
+    llama_dsv4_memory_usage_snapshot memory_usage_snapshot() const;
 
 private:
     llama_hparams hparams_raw;
@@ -206,13 +273,15 @@ public:
 
     bool next() override;
     bool apply() override;
-    bool ensure_backing() const;
+    const slot_info_vec_t::value_type & get_base_write_slot() const;
+    const slot_info_vec_t::value_type & get_swa_write_slot() const;
 
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
     uint32_t get_n_kv() const;
     uint32_t get_n_write() const;
+    uint64_t get_n_backing_rows() const;
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
@@ -382,6 +451,7 @@ public:
     const comp_plan & get_csa_plan(const llama_ubatch & ubatch) const;
     const comp_plan & get_hca_plan(const llama_ubatch & ubatch) const;
     const comp_plan & get_lid_plan(const llama_ubatch & ubatch) const;
+    const llama_dsv4_batch_quote & get_last_batch_quote() const;
 
 private:
     llama_kv_cache_dsv4 * kv = nullptr;
@@ -415,6 +485,8 @@ private:
     mutable comp_plan reserve_plan_csa;
     mutable comp_plan reserve_plan_hca;
     mutable comp_plan reserve_plan_lid;
+
+    llama_dsv4_batch_quote last_batch_quote;
 
     const llama_memory_status status;
 };
