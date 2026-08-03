@@ -1698,7 +1698,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     op->src[1]->ne[1] > 0 && op->src[1]->ne[1] % 64 == 0 &&
                     op->src[1]->ne[1]/64 <= INT32_MAX &&
                     op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
-                    n_comp >= 0 && op->src[2]->ne[0] == (n_comp + 63)/64 &&
+                    n_comp >= 0 && op->src[0]->ne[2] <= INT32_MAX - n_comp &&
+                    op->src[2]->ne[0] == (n_comp + 63)/64 &&
                     op->src[2]->ne[1] == op->src[0]->ne[3] &&
                     op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
                     op->ne[0] == op->src[0]->ne[0] && op->ne[1] == 1 &&
