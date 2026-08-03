@@ -534,9 +534,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_router(ggml
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_sparse_pack(ggml_metal_library_t lib, ggml_type type) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_sparse_pack(
+        ggml_metal_library_t lib, ggml_type type, bool indexed) {
     char name[256];
-    snprintf(name, 256, "kernel_dsv4_sparse_pack_%s", ggml_type_name(type));
+    snprintf(name, 256, "kernel_dsv4_%ssparse_pack_%s", indexed ? "indexed_" : "", ggml_type_name(type));
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
