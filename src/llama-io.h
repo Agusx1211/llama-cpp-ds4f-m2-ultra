@@ -28,6 +28,11 @@ public:
     virtual void read(void * dst, size_t size) = 0;
     virtual void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) = 0;
 
+    // Publish or discard tensor writes queued while parsing. Readers which
+    // write synchronously (for example, file readers) may keep the defaults.
+    virtual void commit() {}
+    virtual void discard() noexcept {}
+
     // bytes read so far
     virtual size_t n_bytes() = 0;
 

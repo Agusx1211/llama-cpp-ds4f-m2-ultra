@@ -2817,11 +2817,15 @@ class llama_io_read_host : public llama_io_read_i {
 public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
-    ~llama_io_read_host() {
-        // flush the reads
+    void commit() override {
         for (const auto & rinfo : rinfos) {
             ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
         }
+        rinfos.clear();
+    }
+
+    void discard() noexcept override {
+        rinfos.clear();
     }
 
     void read(void * dst, size_t size) override {
@@ -2839,7 +2843,7 @@ public:
             throw std::runtime_error("unexpectedly reached end of buffer");
         }
 
-        // save for later during destruction
+        // Publish only after the complete state has parsed and validated.
         rinfos.push_back({tensor, ptr, size, offset});
 
         ptr += size;
@@ -3052,7 +3056,11 @@ public:
     llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs) {
     }
 
-    ~llama_io_read_device() {
+    void commit() override {
+        if (buf_size != 0) {
+            throw std::runtime_error("device sequence state has trailing scalar data");
+        }
+
         llama_memory_buffers mbufs_new;
 
         for (const auto & rinfo : rinfos) {
@@ -3087,18 +3095,29 @@ public:
         }
 
         for (auto & [buft, mbuf] : mbufs_new) {
-            const auto & mbuf_cur = mbufs.at(buft);
+            const auto it = mbufs.find(buft);
+            if (it == mbufs.end()) {
+                throw std::runtime_error("device sequence state buffer type mismatch");
+            }
+            const auto & mbuf_cur = it->second;
 
             if (!mbuf_cur.buf || mbuf_cur.n_tensors != mbuf.n_tensors || mbuf_cur.total_size != mbuf.total_size) {
-                GGML_ABORT("%s: memory buffer mismatch\n", __func__);
+                throw std::runtime_error("device sequence state tensor layout mismatch");
             }
+        }
 
+        for (auto & [buft, mbuf] : mbufs_new) {
+            const auto & mbuf_cur = mbufs.at(buft);
             for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
                 ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
             }
         }
 
-        GGML_ASSERT(buf_size == 0);
+        rinfos.clear();
+    }
+
+    void discard() noexcept override {
+        rinfos.clear();
     }
 
     void read(void * dst, size_t size) override {
@@ -3159,8 +3178,11 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
     llama_io_read_host io(src, size);
     try {
-        return state_read_data(io);
+        const size_t nread = state_read_data(io);
+        io.commit();
+        return nread;
     } catch (const std::exception & err) {
+        io.discard();
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
     }
@@ -3202,38 +3224,126 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
     std::unique_ptr<llama_io_read_i> io;
-    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-        // create a temporary io to read the magic and the src seq_id
-        io = std::make_unique<llama_io_read_host>(src, size);
-
-        uint32_t magic_read;
-        io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
-            throw std::runtime_error("wrong sequence state magic");
-        }
-
-        llama_seq_id seq_id_read;
-        io->read(&seq_id_read, sizeof(seq_id_read));
-
-        GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
-
-        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
-    } else {
-        io = std::make_unique<llama_io_read_host>(src, size);
-    }
+    auto * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
+    llama_seq_id candidate_seq_id = seq_id;
+    bool candidate_is_staging = false;
+    bool candidate_owned = false;
+    bool published = false;
 
     try {
+        if (seq_id < 0 || (uint32_t) seq_id >= cparams.n_seq_max) {
+            throw std::runtime_error("sequence restore destination is out of range");
+        }
+
+        // Validate the bounded scalar prefix before reserving a candidate or
+        // consulting an on-device snapshot keyed by its source sequence.
+        llama_io_read_host prefix(src, size);
         uint32_t magic_read;
-        io->read(&magic_read, sizeof(magic_read));
+        prefix.read(&magic_read, sizeof(magic_read));
         if (io_magic != magic_read) {
             throw std::runtime_error("wrong sequence state magic");
         }
 
         llama_seq_id seq_id_read;
+        prefix.read(&seq_id_read, sizeof(seq_id_read));
+
+        if (dsv4 != nullptr) {
+            const bool dest_empty = dsv4->seq_pos_max(seq_id) < 0;
+
+            for (uint32_t candidate = 0; candidate < cparams.n_seq_max; ++candidate) {
+                if ((llama_seq_id) candidate != seq_id &&
+                        dsv4->seq_pos_max((llama_seq_id) candidate) < 0) {
+                    candidate_seq_id = (llama_seq_id) candidate;
+                    candidate_is_staging = true;
+                    break;
+                }
+            }
+
+            if (!candidate_is_staging && !dest_empty) {
+                throw std::runtime_error(
+                        "transactional DSV4 restore requires an unused sequence staging slot");
+            }
+
+            candidate_owned = candidate_is_staging || dest_empty;
+            if (candidate_is_staging) {
+                if (!dsv4->seq_rm(candidate_seq_id, -1, -1)) {
+                    throw std::runtime_error("failed to clear DSV4 restore staging sequence");
+                }
+
+                // A partial snapshot replaces SWA and recurrent planes while
+                // retaining the destination's full raw/compressed caches.
+                if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && !dest_empty) {
+                    dsv4->seq_cp(seq_id, candidate_seq_id, -1, -1);
+                    if (!memory_update(false)) {
+                        throw std::runtime_error("failed to seed partial DSV4 restore candidate");
+                    }
+                    synchronize();
+                }
+            }
+        }
+
+        if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+            const auto storage = mem_storage.find(seq_id_read);
+            if (storage == mem_storage.end()) {
+                throw std::runtime_error("missing on-device sequence state storage");
+            }
+            io = std::make_unique<llama_io_read_device>(src, size, storage->second);
+        } else {
+            io = std::make_unique<llama_io_read_host>(src, size);
+        }
+
+        io->read(&magic_read, sizeof(magic_read));
+        if (io_magic != magic_read) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
         io->read(&seq_id_read, sizeof(seq_id_read));
 
-        return state_seq_read_data(*io, seq_id, flags);
+        const size_t nread = state_seq_read_data(*io, candidate_seq_id, flags);
+        if (nread != size) {
+            throw std::runtime_error(format(
+                    "sequence state size mismatch: consumed %zu of %zu bytes", nread, size));
+        }
+
+        io->commit();
+        synchronize();
+
+        if (candidate_is_staging) {
+            // This is the first operation which changes an occupied
+            // destination. Until here, every read and tensor write was scoped
+            // to the unused candidate sequence.
+            dsv4->seq_cp(candidate_seq_id, seq_id, -1, -1);
+            if (!memory_update(false)) {
+                throw std::runtime_error("failed to publish DSV4 restore candidate");
+            }
+            synchronize();
+            published = true;
+
+            try {
+                if (!dsv4->seq_rm(candidate_seq_id, -1, -1)) {
+                    LLAMA_LOG_WARN("%s: failed to release DSV4 restore staging sequence %d\n",
+                            __func__, candidate_seq_id);
+                }
+            } catch (const std::exception & cleanup_err) {
+                LLAMA_LOG_WARN("%s: failed to release committed DSV4 restore staging sequence %d: %s\n",
+                        __func__, candidate_seq_id, cleanup_err.what());
+            }
+        } else {
+            published = true;
+        }
+
+        return nread;
     } catch (const std::exception & err) {
+        if (io) {
+            io->discard();
+        }
+        if (dsv4 != nullptr && candidate_owned && !published) {
+            try {
+                dsv4->seq_rm(candidate_seq_id, -1, -1);
+            } catch (const std::exception & cleanup_err) {
+                LLAMA_LOG_ERROR("%s: failed to discard DSV4 restore candidate %d: %s\n",
+                        __func__, candidate_seq_id, cleanup_err.what());
+            }
+        }
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
     }
@@ -3302,6 +3412,8 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
 size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(filepath, "rb");
 
+    std::vector<llama_token> tokens;
+
     // version checks
     {
         const uint32_t magic   = file.read_u32();
@@ -3322,22 +3434,32 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
             return 0;
         }
 
-        file.read_raw(tokens_out, sizeof(llama_token) * n_token_count);
-        *n_token_count_out = n_token_count;
+        tokens.resize(n_token_count);
+        file.read_raw(tokens.data(), sizeof(llama_token) * n_token_count);
     }
 
     // restore the context state
     {
         const size_t state_size = file.size() - file.tell();
-        llama_io_read_file io(&file);
-        const size_t nread = state_seq_read_data(io, seq_id, 0);
-        if (!nread) {
+        std::vector<uint8_t> state(sizeof(io_magic) + sizeof(seq_id) + state_size);
+        size_t offset = 0;
+        memcpy(state.data() + offset, &io_magic, sizeof(io_magic));
+        offset += sizeof(io_magic);
+        memcpy(state.data() + offset, &seq_id, sizeof(seq_id));
+        offset += sizeof(seq_id);
+        file.read_raw(state.data() + offset, state_size);
+
+        const size_t nread = state_seq_set_data(seq_id, state.data(), state.size(), 0);
+        if (nread != state.size()) {
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
             return 0;
         }
-        GGML_ASSERT(nread <= state_size);
-        GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
     }
+
+    if (!tokens.empty()) {
+        memcpy(tokens_out, tokens.data(), sizeof(llama_token)*tokens.size());
+    }
+    *n_token_count_out = tokens.size();
 
     return file.tell();
 }
