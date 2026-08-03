@@ -1,4 +1,9 @@
 export const SCHEMA_VERSION = 1;
+export const MAX_SCHEMA_ARRAY_LENGTH = 4096;
+export const MAX_SCHEMA_STRING_LENGTH = 1024 * 1024;
+export const MAX_SCHEMA_TOTAL_BYTES = 4 * 1024 * 1024;
+export const MAX_SCHEMA_NODES = 65536;
+export const MAX_SCHEMA_DEPTH = 32;
 
 export const LANES = Object.freeze(["low", "normal", "fast"]);
 
@@ -38,6 +43,92 @@ export class SchemaError extends Error {
     }
 }
 
+const textEncoder = new TextEncoder();
+
+function jsonByteLength(value) {
+    return textEncoder.encode(value).byteLength;
+}
+
+function validateJsonBudget(value, kind) {
+    const seen = new WeakSet();
+    const stack = [{ value, depth: 0 }];
+    let bytes = 0;
+    let nodes = 0;
+    const addStringBytes = (text, structuralBytes = 0) => {
+        if (text.length + structuralBytes > MAX_SCHEMA_TOTAL_BYTES - bytes) {
+            throw new SchemaError(kind, [`payload exceeds ${MAX_SCHEMA_TOTAL_BYTES} aggregate bytes`]);
+        }
+        bytes += jsonByteLength(text) + structuralBytes;
+        if (bytes > MAX_SCHEMA_TOTAL_BYTES) {
+            throw new SchemaError(kind, [`payload exceeds ${MAX_SCHEMA_TOTAL_BYTES} aggregate bytes`]);
+        }
+    };
+
+    while (stack.length > 0) {
+        const current = stack.pop();
+        nodes += 1;
+        bytes += 1;
+        if (nodes > MAX_SCHEMA_NODES) {
+            throw new SchemaError(kind, [`payload exceeds ${MAX_SCHEMA_NODES} JSON nodes`]);
+        }
+        if (current.depth > MAX_SCHEMA_DEPTH) {
+            throw new SchemaError(kind, [`payload exceeds JSON depth ${MAX_SCHEMA_DEPTH}`]);
+        }
+
+        const currentValue = current.value;
+        if (typeof currentValue === "string") {
+            addStringBytes(currentValue);
+        } else if (typeof currentValue === "number") {
+            if (!Number.isFinite(currentValue)) {
+                throw new SchemaError(kind, ["payload must contain only finite JSON numbers"]);
+            }
+            bytes += String(currentValue).length;
+        } else if (typeof currentValue === "boolean" || currentValue === null) {
+            bytes += currentValue === null ? 4 : 5;
+        } else if (typeof currentValue === "object") {
+            if (seen.has(currentValue)) {
+                throw new SchemaError(kind, ["payload must not contain cyclic or repeated object references"]);
+            }
+            seen.add(currentValue);
+            if (Array.isArray(currentValue)) {
+                if (currentValue.length > MAX_SCHEMA_NODES - nodes) {
+                    throw new SchemaError(kind, [`payload exceeds ${MAX_SCHEMA_NODES} JSON nodes`]);
+                }
+                for (let index = currentValue.length - 1; index >= 0; index -= 1) {
+                    stack.push({ value: currentValue[index], depth: current.depth + 1 });
+                }
+            } else {
+                const prototype = Object.getPrototypeOf(currentValue);
+                if (prototype !== Object.prototype && prototype !== null) {
+                    throw new SchemaError(kind, ["payload must contain only plain JSON objects"]);
+                }
+                const keys = Reflect.ownKeys(currentValue);
+                if (keys.some((key) => typeof key !== "string")) {
+                    throw new SchemaError(kind, ["payload must not contain symbol properties"]);
+                }
+                if (keys.length > MAX_SCHEMA_NODES - nodes) {
+                    throw new SchemaError(kind, [`payload exceeds ${MAX_SCHEMA_NODES} JSON nodes`]);
+                }
+                for (let index = keys.length - 1; index >= 0; index -= 1) {
+                    const key = keys[index];
+                    const descriptor = Object.getOwnPropertyDescriptor(currentValue, key);
+                    if (!descriptor.enumerable || descriptor.get || descriptor.set) {
+                        throw new SchemaError(kind, ["payload must contain only enumerable JSON data properties"]);
+                    }
+                    addStringBytes(key, 1);
+                    stack.push({ value: descriptor.value, depth: current.depth + 1 });
+                }
+            }
+        } else {
+            throw new SchemaError(kind, ["payload must contain only JSON values"]);
+        }
+
+        if (bytes > MAX_SCHEMA_TOTAL_BYTES) {
+            throw new SchemaError(kind, [`payload exceeds ${MAX_SCHEMA_TOTAL_BYTES} aggregate bytes`]);
+        }
+    }
+}
+
 function isRecord(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -50,17 +141,37 @@ function record(value, path, issues) {
     return value;
 }
 
-function array(value, path, issues) {
+function knownFields(value, allowed, path, issues) {
+    if (!isRecord(value)) {
+        return;
+    }
+    for (const key of Object.keys(value)) {
+        if (!allowed.includes(key)) {
+            issues.push(`${path}.${key} is not allowed`);
+        }
+    }
+}
+
+function array(value, path, issues, { maxLength = MAX_SCHEMA_ARRAY_LENGTH } = {}) {
     if (!Array.isArray(value)) {
         issues.push(`${path} must be an array`);
         return [];
     }
+    if (value.length > maxLength) {
+        issues.push(`${path} must contain at most ${maxLength} items`);
+        return value.slice(0, maxLength);
+    }
     return value;
 }
 
-function string(value, path, issues, { allowEmpty = false } = {}) {
+function string(value, path, issues, {
+    allowEmpty = false,
+    maxLength = MAX_SCHEMA_STRING_LENGTH,
+} = {}) {
     if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
         issues.push(`${path} must be ${allowEmpty ? "a string" : "a non-empty string"}`);
+    } else if (value.length > maxLength) {
+        issues.push(`${path} must contain at most ${maxLength} characters`);
     }
 }
 
@@ -121,6 +232,10 @@ function range(value, path, issues) {
 
 function validateServer(value, path, issues) {
     const server = record(value, path, issues);
+    knownFields(server, [
+        "health", "build", "model", "uptime_seconds", "rss_bytes", "footprint_bytes",
+        "swap_bytes", "memory_pressure_percent", "decode_width", "aggregate_tokens_per_second",
+    ], path, issues);
     enumeration(server.health, ["healthy", "degraded", "unavailable"], `${path}.health`, issues);
     string(server.build, `${path}.build`, issues);
     string(server.model, `${path}.model`, issues);
@@ -135,6 +250,10 @@ function validateServer(value, path, issues) {
 
 function validateLane(value, path, issues) {
     const lane = record(value, path, issues);
+    knownFields(lane, [
+        "id", "queued", "active", "oldest_wait_ms", "service_deficit", "bypass_count",
+        "predicted_start_ms",
+    ], path, issues);
     enumeration(lane.id, LANES, `${path}.id`, issues);
     integer(lane.queued, `${path}.queued`, issues, { min: 0 });
     integer(lane.active, `${path}.active`, issues, { min: 0 });
@@ -146,6 +265,11 @@ function validateLane(value, path, issues) {
 
 function validateRequest(value, path, issues) {
     const request = record(value, path, issues);
+    knownFields(request, [
+        "id", "lane", "state", "arrival_at", "age_ms", "prompt_tokens", "cache_hit_tokens",
+        "output_tokens", "requested_output_tokens", "blocker", "predicted_start_ms", "ttft_ms",
+        "tbt_ms", "kv", "scheduler_reasons", "preemptions", "dspark_cycles", "content",
+    ], path, issues);
     string(request.id, `${path}.id`, issues);
     enumeration(request.lane, LANES, `${path}.lane`, issues);
     enumeration(request.state, REQUEST_STATES, `${path}.state`, issues);
@@ -161,6 +285,7 @@ function validateRequest(value, path, issues) {
     nullableNumber(request.tbt_ms, `${path}.tbt_ms`, issues, { min: 0 });
 
     const kv = record(request.kv, `${path}.kv`, issues);
+    knownFields(kv, ["logical_bytes", "unique_bytes", "lineage"], `${path}.kv`, issues);
     finiteNumber(kv.logical_bytes, `${path}.kv.logical_bytes`, issues, { min: 0 });
     finiteNumber(kv.unique_bytes, `${path}.kv.unique_bytes`, issues, { min: 0 });
     string(kv.lineage, `${path}.kv.lineage`, issues);
@@ -172,6 +297,7 @@ function validateRequest(value, path, issues) {
     integer(request.dspark_cycles, `${path}.dspark_cycles`, issues, { min: 0 });
 
     const content = record(request.content, `${path}.content`, issues);
+    knownFields(content, ["prompt", "output", "retained"], `${path}.content`, issues);
     string(content.prompt, `${path}.content.prompt`, issues, { allowEmpty: true });
     string(content.output, `${path}.content.output`, issues, { allowEmpty: true });
     boolean(content.retained, `${path}.content.retained`, issues);
@@ -179,6 +305,10 @@ function validateRequest(value, path, issues) {
 
 function validatePool(value, path, issues) {
     const pool = record(value, path, issues);
+    knownFields(pool, [
+        "id", "capacity_pages", "free_pages", "reserved_pages", "mapped_pages", "shared_pages",
+        "cow_pages", "high_water_pages",
+    ], path, issues);
     string(pool.id, `${path}.id`, issues);
     for (const field of [
         "capacity_pages",
@@ -195,6 +325,7 @@ function validatePool(value, path, issues) {
 
 function validateAllocator(value, path, issues) {
     const allocator = record(value, path, issues);
+    knownFields(allocator, ["pools"], path, issues);
     for (const [index, pool] of array(allocator.pools, `${path}.pools`, issues).entries()) {
         validatePool(pool, `${path}.pools[${index}]`, issues);
     }
@@ -202,17 +333,30 @@ function validateAllocator(value, path, issues) {
 
 function validateCacheObject(value, path, issues) {
     const object = record(value, path, issues);
+    knownFields(object, [
+        "id", "tier", "kind", "logical_bytes", "unique_bytes", "shared_bytes", "hits", "score",
+        "pinned",
+    ], path, issues);
     string(object.id, `${path}.id`, issues);
     enumeration(object.tier, ["resident", "disk"], `${path}.tier`, issues);
     enumeration(object.kind, ["live", "session", "prefix"], `${path}.kind`, issues);
     for (const field of ["logical_bytes", "unique_bytes", "shared_bytes", "hits", "score"]) {
         finiteNumber(object[field], `${path}.${field}`, issues, { min: 0 });
     }
+    if (
+        Number.isFinite(object.logical_bytes)
+        && Number.isFinite(object.unique_bytes)
+        && Number.isFinite(object.shared_bytes)
+        && object.logical_bytes !== object.unique_bytes + object.shared_bytes
+    ) {
+        issues.push(`${path}.logical_bytes must equal unique_bytes + shared_bytes`);
+    }
     boolean(object.pinned, `${path}.pinned`, issues);
 }
 
 function validateCache(value, path, issues) {
     const cache = record(value, path, issues);
+    knownFields(cache, ["objects"], path, issues);
     for (const [index, object] of array(cache.objects, `${path}.objects`, issues).entries()) {
         validateCacheObject(object, `${path}.objects[${index}]`, issues);
     }
@@ -220,6 +364,10 @@ function validateCache(value, path, issues) {
 
 function validateDisk(value, path, issues) {
     const disk = record(value, path, issues);
+    knownFields(disk, [
+        "id", "path", "capacity_bytes", "free_bytes", "queue_depth", "read_bps", "write_bps",
+        "snapshots", "errors", "healthy",
+    ], path, issues);
     string(disk.id, `${path}.id`, issues);
     string(disk.path, `${path}.path`, issues);
     for (const field of ["capacity_bytes", "free_bytes", "queue_depth", "read_bps", "write_bps", "snapshots", "errors"]) {
@@ -230,6 +378,9 @@ function validateDisk(value, path, issues) {
 
 function validateDspark(value, path, issues) {
     const dspark = record(value, path, issues);
+    knownFields(dspark, [
+        "mode", "scheduled_decode_width", "proposals", "accepted", "acceptance_by_position",
+    ], path, issues);
     string(dspark.mode, `${path}.mode`, issues);
     integer(dspark.scheduled_decode_width, `${path}.scheduled_decode_width`, issues, { min: 0 });
     integer(dspark.proposals, `${path}.proposals`, issues, { min: 0 });
@@ -241,6 +392,10 @@ function validateDspark(value, path, issues) {
 
 function validateCapture(value, path, issues) {
     const capture = record(value, path, issues);
+    knownFields(capture, [
+        "mode", "healthy", "queued_records", "written_records", "dropped_records", "bytes_written",
+        "last_error",
+    ], path, issues);
     string(capture.mode, `${path}.mode`, issues);
     boolean(capture.healthy, `${path}.healthy`, issues);
     for (const field of ["queued_records", "written_records", "dropped_records", "bytes_written"]) {
@@ -251,6 +406,7 @@ function validateCapture(value, path, issues) {
 
 function validateTimelineItem(value, path, issues) {
     const item = record(value, path, issues);
+    knownFields(item, ["id", "at", "type", "label", "request_id", "lane"], path, issues);
     string(item.id, `${path}.id`, issues);
     string(item.at, `${path}.at`, issues);
     string(item.type, `${path}.type`, issues);
@@ -263,6 +419,10 @@ function validateTimelineItem(value, path, issues) {
 
 function validateSnapshotInto(snapshotValue, path, issues) {
     const snapshot = record(snapshotValue, path, issues);
+    knownFields(snapshot, [
+        "schema_version", "sequence", "generated_at", "server", "lanes", "requests", "allocator",
+        "cache", "disks", "dspark", "capture", "timeline",
+    ], path, issues);
     integer(snapshot.schema_version, `${path}.schema_version`, issues, { min: 1 });
     if (snapshot.schema_version !== SCHEMA_VERSION) {
         issues.push(`${path}.schema_version must equal ${SCHEMA_VERSION}`);
@@ -288,14 +448,36 @@ function validateSnapshotInto(snapshotValue, path, issues) {
         }
     }
 
+    const requests = array(snapshot.requests, `${path}.requests`, issues);
     const requestIds = new Set();
-    for (const [index, request] of array(snapshot.requests, `${path}.requests`, issues).entries()) {
+    for (const [index, request] of requests.entries()) {
         validateRequest(request, `${path}.requests[${index}]`, issues);
         if (isRecord(request) && typeof request.id === "string") {
             if (requestIds.has(request.id)) {
                 issues.push(`${path}.requests contains duplicate request ${request.id}`);
             }
             requestIds.add(request.id);
+        }
+    }
+
+    for (const laneId of LANES) {
+        const lane = lanes.find((candidate) => isRecord(candidate) && candidate.id === laneId);
+        if (!lane) {
+            continue;
+        }
+        const laneRequests = requests.filter((request) => isRecord(request) && request.lane === laneId);
+        const queued = laneRequests.filter((request) => request.state === "queued").length;
+        const active = laneRequests.filter((request) => ![
+            "queued",
+            "complete",
+            "cancelled",
+            "failed",
+        ].includes(request.state)).length;
+        if (Number.isSafeInteger(lane.queued) && lane.queued !== queued) {
+            issues.push(`${path}.lanes.${laneId}.queued must equal request aggregate ${queued}`);
+        }
+        if (Number.isSafeInteger(lane.active) && lane.active !== active) {
+            issues.push(`${path}.lanes.${laneId}.active must equal request aggregate ${active}`);
         }
     }
 
@@ -312,6 +494,7 @@ function validateSnapshotInto(snapshotValue, path, issues) {
 }
 
 export function validateSnapshot(value) {
+    validateJsonBudget(value, "snapshot");
     const issues = [];
     validateSnapshotInto(value, "snapshot", issues);
     if (issues.length > 0) {
@@ -324,41 +507,75 @@ function validateEventPayload(event, issues) {
     const payload = record(event.payload, "event.payload", issues);
     switch (event.type) {
         case "request.upsert":
+            knownFields(payload, ["request"], "event.payload", issues);
             validateRequest(payload.request, "event.payload.request", issues);
+            if (isRecord(payload.request)) {
+                if (event.request_id !== payload.request.id) {
+                    issues.push("event.request_id must equal event.payload.request.id");
+                }
+                if (event.lane !== payload.request.lane) {
+                    issues.push("event.lane must equal event.payload.request.lane");
+                }
+            }
             break;
         case "request.remove":
+            knownFields(payload, ["request_id"], "event.payload", issues);
             string(payload.request_id, "event.payload.request_id", issues);
+            if (event.request_id !== payload.request_id) {
+                issues.push("event.request_id must equal event.payload.request_id");
+            }
             break;
         case "lane.replace":
+            knownFields(payload, ["lane"], "event.payload", issues);
             validateLane(payload.lane, "event.payload.lane", issues);
+            if (isRecord(payload.lane) && event.lane !== payload.lane.id) {
+                issues.push("event.lane must equal event.payload.lane.id");
+            }
             break;
         case "allocator.replace":
+            knownFields(payload, ["allocator"], "event.payload", issues);
             validateAllocator(payload.allocator, "event.payload.allocator", issues);
             break;
         case "cache.replace":
+            knownFields(payload, ["cache"], "event.payload", issues);
             validateCache(payload.cache, "event.payload.cache", issues);
             break;
         case "disk.replace":
+            knownFields(payload, ["disks"], "event.payload", issues);
             for (const [index, disk] of array(payload.disks, "event.payload.disks", issues).entries()) {
                 validateDisk(disk, `event.payload.disks[${index}]`, issues);
             }
             break;
         case "dspark.replace":
+            knownFields(payload, ["dspark"], "event.payload", issues);
             validateDspark(payload.dspark, "event.payload.dspark", issues);
             break;
         case "capture.replace":
+            knownFields(payload, ["capture"], "event.payload", issues);
             validateCapture(payload.capture, "event.payload.capture", issues);
             break;
         case "server.replace":
+            knownFields(payload, ["server"], "event.payload", issues);
             validateServer(payload.server, "event.payload.server", issues);
             break;
         case "timeline.append":
+            knownFields(payload, ["item"], "event.payload", issues);
             validateTimelineItem(payload.item, "event.payload.item", issues);
+            if (isRecord(payload.item)) {
+                if (event.request_id !== payload.item.request_id) {
+                    issues.push("event.request_id must equal event.payload.item.request_id");
+                }
+                if (event.lane !== payload.item.lane) {
+                    issues.push("event.lane must equal event.payload.item.lane");
+                }
+            }
             break;
         case "stream.overflow":
+            knownFields(payload, ["oldest_available_sequence"], "event.payload", issues);
             integer(payload.oldest_available_sequence, "event.payload.oldest_available_sequence", issues, { min: 0 });
             break;
         case "stream.slow_client":
+            knownFields(payload, ["dropped_events"], "event.payload", issues);
             integer(payload.dropped_events, "event.payload.dropped_events", issues, { min: 1 });
             break;
         default:
@@ -367,8 +584,14 @@ function validateEventPayload(event, issues) {
 }
 
 export function validateEvent(value) {
+    validateJsonBudget(value, "event");
     const issues = [];
     const event = record(value, "event", issues);
+    knownFields(event, [
+        "schema_version", "id", "sequence", "wall_time", "monotonic_ms", "type", "request_id",
+        "slot_id", "sequence_id", "lane", "scheduler_epoch", "decision_id", "before", "after",
+        "reason_code", "payload",
+    ], "event", issues);
     integer(event.schema_version, "event.schema_version", issues, { min: 1 });
     if (event.schema_version !== SCHEMA_VERSION) {
         issues.push(`event.schema_version must equal ${SCHEMA_VERSION}`);
@@ -418,13 +641,13 @@ export function deepFreeze(value) {
 }
 
 export function parseSnapshot(value) {
+    validateSnapshot(value);
     const snapshot = cloneJson(value);
-    validateSnapshot(snapshot);
     return deepFreeze(snapshot);
 }
 
 export function parseEvent(value) {
+    validateEvent(value);
     const event = cloneJson(value);
-    validateEvent(event);
     return deepFreeze(event);
 }

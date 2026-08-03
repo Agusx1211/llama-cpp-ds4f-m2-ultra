@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+    MAX_SCHEMA_ARRAY_LENGTH,
+    MAX_SCHEMA_DEPTH,
+    MAX_SCHEMA_NODES,
+    MAX_SCHEMA_STRING_LENGTH,
+    MAX_SCHEMA_TOTAL_BYTES,
     SCHEMA_VERSION,
     SchemaError,
     parseEvent,
@@ -68,6 +73,129 @@ test("event validation rejects mismatched SSE IDs and malformed typed payloads",
     const badPayload = clone(fixture);
     delete badPayload.payload.request.kv;
     assert.throws(() => validateEvent(badPayload), /payload.request.kv/);
+
+    const badRequestIdentity = clone(fixture);
+    badRequestIdentity.request_id = "req-envelope-mismatch";
+    assert.throws(() => validateEvent(badRequestIdentity), /request_id must equal.*request.id/);
+
+    const badLaneIdentity = clone(fixture);
+    badLaneIdentity.lane = "normal";
+    assert.throws(() => validateEvent(badLaneIdentity), /event.lane must equal.*request.lane/);
+});
+
+test("event validation ties analogous envelope identities to typed payloads", async () => {
+    const snapshot = await loadSnapshot();
+    const [requestEvent, timelineEvent] = await loadEvents();
+
+    const badTimeline = clone(timelineEvent);
+    badTimeline.payload.item.request_id = "req-other";
+    assert.throws(() => validateEvent(badTimeline), /request_id must equal.*item.request_id/);
+
+    const badRemoval = clone(requestEvent);
+    badRemoval.type = "request.remove";
+    badRemoval.payload = { request_id: "req-other" };
+    assert.throws(() => validateEvent(badRemoval), /request_id must equal.*payload.request_id/);
+
+    const badLane = clone(requestEvent);
+    badLane.type = "lane.replace";
+    badLane.payload = { lane: clone(snapshot.lanes[0]) };
+    assert.throws(() => validateEvent(badLane), /event.lane must equal.*payload.lane.id/);
+});
+
+test("schema validation bounds arrays and strings before cloning", async () => {
+    const snapshot = await loadSnapshot();
+    const tooManyTimelineItems = clone(snapshot);
+    tooManyTimelineItems.timeline = Array.from(
+        { length: MAX_SCHEMA_ARRAY_LENGTH + 1 },
+        (_, index) => ({
+            id: `bounded-${index}`,
+            at: snapshot.generated_at,
+            type: "fixture",
+            label: "bounded",
+            request_id: null,
+            lane: null,
+        }),
+    );
+    assert.throws(() => validateSnapshot(tooManyTimelineItems), /at most 4096 items/);
+
+    const [event] = await loadEvents();
+    const oversizedString = clone(event);
+    oversizedString.payload.request.content.prompt = "x".repeat(MAX_SCHEMA_STRING_LENGTH + 1);
+    assert.throws(() => validateEvent(oversizedString), /at most 1048576 characters/);
+});
+
+test("pre-clone schema budgets bound aggregate bytes, nodes, and depth", async () => {
+    const snapshot = await loadSnapshot();
+    const aggregateSnapshot = clone(snapshot);
+    aggregateSnapshot.timeline = Array.from({ length: 8 }, (_, index) => ({
+        id: `aggregate-${index}`,
+        at: snapshot.generated_at,
+        type: "fixture",
+        label: "x".repeat(Math.floor(MAX_SCHEMA_TOTAL_BYTES / 8)),
+        request_id: null,
+        lane: null,
+    }));
+    assert.throws(() => parseSnapshot(aggregateSnapshot), /aggregate bytes/);
+
+    const [fixture] = await loadEvents();
+
+    const aggregate = clone(fixture);
+    aggregate.payload.request.scheduler_reasons = Array.from(
+        { length: 8 },
+        () => "x".repeat(Math.floor(MAX_SCHEMA_TOTAL_BYTES / 8)),
+    );
+    assert.throws(() => parseEvent(aggregate), /aggregate bytes/);
+
+    const tooManyNodes = clone(fixture);
+    tooManyNodes.unexpected = Array.from({ length: MAX_SCHEMA_NODES }, () => null);
+    assert.throws(() => parseEvent(tooManyNodes), /JSON nodes/);
+
+    const tooDeep = clone(fixture);
+    let cursor = tooDeep;
+    for (let depth = 0; depth <= MAX_SCHEMA_DEPTH; depth += 1) {
+        cursor.unexpected = {};
+        cursor = cursor.unexpected;
+    }
+    assert.throws(() => parseEvent(tooDeep), /JSON depth/);
+});
+
+test("unknown snapshot and event fields are rejected instead of retained", async () => {
+    const snapshot = await loadSnapshot();
+    const unknownSnapshot = clone(snapshot);
+    unknownSnapshot.server.debug_dump = "must not be retained";
+    assert.throws(() => parseSnapshot(unknownSnapshot), /server.debug_dump is not allowed/);
+
+    const [fixture] = await loadEvents();
+    const unknownEvent = clone(fixture);
+    unknownEvent.payload.request.content.internal = "must not be retained";
+    assert.throws(() => parseEvent(unknownEvent), /content.internal is not allowed/);
+});
+
+test("snapshot validation enforces lane aggregates and cache byte accounting", async () => {
+    const snapshot = await loadSnapshot();
+    for (const lane of snapshot.lanes) {
+        const requests = snapshot.requests.filter((request) => request.lane === lane.id);
+        const queued = requests.filter((request) => request.state === "queued").length;
+        const active = requests.filter((request) => ![
+            "queued",
+            "complete",
+            "cancelled",
+            "failed",
+        ].includes(request.state)).length;
+        assert.equal(lane.queued, queued);
+        assert.equal(lane.active, active);
+    }
+    for (const object of snapshot.cache.objects) {
+        assert.equal(object.logical_bytes, object.unique_bytes + object.shared_bytes);
+    }
+
+    const badAggregate = clone(snapshot);
+    badAggregate.lanes[0].queued += 1;
+    assert.throws(() => validateSnapshot(badAggregate), /queued must equal request aggregate/);
+
+    const badCacheBytes = clone(snapshot);
+    badCacheBytes.cache.objects[0].shared_bytes += 1;
+    assert.throws(() => validateSnapshot(badCacheBytes), /logical_bytes must equal/);
 });
 
 test("malicious-looking prompt strings remain schema-valid data", async () => {

@@ -57,7 +57,10 @@ function renderHealth(snapshot, state) {
     );
 
     const connection = document.querySelector("#connection-status");
-    setSafeText(connection, `${state.connection} · event ${state.lastEventId}`);
+    const recovery = state.recovery.lastError === null
+        ? ""
+        : ` · ${state.recovery.reason}: ${state.recovery.lastError}`;
+    setSafeText(connection, `${state.connection} · event ${state.lastEventId}${recovery}`);
 }
 
 function requestCard(request) {

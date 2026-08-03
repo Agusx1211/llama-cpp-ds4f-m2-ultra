@@ -66,19 +66,40 @@ test("explicit server overflow and slow-client signals force resnapshot", async 
     const snapshot = await loadSnapshot();
     const [template] = await loadEvents();
 
-    const overflow = streamSignal(template, 101, "stream.overflow", {
+    const overflow = streamSignal(template, 140, "stream.overflow", {
         oldest_available_sequence: 120,
     });
     const overflowState = reduceDashboardEvent(createDashboardState(snapshot), overflow);
     assert.equal(overflowState.synchronization.reason, "server_overflow");
     assert.equal(overflowState.snapshot.sequence, 100);
 
-    const slow = streamSignal(template, 101, "stream.slow_client", {
+    const slow = streamSignal(template, 115, "stream.slow_client", {
         dropped_events: 9,
     });
     const slowState = reduceDashboardEvent(createDashboardState(snapshot), slow);
     assert.equal(slowState.synchronization.reason, "server_slow_client");
     assert.equal(slowState.synchronization.details.droppedEvents, 9);
+});
+
+test("stale and replayed stream signals are duplicates, not fresh recovery causes", async () => {
+    const snapshot = await loadSnapshot();
+    const [event] = await loadEvents();
+    const accepted = reduceDashboardEvent(createDashboardState(snapshot), event);
+    const replayedOverflow = streamSignal(event, 101, "stream.overflow", {
+        oldest_available_sequence: 140,
+    });
+    const staleSlowClient = streamSignal(event, 99, "stream.slow_client", {
+        dropped_events: 2,
+    });
+
+    const afterReplay = reduceDashboardEvent(accepted, replayedOverflow);
+    const afterStale = reduceDashboardEvent(afterReplay, staleSlowClient);
+
+    assert.equal(afterStale.synchronization.status, "live");
+    assert.equal(afterStale.synchronization.reason, null);
+    assert.equal(afterStale.synchronization.duplicates, 2);
+    assert.equal(afterStale.lastSequence, 101);
+    assert.equal(afterStale.snapshot, accepted.snapshot);
 });
 
 test("malformed typed events become resnapshot state rather than partial updates", async () => {
@@ -90,6 +111,20 @@ test("malformed typed events become resnapshot state rather than partial updates
     const state = reduceDashboardEvent(createDashboardState(snapshot), malformed);
     assert.equal(state.synchronization.status, "resnapshot_required");
     assert.equal(state.synchronization.reason, "invalid_event");
+    assert.equal(state.lastEventId, "100");
+});
+
+test("aggregate budget rejects oversized object-form events before cloning", async () => {
+    const snapshot = await loadSnapshot();
+    const [fixture] = await loadEvents();
+    const oversized = clone(fixture);
+    oversized.unknown_debug_tree = Array.from({ length: 8 }, () => "x".repeat(600000));
+
+    const initial = createDashboardState(snapshot);
+    const state = reduceDashboardEvent(initial, oversized);
+    assert.equal(state.synchronization.reason, "invalid_event");
+    assert.match(state.synchronization.details.message, /aggregate bytes/);
+    assert.equal(state.snapshot, initial.snapshot);
     assert.equal(state.lastEventId, "100");
 });
 

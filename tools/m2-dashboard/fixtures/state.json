@@ -17,7 +17,7 @@
   "lanes": [
     {
       "id": "low",
-      "queued": 2,
+      "queued": 1,
       "active": 1,
       "oldest_wait_ms": 84000,
       "service_deficit": 3.5,
@@ -26,8 +26,8 @@
     },
     {
       "id": "normal",
-      "queued": 1,
-      "active": 3,
+      "queued": 0,
+      "active": 2,
       "oldest_wait_ms": 4800,
       "service_deficit": 0.8,
       "bypass_count": 0,
@@ -255,7 +255,7 @@
         "kind": "prefix",
         "logical_bytes": 33554432,
         "unique_bytes": 12582912,
-        "shared_bytes": 23068672,
+        "shared_bytes": 20971520,
         "hits": 184,
         "score": 91.4,
         "pinned": true

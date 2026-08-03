@@ -50,6 +50,13 @@ export function createDashboardState(snapshotValue, options = {}) {
             details: null,
             duplicates: 0,
         },
+        recovery: {
+            status: "idle",
+            reason: null,
+            attempt: 0,
+            lastError: null,
+            retryDelayMs: null,
+        },
         connection: "disconnected",
     });
 }
@@ -70,13 +77,23 @@ export function requireResnapshot(state, reason, details = null) {
 }
 
 export function setConnection(state, connection) {
-    if (!["disconnected", "connecting", "live", "reconnecting", "stopped"].includes(connection)) {
+    if (!["disconnected", "connecting", "live", "retry_wait", "error", "stopped"].includes(connection)) {
         throw new RangeError(`unknown connection state: ${connection}`);
     }
     if (state.connection === connection) {
         return state;
     }
     return freezeState({ ...state, connection });
+}
+
+export function setRecovery(state, recovery) {
+    return freezeState({
+        ...state,
+        recovery: {
+            ...state.recovery,
+            ...cloneJson(recovery),
+        },
+    });
 }
 
 function replaceById(values, replacement) {
@@ -168,15 +185,6 @@ export function reduceDashboardEvent(state, eventValue) {
         });
     }
 
-    const expected = state.lastSequence + 1;
-    if (event.sequence !== expected) {
-        return requireResnapshot(state, "sequence_gap", {
-            expected,
-            received: event.sequence,
-            lastEventId: state.lastEventId,
-        });
-    }
-
     if (event.type === "stream.overflow") {
         return requireResnapshot(state, "server_overflow", {
             eventId: event.id,
@@ -187,6 +195,15 @@ export function reduceDashboardEvent(state, eventValue) {
         return requireResnapshot(state, "server_slow_client", {
             eventId: event.id,
             droppedEvents: event.payload.dropped_events,
+        });
+    }
+
+    const expected = state.lastSequence + 1;
+    if (event.sequence !== expected) {
+        return requireResnapshot(state, "sequence_gap", {
+            expected,
+            received: event.sequence,
+            lastEventId: state.lastEventId,
         });
     }
 

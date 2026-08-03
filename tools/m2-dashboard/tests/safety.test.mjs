@@ -67,8 +67,10 @@ test("dashboard sources avoid HTML injection and browser persistence primitives"
 test("control intents are immutable, bounded, and explicitly transport-free", () => {
     const buffer = new ControlIntentBuffer(2);
     const first = createControlIntent("request.pause", "req-1", {}, "2026-08-03T22:00:00Z");
-    const second = createControlIntent("request.reprioritize", "req-2", { lane: "fast" }, "2026-08-03T22:00:01Z");
+    const sourceParameters = { lane: "fast", policy: { reasons: ["latency"] } };
+    const second = createControlIntent("request.reprioritize", "req-2", sourceParameters, "2026-08-03T22:00:01Z");
     const third = createControlIntent("cache.pin", "prefix-3", {}, "2026-08-03T22:00:02Z");
+    sourceParameters.policy.reasons[0] = "mutated";
     buffer.add(first);
     buffer.add(second);
     const snapshot = buffer.add(third);
@@ -76,6 +78,71 @@ test("control intents are immutable, bounded, and explicitly transport-free", ()
     assert.equal(first.transport, "local-preview-only");
     assert.ok(Object.isFrozen(first));
     assert.ok(Object.isFrozen(second.parameters));
+    assert.ok(Object.isFrozen(second.parameters.policy));
+    assert.ok(Object.isFrozen(second.parameters.policy.reasons));
+    assert.equal(second.parameters.policy.reasons[0], "latency");
     assert.deepEqual(snapshot.map((intent) => intent.targetId), ["req-2", "prefix-3"]);
+    assert.throws(() => {
+        second.parameters.policy.reasons.push("unsafe");
+    }, TypeError);
     assert.throws(() => createControlIntent("request.delete", "req-1"), /unsupported/);
+});
+
+test("control buffer clones externally supplied local intents before retaining them", () => {
+    const buffer = new ControlIntentBuffer(1);
+    const external = {
+        action: "request.pause",
+        targetId: "req-1",
+        parameters: { nested: { value: 1 } },
+        createdAt: "2026-08-03T22:00:00Z",
+        transport: "local-preview-only",
+    };
+    buffer.add(external);
+    external.parameters.nested.value = 2;
+
+    const [stored] = buffer.snapshot();
+    assert.equal(stored.parameters.nested.value, 1);
+    assert.ok(Object.isFrozen(stored.parameters.nested));
+});
+
+test("control parameters reject cyclic, deep, wide, and aggregate-oversized graphs", () => {
+    const cyclic = {};
+    cyclic.self = cyclic;
+    assert.throws(
+        () => createControlIntent("request.pause", "req-1", cyclic),
+        /must not contain cycles/,
+    );
+
+    const deep = {};
+    let cursor = deep;
+    for (let depth = 0; depth < 14; depth += 1) {
+        cursor.next = {};
+        cursor = cursor.next;
+    }
+    assert.throws(
+        () => createControlIntent("request.pause", "req-1", deep),
+        /JSON depth/,
+    );
+
+    assert.throws(
+        () => createControlIntent("request.pause", "req-1", {
+            values: Array.from({ length: 256 }, () => 0),
+        }),
+        /JSON nodes/,
+    );
+    assert.throws(
+        () => createControlIntent("request.pause", "req-1", {
+            value: "x".repeat(64 * 1024),
+        }),
+        /aggregate bytes/,
+    );
+
+    const specialKey = createControlIntent(
+        "request.pause",
+        "req-1",
+        JSON.parse('{"__proto__":{"polluted":true}}'),
+    );
+    assert.equal(Object.getPrototypeOf(specialKey.parameters), Object.prototype);
+    assert.equal(Object.hasOwn(specialKey.parameters, "__proto__"), true);
+    assert.equal(Object.prototype.polluted, undefined);
 });

@@ -133,13 +133,14 @@ footer {
 }
 
 .badge-degraded,
-.badge-reconnecting,
+.badge-retry_wait,
 .badge-connecting {
   color: var(--warning);
   background: #352d1d;
 }
 
 .badge-unavailable,
+.badge-error,
 .badge-failed,
 .badge-resnapshot_required {
   color: var(--danger);
