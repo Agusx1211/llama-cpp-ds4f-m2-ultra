@@ -2645,6 +2645,23 @@ extern "C" {
             struct ggml_tensor  * comp_idx,
             int64_t               n_raw);
 
+    // Indexed form of ggml_dsv4_sparse_pack for a shared 64-row compressed
+    // pool. comp_mask and comp_idx remain in logical per-stream order; only
+    // compressed K rows are resolved through segment_ids.
+    // comp_pool:   [d, pool_rows], pool_rows is a multiple of 64
+    // comp_mask:   [n_comp, n_query, 1, n_stream]
+    // comp_idx:    [n_select, n_query, 1, n_stream], logical row IDs
+    // segment_ids: [ceil(n_comp/64), n_stream]
+    GGML_API struct ggml_tensor * ggml_dsv4_indexed_sparse_pack(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * raw_k,
+            struct ggml_tensor  * comp_pool,
+            struct ggml_tensor  * raw_mask,
+            struct ggml_tensor  * comp_mask,
+            struct ggml_tensor  * comp_idx,
+            struct ggml_tensor  * segment_ids,
+            int64_t               n_raw);
+
     // Concatenates a per-stream raw F16 key window with logical rows from a
     // shared, 64-row-segmented compressed pool.
     // raw_k:       [d, 1, n_raw, n_stream]

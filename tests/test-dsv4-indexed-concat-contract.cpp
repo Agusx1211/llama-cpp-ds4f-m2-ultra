@@ -128,19 +128,68 @@ static void invalid_directory_index() {
     ggml_free(ctx);
 }
 
+static void invalid_sparse_pool_shape() {
+    ggml_context * ctx = make_context();
+    ggml_tensor * raw = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 8, 1, 1, 1);
+    ggml_tensor * pool = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 8, 65);
+    ggml_tensor * raw_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1, 1, 1, 1);
+    ggml_tensor * comp_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1, 1, 1, 1);
+    ggml_tensor * comp_idx = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1);
+    (void) ggml_dsv4_indexed_sparse_pack(ctx, raw, pool, raw_mask, comp_mask, comp_idx, ids, 0);
+    ggml_free(ctx);
+}
+
+static void invalid_sparse_directory_shape() {
+    ggml_context * ctx = make_context();
+    ggml_tensor * raw = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 8, 1, 1, 1);
+    ggml_tensor * pool = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 8, 128);
+    ggml_tensor * raw_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1, 1, 1, 1);
+    ggml_tensor * comp_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 65, 1, 1, 1);
+    ggml_tensor * comp_idx = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1);
+    (void) ggml_dsv4_indexed_sparse_pack(ctx, raw, pool, raw_mask, comp_mask, comp_idx, ids, 0);
+    ggml_free(ctx);
+}
+
+static void invalid_sparse_directory_index() {
+    ggml_context * ctx = make_context();
+    ggml_tensor * raw = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 8, 1, 1, 1);
+    ggml_tensor * pool = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 8, 64);
+    ggml_tensor * raw_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1, 1, 1, 1);
+    ggml_tensor * comp_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1, 1, 1, 1);
+    ggml_tensor * comp_idx = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1);
+    *(ggml_fp16_t *) comp_mask->data = ggml_fp32_to_fp16(0.0f);
+    *(int32_t *) comp_idx->data = 0;
+    *(int32_t *) ids->data = 1; // The only valid physical segment is zero.
+    ggml_tensor * out = ggml_dsv4_indexed_sparse_pack(
+            ctx, raw, pool, raw_mask, comp_mask, comp_idx, ids, 0);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    ggml_graph_compute_with_ctx(ctx, graph, 2);
+    ggml_free(ctx);
+}
+
 int main() {
     const bool pool_rejected = rejects(invalid_pool_shape);
     const bool shape_rejected = rejects(invalid_directory_shape);
     const bool index_rejected = rejects(invalid_directory_index);
+    const bool sparse_pool_rejected = rejects(invalid_sparse_pool_shape);
+    const bool sparse_shape_rejected = rejects(invalid_sparse_directory_shape);
+    const bool sparse_index_rejected = rejects(invalid_sparse_directory_index);
     // Run the non-forking oracle last: forking after the CPU worker pool has
     // initialized can inherit library locks from helper threads.
     const bool output_matches = valid_output_matches_affine_concat();
-    if (!output_matches || !pool_rejected || !shape_rejected || !index_rejected) {
+    if (!output_matches || !pool_rejected || !shape_rejected || !index_rejected ||
+            !sparse_pool_rejected || !sparse_shape_rejected || !sparse_index_rejected) {
         std::cerr << "indexed concat contract failed: output=" << output_matches << " pool=" << pool_rejected
-                  << " directory=" << shape_rejected << " index=" << index_rejected << '\n';
+                  << " directory=" << shape_rejected << " index=" << index_rejected
+                  << " sparse_pool=" << sparse_pool_rejected << " sparse_directory=" << sparse_shape_rejected
+                  << " sparse_index=" << sparse_index_rejected << '\n';
         return 1;
     }
 
-    std::cout << "indexed concat matches affine output and rejects invalid pool shape, directory shape, and segment index\n";
+    std::cout << "indexed concat and sparse pack reject invalid pool shape, directory shape, and segment index\n";
     return 0;
 }
