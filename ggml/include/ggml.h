@@ -577,6 +577,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_DSV4_SPARSE_PACK,
+        GGML_OP_DSV4_INDEXED_CONCAT,
 
         GGML_OP_UNARY,
 
@@ -2643,6 +2644,23 @@ extern "C" {
             struct ggml_tensor  * comp_mask,
             struct ggml_tensor  * comp_idx,
             int64_t               n_raw);
+
+    // Concatenates a per-stream raw F16 key window with logical rows from a
+    // shared, 64-row-segmented compressed pool.
+    // raw_k:       [d, 1, n_raw, n_stream]
+    // k_pool:      [d, pool_rows], where pool_rows is a multiple of 64
+    // segment_ids: [ceil(n_comp/64), n_stream]
+    // res:         [d, 1, n_raw + n_comp, n_stream]
+    //
+    // Logical compressed row r uses physical row
+    // segment_ids[r/64, stream]*64 + r%64. Segment IDs must be in
+    // [0, pool_rows/64); the CPU oracle rejects invalid IDs.
+    GGML_API struct ggml_tensor * ggml_dsv4_indexed_concat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * raw_k,
+            struct ggml_tensor  * k_pool,
+            struct ggml_tensor  * segment_ids,
+            int64_t               n_comp);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)

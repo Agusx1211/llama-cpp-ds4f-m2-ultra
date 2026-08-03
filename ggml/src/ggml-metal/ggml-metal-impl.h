@@ -1309,6 +1309,20 @@ typedef struct {
 } ggml_metal_kargs_dsv4_sparse_pack;
 
 typedef struct {
+    int32_t  n_embd4;
+    int32_t  n_raw;
+    int32_t  n_comp;
+    int32_t  n_pool_segments;
+    uint64_t nb_rk2;
+    uint64_t nb_rk3;
+    uint64_t nb_kp1;
+    uint64_t nb_si0;
+    uint64_t nb_si1;
+    uint64_t nb_d2;
+    uint64_t nb_d3;
+} ggml_metal_kargs_dsv4_indexed_concat;
+
+typedef struct {
     int32_t  n_kv;
     int32_t  n_batch;
     int32_t  kv_offset;

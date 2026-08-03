@@ -446,6 +446,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_dsv4_sparse_pack(ctx, idx);
             } break;
+        case GGML_OP_DSV4_INDEXED_CONCAT:
+            {
+                n_fuse = ggml_metal_op_dsv4_indexed_concat(ctx, idx);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 n_fuse = ggml_metal_op_lightning_indexer(ctx, idx);
@@ -2061,6 +2065,46 @@ int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
     } else {
         ggml_metal_encoder_dispatch_threadgroups(enc, op->ne[1], 1, 1, nth, 1, 1);
     }
+
+    return 1;
+}
+
+int ggml_metal_op_dsv4_indexed_concat(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    GGML_ASSERT(op->op == GGML_OP_DSV4_INDEXED_CONCAT);
+
+    const ggml_tensor * raw_k       = op->src[0];
+    const ggml_tensor * k_pool      = op->src[1];
+    const ggml_tensor * segment_ids = op->src[2];
+
+    const ggml_metal_kargs_dsv4_indexed_concat args = {
+        /*.n_embd4         =*/ (int32_t) raw_k->ne[0]/4,
+        /*.n_raw           =*/ (int32_t) raw_k->ne[2],
+        /*.n_comp          =*/ ggml_get_op_params_i32(op, 0),
+        /*.n_pool_segments =*/ (int32_t) k_pool->ne[1]/64,
+        /*.nb_rk2          =*/ raw_k->nb[2],
+        /*.nb_rk3          =*/ raw_k->nb[3],
+        /*.nb_kp1          =*/ k_pool->nb[1],
+        /*.nb_si0          =*/ segment_ids->nb[0],
+        /*.nb_si1          =*/ segment_ids->nb[1],
+        /*.nb_d2           =*/ op->nb[2],
+        /*.nb_d3           =*/ op->nb[3],
+    };
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    auto pipeline = ggml_metal_library_get_pipeline_base(ctx->lib, op->op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(raw_k),       1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(k_pool),      2);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(segment_ids), 3);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),          4);
+
+    const int nth = std::min({ args.n_embd4, 128,
+            ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) });
+    ggml_metal_encoder_dispatch_threadgroups(
+            enc, args.n_raw + args.n_comp, raw_k->ne[3], 1, nth, 1, 1);
 
     return 1;
 }

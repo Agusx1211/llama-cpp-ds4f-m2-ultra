@@ -69,6 +69,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
         case GGML_OP_ADD_ID: op_str = "add_id"; break;
         case GGML_OP_DSV4_COMPRESS: op_str = "dsv4_compress"; break;
         case GGML_OP_DSV4_TOP_K_MASK: op_str = "dsv4_top_k_mask"; break;
+        case GGML_OP_DSV4_INDEXED_CONCAT: op_str = "dsv4_indexed_concat"; break;
         default: GGML_ABORT("fatal error");
     };
 
