@@ -12111,6 +12111,27 @@ kernel void kernel_dsv4_sparse_pack(
         const int is = it / args.n_batch;
         const int idx = *(device const int *) (comp_idx +
                 (uint64_t) i*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
+
+        // Keep the established affine decode specialization byte-for-byte in
+        // its hot loop. Indexed validation and invisible-row handling must not
+        // add work to the current DeepSeek V4 path before runtime migration.
+        if (!indexed) {
+            device const k4_t * src = (device const k4_t *) (comp_k +
+                    (uint64_t) idx*args.nb_ck2 + (uint64_t) is*args.nb_ck3);
+            device half * out = (device half *) (dst + (uint64_t) it*args.nb_d1);
+            device half4 * out_k = (device half4 *) out;
+            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
+                half4 values;
+                dequantize_func(src + e4/nl, e4%nl, values);
+                out_k[i*args.n_embd/4 + e4] = values;
+            }
+            if (tiitg == 0) {
+                out[args.n_embd*args.n_comp + i] = *(device const half *) (comp_mask +
+                        (uint64_t) idx*args.nb_cm0 + (uint64_t) iq*args.nb_cm1 + (uint64_t) is*args.nb_cm3);
+            }
+            return;
+        }
+
         const int physical = dsv4_sparse_pack_physical_row<indexed>(args, segment_ids, idx, is);
         const half mask = physical >= 0 ? *(device const half *) (comp_mask +
                 (uint64_t) idx*args.nb_cm0 + (uint64_t) iq*args.nb_cm1 + (uint64_t) is*args.nb_cm3) : -INFINITY;
