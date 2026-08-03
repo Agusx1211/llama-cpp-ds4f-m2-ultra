@@ -11,7 +11,7 @@
 
 static constexpr int rejection_exit_code = 125;
 
-static void abort_as_rejection(const char *) {
+[[noreturn]] static void abort_as_rejection(const char *) {
     std::_Exit(rejection_exit_code);
 }
 
