@@ -1579,6 +1579,17 @@ static int test_dsv4_parallel(size_t seed) {
     return all_ok ? 0 : 1;
 }
 
+static int test_dsv4_restore(size_t seed) {
+    bool all_ok = true;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        printf("DSV4 transactional restore on %s\n", ggml_backend_dev_description(dev));
+        all_ok = test_dsv4_restore_boundaries(seed, dev) && all_ok;
+        all_ok = test_dsv4_transactional_restore(seed, dev) && all_ok;
+    }
+    return all_ok ? 0 : 1;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -1910,6 +1921,7 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    bool dsv4_restore_only = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -1945,12 +1957,19 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        if (strcmp(argv[i], "--dsv4-restore-only") == 0) {
+            dsv4_restore_only = true;
+            continue;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
+        }
+        if (dsv4_restore_only) {
+            return test_dsv4_restore(seed);
         }
         const int backends_result = test_backends(arch, seed, log_level);
         if (backends_result != 0) {
