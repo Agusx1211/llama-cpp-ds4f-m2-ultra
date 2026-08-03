@@ -939,11 +939,13 @@ static void dsv4_build_comp_inputs(
 
     if (plan.n_kv > 0) {
         const int64_t n_tokens = (int64_t) plan.n_visible.size();
+        const bool is_lid = strcmp(name, "lid") == 0;
+        const bool use_f16_mask = is_lid ? cparams.fused_lid || !plan.segment_ids.empty() : cparams.flash_attn;
 
         GGML_ASSERT(n_stream > 0);
         GGML_ASSERT(n_tokens%n_stream == 0);
 
-        inp.kq_mask = ggml_new_tensor_4d(ctx, (strcmp(name, "lid") != 0 && cparams.flash_attn) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
+        inp.kq_mask = ggml_new_tensor_4d(ctx, use_f16_mask ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
         ggml_set_input(inp.kq_mask);
         ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
     }
