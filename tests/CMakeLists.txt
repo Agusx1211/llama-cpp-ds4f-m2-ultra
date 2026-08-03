@@ -196,9 +196,20 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build_and_test(test-llama-archs.cpp)
     llama_build_and_test(test-dsv4-amx-contract.cpp)
+    llama_build_and_test(test-dsv4-sparse-accounting.cpp)
+    target_include_directories(test-dsv4-sparse-accounting PRIVATE
+        ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-metal-sparse-planner.cpp)
     target_include_directories(test-metal-sparse-planner PRIVATE
         ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+    llama_build_and_test(test-metal-sparse-reservation.cpp)
+    if (TARGET ggml-metal AND NOT GGML_BACKEND_DL)
+        target_link_libraries(test-metal-sparse-reservation PRIVATE ggml-metal)
+        target_include_directories(test-metal-sparse-reservation PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+        target_compile_definitions(test-metal-sparse-reservation PRIVATE
+            GGML_TEST_METAL_SPARSE_RESERVATION)
+    endif()
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if (Python3_Interpreter_FOUND)
         llama_test_cmd(

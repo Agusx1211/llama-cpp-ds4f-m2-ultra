@@ -1,4 +1,5 @@
 #include "llama-kv-cache-dsv4.h"
+#include "llama-kv-cache-dsv4-accounting.h"
 
 #include "ggml-backend.h"
 #include "llama-impl.h"
@@ -387,16 +388,6 @@ private:
     bool ticket_issued = false;
     bool usage_proc_available = false;
 };
-
-static uint32_t dsv4_state_n_used_k_rows(llama_pos pos_max, uint32_t ratio, uint32_t kv_size) {
-    if (pos_max < 0) {
-        return 0;
-    }
-
-    const uint64_t n_rows = ((uint64_t) pos_max + 1)/ratio;
-
-    return (uint32_t) std::min<uint64_t>(kv_size, n_rows);
-}
 
 static int64_t dsv4_stream_offset(uint32_t n_stream, llama_seq_id seq_id, uint32_t size) {
     if (n_stream <= 1) {
@@ -1919,32 +1910,18 @@ static llama_dsv4_sparse_pool_usage dsv4_convert_sparse_usage(
     };
 }
 
-static void dsv4_add_sparse_usage(
-        llama_dsv4_sparse_pool_usage & dst,
-        const llama_dsv4_sparse_pool_usage & src) {
-    if (dst.page_size == 0) {
-        dst.page_size = src.page_size;
-    } else if (dst.page_size != src.page_size) {
-        dst.page_size = 0;
-    }
-    dst.virtual_pages += src.virtual_pages;
-    dst.physical_pages += src.physical_pages;
-    dst.free_pages += src.free_pages;
-    dst.reserved_pages += src.reserved_pages;
-    dst.mapped_mappings += src.mapped_mappings;
-    dst.unique_physical_pages += src.unique_physical_pages;
-    dst.shared_physical_pages += src.shared_physical_pages;
-    dst.shared_mappings += src.shared_mappings;
-    dst.refcount_sum += src.refcount_sum;
-    dst.refcount_max = std::max(dst.refcount_max, src.refcount_max);
-    dst.generation = std::max(dst.generation, src.generation);
-    dst.cow_allocations += src.cow_allocations;
-    dst.cow_pages += src.cow_pages;
-}
+struct dsv4_sparse_buffer_snapshot {
+    int status = 0;
+    ggml_metal_sparse_usage usage = {};
+};
+
+using dsv4_sparse_buffer_snapshots =
+        std::map<ggml_backend_buffer_t, dsv4_sparse_buffer_snapshot>;
 
 static llama_dsv4_family_usage dsv4_family_usage(
         const llama_kv_cache * cache,
-        llama_dsv4_memory_family family) {
+        llama_dsv4_memory_family family,
+        dsv4_sparse_buffer_snapshots & snapshots) {
     llama_dsv4_family_usage result;
     result.family = family;
     result.logical_capacity_rows = (uint64_t) cache->get_size()*cache->get_n_stream();
@@ -1959,52 +1936,76 @@ static llama_dsv4_family_usage dsv4_family_usage(
     std::map<uintptr_t, llama_dsv4_sparse_pool_usage> unique;
     for (uint32_t il : cache->get_layer_ids()) {
         ggml_tensor * tensor = cache->get_k_storage(il);
-        auto * usage = (usage_fn) dsv4_backend_proc(
-                tensor, "ggml_backend_metal_dsv4_sparse_tensor_usage");
-        if (usage == nullptr) {
-            continue;
+        const auto [it, inserted] = snapshots.try_emplace(tensor->buffer);
+        if (inserted) {
+            auto * usage = (usage_fn) dsv4_backend_proc(
+                    tensor, "ggml_backend_metal_dsv4_sparse_tensor_usage");
+            if (usage != nullptr) {
+                it->second.status = usage(tensor, &it->second.usage);
+            }
         }
-        ggml_metal_sparse_usage snapshot = {};
-        const int status = usage(tensor, &snapshot);
-        if (status < 0) {
+        const auto & snapshot = it->second;
+        if (snapshot.status < 0) {
             throw std::runtime_error("failed to read DSV4 sparse usage snapshot");
         }
-        if (status > 0) {
-            unique.emplace(snapshot.pool_id, dsv4_convert_sparse_usage(snapshot));
+        if (snapshot.status > 0) {
+            if (!dsv4_sparse_pool_insert(unique, dsv4_convert_sparse_usage(snapshot.usage))) {
+                throw std::runtime_error("inconsistent DSV4 sparse pool usage snapshot");
+            }
         }
     }
     for (const auto & [_, pool] : unique) {
         result.pools.push_back(pool);
-        dsv4_add_sparse_usage(result.total, pool);
+        dsv4_sparse_usage_add(result.total, pool);
     }
     result.placement_sparse = !result.pools.empty();
     return result;
 }
 
+static void dsv4_set_compressed_logical_usage(
+        llama_dsv4_family_usage & result,
+        const llama_kv_cache * cache,
+        const llama_kv_cache_iswa * raw,
+        uint32_t ratio) {
+    result.logical_capacity_rows = (uint64_t) cache->get_size()*cache->get_n_stream();
+    result.logical_mapped_rows = 0;
+    result.sequence_mapped_rows.clear();
+    result.sequence_mapped_rows.reserve(cache->get_n_stream());
+    for (uint32_t seq = 0; seq < cache->get_n_stream(); ++seq) {
+        const uint64_t used = dsv4_state_n_used_k_rows(
+                raw->seq_pos_max((llama_seq_id) seq), ratio, cache->get_size());
+        result.sequence_mapped_rows.push_back(used);
+        result.logical_mapped_rows += used;
+    }
+}
+
 llama_dsv4_memory_usage_snapshot llama_kv_cache_dsv4::memory_usage_snapshot() const {
     llama_dsv4_memory_usage_snapshot result;
+    dsv4_sparse_buffer_snapshots snapshots;
     result.families[LLAMA_DSV4_MEMORY_RAW] =
-            dsv4_family_usage(kv_raw->get_swa(), LLAMA_DSV4_MEMORY_RAW);
+            dsv4_family_usage(kv_raw->get_swa(), LLAMA_DSV4_MEMORY_RAW, snapshots);
+    const bool raw_pools_merged = dsv4_family_sparse_usage_merge(
+            result.families[LLAMA_DSV4_MEMORY_RAW],
+            dsv4_family_usage(kv_raw->get_base(), LLAMA_DSV4_MEMORY_RAW, snapshots));
+    if (!raw_pools_merged) {
+        throw std::runtime_error("inconsistent RAW DSV4 sparse pool usage snapshot");
+    }
     result.families[LLAMA_DSV4_MEMORY_CSA] =
-            dsv4_family_usage(kv_csa.get(), LLAMA_DSV4_MEMORY_CSA);
+            dsv4_family_usage(kv_csa.get(), LLAMA_DSV4_MEMORY_CSA, snapshots);
     result.families[LLAMA_DSV4_MEMORY_HCA] =
-            dsv4_family_usage(kv_hca.get(), LLAMA_DSV4_MEMORY_HCA);
+            dsv4_family_usage(kv_hca.get(), LLAMA_DSV4_MEMORY_HCA, snapshots);
     result.families[LLAMA_DSV4_MEMORY_LID] =
-            dsv4_family_usage(kv_lid.get(), LLAMA_DSV4_MEMORY_LID);
+            dsv4_family_usage(kv_lid.get(), LLAMA_DSV4_MEMORY_LID, snapshots);
 
-    bool have_limit = false;
-    for (const auto & family : result.families) {
-        dsv4_add_sparse_usage(result.sparse_total, family.total);
-        for (const auto & pool : family.pools) {
-            const uint64_t available = pool.reserved_pages <= pool.free_pages ?
-                    pool.free_pages - pool.reserved_pages : 0;
-            if (!have_limit || available < result.limiting_available_pages) {
-                have_limit = true;
-                result.limiting_family = family.family;
-                result.limiting_pool_id = pool.pool_id;
-                result.limiting_available_pages = available;
-            }
-        }
+    dsv4_set_compressed_logical_usage(
+            result.families[LLAMA_DSV4_MEMORY_CSA], kv_csa.get(), kv_raw.get(), DSV4_CSA_RATIO);
+    dsv4_set_compressed_logical_usage(
+            result.families[LLAMA_DSV4_MEMORY_HCA], kv_hca.get(), kv_raw.get(), DSV4_HCA_RATIO);
+    dsv4_set_compressed_logical_usage(
+            result.families[LLAMA_DSV4_MEMORY_LID], kv_lid.get(), kv_raw.get(), DSV4_CSA_RATIO);
+
+    if (!dsv4_memory_usage_finalize(result)) {
+        throw std::runtime_error("inconsistent shared DSV4 sparse pool usage snapshot");
     }
     return result;
 }

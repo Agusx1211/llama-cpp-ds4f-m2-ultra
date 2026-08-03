@@ -55,6 +55,7 @@ struct llama_dsv4_memory_usage_snapshot {
     std::array<llama_dsv4_family_usage, LLAMA_DSV4_MEMORY_FAMILY_COUNT> families;
     llama_dsv4_sparse_pool_usage sparse_total;
     llama_dsv4_memory_family limiting_family = LLAMA_DSV4_MEMORY_RAW;
+    uint32_t limiting_family_mask = 0;
     uintptr_t limiting_pool_id = 0;
     uint64_t limiting_available_pages = 0;
 };
