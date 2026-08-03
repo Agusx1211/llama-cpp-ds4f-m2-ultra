@@ -732,6 +732,12 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+enum llm_dsv4_amx_mode : uint8_t {
+    LLM_DSV4_AMX_DISABLED = 0,
+    LLM_DSV4_AMX_COEXEC   = 1,
+    LLM_DSV4_AMX_VALIDATE = 2,
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -751,6 +757,8 @@ struct llm_graph_params {
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    llm_dsv4_amx_mode dsv4_amx_mode = LLM_DSV4_AMX_DISABLED;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -841,6 +849,7 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
+            dsv4_amx_mode == other.dsv4_amx_mode &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;

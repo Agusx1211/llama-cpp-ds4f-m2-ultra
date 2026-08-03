@@ -15,6 +15,7 @@
 #include <vector>
 
 struct llama_model;
+class llama_dsv4_amx_context;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -350,6 +351,8 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    std::unique_ptr<llama_dsv4_amx_context> dsv4_amx;
 
     bool sched_need_reserve = true;
 

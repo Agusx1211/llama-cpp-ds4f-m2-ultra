@@ -1748,12 +1748,37 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 selected_experts);
         cb(moe_out, "ffn_moe_out", il);
 
-        ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
+        ggml_tensor * ffn_shexp;
+        if (params.dsv4_amx_mode == LLM_DSV4_AMX_DISABLED) {
+            ffn_shexp = build_ffn(cur,
+                    layer.ffn_up_shexp, nullptr, nullptr,
+                    layer.ffn_gate_shexp, nullptr, nullptr,
+                    layer.ffn_down_shexp, nullptr, nullptr,
+                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cb(ffn_shexp, "ffn_shexp", il);
+        } else {
+            // The direct AMX worker fills this context-owned Metal-shared leaf
+            // before the existing routed+shared add is submitted. All layer-local
+            // leaf records reuse one external buffer under exact callback ordering.
+            ffn_shexp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+            cb(ffn_shexp, "ffn_amx_out", il);
+
+            if (params.dsv4_amx_mode == LLM_DSV4_AMX_VALIDATE) {
+                ggml_tensor * reference = build_ffn(cur,
+                        layer.ffn_up_shexp, nullptr, nullptr,
+                        layer.ffn_gate_shexp, nullptr, nullptr,
+                        layer.ffn_down_shexp, nullptr, nullptr,
+                        nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                cb(reference, "ffn_amx_ref", il);
+
+                // Keep both tensors live until after the retained Metal result is
+                // available. The callback waits for AMX at reference; this diff is
+                // correctness-only and is absent from ordinary coexecution graphs.
+                ggml_tensor * validation = ggml_sub(ctx0, reference, ffn_shexp);
+                cb(validation, "ffn_amx_validation", il);
+                ggml_build_forward_expand(gf, validation);
+            }
+        }
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);

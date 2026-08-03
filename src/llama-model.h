@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+class llama_dsv4_amx_model;
 
 // available models
 enum llm_type {
@@ -683,6 +684,8 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+
+    const std::shared_ptr<const llama_dsv4_amx_model> & dsv4_amx_model() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

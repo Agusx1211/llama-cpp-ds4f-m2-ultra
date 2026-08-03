@@ -17,6 +17,7 @@ add_library(llama
             llama-chat.cpp
             llama-context.cpp
             llama-cparams.cpp
+            llama-dsv4-amx.cpp
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp
@@ -55,6 +56,12 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+if (APPLE AND (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64" OR CMAKE_OSX_ARCHITECTURES MATCHES "arm64"))
+    find_library(ACCELERATE_FRAMEWORK Accelerate REQUIRED)
+    target_link_libraries(llama PRIVATE ${ACCELERATE_FRAMEWORK})
+    target_compile_definitions(llama PRIVATE LLAMA_DSV4_AMX_APPLE_ARM64=1)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

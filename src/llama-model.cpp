@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
+#include "llama-dsv4-amx.h"
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
@@ -1037,6 +1038,8 @@ struct llama_model::impl {
 
     bool has_tensor_overrides;
 
+    std::shared_ptr<const llama_dsv4_amx_model> dsv4_amx_model;
+
     std::vector<float> tensor_split_owned;
 };
 
@@ -1662,6 +1665,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    pimpl->dsv4_amx_model = llama_dsv4_amx_model_create(*this);
+
     return true;
 }
 
@@ -2012,6 +2017,10 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
 
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
+}
+
+const std::shared_ptr<const llama_dsv4_amx_model> & llama_model::dsv4_amx_model() const {
+    return pimpl->dsv4_amx_model;
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {

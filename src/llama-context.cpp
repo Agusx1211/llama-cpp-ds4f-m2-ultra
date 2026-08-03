@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-dsv4-amx.h"
 #include "llama-io.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory.h"
@@ -506,6 +507,8 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        dsv4_amx = llama_dsv4_amx_context_create(model, cparams, backend_ptrs, backend_buft);
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -527,8 +530,15 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // Join the worker first, then drain Metal before releasing the persistent
+    // context-owned AMX output buffer.
+    if (dsv4_amx) {
+        dsv4_amx->shutdown();
+    }
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    dsv4_amx.reset();
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -675,6 +685,9 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (dsv4_amx) {
+        dsv4_amx->set_scheduler(sched.get());
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1471,6 +1484,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        if (dsv4_amx) {
+            dsv4_amx->prepare_graph(gf, gparams.dsv4_amx_mode, true);
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -2547,6 +2564,10 @@ ggml_cgraph * llama_context::graph_reserve_type(
 
     auto * gf = model.build_graph(gparams);
 
+    if (dsv4_amx) {
+        dsv4_amx->prepare_graph(gf, gparams.dsv4_amx_mode, false);
+    }
+
     this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph
@@ -2583,6 +2604,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
+        /*.dsv4_amx_mode =*/ dsv4_amx ? dsv4_amx->mode_for(gtype, ubatch.n_tokens, !loras->empty()) : LLM_DSV4_AMX_DISABLED,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -2608,7 +2630,21 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    const bool amx_graph = dsv4_amx && dsv4_amx->owns_graph(gf);
+    if (amx_graph && !dsv4_amx->begin_graph(gf)) {
+        LLAMA_LOG_ERROR("%s: DeepSeek V4 AMX graph failed its pre-submission state gate\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+    ggml_backend_sched_set_eval_callback(
+            sched.get(),
+            amx_graph ? llama_dsv4_amx_context::eval_callback : cparams.cb_eval,
+            amx_graph ? static_cast<void *>(dsv4_amx.get()) : cparams.cb_eval_user_data);
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    if (amx_graph) {
+        status = dsv4_amx->finish_graph(status);
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }

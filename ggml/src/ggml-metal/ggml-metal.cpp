@@ -9,6 +9,7 @@
 
 #include <mutex>
 #include <map>
+#include <memory>
 #include <string>
 
 #define GGML_METAL_NAME "MTL"
@@ -20,6 +21,7 @@ static int g_devices = 1;
 
 // forward declaration
 static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer);
+static const char * ggml_backend_metal_buffer_type_shared_get_name(ggml_backend_buffer_type_t buft);
 
 ////////////////////////////////////////////////////////////////////////////////
 // backend interface
@@ -180,6 +182,27 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_private_i = {
 static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_metal_buffer_shared_free_buffer ||
            buffer->iface.free_buffer == ggml_backend_metal_buffer_private_free_buffer;
+}
+
+// Target-specific unified-memory escape hatch for the production DSV4 AMX
+// experiment. Keep Metal buffer types non-host to preserve scheduler transfer
+// and dependency semantics; callers must opt in and validate each tensor here.
+static void * ggml_backend_metal_get_tensor_host_ptr(const ggml_tensor * tensor) {
+    if (tensor == NULL || tensor->buffer == NULL || tensor->data == NULL ||
+        !ggml_backend_buffer_is_metal(tensor->buffer)) {
+        return NULL;
+    }
+
+    ggml_metal_buffer_t ctx = (ggml_metal_buffer_t) tensor->buffer->context;
+    if (!ggml_metal_buffer_is_shared(ctx)) {
+        return NULL;
+    }
+
+    return tensor->data;
+}
+
+static bool ggml_backend_metal_buffer_type_is_shared(ggml_backend_buffer_type_t buft) {
+    return buft != NULL && buft->iface.get_name == ggml_backend_metal_buffer_type_shared_get_name;
 }
 
 //
@@ -1078,6 +1101,12 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_dsv4_sparse_unmap_tensor_range") == 0) {
         return (void *)ggml_backend_metal_dsv4_sparse_unmap_tensor_range;
+    }
+    if (strcmp(name, "ggml_backend_metal_get_tensor_host_ptr") == 0) {
+        return (void *)ggml_backend_metal_get_tensor_host_ptr;
+    }
+    if (strcmp(name, "ggml_backend_metal_buffer_type_is_shared") == 0) {
+        return (void *)ggml_backend_metal_buffer_type_is_shared;
     }
 
     return NULL;

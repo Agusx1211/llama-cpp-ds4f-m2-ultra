@@ -195,6 +195,22 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+    llama_build_and_test(test-dsv4-amx-contract.cpp)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        llama_test_cmd(
+            ${Python3_EXECUTABLE}
+            NAME test-dsv4-amx-gate-parser
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            ARGS tests/test-dsv4-amx-gate-parser.py
+        )
+        llama_test_cmd(
+            ${Python3_EXECUTABLE}
+            NAME test-dsv4-amx-full-model-gate-parser
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            ARGS tests/test-dsv4-amx-full-model-gate-parser.py
+        )
+    endif()
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
