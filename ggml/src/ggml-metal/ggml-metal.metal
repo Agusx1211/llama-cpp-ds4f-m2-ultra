@@ -12067,15 +12067,142 @@ kernel void kernel_dsv4_hc_post_f32(
 // Prefill assigns one threadgroup per token. Decode's compressed-only mode
 // assigns one threadgroup per selected row to expose enough random-read
 // parallelism. The packed masks remain adjacent to the F16 key storage.
-template <bool indexed>
-static inline int dsv4_sparse_pack_physical_row(
+template <typename k4_t, short nl, void (*dequantize_func)(device const k4_t *, short, thread half4 &)>
+kernel void kernel_dsv4_sparse_pack(
         constant ggml_metal_kargs_dsv4_sparse_pack & args,
+        device const char * raw_k,
+        device const char * comp_k,
+        device const char * raw_mask,
+        device const char * comp_mask,
+        device const char * comp_idx,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort3  ntg[[threads_per_threadgroup]]) {
+    constexpr int max_selected = 128 + 512;
+    threadgroup int  selected_idx[max_selected];
+    threadgroup half selected_mask[max_selected];
+
+    if (args.n_raw == 0) {
+        const int i  = tgpig.x;
+        const int it = tgpig.y;
+        const int iq = it % args.n_batch;
+        const int is = it / args.n_batch;
+        const int idx = *(device const int *) (comp_idx +
+                (uint64_t) i*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
+
+        device const k4_t * src = (device const k4_t *) (comp_k +
+                (uint64_t) idx*args.nb_ck2 + (uint64_t) is*args.nb_ck3);
+        device half * out = (device half *) (dst + (uint64_t) it*args.nb_d1);
+        device half4 * out_k = (device half4 *) out;
+        for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
+            half4 values;
+            dequantize_func(src + e4/nl, e4%nl, values);
+            out_k[i*args.n_embd/4 + e4] = values;
+        }
+        if (tiitg == 0) {
+            out[args.n_embd*args.n_comp + i] = *(device const half *) (comp_mask +
+                    (uint64_t) idx*args.nb_cm0 + (uint64_t) iq*args.nb_cm1 + (uint64_t) is*args.nb_cm3);
+        }
+        return;
+    }
+
+    const int it = tgpig.x;
+    const int iq = it % args.n_batch;
+    const int is = it / args.n_batch;
+    const int nk = args.n_raw + args.n_comp;
+
+    device half * out = (device half *) (dst + (uint64_t) it*args.nb_d1);
+    device half * out_k = out;
+    device half * out_m = out + args.n_embd*nk;
+
+    // Selection indices and masks are shared by every embedding lane/head. Load
+    // them once per token instead of issuing up to 512 identical device reads.
+    // The raw SWA mask has at most n_raw finite entries. Avoid a separate F32
+    // cast + top-k dispatch by compacting those entries directly here.
+    if (tiitg == 0) {
+        int n = 0;
+        for (int idx = 0; idx < args.n_raw_k && n < args.n_raw; ++idx) {
+            const half m = *(device const half *) (raw_mask +
+                    (uint64_t) idx*args.nb_rm0 + (uint64_t) iq*args.nb_rm1 + (uint64_t) is*args.nb_rm3);
+            if (isfinite(m)) {
+                selected_idx[n] = idx;
+                selected_mask[n] = m;
+                ++n;
+            }
+        }
+        for (; n < args.n_raw; ++n) {
+            selected_idx[n] = -1;
+            selected_mask[n] = -INFINITY;
+        }
+    }
+    for (int i = tiitg; i < args.n_comp; i += ntg.x) {
+        const int oi = args.n_raw + i;
+        const int idx = *(device const int *) (comp_idx +
+                (uint64_t) i*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
+        selected_idx[oi] = idx;
+        const half mask = *(device const half *) (comp_mask +
+                (uint64_t) idx*args.nb_cm0 + (uint64_t) iq*args.nb_cm1 + (uint64_t) is*args.nb_cm3);
+        selected_mask[oi] = isfinite(mask) ? mask : -INFINITY;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i = 0; i < args.n_raw; ++i) {
+        const int idx = selected_idx[i];
+        if (idx >= 0) {
+            device const k4_t * src = (device const k4_t *) (raw_k +
+                    (uint64_t) idx*args.nb_rk2 + (uint64_t) is*args.nb_rk3);
+            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
+                half4 values;
+                dequantize_func(src + e4/nl, e4%nl, values);
+                ((device half4 *) out_k)[i*args.n_embd/4 + e4] = values;
+            }
+        } else {
+            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
+                ((device half4 *) out_k)[i*args.n_embd/4 + e4] = 0.0h;
+            }
+        }
+        if (tiitg == 0) {
+            out_m[i] = selected_mask[i];
+        }
+    }
+
+    for (int i = 0; i < args.n_comp; ++i) {
+        const int oi = args.n_raw + i;
+        const int idx = selected_idx[oi];
+        if (isfinite(selected_mask[oi])) {
+            device const k4_t * src = (device const k4_t *) (comp_k +
+                    (uint64_t) idx*args.nb_ck2 + (uint64_t) is*args.nb_ck3);
+            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
+                half4 values;
+                dequantize_func(src + e4/nl, e4%nl, values);
+                ((device half4 *) out_k)[oi*args.n_embd/4 + e4] = values;
+            }
+        } else {
+            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
+                ((device half4 *) out_k)[oi*args.n_embd/4 + e4] = 0.0h;
+            }
+        }
+        if (tiitg == 0) {
+            out_m[oi] = selected_mask[oi];
+        }
+    }
+
+}
+
+typedef decltype(kernel_dsv4_sparse_pack<half4, 1, dequantize_f16_t4>) dsv4_sparse_pack_t;
+
+template [[host_name("kernel_dsv4_sparse_pack_f16")]]
+kernel dsv4_sparse_pack_t kernel_dsv4_sparse_pack<half4, 1, dequantize_f16_t4>;
+
+template [[host_name("kernel_dsv4_sparse_pack_q8_0")]]
+kernel dsv4_sparse_pack_t kernel_dsv4_sparse_pack<block_q8_0, 8, dequantize_q8_0_t4>;
+
+static inline int dsv4_sparse_pack_physical_row(
+        constant ggml_metal_kargs_dsv4_indexed_sparse_pack & args,
         device const char * segment_ids,
         int idx,
         int is) {
-    if (!indexed) {
-        return idx;
-    }
     if (idx < 0 || idx >= args.n_comp_k) {
         return -1;
     }
@@ -12087,9 +12214,9 @@ static inline int dsv4_sparse_pack_physical_row(
     return segment*64 + idx%64;
 }
 
-template <typename k4_t, short nl, void (*dequantize_func)(device const k4_t *, short, thread half4 &), bool indexed>
-kernel void kernel_dsv4_sparse_pack(
-        constant ggml_metal_kargs_dsv4_sparse_pack & args,
+template <typename k4_t, short nl, void (*dequantize_func)(device const k4_t *, short, thread half4 &)>
+kernel void kernel_dsv4_indexed_sparse_pack(
+        constant ggml_metal_kargs_dsv4_indexed_sparse_pack & args,
         device const char * raw_k,
         device const char * comp_k,
         device const char * raw_mask,
@@ -12112,27 +12239,7 @@ kernel void kernel_dsv4_sparse_pack(
         const int idx = *(device const int *) (comp_idx +
                 (uint64_t) i*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
 
-        // Keep the established affine decode specialization byte-for-byte in
-        // its hot loop. Indexed validation and invisible-row handling must not
-        // add work to the current DeepSeek V4 path before runtime migration.
-        if (!indexed) {
-            device const k4_t * src = (device const k4_t *) (comp_k +
-                    (uint64_t) idx*args.nb_ck2 + (uint64_t) is*args.nb_ck3);
-            device half * out = (device half *) (dst + (uint64_t) it*args.nb_d1);
-            device half4 * out_k = (device half4 *) out;
-            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
-                half4 values;
-                dequantize_func(src + e4/nl, e4%nl, values);
-                out_k[i*args.n_embd/4 + e4] = values;
-            }
-            if (tiitg == 0) {
-                out[args.n_embd*args.n_comp + i] = *(device const half *) (comp_mask +
-                        (uint64_t) idx*args.nb_cm0 + (uint64_t) iq*args.nb_cm1 + (uint64_t) is*args.nb_cm3);
-            }
-            return;
-        }
-
-        const int physical = dsv4_sparse_pack_physical_row<indexed>(args, segment_ids, idx, is);
+        const int physical = dsv4_sparse_pack_physical_row(args, segment_ids, idx, is);
         const half mask = physical >= 0 ? *(device const half *) (comp_mask +
                 (uint64_t) idx*args.nb_cm0 + (uint64_t) iq*args.nb_cm1 + (uint64_t) is*args.nb_cm3) : -INFINITY;
         const bool visible = isfinite(mask);
@@ -12141,8 +12248,7 @@ kernel void kernel_dsv4_sparse_pack(
         device half4 * out_k = (device half4 *) out;
         if (visible) {
             device const k4_t * src = (device const k4_t *) (comp_k +
-                    (uint64_t) physical*(indexed ? args.nb_ck1 : args.nb_ck2) +
-                    (uint64_t) is*(indexed ? 0 : args.nb_ck3));
+                    (uint64_t) physical*args.nb_ck1);
             for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
                 half4 values;
                 dequantize_func(src + e4/nl, e4%nl, values);
@@ -12194,7 +12300,7 @@ kernel void kernel_dsv4_sparse_pack(
         const int idx = *(device const int *) (comp_idx +
                 (uint64_t) i*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
         selected_idx[oi] = idx;
-        const half mask = (!indexed || (idx >= 0 && idx < args.n_comp_k)) ? *(device const half *) (comp_mask +
+        const half mask = (idx >= 0 && idx < args.n_comp_k) ? *(device const half *) (comp_mask +
                 (uint64_t) idx*args.nb_cm0 + (uint64_t) iq*args.nb_cm1 + (uint64_t) is*args.nb_cm3) : -INFINITY;
         selected_mask[oi] = isfinite(mask) ? mask : -INFINITY;
     }
@@ -12223,11 +12329,10 @@ kernel void kernel_dsv4_sparse_pack(
     for (int i = 0; i < args.n_comp; ++i) {
         const int oi = args.n_raw + i;
         const int idx = selected_idx[oi];
-        const int physical = dsv4_sparse_pack_physical_row<indexed>(args, segment_ids, idx, is);
+        const int physical = dsv4_sparse_pack_physical_row(args, segment_ids, idx, is);
         if (physical >= 0 && isfinite(selected_mask[oi])) {
             device const k4_t * src = (device const k4_t *) (comp_k +
-                    (uint64_t) physical*(indexed ? args.nb_ck1 : args.nb_ck2) +
-                    (uint64_t) is*(indexed ? 0 : args.nb_ck3));
+                    (uint64_t) physical*args.nb_ck1);
             for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
                 half4 values;
                 dequantize_func(src + e4/nl, e4%nl, values);
@@ -12246,20 +12351,13 @@ kernel void kernel_dsv4_sparse_pack(
 
 }
 
-typedef decltype(kernel_dsv4_sparse_pack<half4, 1, dequantize_f16_t4, false>) dsv4_sparse_pack_t;
-typedef decltype(kernel_dsv4_sparse_pack<half4, 1, dequantize_f16_t4, true>) dsv4_indexed_sparse_pack_t;
-
-template [[host_name("kernel_dsv4_sparse_pack_f16")]]
-kernel dsv4_sparse_pack_t kernel_dsv4_sparse_pack<half4, 1, dequantize_f16_t4, false>;
-
-template [[host_name("kernel_dsv4_sparse_pack_q8_0")]]
-kernel dsv4_sparse_pack_t kernel_dsv4_sparse_pack<block_q8_0, 8, dequantize_q8_0_t4, false>;
+typedef decltype(kernel_dsv4_indexed_sparse_pack<half4, 1, dequantize_f16_t4>) dsv4_indexed_sparse_pack_t;
 
 template [[host_name("kernel_dsv4_indexed_sparse_pack_f16")]]
-kernel dsv4_indexed_sparse_pack_t kernel_dsv4_sparse_pack<half4, 1, dequantize_f16_t4, true>;
+kernel dsv4_indexed_sparse_pack_t kernel_dsv4_indexed_sparse_pack<half4, 1, dequantize_f16_t4>;
 
 template [[host_name("kernel_dsv4_indexed_sparse_pack_q8_0")]]
-kernel dsv4_indexed_sparse_pack_t kernel_dsv4_sparse_pack<block_q8_0, 8, dequantize_q8_0_t4, true>;
+kernel dsv4_indexed_sparse_pack_t kernel_dsv4_indexed_sparse_pack<block_q8_0, 8, dequantize_q8_0_t4>;
 
 // Materialize the affine raw-plus-compressed K layout directly from the shared
 // 64-row segmented pool. Each threadgroup owns one output row and copies half4
