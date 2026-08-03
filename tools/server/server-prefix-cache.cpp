@@ -4,6 +4,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 
@@ -65,6 +66,10 @@ bool server_prefix_entry::operator==(const server_prefix_entry & other) const {
            saved_prefill_ms == other.saved_prefill_ms;
 }
 
+bool server_prefix_policy_key::operator==(const server_prefix_policy_key & other) const {
+    return digest == other.digest && aligned_tokens == other.aligned_tokens;
+}
+
 struct identity_hash {
     bool constant = false;
 
@@ -100,6 +105,441 @@ struct token_block_hash {
         return hash;
     }
 };
+
+constexpr size_t POLICY_SKETCH_DEPTH = 4;
+
+static size_t policy_key_hash_value(const server_prefix_policy_key & key, uint64_t salt, bool constant) {
+    if (constant) {
+        return 0;
+    }
+    size_t hash = hash_mix(static_cast<size_t>(salt), key.aligned_tokens);
+    return hash_bytes(hash, key.digest.data(), key.digest.size());
+}
+
+struct policy_key_hash {
+    bool constant = false;
+
+    size_t operator()(const server_prefix_policy_key & key) const {
+        return policy_key_hash_value(key, 0xd6e8feb86659fd93ULL, constant);
+    }
+};
+
+static bool policy_key_less(const server_prefix_policy_key & lhs, const server_prefix_policy_key & rhs) {
+    if (lhs.digest != rhs.digest) {
+        return lhs.digest < rhs.digest;
+    }
+    return lhs.aligned_tokens < rhs.aligned_tokens;
+}
+
+static bool valid_policy_key(const server_prefix_policy_key & key) {
+    return digest_present(key.digest) && key.aligned_tokens != 0 &&
+           key.aligned_tokens % SERVER_PREFIX_BLOCK_TOKENS == 0;
+}
+
+static bool valid_policy_candidate(const server_prefix_policy_candidate & candidate) {
+    return valid_policy_key(candidate.key) && candidate.unique_bytes != 0 &&
+           std::isfinite(candidate.prefill_ms_avoided) && candidate.prefill_ms_avoided >= 0.0 &&
+           std::isfinite(candidate.restore_ms) && candidate.restore_ms >= 0.0;
+}
+
+static double policy_value(uint16_t frequency, double prefill_ms_avoided, double restore_ms, uint64_t unique_bytes) {
+    const double benefit = std::max(0.0, prefill_ms_avoided - restore_ms);
+    return static_cast<double>(frequency) * benefit / static_cast<double>(unique_bytes);
+}
+
+struct policy_ghost_slot {
+    server_prefix_policy_key key;
+    uint64_t                 seen_at  = 0;
+    bool                     occupied = false;
+};
+
+struct policy_resident_record {
+    server_prefix_policy_segment segment;
+    uint64_t                     unique_bytes;
+    double                       prefill_ms_avoided;
+    double                       restore_ms;
+    uint16_t                     frequency;
+    double                       priority;
+    uint64_t                     recency;
+};
+
+struct policy_victim {
+    server_prefix_policy_key     key;
+    server_prefix_policy_segment segment;
+    uint64_t                     unique_bytes;
+    double                       priority;
+    uint64_t                     recency;
+};
+
+static bool policy_victim_less(const policy_victim & lhs, const policy_victim & rhs) {
+    if (lhs.segment != rhs.segment) {
+        return lhs.segment == server_prefix_policy_segment::probation;
+    }
+    if (lhs.priority != rhs.priority) {
+        return lhs.priority < rhs.priority;
+    }
+    if (lhs.recency != rhs.recency) {
+        return lhs.recency < rhs.recency;
+    }
+    return policy_key_less(lhs.key, rhs.key);
+}
+
+static bool valid_policy_config(const server_prefix_policy_config & config) {
+    if (config.max_resident_entries == 0 || config.max_resident_bytes == 0 ||
+        config.max_protected_bytes > config.max_resident_bytes ||
+        config.max_pinned_entries > config.max_resident_entries ||
+        config.max_pinned_bytes > config.max_resident_bytes || config.ghost_buckets == 0 || config.ghost_ways == 0 ||
+        config.sketch_width == 0 || config.decay_interval == 0 || !std::isfinite(config.hysteresis_fraction) ||
+        config.hysteresis_fraction < 0.0) {
+        return false;
+    }
+    if (config.ghost_buckets > std::numeric_limits<size_t>::max() / config.ghost_ways) {
+        return false;
+    }
+    const size_t ghost_cells = config.ghost_buckets * config.ghost_ways;
+    return ghost_cells <= std::vector<policy_ghost_slot>().max_size() &&
+           config.sketch_width <= std::vector<uint16_t>().max_size() / POLICY_SKETCH_DEPTH;
+}
+
+struct server_prefix_policy::impl {
+    explicit impl(server_prefix_policy_config config) :
+        cfg(config),
+        residents(0, policy_key_hash{ config.force_hash_collisions }),
+        sketch(config.sketch_width * POLICY_SKETCH_DEPTH),
+        ghosts(config.ghost_buckets * config.ghost_ways),
+        ghost_hands(config.ghost_buckets) {}
+
+    void decay_if_due() {
+        if (observations == 0 || observations % cfg.decay_interval != 0) {
+            return;
+        }
+        for (uint16_t & counter : sketch) {
+            counter = static_cast<uint16_t>(counter >> 1);
+        }
+        ++decays;
+    }
+
+    uint16_t record_frequency(const server_prefix_policy_key & key) {
+        static constexpr uint64_t salts[POLICY_SKETCH_DEPTH] = {
+            0x9e3779b97f4a7c15ULL,
+            0xbf58476d1ce4e5b9ULL,
+            0x94d049bb133111ebULL,
+            0xd6e8feb86659fd93ULL,
+        };
+        uint16_t estimate = std::numeric_limits<uint16_t>::max();
+        for (size_t depth = 0; depth < POLICY_SKETCH_DEPTH; ++depth) {
+            const size_t column =
+                policy_key_hash_value(key, salts[depth], cfg.force_hash_collisions) % cfg.sketch_width;
+            uint16_t & counter = sketch[depth * cfg.sketch_width + column];
+            if (counter != std::numeric_limits<uint16_t>::max()) {
+                ++counter;
+            }
+            estimate = std::min(estimate, counter);
+        }
+        return estimate;
+    }
+
+    size_t ghost_bucket(const server_prefix_policy_key & key) const {
+        return policy_key_hash_value(key, 0xa0761d6478bd642fULL, cfg.force_hash_collisions) % cfg.ghost_buckets;
+    }
+
+    bool take_fresh_ghost(const server_prefix_policy_key & key) {
+        const size_t bucket = ghost_bucket(key);
+        const size_t begin  = bucket * cfg.ghost_ways;
+        for (size_t way = 0; way < cfg.ghost_ways; ++way) {
+            policy_ghost_slot & slot = ghosts[begin + way];
+            if (!slot.occupied || !(slot.key == key)) {
+                continue;
+            }
+            const bool fresh = observations - slot.seen_at <= cfg.decay_interval;
+            if (fresh) {
+                slot.occupied = false;
+                --ghost_entries;
+                return true;
+            }
+            slot.seen_at = observations;
+            return false;
+        }
+        return false;
+    }
+
+    void remember_ghost(const server_prefix_policy_key & key) {
+        const size_t bucket = ghost_bucket(key);
+        const size_t begin  = bucket * cfg.ghost_ways;
+        for (size_t way = 0; way < cfg.ghost_ways; ++way) {
+            policy_ghost_slot & slot = ghosts[begin + way];
+            if (slot.occupied && slot.key == key) {
+                slot.seen_at = observations;
+                return;
+            }
+            if (!slot.occupied) {
+                slot = { key, observations, true };
+                ++ghost_entries;
+                return;
+            }
+        }
+        const size_t replacement    = ghost_hands[bucket];
+        ghosts[begin + replacement] = { key, observations, true };
+        ghost_hands[bucket]         = (replacement + 1) % cfg.ghost_ways;
+    }
+
+    void remove_resident(const server_prefix_policy_key & key) {
+        const auto found = residents.find(key);
+        if (found == residents.end()) {
+            return;
+        }
+        const policy_resident_record & record = found->second;
+        resident_bytes -= record.unique_bytes;
+        if (record.segment == server_prefix_policy_segment::protected_segment) {
+            protected_bytes -= record.unique_bytes;
+        } else if (record.segment == server_prefix_policy_segment::pinned) {
+            pinned_bytes -= record.unique_bytes;
+            --pinned_entries;
+        }
+        residents.erase(found);
+    }
+
+    void enforce_protected_budget() {
+        while (protected_bytes > cfg.max_protected_bytes) {
+            auto oldest = residents.end();
+            for (auto it = residents.begin(); it != residents.end(); ++it) {
+                if (it->second.segment != server_prefix_policy_segment::protected_segment) {
+                    continue;
+                }
+                if (oldest == residents.end() || it->second.recency < oldest->second.recency ||
+                    (it->second.recency == oldest->second.recency && policy_key_less(it->first, oldest->first))) {
+                    oldest = it;
+                }
+            }
+            if (oldest == residents.end()) {
+                break;
+            }
+            oldest->second.segment = server_prefix_policy_segment::probation;
+            protected_bytes -= oldest->second.unique_bytes;
+        }
+    }
+
+    server_prefix_policy_config                                                           cfg;
+    std::unordered_map<server_prefix_policy_key, policy_resident_record, policy_key_hash> residents;
+    std::vector<uint16_t>                                                                 sketch;
+    std::vector<policy_ghost_slot>                                                        ghosts;
+    std::vector<size_t>                                                                   ghost_hands;
+    uint64_t                                                                              resident_bytes  = 0;
+    uint64_t                                                                              protected_bytes = 0;
+    uint64_t                                                                              pinned_bytes    = 0;
+    size_t                                                                                pinned_entries  = 0;
+    size_t                                                                                ghost_entries   = 0;
+    uint64_t                                                                              observations    = 0;
+    uint64_t                                                                              decays          = 0;
+    double                                                                                aging           = 0.0;
+};
+
+server_prefix_policy::server_prefix_policy(server_prefix_policy_config config) {
+    if (!valid_policy_config(config)) {
+        throw std::invalid_argument("invalid server prefix policy configuration");
+    }
+    data = std::make_unique<impl>(config);
+}
+
+server_prefix_policy::~server_prefix_policy() = default;
+
+server_prefix_policy_result server_prefix_policy::observe(const server_prefix_policy_candidate & candidate) {
+    server_prefix_policy_result result;
+    if (!valid_policy_candidate(candidate)) {
+        return result;
+    }
+
+    auto resident = data->residents.find(candidate.key);
+    if (resident != data->residents.end() && resident->second.unique_bytes != candidate.unique_bytes) {
+        return result;
+    }
+
+    data->decay_if_due();
+    ++data->observations;
+    const uint16_t estimate    = data->record_frequency(candidate.key);
+    result.estimated_frequency = estimate;
+
+    if (resident != data->residents.end()) {
+        policy_resident_record & record = resident->second;
+        if (candidate.pin && record.segment != server_prefix_policy_segment::pinned) {
+            if (data->pinned_entries >= data->cfg.max_pinned_entries ||
+                record.unique_bytes > data->cfg.max_pinned_bytes - data->pinned_bytes) {
+                result.status   = server_prefix_policy_status::rejected_pin_quota;
+                result.priority = record.priority;
+                return result;
+            }
+            if (record.segment == server_prefix_policy_segment::protected_segment) {
+                data->protected_bytes -= record.unique_bytes;
+            }
+            record.segment = server_prefix_policy_segment::pinned;
+            data->pinned_bytes += record.unique_bytes;
+            ++data->pinned_entries;
+        } else if (record.segment == server_prefix_policy_segment::probation) {
+            record.segment = server_prefix_policy_segment::protected_segment;
+            data->protected_bytes += record.unique_bytes;
+        }
+        record.frequency          = estimate;
+        record.prefill_ms_avoided = candidate.prefill_ms_avoided;
+        record.restore_ms         = candidate.restore_ms;
+        record.priority =
+            data->aging + policy_value(estimate, record.prefill_ms_avoided, record.restore_ms, record.unique_bytes);
+        record.recency = data->observations;
+        data->enforce_protected_budget();
+        result.status   = server_prefix_policy_status::resident_hit;
+        result.priority = record.priority;
+        return result;
+    }
+
+    if (candidate.pin) {
+        if (data->pinned_entries >= data->cfg.max_pinned_entries ||
+            candidate.unique_bytes > data->cfg.max_pinned_bytes - data->pinned_bytes) {
+            result.status = server_prefix_policy_status::rejected_pin_quota;
+            return result;
+        }
+    } else if (!data->take_fresh_ghost(candidate.key)) {
+        data->remember_ghost(candidate.key);
+        result.status = server_prefix_policy_status::first_sighting;
+        return result;
+    }
+
+    if (candidate.unique_bytes > data->cfg.max_resident_bytes) {
+        if (!candidate.pin) {
+            data->remember_ghost(candidate.key);
+        }
+        result.status = server_prefix_policy_status::rejected_capacity;
+        return result;
+    }
+
+    const uint16_t admission_frequency = candidate.pin ? estimate : std::max<uint16_t>(2, estimate);
+    const double   candidate_priority  = data->aging + policy_value(admission_frequency, candidate.prefill_ms_avoided,
+                                                                    candidate.restore_ms, candidate.unique_bytes);
+    result.priority                    = candidate_priority;
+
+    std::vector<policy_victim> victims;
+    size_t                     victim_count = 0;
+    if (data->residents.size() >= data->cfg.max_resident_entries ||
+        candidate.unique_bytes > data->cfg.max_resident_bytes - data->resident_bytes) {
+        victims.reserve(data->residents.size());
+        for (const auto & item : data->residents) {
+            if (item.second.segment == server_prefix_policy_segment::pinned) {
+                continue;
+            }
+            victims.push_back({ item.first, item.second.segment, item.second.unique_bytes, item.second.priority,
+                                item.second.recency });
+        }
+        // SLRU retention makes probation the first victim class. GreedyDual
+        // cost/size priority and deterministic recency/key ties order each
+        // class. Explicit pins may cross hysteresis, but never their quotas.
+        std::sort(victims.begin(), victims.end(), policy_victim_less);
+
+        size_t   retained_entries = data->residents.size();
+        uint64_t retained_bytes   = data->resident_bytes;
+        while (retained_entries >= data->cfg.max_resident_entries ||
+               candidate.unique_bytes > data->cfg.max_resident_bytes - retained_bytes) {
+            if (victim_count == victims.size()) {
+                if (!candidate.pin) {
+                    data->remember_ghost(candidate.key);
+                }
+                result.status = server_prefix_policy_status::rejected_capacity;
+                return result;
+            }
+            const policy_victim & victim = victims[victim_count];
+            if (!candidate.pin && candidate_priority <= victim.priority * (1.0 + data->cfg.hysteresis_fraction)) {
+                data->remember_ghost(candidate.key);
+                result.status = server_prefix_policy_status::rejected_hysteresis;
+                return result;
+            }
+            --retained_entries;
+            retained_bytes -= victim.unique_bytes;
+            ++victim_count;
+        }
+    }
+
+    for (size_t i = 0; i < victim_count; ++i) {
+        data->aging = std::max(data->aging, victims[i].priority);
+        result.evicted.push_back(victims[i].key);
+        data->remove_resident(victims[i].key);
+    }
+
+    const server_prefix_policy_segment segment =
+        candidate.pin ? server_prefix_policy_segment::pinned : server_prefix_policy_segment::probation;
+    const double final_priority = data->aging + policy_value(admission_frequency, candidate.prefill_ms_avoided,
+                                                             candidate.restore_ms, candidate.unique_bytes);
+    data->residents.emplace(
+        candidate.key,
+        policy_resident_record{ segment, candidate.unique_bytes, candidate.prefill_ms_avoided, candidate.restore_ms,
+                                admission_frequency, final_priority, data->observations });
+    data->resident_bytes += candidate.unique_bytes;
+    if (candidate.pin) {
+        data->pinned_bytes += candidate.unique_bytes;
+        ++data->pinned_entries;
+        result.status = server_prefix_policy_status::admitted_pinned;
+    } else {
+        result.status = server_prefix_policy_status::admitted_probation;
+    }
+    result.priority = final_priority;
+    return result;
+}
+
+std::optional<server_prefix_policy_resident> server_prefix_policy::resident(
+    const server_prefix_policy_key & key) const {
+    const auto found = data->residents.find(key);
+    if (found == data->residents.end()) {
+        return std::nullopt;
+    }
+    const policy_resident_record & record = found->second;
+    return server_prefix_policy_resident{ record.segment,    record.unique_bytes, record.prefill_ms_avoided,
+                                          record.restore_ms, record.frequency,    record.priority };
+}
+
+bool server_prefix_policy::erase(const server_prefix_policy_key & key) {
+    if (data->residents.find(key) == data->residents.end()) {
+        return false;
+    }
+    data->remove_resident(key);
+    return true;
+}
+
+void server_prefix_policy::clear() {
+    data->residents.clear();
+    std::fill(data->sketch.begin(), data->sketch.end(), 0);
+    std::fill(data->ghosts.begin(), data->ghosts.end(), policy_ghost_slot{});
+    std::fill(data->ghost_hands.begin(), data->ghost_hands.end(), 0);
+    data->resident_bytes  = 0;
+    data->protected_bytes = 0;
+    data->pinned_bytes    = 0;
+    data->pinned_entries  = 0;
+    data->ghost_entries   = 0;
+    data->observations    = 0;
+    data->decays          = 0;
+    data->aging           = 0.0;
+}
+
+server_prefix_policy_stats server_prefix_policy::stats() const {
+    server_prefix_policy_stats result;
+    result.resident_entries     = data->residents.size();
+    result.resident_bytes       = data->resident_bytes;
+    result.pinned_entries       = data->pinned_entries;
+    result.pinned_bytes         = data->pinned_bytes;
+    result.ghost_entries        = data->ghost_entries;
+    result.ghost_capacity       = data->ghosts.size();
+    result.ghost_bytes          = data->ghosts.size() * sizeof(policy_ghost_slot);
+    result.sketch_cells         = data->sketch.size();
+    result.sketch_bytes         = data->sketch.size() * sizeof(uint16_t);
+    result.fixed_metadata_bytes = result.ghost_bytes + result.sketch_bytes + data->ghost_hands.size() * sizeof(size_t);
+    result.observations         = data->observations;
+    result.decays               = data->decays;
+    for (const auto & item : data->residents) {
+        if (item.second.segment == server_prefix_policy_segment::probation) {
+            ++result.probation_entries;
+            result.probation_bytes += item.second.unique_bytes;
+        } else if (item.second.segment == server_prefix_policy_segment::protected_segment) {
+            ++result.protected_entries;
+            result.protected_bytes += item.second.unique_bytes;
+        }
+    }
+    return result;
+}
 
 struct radix_node {
     explicit radix_node(bool force_collisions) : children(0, token_block_hash{ force_collisions }) {}
