@@ -322,13 +322,14 @@ class metal_graphs {
         backend_(backend),
         tokens_(tokens) {
         constexpr size_t       graph_nodes   = 256;
+        constexpr size_t       graph_count   = 4;
         const ggml_init_params weight_params = {
             ggml_tensor_overhead() * 8,
             nullptr,
             true,
         };
         const ggml_init_params compute_params = {
-            ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(graph_nodes, false) * 3,
+            ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(graph_nodes, false) * graph_count,
             nullptr,
             true,
         };
@@ -380,12 +381,14 @@ class metal_graphs {
         shared_out_        = ggml_mul_mat(compute_.get(), shared_down_, shared_hidden_out_);
         all_out_           = ggml_add(compute_.get(), routed_out_, shared_out_);
 
-        route_graph_  = ggml_new_graph_custom(compute_.get(), graph_nodes, false);
-        shared_graph_ = ggml_new_graph_custom(compute_.get(), graph_nodes, false);
-        all_graph_    = ggml_new_graph_custom(compute_.get(), graph_nodes, false);
+        route_graph_                  = ggml_new_graph_custom(compute_.get(), graph_nodes, false);
+        shared_graph_                 = ggml_new_graph_custom(compute_.get(), graph_nodes, false);
+        all_graph_                    = ggml_new_graph_custom(compute_.get(), graph_nodes, false);
+        routed_down_validation_graph_ = ggml_new_graph_custom(compute_.get(), graph_nodes, false);
         ggml_build_forward_expand(route_graph_, routed_out_);
         ggml_build_forward_expand(shared_graph_, shared_out_);
         ggml_build_forward_expand(all_graph_, all_out_);
+        ggml_build_forward_expand(routed_down_validation_graph_, routed_down_out_);
 
         weights_buffer_.reset(ggml_backend_alloc_ctx_tensors(weights_.get(), backend_));
         compute_buffer_.reset(ggml_backend_alloc_ctx_tensors(compute_.get(), backend_));
@@ -398,6 +401,7 @@ class metal_graphs {
         validate_graph_support(route_graph_, "routed");
         validate_graph_support(shared_graph_, "shared");
         validate_graph_support(all_graph_, "all-metal");
+        validate_graph_support(routed_down_validation_graph_, "routed-down validation");
     }
 
     double time_route_ms() { return time_graph(route_graph_); }
@@ -405,6 +409,8 @@ class metal_graphs {
     double time_shared_ms() { return time_graph(shared_graph_); }
 
     double time_all_ms() { return time_graph(all_graph_); }
+
+    void materialize_routed_down_for_validation() { compute_graph(routed_down_validation_graph_); }
 
     void launch_route_async() {
         const ggml_status status = ggml_backend_graph_compute_async(backend_, route_graph_);
@@ -509,12 +515,16 @@ class metal_graphs {
         }
     }
 
-    double time_graph(ggml_cgraph * graph) {
-        const auto        begin  = clock_type::now();
+    void compute_graph(ggml_cgraph * graph) {
         const ggml_status status = ggml_backend_graph_compute(backend_, graph);
         if (status != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("Metal graph execution failed");
         }
+    }
+
+    double time_graph(ggml_cgraph * graph) {
+        const auto begin = clock_type::now();
+        compute_graph(graph);
         return elapsed_ms(begin, clock_type::now());
     }
 
@@ -524,30 +534,31 @@ class metal_graphs {
     ggml_context_ptr        compute_;
     ggml_backend_buffer_ptr weights_buffer_;
     ggml_backend_buffer_ptr compute_buffer_;
-    ggml_tensor *           route_gate_        = nullptr;
-    ggml_tensor *           route_up_          = nullptr;
-    ggml_tensor *           route_down_        = nullptr;
-    ggml_tensor *           shared_gate_       = nullptr;
-    ggml_tensor *           shared_up_         = nullptr;
-    ggml_tensor *           shared_down_       = nullptr;
-    ggml_tensor *           route_input_       = nullptr;
-    ggml_tensor *           ids_base_          = nullptr;
-    ggml_tensor *           ids_               = nullptr;
-    ggml_tensor *           route_weights_     = nullptr;
-    ggml_tensor *           shared_input_      = nullptr;
-    ggml_tensor *           routed_gate_out_   = nullptr;
-    ggml_tensor *           routed_up_out_     = nullptr;
-    ggml_tensor *           routed_hidden_out_ = nullptr;
-    ggml_tensor *           routed_down_out_   = nullptr;
-    ggml_tensor *           routed_out_        = nullptr;
-    ggml_tensor *           shared_gate_out_   = nullptr;
-    ggml_tensor *           shared_up_out_     = nullptr;
-    ggml_tensor *           shared_hidden_out_ = nullptr;
-    ggml_tensor *           shared_out_        = nullptr;
-    ggml_tensor *           all_out_           = nullptr;
-    ggml_cgraph *           route_graph_       = nullptr;
-    ggml_cgraph *           shared_graph_      = nullptr;
-    ggml_cgraph *           all_graph_         = nullptr;
+    ggml_tensor *           route_gate_                   = nullptr;
+    ggml_tensor *           route_up_                     = nullptr;
+    ggml_tensor *           route_down_                   = nullptr;
+    ggml_tensor *           shared_gate_                  = nullptr;
+    ggml_tensor *           shared_up_                    = nullptr;
+    ggml_tensor *           shared_down_                  = nullptr;
+    ggml_tensor *           route_input_                  = nullptr;
+    ggml_tensor *           ids_base_                     = nullptr;
+    ggml_tensor *           ids_                          = nullptr;
+    ggml_tensor *           route_weights_                = nullptr;
+    ggml_tensor *           shared_input_                 = nullptr;
+    ggml_tensor *           routed_gate_out_              = nullptr;
+    ggml_tensor *           routed_up_out_                = nullptr;
+    ggml_tensor *           routed_hidden_out_            = nullptr;
+    ggml_tensor *           routed_down_out_              = nullptr;
+    ggml_tensor *           routed_out_                   = nullptr;
+    ggml_tensor *           shared_gate_out_              = nullptr;
+    ggml_tensor *           shared_up_out_                = nullptr;
+    ggml_tensor *           shared_hidden_out_            = nullptr;
+    ggml_tensor *           shared_out_                   = nullptr;
+    ggml_tensor *           all_out_                      = nullptr;
+    ggml_cgraph *           route_graph_                  = nullptr;
+    ggml_cgraph *           shared_graph_                 = nullptr;
+    ggml_cgraph *           all_graph_                    = nullptr;
+    ggml_cgraph *           routed_down_validation_graph_ = nullptr;
 };
 
 static overlap_timing run_overlap(cpu_shared_ffn & cpu, metal_graphs & metal) {
@@ -658,6 +669,8 @@ int main(int argc, char ** argv) try {
 
     cpu.run();
     metal.time_all_ms();
+    metal.materialize_routed_down_for_validation();
+    std::printf("validation\tgraph=routed_down_materialization\ttimed=0\n");
     const std::vector<float> metal_gate   = metal.get_shared_gate();
     const std::vector<float> metal_up     = metal.get_shared_up();
     const std::vector<float> metal_hidden = metal.get_shared_hidden();
