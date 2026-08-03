@@ -377,6 +377,19 @@ enum ggml_metal_sparse_reservation_result {
     GGML_METAL_SPARSE_RESERVATION_UNSUPPORTED,
 };
 
+static inline const char * ggml_metal_sparse_reservation_result_name(
+        enum ggml_metal_sparse_reservation_result result) {
+    switch (result) {
+        case GGML_METAL_SPARSE_RESERVATION_OK:          return "ok";
+        case GGML_METAL_SPARSE_RESERVATION_PRESSURE:    return "pressure";
+        case GGML_METAL_SPARSE_RESERVATION_STALE:       return "stale";
+        case GGML_METAL_SPARSE_RESERVATION_INVALID:     return "invalid";
+        case GGML_METAL_SPARSE_RESERVATION_OOM:         return "oom";
+        case GGML_METAL_SPARSE_RESERVATION_UNSUPPORTED: return "unsupported";
+    }
+    return "unknown";
+}
+
 typedef struct ggml_metal_sparse_reservation * ggml_metal_sparse_reservation_t;
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);

@@ -2641,6 +2641,14 @@ static enum ggml_metal_sparse_reservation_result ggml_metal_sparse_prepare(
                     entry->quote.feasible;
         }
         if (entry->quote.status != GGML_METAL_SPARSE_PLAN_OK) {
+            GGML_LOG_ERROR(
+                    "%s: result=%s entry=%zu pool=%p plan_status=%s"
+                    " generation=%llu ranges=%zu\n",
+                    __func__, ggml_metal_sparse_reservation_result_name(
+                            GGML_METAL_SPARSE_RESERVATION_INVALID),
+                    i, (void *) buf,
+                    ggml_metal_sparse_plan_status_name(entry->quote.status),
+                    (unsigned long long) buf->sparse_generation, entry->n_ranges);
             status = GGML_METAL_SPARSE_RESERVATION_INVALID;
         } else if (!entry->quote.feasible && status == GGML_METAL_SPARSE_RESERVATION_OK) {
             status = GGML_METAL_SPARSE_RESERVATION_PRESSURE;
@@ -2687,6 +2695,20 @@ static enum ggml_metal_sparse_reservation_result ggml_metal_sparse_prepare(
             if (!ggml_metal_sparse_accounting_try_reserve(
                         entry->buffer->sparse_n_free, &entry->buffer->sparse_n_reserved,
                         entry->buffer->sparse_generation, &entry->quote, &entry->accounting)) {
+                GGML_LOG_ERROR(
+                        "%s: result=%s entry=%zu pool=%p plan_status=%s feasible=%d"
+                        " quote_generation=%llu current_generation=%llu"
+                        " required=%zu free=%zu reserved=%zu ticket_state=%s\n",
+                        __func__, ggml_metal_sparse_reservation_result_name(
+                                GGML_METAL_SPARSE_RESERVATION_STALE),
+                        i, (void *) entry->buffer,
+                        ggml_metal_sparse_plan_status_name(entry->quote.status),
+                        (int) entry->quote.feasible,
+                        (unsigned long long) entry->quote.generation,
+                        (unsigned long long) entry->buffer->sparse_generation,
+                        entry->quote.required_pages, entry->buffer->sparse_n_free,
+                        entry->buffer->sparse_n_reserved,
+                        ggml_metal_sparse_ticket_state_name(entry->accounting.state));
                 status = GGML_METAL_SPARSE_RESERVATION_STALE;
                 for (size_t j = 0; j < i; ++j) {
                     ggml_metal_sparse_accounting_finish(
@@ -2838,6 +2860,18 @@ enum ggml_metal_sparse_reservation_result ggml_metal_sparse_reservation_commit(
             ggml_metal_buffer_t buf = entry->buffer;
             if (!ggml_metal_sparse_accounting_is_current(
                         buf->sparse_generation, &entry->accounting)) {
+                GGML_LOG_ERROR(
+                        "%s: result=%s reason=ticket-current entry=%zu pool=%p"
+                        " ticket_state=%s ticket_generation=%llu current_generation=%llu"
+                        " ticket_pages=%zu free=%zu reserved=%zu\n",
+                        __func__, ggml_metal_sparse_reservation_result_name(
+                                GGML_METAL_SPARSE_RESERVATION_STALE),
+                        i, (void *) buf,
+                        ggml_metal_sparse_ticket_state_name(entry->accounting.state),
+                        (unsigned long long) entry->accounting.generation,
+                        (unsigned long long) buf->sparse_generation,
+                        entry->accounting.reserved_pages, buf->sparse_n_free,
+                        buf->sparse_n_reserved);
                 status = GGML_METAL_SPARSE_RESERVATION_STALE;
                 break;
             }
@@ -2848,11 +2882,29 @@ enum ggml_metal_sparse_reservation_result ggml_metal_sparse_reservation_commit(
                     buf->sparse_n_free, other_reserved, buf->sparse_generation,
                     buf->sparse_v2p, buf->sparse_p_ref, entry->ranges, entry->n_ranges,
                     entry->marked, entry->marked_per_physical);
-            if (current.status != GGML_METAL_SPARSE_PLAN_OK || !current.feasible ||
-                    current.required_pages != entry->quote.required_pages ||
-                    current.new_pages != entry->quote.new_pages ||
-                    current.cow_pages != entry->quote.cow_pages ||
-                    current.target_mappings != entry->quote.target_mappings) {
+            if (!ggml_metal_sparse_quote_commit_compatible(&entry->quote, &current)) {
+                GGML_LOG_ERROR(
+                        "%s: result=%s reason=requote entry=%zu pool=%p ticket_state=%s"
+                        " expected_generation=%llu current_generation=%llu"
+                        " current_plan_status=%s current_feasible=%d"
+                        " expected={target=%zu,new=%zu,cow=%zu,required=%zu}"
+                        " current={target=%zu,new=%zu,cow=%zu,required=%zu}"
+                        " free=%zu reserved_total=%zu reserved_by_ticket=%zu"
+                        " reserved_other=%zu\n",
+                        __func__, ggml_metal_sparse_reservation_result_name(
+                                GGML_METAL_SPARSE_RESERVATION_STALE),
+                        i, (void *) buf,
+                        ggml_metal_sparse_ticket_state_name(entry->accounting.state),
+                        (unsigned long long) entry->quote.generation,
+                        (unsigned long long) current.generation,
+                        ggml_metal_sparse_plan_status_name(current.status),
+                        (int) current.feasible,
+                        entry->quote.target_mappings, entry->quote.new_pages,
+                        entry->quote.cow_pages, entry->quote.required_pages,
+                        current.target_mappings, current.new_pages,
+                        current.cow_pages, current.required_pages,
+                        buf->sparse_n_free, buf->sparse_n_reserved,
+                        entry->accounting.reserved_pages, other_reserved);
                 status = GGML_METAL_SPARSE_RESERVATION_STALE;
                 break;
             }

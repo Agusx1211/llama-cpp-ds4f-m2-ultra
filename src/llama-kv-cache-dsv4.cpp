@@ -173,6 +173,15 @@ public:
         ERROR,
     };
 
+    enum failure_phase {
+        PHASE_NONE,
+        PHASE_PROC_LOOKUP,
+        PHASE_USAGE,
+        PHASE_RESERVE,
+        PHASE_POOL_ACCOUNTING,
+        PHASE_COMMIT,
+    };
+
     ~dsv4_sparse_transaction() {
         if (ticket != nullptr) {
             cancel(ticket);
@@ -183,6 +192,7 @@ public:
     prepare_status reserve_ranges(
             const std::vector<dsv4_sparse_range> & ranges,
             llama_dsv4_batch_quote & result) {
+        n_ranges = ranges.size();
         for (size_t i = 0; i < result.families.size(); ++i) {
             result.families[i].family = (llama_dsv4_memory_family) i;
         }
@@ -220,7 +230,9 @@ public:
                 proc_tensor, "ggml_backend_metal_dsv4_sparse_reservation_free");
         auto * usage = (usage_fn) dsv4_backend_proc(
                 proc_tensor, "ggml_backend_metal_dsv4_sparse_tensor_usage");
+        usage_proc_available = usage != nullptr;
         if (commit == nullptr || cancel == nullptr || free_ticket == nullptr || usage == nullptr) {
+            phase = PHASE_PROC_LOOKUP;
             return ERROR;
         }
 
@@ -230,7 +242,7 @@ public:
         tensors.reserve(ranges.size());
         offsets.reserve(ranges.size());
         sizes.reserve(ranges.size());
-        std::map<uintptr_t, llama_dsv4_memory_family> pool_families;
+        std::map<uintptr_t, uint32_t> pool_family_masks;
         for (const auto & range : ranges) {
             tensors.push_back(range.tensor);
             offsets.push_back(range.offset);
@@ -238,11 +250,20 @@ public:
             ggml_metal_sparse_usage snapshot = {};
             const int snapshot_result = usage(range.tensor, &snapshot);
             if (snapshot_result < 0) {
+                phase = PHASE_USAGE;
                 return ERROR;
             }
             if (snapshot_result > 0) {
-                pool_families.emplace(snapshot.pool_id, range.family);
+                ++n_sparse_ranges;
+                pool_family_masks[snapshot.pool_id] |= 1u << range.family;
             }
+        }
+
+        // The Metal registry exposes the sparse transaction procedures for
+        // ordinary buffers too. No sparse ranges is therefore a successful
+        // no-op, not an unsupported reservation failure.
+        if (n_sparse_ranges == 0) {
+            return SUCCESS;
         }
 
         std::vector<ggml_metal_sparse_pool_quote> pools(ranges.size());
@@ -251,14 +272,24 @@ public:
         const auto status = reserve(
                 tensors.data(), offsets.data(), sizes.data(), tensors.size(),
                 pools.data(), pools.size(), &n_pools, &limiting_pool, &ticket);
+        backend_status = status;
+        ticket_issued = ticket != nullptr;
+        n_quoted_pools = n_pools;
         pools.resize(n_pools);
 
         for (const auto & pool : pools) {
-            const auto found = pool_families.find(pool.pool_id);
-            if (found == pool_families.end()) {
+            const auto found = pool_family_masks.find(pool.pool_id);
+            if (found == pool_family_masks.end() || found->second == 0) {
+                phase = PHASE_POOL_ACCOUNTING;
+                failure_pool_id = pool.pool_id;
                 return ERROR;
             }
-            auto & family = result.families[found->second];
+            const uint32_t family_mask = found->second;
+            if ((family_mask & (family_mask - 1)) != 0) {
+                ++n_shared_family_pools;
+            }
+            const auto representative = (llama_dsv4_memory_family) __builtin_ctz(family_mask);
+            auto & family = result.families[representative];
             family.target_mappings += pool.write.target_mappings;
             family.new_pages += pool.write.new_pages;
             family.cow_pages += pool.write.cow_pages;
@@ -270,9 +301,10 @@ public:
         }
         if (limiting_pool < pools.size()) {
             result.limiting_pool_id = pools[limiting_pool].pool_id;
-            const auto found = pool_families.find(result.limiting_pool_id);
-            if (found != pool_families.end()) {
-                result.limiting_family = found->second;
+            const auto found = pool_family_masks.find(result.limiting_pool_id);
+            if (found != pool_family_masks.end() && found->second != 0) {
+                limiting_family_mask_value = found->second;
+                result.limiting_family = (llama_dsv4_memory_family) __builtin_ctz(found->second);
             }
         }
         result.feasible = status == GGML_METAL_SPARSE_RESERVATION_OK;
@@ -281,26 +313,79 @@ public:
             return PRESSURE;
         }
         if (status != GGML_METAL_SPARSE_RESERVATION_OK || ticket == nullptr) {
+            phase = PHASE_RESERVE;
             return ERROR;
         }
         return SUCCESS;
     }
 
-    bool commit_ranges() {
+    ggml_metal_sparse_reservation_result commit_ranges() {
         if (ticket == nullptr) {
-            return true;
+            return GGML_METAL_SPARSE_RESERVATION_OK;
         }
-        const bool ok = commit(ticket) == GGML_METAL_SPARSE_RESERVATION_OK;
+        const auto status = commit(ticket);
+        backend_status = status;
+        if (status != GGML_METAL_SPARSE_RESERVATION_OK) {
+            phase = PHASE_COMMIT;
+        }
         free_ticket(ticket);
         ticket = nullptr;
-        return ok;
+        return status;
+    }
+
+    void log_failure(const char * caller) const {
+        LLAMA_LOG_ERROR(
+                "%s: DSV4 sparse reservation failed: phase=%s backend_status=%s"
+                " ranges=%zu sparse_ranges=%zu pools=%zu ticket=%s"
+                " failure_pool=%" PRIuPTR " shared_family_pools=%zu"
+                " procs={commit=%d,cancel=%d,free=%d,usage=%d}\n",
+                caller, failure_phase_name(phase),
+                ggml_metal_sparse_reservation_result_name(backend_status),
+                n_ranges, n_sparse_ranges, n_quoted_pools,
+                ticket_issued ? "issued" : "none", failure_pool_id,
+                n_shared_family_pools, commit != nullptr, cancel != nullptr,
+                free_ticket != nullptr, usage_proc_available);
+    }
+
+    uint32_t limiting_family_mask() const {
+        return limiting_family_mask_value;
+    }
+
+    size_t sparse_range_count() const {
+        return n_sparse_ranges;
+    }
+
+    size_t shared_family_pool_count() const {
+        return n_shared_family_pools;
     }
 
 private:
+    static const char * failure_phase_name(failure_phase value) {
+        switch (value) {
+            case PHASE_NONE:            return "none";
+            case PHASE_PROC_LOOKUP:     return "proc-lookup";
+            case PHASE_USAGE:           return "usage";
+            case PHASE_RESERVE:         return "reserve";
+            case PHASE_POOL_ACCOUNTING: return "pool-accounting";
+            case PHASE_COMMIT:          return "commit";
+        }
+        return "unknown";
+    }
+
     void * ticket = nullptr;
     ggml_metal_sparse_reservation_result (*commit)(void *) = nullptr;
     bool (*cancel)(void *) = nullptr;
     void (*free_ticket)(void *) = nullptr;
+    failure_phase phase = PHASE_NONE;
+    ggml_metal_sparse_reservation_result backend_status = GGML_METAL_SPARSE_RESERVATION_OK;
+    size_t n_ranges = 0;
+    size_t n_sparse_ranges = 0;
+    size_t n_quoted_pools = 0;
+    size_t n_shared_family_pools = 0;
+    uintptr_t failure_pool_id = 0;
+    uint32_t limiting_family_mask_value = 0;
+    bool ticket_issued = false;
+    bool usage_proc_available = false;
 };
 
 static uint32_t dsv4_state_n_used_k_rows(llama_pos pos_max, uint32_t ratio, uint32_t kv_size) {
@@ -2512,17 +2597,23 @@ bool llama_kv_cache_dsv4_context::apply() {
         const auto reserve_status = reservation.reserve_ranges(ranges, last_batch_quote);
         if (reserve_status == dsv4_sparse_transaction::PRESSURE) {
             const auto & limiting = last_batch_quote.families[last_batch_quote.limiting_family];
-            LLAMA_LOG_WARN("%s: DSV4 elastic Metal page pressure: family=%d pool=%" PRIuPTR
+            LLAMA_LOG_WARN("%s: DSV4 elastic Metal page pressure: family_mask=0x%x pool=%" PRIuPTR
                     " need=%" PRIu64 " (new=%" PRIu64 ", COW=%" PRIu64
-                    ") free=%" PRIu64 " reserved=%" PRIu64 " capacity=%" PRIu64 " pages\n",
-                    __func__, (int) last_batch_quote.limiting_family,
+                    ") free=%" PRIu64 " reserved=%" PRIu64 " capacity=%" PRIu64
+                    " pages sparse_ranges=%zu shared_family_pools=%zu\n",
+                    __func__, reservation.limiting_family_mask(),
                     last_batch_quote.limiting_pool_id,
                     limiting.required_pages, limiting.new_pages, limiting.cow_pages,
-                    limiting.free_pages, limiting.reserved_pages, limiting.physical_pages);
+                    limiting.free_pages, limiting.reserved_pages, limiting.physical_pages,
+                    reservation.sparse_range_count(), reservation.shared_family_pool_count());
             return false;
         }
-        if (reserve_status != dsv4_sparse_transaction::SUCCESS || !reservation.commit_ranges()) {
-            LLAMA_LOG_ERROR("%s: failed to commit DSV4 sparse page reservation\n", __func__);
+        if (reserve_status != dsv4_sparse_transaction::SUCCESS) {
+            reservation.log_failure(__func__);
+            return false;
+        }
+        if (reservation.commit_ranges() != GGML_METAL_SPARSE_RESERVATION_OK) {
+            reservation.log_failure(__func__);
             return false;
         }
     }

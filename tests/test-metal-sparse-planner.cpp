@@ -1,8 +1,9 @@
-#include "ggml-metal-sparse-planner.h"
+#include "ggml-metal-device.h"
 
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <utility>
 #include <vector>
@@ -144,6 +145,43 @@ static void test_unmapped_overlap_and_rounding() {
     assert(q.status == GGML_METAL_SPARSE_PLAN_INVALID_RANGE && !q.feasible);
 }
 
+static void test_diagnostic_status_names() {
+    const auto named = [](const char * actual, const char * expected) {
+        assert(std::strcmp(actual, expected) == 0);
+    };
+    named(ggml_metal_sparse_plan_status_name(GGML_METAL_SPARSE_PLAN_OK), "ok");
+    named(ggml_metal_sparse_plan_status_name(
+            GGML_METAL_SPARSE_PLAN_INVALID_RANGE), "invalid-range");
+    named(ggml_metal_sparse_plan_status_name(
+            GGML_METAL_SPARSE_PLAN_INVALID_STATE), "invalid-state");
+    named(ggml_metal_sparse_plan_status_name(
+            (ggml_metal_sparse_plan_status) 99), "unknown");
+
+    named(ggml_metal_sparse_ticket_state_name(GGML_METAL_SPARSE_TICKET_EMPTY), "empty");
+    named(ggml_metal_sparse_ticket_state_name(GGML_METAL_SPARSE_TICKET_RESERVED), "reserved");
+    named(ggml_metal_sparse_ticket_state_name(GGML_METAL_SPARSE_TICKET_COMMITTED), "committed");
+    named(ggml_metal_sparse_ticket_state_name(
+            GGML_METAL_SPARSE_TICKET_ROLLED_BACK), "rolled-back");
+    named(ggml_metal_sparse_ticket_state_name(GGML_METAL_SPARSE_TICKET_CANCELLED), "cancelled");
+    named(ggml_metal_sparse_ticket_state_name(
+            (ggml_metal_sparse_ticket_state) 99), "unknown");
+
+    named(ggml_metal_sparse_reservation_result_name(
+            GGML_METAL_SPARSE_RESERVATION_OK), "ok");
+    named(ggml_metal_sparse_reservation_result_name(
+            GGML_METAL_SPARSE_RESERVATION_PRESSURE), "pressure");
+    named(ggml_metal_sparse_reservation_result_name(
+            GGML_METAL_SPARSE_RESERVATION_STALE), "stale");
+    named(ggml_metal_sparse_reservation_result_name(
+            GGML_METAL_SPARSE_RESERVATION_INVALID), "invalid");
+    named(ggml_metal_sparse_reservation_result_name(
+            GGML_METAL_SPARSE_RESERVATION_OOM), "oom");
+    named(ggml_metal_sparse_reservation_result_name(
+            GGML_METAL_SPARSE_RESERVATION_UNSUPPORTED), "unsupported");
+    named(ggml_metal_sparse_reservation_result_name(
+            (ggml_metal_sparse_reservation_result) 99), "unknown");
+}
+
 static void test_alias_cow_rules() {
     std::vector<uint8_t> marked;
     std::vector<uint32_t> selected;
@@ -264,6 +302,34 @@ static void test_stale_rollback_and_cancel() {
     assert(f.reserved_pages == 0);
 }
 
+static void test_commit_compatibility_including_zero_pages() {
+    fixture f(8, 8);
+    std::vector<uint8_t> marked;
+    std::vector<uint32_t> selected;
+    const auto zero = f.quote({ { 0, 0 } }, marked, selected);
+    assert(zero.status == GGML_METAL_SPARSE_PLAN_OK && zero.feasible);
+    assert(zero.required_pages == 0 && zero.target_mappings == 0);
+
+    ggml_metal_sparse_ticket_accounting ticket = {};
+    assert(ggml_metal_sparse_accounting_try_reserve(
+            f.free_pages, &f.reserved_pages, f.generation, &zero, &ticket));
+    const auto current = f.quote({ { 0, 0 } }, marked, selected);
+    assert(ggml_metal_sparse_quote_commit_compatible(&zero, &current));
+
+    auto changed = current;
+    changed.target_mappings = 1;
+    assert(!ggml_metal_sparse_quote_commit_compatible(&zero, &changed));
+    changed = current;
+    changed.feasible = false;
+    assert(!ggml_metal_sparse_quote_commit_compatible(&zero, &changed));
+    changed = zero;
+    changed.status = GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+    assert(!ggml_metal_sparse_quote_commit_compatible(&changed, &current));
+    assert(!ggml_metal_sparse_quote_commit_compatible(nullptr, &current));
+    assert(ggml_metal_sparse_accounting_finish(
+            &f.reserved_pages, &ticket, GGML_METAL_SPARSE_TICKET_COMMITTED));
+}
+
 static void test_multi_pool_failure_is_atomic() {
     fixture enough(8, 4);
     fixture short_pool(8, 1);
@@ -301,11 +367,13 @@ static void test_quote_equals_commit() {
 }
 
 int main() {
+    test_diagnostic_status_names();
     test_unmapped_overlap_and_rounding();
     test_alias_cow_rules();
     test_stable_cow_sources();
     test_insufficient_is_immutable();
     test_stale_rollback_and_cancel();
+    test_commit_compatibility_including_zero_pages();
     test_multi_pool_failure_is_atomic();
     test_quote_equals_commit();
     std::cout << "metal sparse planner tests passed\n";

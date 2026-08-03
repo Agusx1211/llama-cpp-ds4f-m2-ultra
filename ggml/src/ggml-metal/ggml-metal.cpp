@@ -622,7 +622,19 @@ static ggml_metal_sparse_reservation_result ggml_backend_metal_dsv4_sparse_prepa
         absolute.push_back({ buffer, bid.offs + offsets[i], sizes[i] });
     }
     if (absolute.empty()) {
-        return GGML_METAL_SPARSE_RESERVATION_UNSUPPORTED;
+        // Registry procedures are available to ordinary Metal buffers too.
+        // A range set containing no placement-sparse storage needs no ticket
+        // and is a successful no-op, including reserve calls.
+        if (n_pools != nullptr) {
+            *n_pools = 0;
+        }
+        if (limiting_pool != nullptr) {
+            *limiting_pool = SIZE_MAX;
+        }
+        if (reservation != nullptr) {
+            *reservation = nullptr;
+        }
+        return GGML_METAL_SPARSE_RESERVATION_OK;
     }
 
     if (reservation != nullptr) {

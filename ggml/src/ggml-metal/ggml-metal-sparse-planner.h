@@ -19,6 +19,16 @@ enum ggml_metal_sparse_plan_status {
     GGML_METAL_SPARSE_PLAN_INVALID_STATE,
 };
 
+static inline const char * ggml_metal_sparse_plan_status_name(
+        enum ggml_metal_sparse_plan_status status) {
+    switch (status) {
+        case GGML_METAL_SPARSE_PLAN_OK:            return "ok";
+        case GGML_METAL_SPARSE_PLAN_INVALID_RANGE: return "invalid-range";
+        case GGML_METAL_SPARSE_PLAN_INVALID_STATE: return "invalid-state";
+    }
+    return "unknown";
+}
+
 struct ggml_metal_sparse_range {
     size_t offset;
     size_t size;
@@ -43,6 +53,18 @@ enum ggml_metal_sparse_ticket_state {
     GGML_METAL_SPARSE_TICKET_ROLLED_BACK,
     GGML_METAL_SPARSE_TICKET_CANCELLED,
 };
+
+static inline const char * ggml_metal_sparse_ticket_state_name(
+        enum ggml_metal_sparse_ticket_state state) {
+    switch (state) {
+        case GGML_METAL_SPARSE_TICKET_EMPTY:       return "empty";
+        case GGML_METAL_SPARSE_TICKET_RESERVED:    return "reserved";
+        case GGML_METAL_SPARSE_TICKET_COMMITTED:   return "committed";
+        case GGML_METAL_SPARSE_TICKET_ROLLED_BACK: return "rolled-back";
+        case GGML_METAL_SPARSE_TICKET_CANCELLED:   return "cancelled";
+    }
+    return "unknown";
+}
 
 struct ggml_metal_sparse_ticket_accounting {
     uint64_t generation;
@@ -256,6 +278,22 @@ static inline bool ggml_metal_sparse_accounting_is_current(
         const struct ggml_metal_sparse_ticket_accounting * ticket) {
     return ticket != NULL && ticket->state == GGML_METAL_SPARSE_TICKET_RESERVED &&
             ticket->generation == generation;
+}
+
+// Commit may proceed only when a fresh plan has the same mapping effect as
+// the reserved quote. Generation and ticket state are checked separately.
+// This deliberately accepts zero-page writes: they are valid transactions
+// whose mapping effect is empty.
+static inline bool ggml_metal_sparse_quote_commit_compatible(
+        const struct ggml_metal_sparse_quote * reserved,
+        const struct ggml_metal_sparse_quote * current) {
+    return reserved != NULL && current != NULL &&
+            reserved->status == GGML_METAL_SPARSE_PLAN_OK && reserved->feasible &&
+            current->status == GGML_METAL_SPARSE_PLAN_OK && current->feasible &&
+            current->required_pages == reserved->required_pages &&
+            current->new_pages == reserved->new_pages &&
+            current->cow_pages == reserved->cow_pages &&
+            current->target_mappings == reserved->target_mappings;
 }
 
 static inline bool ggml_metal_sparse_accounting_finish(
