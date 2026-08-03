@@ -521,6 +521,36 @@ admission_result scheduler::admit(const request & req, const feasibility_quote &
     return result;
 }
 
+completion_result scheduler::cancel(uint64_t request_id) {
+    completion_result result;
+    if (request_id == 0 || (pimpl->pending.active && pimpl->pending.selected.req.id == request_id)) {
+        result.reason = reason_code::service_invalid_decision;
+        return result;
+    }
+
+    for (size_t lane_id = 0; lane_id < lane_count; ++lane_id) {
+        auto & queue = pimpl->queues[lane_id];
+        const auto it = std::find_if(queue.begin(), queue.end(), [request_id](const impl::queued_request & queued) {
+            return queued.req.id == request_id;
+        });
+        if (it == queue.end()) {
+            continue;
+        }
+
+        queue.erase(it);
+        pimpl->request_ids.erase(request_id);
+        if (queue.empty()) {
+            pimpl->hdrr_credit_units[lane_id] = 0;
+        }
+        result.completed = true;
+        result.reason    = reason_code::service_cancelled;
+        return result;
+    }
+
+    result.reason = reason_code::service_invalid_decision;
+    return result;
+}
+
 service_decision scheduler::select_next(uint64_t now_us, const evaluation_provider & evaluate) {
     service_decision result;
     if (pimpl->pending.active) {

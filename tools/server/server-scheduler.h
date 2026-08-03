@@ -185,6 +185,7 @@ class scheduler {
     explicit scheduler(scheduler_config config = {});
 
     admission_result  admit(const request & req, const feasibility_quote & quote);
+    completion_result cancel(uint64_t request_id);
     service_decision  select_next(uint64_t now_us, const evaluation_provider & evaluate);
     completion_result complete_service(uint64_t decision_id, uint64_t actual_gpu_us, service_disposition disposition);
 

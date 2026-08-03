@@ -90,6 +90,27 @@ void test_fifo_virtual_runtime_and_ties() {
     require(decision.selected && decision.request_id == 1, "remaining request must run");
 }
 
+void test_cancel_queued_request() {
+    scheduler_config config;
+    config.lanes[static_cast<size_t>(lane::fast)].queue_cap = 1;
+    scheduler policy(config);
+
+    require(policy.admit(make_request(1, lane::fast), feasible_quote()).accepted, "admit cancellable request");
+    require(!policy.admit(make_request(2, lane::fast), feasible_quote()).accepted, "queue cap reached");
+
+    const completion_result cancelled = policy.cancel(1);
+    require(cancelled.completed && cancelled.reason == reason_code::service_cancelled, "cancel queued request");
+    require(!policy.contains(1) && policy.queued_total() == 0, "cancel removes scheduler identity");
+    require(policy.admit(make_request(2, lane::fast), feasible_quote()).accepted, "cancel releases lane capacity");
+    require(!policy.cancel(999).completed, "unknown cancellation is rejected");
+
+    const service_decision selected = policy.select_next(1, {});
+    require(selected.selected && selected.request_id == 2, "remaining request selected");
+    require(!policy.cancel(2).completed, "in-flight decision cannot be cancelled as queued work");
+    require(policy.complete_service(selected.decision_id, 1, service_disposition::cancelled).completed,
+            "in-flight request uses decision completion");
+}
+
 void test_cache_lookahead_bonus_and_bypass_bound() {
     scheduler_config config;
     config.aging_credit_us     = 1;
@@ -617,6 +638,7 @@ int main() {
     const std::vector<std::pair<const char *, void (*)()>> tests = {
         { "default descriptors",              test_default_descriptors                                  },
         { "FIFO, virtual runtime, and ties",  test_fifo_virtual_runtime_and_ties                        },
+        { "queued cancellation",              test_cancel_queued_request                               },
         { "cache lookahead and bypass bound", test_cache_lookahead_bonus_and_bypass_bound               },
         { "infeasible head",                  test_infeasible_head_is_not_bypassed                      },
         { "aging",                            test_aging                                                },
