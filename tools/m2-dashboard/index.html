@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>M2 Ultra operations</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="page-header">
+    <div>
+      <p class="eyebrow">DeepSeek V4 Flash · M2 Ultra</p>
+      <h1>Operations</h1>
+    </div>
+    <div class="mode-block">
+      <span id="mode-badge" class="badge badge-fixture">fixture data</span>
+      <span id="connection-status" class="muted">starting</span>
+    </div>
+  </header>
+
+  <main>
+    <section aria-label="system summary">
+      <div id="health-strip" class="health-strip"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="lanes-title">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Live scheduler</p>
+          <h2 id="lanes-title">Lanes and requests</h2>
+        </div>
+        <p class="muted">Predicted starts are ranges, not promises.</p>
+      </div>
+      <div id="lane-columns" class="lane-grid"></div>
+    </section>
+
+    <div class="two-column">
+      <section class="panel" aria-labelledby="request-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Selected request</p>
+            <h2 id="request-title">Request detail</h2>
+          </div>
+        </div>
+        <div id="request-detail" class="detail-empty">Select a request.</div>
+      </section>
+
+      <section class="panel" aria-labelledby="timeline-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Committed boundaries</p>
+            <h2 id="timeline-title">Active timeline</h2>
+          </div>
+        </div>
+        <ol id="timeline" class="timeline"></ol>
+      </section>
+    </div>
+
+    <div class="two-column">
+      <section class="panel" aria-labelledby="allocator-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Physical ownership</p>
+            <h2 id="allocator-title">Allocator</h2>
+          </div>
+        </div>
+        <div id="allocator-pools" class="stack"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="cache-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Resident and disk tiers</p>
+            <h2 id="cache-title">Cache</h2>
+          </div>
+        </div>
+        <div id="cache-objects" class="stack"></div>
+      </section>
+    </div>
+
+    <div class="two-column">
+      <section class="panel" aria-labelledby="storage-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Snapshot paths</p>
+            <h2 id="storage-title">Storage</h2>
+          </div>
+        </div>
+        <div id="disk-list" class="stack"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="aux-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Auxiliary systems</p>
+            <h2 id="aux-title">DSpark and capture</h2>
+          </div>
+        </div>
+        <div id="aux-status" class="stack"></div>
+      </section>
+    </div>
+
+    <div class="two-column">
+      <section class="panel" aria-labelledby="events-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Bounded client history</p>
+            <h2 id="events-title">Recent events</h2>
+          </div>
+          <span id="event-sequence" class="monospace muted"></span>
+        </div>
+        <ol id="event-history" class="timeline"></ol>
+      </section>
+
+      <section class="panel" aria-labelledby="intent-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">No transport attached</p>
+            <h2 id="intent-title">Control intents</h2>
+          </div>
+        </div>
+        <p class="notice">Buttons draft local intents only. No control request is sent.</p>
+        <ol id="intent-list" class="timeline"></ol>
+      </section>
+    </div>
+  </main>
+
+  <footer>
+    Fixture foundation only · content reveal disabled · no browser persistence
+  </footer>
+
+  <script type="module" src="dashboard.js"></script>
+</body>
+</html>

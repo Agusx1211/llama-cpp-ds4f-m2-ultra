@@ -1,0 +1,214 @@
+[
+  {
+    "schema_version": 1,
+    "id": "101",
+    "sequence": 101,
+    "wall_time": "2026-08-03T22:00:00.200Z",
+    "monotonic_ms": 18422200,
+    "type": "request.upsert",
+    "request_id": "req-fast-a",
+    "slot_id": 4,
+    "sequence_id": 4,
+    "lane": "fast",
+    "scheduler_epoch": 1221,
+    "decision_id": "decision-1221",
+    "before": "decode",
+    "after": "decode",
+    "reason_code": "progress_aggregated",
+    "payload": {
+      "request": {
+        "id": "req-fast-a",
+        "lane": "fast",
+        "state": "decode",
+        "arrival_at": "2026-08-03T21:59:59.100Z",
+        "age_ms": 1100,
+        "prompt_tokens": 2100,
+        "cache_hit_tokens": 2048,
+        "output_tokens": 35,
+        "requested_output_tokens": 128,
+        "blocker": "",
+        "predicted_start_ms": [0, 0],
+        "ttft_ms": 138,
+        "tbt_ms": 21.6,
+        "kv": {
+          "logical_bytes": 14486036,
+          "unique_bytes": 4259840,
+          "lineage": "prefix:system-v4/tail"
+        },
+        "scheduler_reasons": ["fast_lane", "prefix_hit"],
+        "preemptions": 0,
+        "dspark_cycles": 4,
+        "content": {
+          "prompt": "Give the current service status.",
+          "output": "The service remains in a six-stream physical decode cohort.",
+          "retained": false
+        }
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "id": "102",
+    "sequence": 102,
+    "wall_time": "2026-08-03T22:00:00.400Z",
+    "monotonic_ms": 18422400,
+    "type": "timeline.append",
+    "request_id": "req-fast-a",
+    "slot_id": 4,
+    "sequence_id": 4,
+    "lane": "fast",
+    "scheduler_epoch": 1222,
+    "decision_id": "decision-1222",
+    "before": "decode",
+    "after": "decode",
+    "reason_code": "verification_committed",
+    "payload": {
+      "item": {
+        "id": "timeline-102",
+        "at": "2026-08-03T22:00:00.400Z",
+        "type": "verify",
+        "label": "Committed eight target-verified tokens",
+        "request_id": "req-fast-a",
+        "lane": "fast"
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "id": "103",
+    "sequence": 103,
+    "wall_time": "2026-08-03T22:00:00.600Z",
+    "monotonic_ms": 18422600,
+    "type": "allocator.replace",
+    "request_id": null,
+    "slot_id": null,
+    "sequence_id": null,
+    "lane": null,
+    "scheduler_epoch": 1223,
+    "decision_id": "decision-1223",
+    "before": null,
+    "after": null,
+    "reason_code": "periodic_allocator_snapshot",
+    "payload": {
+      "allocator": {
+        "pools": [
+          {
+            "id": "raw-swa",
+            "capacity_pages": 32768,
+            "free_pages": 18288,
+            "reserved_pages": 64,
+            "mapped_pages": 14416,
+            "shared_pages": 0,
+            "cow_pages": 4,
+            "high_water_pages": 14720
+          },
+          {
+            "id": "c4-compressed",
+            "capacity_pages": 88480,
+            "free_pages": 26694,
+            "reserved_pages": 630,
+            "mapped_pages": 61156,
+            "shared_pages": 18816,
+            "cow_pages": 21,
+            "high_water_pages": 62240
+          },
+          {
+            "id": "hca-compressed",
+            "capacity_pages": 3860,
+            "free_pages": 2010,
+            "reserved_pages": 0,
+            "mapped_pages": 1850,
+            "shared_pages": 320,
+            "cow_pages": 0,
+            "high_water_pages": 1900
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "id": "104",
+    "sequence": 104,
+    "wall_time": "2026-08-03T22:00:00.800Z",
+    "monotonic_ms": 18422800,
+    "type": "server.replace",
+    "request_id": null,
+    "slot_id": null,
+    "sequence_id": null,
+    "lane": null,
+    "scheduler_epoch": 1224,
+    "decision_id": "decision-1224",
+    "before": "degraded",
+    "after": "healthy",
+    "reason_code": "pressure_below_watermark",
+    "payload": {
+      "server": {
+        "health": "healthy",
+        "build": "0eaed1943-fixture",
+        "model": "DeepSeek V4 Flash UD-Q8_K_XL",
+        "uptime_seconds": 18423,
+        "rss_bytes": 171443224576,
+        "footprint_bytes": 9291436032,
+        "swap_bytes": 0,
+        "memory_pressure_percent": 68,
+        "decode_width": 6,
+        "aggregate_tokens_per_second": 89.1
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "id": "105",
+    "sequence": 105,
+    "wall_time": "2026-08-03T22:00:01.000Z",
+    "monotonic_ms": 18423000,
+    "type": "capture.replace",
+    "request_id": null,
+    "slot_id": null,
+    "sequence_id": null,
+    "lane": null,
+    "scheduler_epoch": 1225,
+    "decision_id": "decision-1225",
+    "before": "compact",
+    "after": "compact",
+    "reason_code": "writer_progress",
+    "payload": {
+      "capture": {
+        "mode": "compact",
+        "healthy": true,
+        "queued_records": 18,
+        "written_records": 184226,
+        "dropped_records": 19,
+        "bytes_written": 314638336,
+        "last_error": null
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "id": "106",
+    "sequence": 106,
+    "wall_time": "2026-08-03T22:00:01.200Z",
+    "monotonic_ms": 18423200,
+    "type": "dspark.replace",
+    "request_id": null,
+    "slot_id": null,
+    "sequence_id": null,
+    "lane": null,
+    "scheduler_epoch": 1226,
+    "decision_id": "decision-1226",
+    "before": "target-only-width>=2",
+    "after": "target-only-width>=2",
+    "reason_code": "acceptance_aggregate",
+    "payload": {
+      "dspark": {
+        "mode": "target-only-width>=2",
+        "scheduled_decode_width": 6,
+        "proposals": 15420,
+        "accepted": 10948,
+        "acceptance_by_position": [0.92, 0.81, 0.69, 0.55, 0.43]
+      }
+    }
+  }
+]

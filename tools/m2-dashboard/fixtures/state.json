@@ -1,0 +1,355 @@
+{
+  "schema_version": 1,
+  "sequence": 100,
+  "generated_at": "2026-08-03T22:00:00.000Z",
+  "server": {
+    "health": "degraded",
+    "build": "0eaed1943-fixture",
+    "model": "DeepSeek V4 Flash UD-Q8_K_XL",
+    "uptime_seconds": 18422,
+    "rss_bytes": 171442176000,
+    "footprint_bytes": 9290387456,
+    "swap_bytes": 0,
+    "memory_pressure_percent": 72,
+    "decode_width": 6,
+    "aggregate_tokens_per_second": 88.4
+  },
+  "lanes": [
+    {
+      "id": "low",
+      "queued": 1,
+      "active": 1,
+      "oldest_wait_ms": 84000,
+      "service_deficit": 3.5,
+      "bypass_count": 2,
+      "predicted_start_ms": [12000, 26000]
+    },
+    {
+      "id": "normal",
+      "queued": 0,
+      "active": 2,
+      "oldest_wait_ms": 4800,
+      "service_deficit": 0.8,
+      "bypass_count": 0,
+      "predicted_start_ms": [900, 3100]
+    },
+    {
+      "id": "fast",
+      "queued": 0,
+      "active": 2,
+      "oldest_wait_ms": 0,
+      "service_deficit": 0,
+      "bypass_count": 0,
+      "predicted_start_ms": [0, 450]
+    }
+  ],
+  "requests": [
+    {
+      "id": "req-low-700k",
+      "lane": "low",
+      "state": "prefill",
+      "arrival_at": "2026-08-03T21:58:36.000Z",
+      "age_ms": 84000,
+      "prompt_tokens": 700000,
+      "cache_hit_tokens": 128000,
+      "output_tokens": 0,
+      "requested_output_tokens": 4096,
+      "blocker": "prefill lease",
+      "predicted_start_ms": [12000, 26000],
+      "ttft_ms": null,
+      "tbt_ms": null,
+      "kv": {
+        "logical_bytes": 4810363371,
+        "unique_bytes": 3919157658,
+        "lineage": "session:agent-41/gen-8"
+      },
+      "scheduler_reasons": ["low_lane_share", "yield_for_fast_tbt"],
+      "preemptions": 1,
+      "dspark_cycles": 0,
+      "content": {
+        "prompt": "<script>globalThis.pwned = true</script> Review the migration plan.",
+        "output": "",
+        "retained": false
+      }
+    },
+    {
+      "id": "req-low-queue",
+      "lane": "low",
+      "state": "queued",
+      "arrival_at": "2026-08-03T21:59:24.000Z",
+      "age_ms": 36000,
+      "prompt_tokens": 180000,
+      "cache_hit_tokens": 0,
+      "output_tokens": 0,
+      "requested_output_tokens": null,
+      "blocker": "aggregate KV quote",
+      "predicted_start_ms": [18000, 35000],
+      "ttft_ms": null,
+      "tbt_ms": null,
+      "kv": {
+        "logical_bytes": 0,
+        "unique_bytes": 0,
+        "lineage": "unbound"
+      },
+      "scheduler_reasons": ["capacity_runway"],
+      "preemptions": 0,
+      "dspark_cycles": 0,
+      "content": {
+        "prompt": "A long background request with <img src=x onerror=alert(1)>.",
+        "output": "",
+        "retained": false
+      }
+    },
+    {
+      "id": "req-normal-17",
+      "lane": "normal",
+      "state": "decode",
+      "arrival_at": "2026-08-03T21:59:55.200Z",
+      "age_ms": 4800,
+      "prompt_tokens": 32000,
+      "cache_hit_tokens": 28672,
+      "output_tokens": 183,
+      "requested_output_tokens": 512,
+      "blocker": "",
+      "predicted_start_ms": [0, 0],
+      "ttft_ms": 842,
+      "tbt_ms": 47.6,
+      "kv": {
+        "logical_bytes": 219915747,
+        "unique_bytes": 23068672,
+        "lineage": "prefix:tooling-v12/request-tail"
+      },
+      "scheduler_reasons": ["resident_prefix_hit", "normal_lane_turn"],
+      "preemptions": 0,
+      "dspark_cycles": 0,
+      "content": {
+        "prompt": "Explain why sequence gaps require a full snapshot.",
+        "output": "The event stream is a delta log, so missing one transition can invalidate later state.",
+        "retained": false
+      }
+    },
+    {
+      "id": "req-normal-parked",
+      "lane": "normal",
+      "state": "parked",
+      "arrival_at": "2026-08-03T21:59:57.000Z",
+      "age_ms": 3000,
+      "prompt_tokens": 90000,
+      "cache_hit_tokens": 64000,
+      "output_tokens": 44,
+      "requested_output_tokens": 300,
+      "blocker": "fast lease",
+      "predicted_start_ms": [900, 3100],
+      "ttft_ms": 1100,
+      "tbt_ms": 61.2,
+      "kv": {
+        "logical_bytes": 618513024,
+        "unique_bytes": 178257920,
+        "lineage": "session:bench-9/gen-2"
+      },
+      "scheduler_reasons": ["park_for_fast_arrival"],
+      "preemptions": 1,
+      "dspark_cycles": 0,
+      "content": {
+        "prompt": "Summarize these benchmark logs.",
+        "output": "The target-only run remained within its token budget.",
+        "retained": false
+      }
+    },
+    {
+      "id": "req-fast-a",
+      "lane": "fast",
+      "state": "decode",
+      "arrival_at": "2026-08-03T21:59:59.100Z",
+      "age_ms": 900,
+      "prompt_tokens": 2100,
+      "cache_hit_tokens": 2048,
+      "output_tokens": 27,
+      "requested_output_tokens": 128,
+      "blocker": "",
+      "predicted_start_ms": [0, 0],
+      "ttft_ms": 138,
+      "tbt_ms": 21.8,
+      "kv": {
+        "logical_bytes": 14431090,
+        "unique_bytes": 4194304,
+        "lineage": "prefix:system-v4/tail"
+      },
+      "scheduler_reasons": ["fast_lane", "prefix_hit"],
+      "preemptions": 0,
+      "dspark_cycles": 4,
+      "content": {
+        "prompt": "Give the current service status.",
+        "output": "The service is handling a six-stream physical decode cohort.",
+        "retained": false
+      }
+    },
+    {
+      "id": "req-fast-b",
+      "lane": "fast",
+      "state": "decode",
+      "arrival_at": "2026-08-03T21:59:59.550Z",
+      "age_ms": 450,
+      "prompt_tokens": 1400,
+      "cache_hit_tokens": 1024,
+      "output_tokens": 11,
+      "requested_output_tokens": 64,
+      "blocker": "",
+      "predicted_start_ms": [0, 0],
+      "ttft_ms": 112,
+      "tbt_ms": 20.9,
+      "kv": {
+        "logical_bytes": 9620726,
+        "unique_bytes": 3145728,
+        "lineage": "prefix:system-v4/tail"
+      },
+      "scheduler_reasons": ["fast_lane"],
+      "preemptions": 0,
+      "dspark_cycles": 3,
+      "content": {
+        "prompt": "List the next safe actions.",
+        "output": "Validate, commit, and retain the prior rollback target.",
+        "retained": false
+      }
+    }
+  ],
+  "allocator": {
+    "pools": [
+      {
+        "id": "raw-swa",
+        "capacity_pages": 32768,
+        "free_pages": 18304,
+        "reserved_pages": 128,
+        "mapped_pages": 14336,
+        "shared_pages": 0,
+        "cow_pages": 4,
+        "high_water_pages": 14720
+      },
+      {
+        "id": "c4-compressed",
+        "capacity_pages": 88480,
+        "free_pages": 26736,
+        "reserved_pages": 672,
+        "mapped_pages": 61072,
+        "shared_pages": 18816,
+        "cow_pages": 21,
+        "high_water_pages": 62240
+      },
+      {
+        "id": "hca-compressed",
+        "capacity_pages": 3860,
+        "free_pages": 2010,
+        "reserved_pages": 20,
+        "mapped_pages": 1830,
+        "shared_pages": 320,
+        "cow_pages": 0,
+        "high_water_pages": 1900
+      }
+    ]
+  },
+  "cache": {
+    "objects": [
+      {
+        "id": "prefix:system-v4",
+        "tier": "resident",
+        "kind": "prefix",
+        "logical_bytes": 33554432,
+        "unique_bytes": 12582912,
+        "shared_bytes": 20971520,
+        "hits": 184,
+        "score": 91.4,
+        "pinned": true
+      },
+      {
+        "id": "prefix:tooling-v12",
+        "tier": "resident",
+        "kind": "prefix",
+        "logical_bytes": 197132288,
+        "unique_bytes": 88080384,
+        "shared_bytes": 109051904,
+        "hits": 31,
+        "score": 48.2,
+        "pinned": false
+      },
+      {
+        "id": "session:agent-41/gen-7",
+        "tier": "disk",
+        "kind": "session",
+        "logical_bytes": 4664066048,
+        "unique_bytes": 3758096384,
+        "shared_bytes": 905969664,
+        "hits": 2,
+        "score": 18.7,
+        "pinned": false
+      }
+    ]
+  },
+  "disks": [
+    {
+      "id": "disk0",
+      "path": "/Volumes/Internal/adaptive-kv",
+      "capacity_bytes": 1000204886016,
+      "free_bytes": 264140488704,
+      "healthy": true,
+      "queue_depth": 2,
+      "read_bps": 838860800,
+      "write_bps": 314572800,
+      "snapshots": 18,
+      "errors": 0
+    },
+    {
+      "id": "archive-fixture",
+      "path": "/Volumes/Archive/adaptive-kv",
+      "capacity_bytes": 2000398934016,
+      "free_bytes": 1200398934016,
+      "healthy": false,
+      "queue_depth": 0,
+      "read_bps": 0,
+      "write_bps": 0,
+      "snapshots": 4,
+      "errors": 3
+    }
+  ],
+  "dspark": {
+    "mode": "target-only-width>=2",
+    "scheduled_decode_width": 6,
+    "proposals": 15420,
+    "accepted": 10948,
+    "acceptance_by_position": [0.92, 0.81, 0.69, 0.55, 0.43]
+  },
+  "capture": {
+    "mode": "compact",
+    "healthy": true,
+    "queued_records": 42,
+    "written_records": 184202,
+    "dropped_records": 19,
+    "bytes_written": 314572800,
+    "last_error": null
+  },
+  "timeline": [
+    {
+      "id": "timeline-96",
+      "at": "2026-08-03T21:59:56.800Z",
+      "type": "park",
+      "label": "Parked normal request at committed token 44",
+      "request_id": "req-normal-parked",
+      "lane": "normal"
+    },
+    {
+      "id": "timeline-98",
+      "at": "2026-08-03T21:59:59.130Z",
+      "type": "cohort",
+      "label": "Selected six-stream target-only cohort",
+      "request_id": null,
+      "lane": null
+    },
+    {
+      "id": "timeline-100",
+      "at": "2026-08-03T22:00:00.000Z",
+      "type": "pressure",
+      "label": "C4 pool crossed the fixture warning watermark",
+      "request_id": null,
+      "lane": null
+    }
+  ]
+}
