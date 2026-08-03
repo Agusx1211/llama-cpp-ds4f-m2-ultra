@@ -1748,17 +1748,11 @@ static bool test_dsv4_aggregate_device(size_t seed, ggml_backend_dev_t dev) {
     all_ok = compare_dsv4_trace("aggregate-copied", "A", isolated_a, copied.seq_a) && all_ok;
     all_ok = compare_dsv4_trace("aggregate-copied", "B", isolated_b, copied.seq_b) && all_ok;
 
-    bool full_state_rejected = false;
-    try {
-        dsv4_test_context state_test(seed, dev, 2, true, n_prompt);
-        const auto state_tokens = get_tokens(n_prompt, n_vocab, seed + 62);
-        dsv4_decode_sequence(state_test, state_tokens, 0, "aggregate full-state limitation");
-        (void) dsv4_sequence_state(state_test.lctx.get(), 0);
-    } catch (const std::runtime_error & err) {
-        full_state_rejected = std::string(err.what()).find(
-                "full DSV4 state write is not yet supported by the aggregate compressed pool") != std::string::npos;
-    }
-    GGML_ASSERT(full_state_rejected && "aggregate full-state limitation was not reported explicitly");
+    dsv4_test_context state_test(seed, dev, 2, true, n_prompt);
+    const auto state_tokens = get_tokens(n_prompt, n_vocab, seed + 62);
+    dsv4_decode_sequence(state_test, state_tokens, 0, "aggregate full-state limitation");
+    GGML_ASSERT(llama_state_seq_get_size(state_test.lctx.get(), 0) == 0 &&
+            "aggregate full-state limitation did not reject the size request");
 
     printf("DSV4 aggregate selection/alias matrix (%s): %s; single-slot = affine, "
            "multi-slot = aggregate, full state = explicitly unsupported\n",
