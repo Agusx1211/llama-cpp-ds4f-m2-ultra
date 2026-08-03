@@ -295,6 +295,7 @@ struct test_context_config {
     uint32_t n_seq_max   = 1;
     bool     kv_unified  = false;
     bool     load_mtp    = false;
+    enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
     llama_context_type ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
 };
 
@@ -319,6 +320,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_seq_max = config.n_seq_max;
     ctx_params.kv_unified = config.kv_unified;
     ctx_params.ctx_type = config.ctx_type;
+    ctx_params.flash_attn_type = config.flash_attn_type;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
     if (!encode) {
@@ -371,6 +373,27 @@ static std::vector<float> get_logits(
     }
     llama_batch_free(batch);
     return ret;
+}
+
+static void test_minimax_m3_dense_fallback(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_MINIMAX_M3, true);
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+
+    test_context_config config;
+    config.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+
+    const size_t device_count = ggml_backend_dev_count();
+    GGML_ASSERT(device_count > 0);
+    for (size_t i = 0; i < device_count; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        auto model_and_ctx = get_model_and_ctx(
+                gguf_ctx.get(), nullptr, seed, {dev}, LLAMA_SPLIT_MODE_LAYER, false, config);
+        const std::vector<float> logits = get_logits(
+                model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+
+        GGML_ASSERT(!logits.empty());
+        printf("MiniMax-M3 forced-no-FA dense fallback (%s): OK\n", ggml_backend_dev_description(dev));
+    }
 }
 
 static void test_dsv4_mtp_device(
@@ -1459,6 +1482,9 @@ int main(int argc, char ** argv) {
         const int backends_result = test_backends(arch, seed, log_level);
         if (backends_result != 0) {
             return backends_result;
+        }
+        if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_MINIMAX_M3) {
+            test_minimax_m3_dense_fallback(seed);
         }
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_DEEPSEEK4) {
             test_dsv4_mtp(seed);

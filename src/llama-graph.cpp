@@ -531,7 +531,10 @@ llm_graph_input_attn_kv_msa::llm_graph_input_attn_kv_msa(
 void llm_graph_input_attn_kv_msa::set_input(const llama_ubatch * ubatch) {
     llm_graph_input_attn_kv::set_input(ubatch);
 
-    mctx_msa->get_idx()->set_input_k_idxs(self_k_idxs_idx, ubatch);
+    // Dense MSA fallback does not consume this input, so gallocr may leave it unbacked.
+    if (self_k_idxs_idx && self_k_idxs_idx->buffer) {
+        mctx_msa->get_idx()->set_input_k_idxs(self_k_idxs_idx, ubatch);
+    }
 }
 
 bool llm_graph_input_attn_kv_msa::can_reuse(const llm_graph_params & params) {
