@@ -79,7 +79,8 @@ static inline struct ggml_metal_sparse_quote ggml_metal_sparse_plan_write(
         false,
     };
 
-    if (page_size == 0 || n_virtual > SIZE_MAX/page_size ||
+    if (page_size == 0 || n_virtual > UINT32_MAX || n_physical > UINT32_MAX ||
+            n_virtual > SIZE_MAX/page_size ||
             (n_ranges > 0 && ranges == NULL) ||
             (n_virtual > 0 && (v2p == NULL || marked == NULL)) ||
             (n_physical > 0 && (p_ref == NULL || marked_per_physical == NULL))) {
@@ -142,6 +143,92 @@ static inline struct ggml_metal_sparse_quote ggml_metal_sparse_plan_write(
     result.feasible = result.status == GGML_METAL_SPARSE_PLAN_OK &&
             n_reserved <= n_free && result.required_pages <= n_free - n_reserved;
     return result;
+}
+
+// Select one stable source virtual mapping for every physical page touched by
+// COW. If an unselected alias exists it remains the source. If all aliases are
+// selected, the lowest selected virtual page is deliberately retained on the
+// original physical page. Every remapped alias copies directly from that
+// retained mapping; no action depends on another newly mapped destination.
+// The caller supplies retained_by_physical[n_physical] and
+// copy_source_by_virtual[n_virtual]. UINT32_MAX means no retained source or no
+// COW copy respectively.
+static inline enum ggml_metal_sparse_plan_status ggml_metal_sparse_select_cow_sources(
+        size_t n_virtual,
+        size_t n_physical,
+        const uint32_t * v2p,
+        const uint32_t * p_ref,
+        const uint8_t * marked,
+        const uint32_t * marked_per_physical,
+        uint32_t * retained_by_physical,
+        uint32_t * copy_source_by_virtual) {
+    if (n_virtual > UINT32_MAX || n_physical > UINT32_MAX ||
+            (n_virtual > 0 && (v2p == NULL || marked == NULL || copy_source_by_virtual == NULL)) ||
+            (n_physical > 0 && (p_ref == NULL || marked_per_physical == NULL ||
+                                retained_by_physical == NULL))) {
+        return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+    }
+
+    for (size_t p = 0; p < n_physical; ++p) {
+        retained_by_physical[p] = UINT32_MAX;
+    }
+    for (size_t v = 0; v < n_virtual; ++v) {
+        copy_source_by_virtual[v] = UINT32_MAX;
+    }
+
+    for (size_t p = 0; p < n_physical; ++p) {
+        const uint32_t selected = marked_per_physical[p];
+        if (selected == 0) {
+            continue;
+        }
+        if (p_ref[p] == 0 || selected > p_ref[p]) {
+            return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+        }
+    }
+
+    // One virtual-table pass selects the lowest eligible source for every
+    // physical page; avoid a physical x virtual scan on 1M-context buffers.
+    for (size_t v = 0; v < n_virtual; ++v) {
+        const uint32_t p = v2p[v];
+        if (p == UINT32_MAX) {
+            continue;
+        }
+        if (p >= n_physical || p_ref[p] == 0) {
+            return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+        }
+        const uint32_t selected = marked_per_physical[p];
+        if (selected == 0 || retained_by_physical[p] != UINT32_MAX) {
+            continue;
+        }
+        const bool retain_unselected = selected < p_ref[p];
+        if (retain_unselected ? !marked[v] : marked[v]) {
+            retained_by_physical[p] = (uint32_t) v;
+        }
+    }
+
+    for (size_t p = 0; p < n_physical; ++p) {
+        if (marked_per_physical[p] == 0) {
+            continue;
+        }
+        if (retained_by_physical[p] == UINT32_MAX) {
+            return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+        }
+    }
+
+    for (size_t v = 0; v < n_virtual; ++v) {
+        if (!marked[v] || v2p[v] == UINT32_MAX) {
+            continue;
+        }
+        const uint32_t p = v2p[v];
+        if (p >= n_physical || retained_by_physical[p] == UINT32_MAX) {
+            return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+        }
+        if (retained_by_physical[p] != v) {
+            copy_source_by_virtual[v] = retained_by_physical[p];
+        }
+    }
+
+    return GGML_METAL_SPARSE_PLAN_OK;
 }
 
 static inline bool ggml_metal_sparse_accounting_try_reserve(

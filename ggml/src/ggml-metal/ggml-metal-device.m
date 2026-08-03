@@ -2353,18 +2353,6 @@ struct ggml_metal_sparse_write_action {
     uint32_t copy_src_vtile;
 };
 
-static uint32_t ggml_metal_sparse_find_alias(
-        ggml_metal_buffer_t buf,
-        uint32_t ptile,
-        uint32_t exclude_vtile) {
-    for (size_t v = 0; v < buf->sparse_n_virtual; ++v) {
-        if (v != exclude_vtile && buf->sparse_v2p[v] == ptile) {
-            return (uint32_t) v;
-        }
-    }
-    return UINT32_MAX;
-}
-
 static void ggml_metal_sparse_submit(
         ggml_metal_buffer_t buf,
         const MTL4UpdateSparseBufferMappingOperation * operations,
@@ -2412,10 +2400,9 @@ static void ggml_metal_sparse_submit(
             }
         }
 
-        // COW chains are constructed from the last remaining alias backwards.
-        // Reverse order ensures every source page has been initialized before
-        // an earlier alias copies from it.
-        for (size_t i = n_writes; i-- > 0;) {
+        // Every COW action reads the stable alias deliberately retained on the
+        // original physical page, so copies are independent of action order.
+        for (size_t i = 0; i < n_writes; ++i) {
             if (writes[i].copy_src_vtile != UINT32_MAX) {
                 [blit copyFromBuffer:metal
                         sourceOffset:(size_t) writes[i].copy_src_vtile*buf->sparse_page_size
@@ -2437,6 +2424,8 @@ struct ggml_metal_sparse_reservation_entry {
     size_t n_ranges;
     uint8_t * marked;
     uint32_t * marked_per_physical;
+    uint32_t * retained_by_physical;
+    uint32_t * copy_source_by_virtual;
     struct ggml_metal_sparse_quote quote;
     struct ggml_metal_sparse_ticket_accounting accounting;
     struct ggml_metal_sparse_write_action * writes;
@@ -2530,6 +2519,8 @@ static void ggml_metal_sparse_reservation_destroy(
         free(reservation->entries[i].ranges);
         free(reservation->entries[i].marked);
         free(reservation->entries[i].marked_per_physical);
+        free(reservation->entries[i].retained_by_physical);
+        free(reservation->entries[i].copy_source_by_virtual);
         free(reservation->entries[i].writes);
         free(reservation->entries[i].operations);
     }
@@ -2607,7 +2598,12 @@ static enum ggml_metal_sparse_reservation_result ggml_metal_sparse_prepare(
         entry->marked = calloc(entry->buffer->sparse_n_virtual, sizeof(*entry->marked));
         entry->marked_per_physical = calloc(
                 entry->buffer->sparse_n_physical, sizeof(*entry->marked_per_physical));
-        if (entry->ranges == NULL || entry->marked == NULL || entry->marked_per_physical == NULL) {
+        entry->retained_by_physical = malloc(
+                entry->buffer->sparse_n_physical*sizeof(*entry->retained_by_physical));
+        entry->copy_source_by_virtual = malloc(
+                entry->buffer->sparse_n_virtual*sizeof(*entry->copy_source_by_virtual));
+        if (entry->ranges == NULL || entry->marked == NULL || entry->marked_per_physical == NULL ||
+                entry->retained_by_physical == NULL || entry->copy_source_by_virtual == NULL) {
             free(sorted);
             ggml_metal_sparse_reservation_destroy(reservation);
             return GGML_METAL_SPARSE_RESERVATION_OOM;
@@ -2635,6 +2631,15 @@ static enum ggml_metal_sparse_reservation_result ggml_metal_sparse_prepare(
                 buf->sparse_n_free, buf->sparse_n_reserved, buf->sparse_generation,
                 buf->sparse_v2p, buf->sparse_p_ref, entry->ranges, entry->n_ranges,
                 entry->marked, entry->marked_per_physical);
+        if (entry->quote.status == GGML_METAL_SPARSE_PLAN_OK) {
+            entry->quote.status = ggml_metal_sparse_select_cow_sources(
+                    buf->sparse_n_virtual, buf->sparse_n_physical,
+                    buf->sparse_v2p, buf->sparse_p_ref,
+                    entry->marked, entry->marked_per_physical,
+                    entry->retained_by_physical, entry->copy_source_by_virtual);
+            entry->quote.feasible = entry->quote.status == GGML_METAL_SPARSE_PLAN_OK &&
+                    entry->quote.feasible;
+        }
         if (entry->quote.status != GGML_METAL_SPARSE_PLAN_OK) {
             status = GGML_METAL_SPARSE_RESERVATION_INVALID;
         } else if (!entry->quote.feasible && status == GGML_METAL_SPARSE_RESERVATION_OK) {
@@ -2876,17 +2881,26 @@ enum ggml_metal_sparse_reservation_result ggml_metal_sparse_reservation_commit(
                     continue;
                 }
                 const uint32_t old_p = buf->sparse_v2p[v];
-                if (old_p != UINT32_MAX && buf->sparse_p_ref[old_p] == 1) {
-                    continue;
+                const uint32_t copy_src = entry->copy_source_by_virtual[v];
+                if (old_p != UINT32_MAX) {
+                    GGML_ASSERT(old_p < buf->sparse_n_physical);
+                    const uint32_t retained = entry->retained_by_physical[old_p];
+                    GGML_ASSERT(retained != UINT32_MAX);
+                    GGML_ASSERT(retained < buf->sparse_n_virtual);
+                    GGML_ASSERT(buf->sparse_v2p[retained] == old_p);
+                    if (retained == v) {
+                        GGML_ASSERT(copy_src == UINT32_MAX);
+                        continue;
+                    }
+                    GGML_ASSERT(copy_src == retained);
+                } else {
+                    GGML_ASSERT(copy_src == UINT32_MAX);
                 }
 
                 GGML_ASSERT(buf->sparse_n_free > 0);
                 const uint32_t new_p = buf->sparse_free[--buf->sparse_n_free];
-                uint32_t copy_src = UINT32_MAX;
                 if (old_p != UINT32_MAX) {
                     GGML_ASSERT(buf->sparse_p_ref[old_p] > 1);
-                    copy_src = ggml_metal_sparse_find_alias(buf, old_p, (uint32_t) v);
-                    GGML_ASSERT(copy_src != UINT32_MAX);
                     --buf->sparse_p_ref[old_p];
                 }
 

@@ -52,14 +52,33 @@ struct fixture {
     }
 
     size_t commit(const ggml_metal_sparse_quote & quote, const std::vector<uint8_t> & marked) {
+        std::vector<uint32_t> selected(refs.size(), 0);
+        for (size_t v = 0; v < v2p.size(); ++v) {
+            if (marked[v] && v2p[v] != UINT32_MAX) {
+                ++selected[v2p[v]];
+            }
+        }
+        std::vector<uint32_t> retained(refs.size());
+        std::vector<uint32_t> copy_sources(v2p.size());
+        assert(ggml_metal_sparse_select_cow_sources(
+                v2p.size(), refs.size(), v2p.data(), refs.data(), marked.data(),
+                selected.data(), retained.data(), copy_sources.data()) == GGML_METAL_SPARSE_PLAN_OK);
+
         size_t allocated = 0;
         for (size_t v = 0; v < v2p.size(); ++v) {
             if (!marked[v]) {
                 continue;
             }
             const uint32_t old = v2p[v];
-            if (old != UINT32_MAX && refs[old] == 1) {
-                continue;
+            if (old != UINT32_MAX) {
+                assert(retained[old] != UINT32_MAX && v2p[retained[old]] == old);
+                if (retained[old] == v) {
+                    assert(copy_sources[v] == UINT32_MAX);
+                    continue;
+                }
+                assert(copy_sources[v] == retained[old]);
+            } else {
+                assert(copy_sources[v] == UINT32_MAX);
             }
             uint32_t fresh = UINT32_MAX;
             for (uint32_t p = 0; p < refs.size(); ++p) {
@@ -144,6 +163,53 @@ static void test_alias_cow_rules() {
     const size_t before_free = many.free_pages;
     assert(many.commit(q, marked) == q.required_pages);
     assert(before_free - many.free_pages == q.required_pages);
+}
+
+static void check_cow_sources(
+        std::initializer_list<size_t> aliases,
+        std::initializer_list<size_t> writes,
+        uint32_t expected_retained) {
+    fixture f(8, 8);
+    f.alias(aliases, 0);
+    std::vector<ggml_metal_sparse_range> ranges;
+    for (size_t v : writes) {
+        ranges.push_back({ v*fixture::page, 1 });
+    }
+    std::vector<uint8_t> marked;
+    std::vector<uint32_t> selected;
+    const auto q = f.quote(ranges, marked, selected);
+    assert(q.status == GGML_METAL_SPARSE_PLAN_OK);
+    const size_t expected_cow = writes.size() < aliases.size() ? writes.size() : writes.size() - 1;
+    assert(q.cow_pages == expected_cow);
+
+    std::vector<uint32_t> retained(f.refs.size());
+    std::vector<uint32_t> copy_sources(f.v2p.size());
+    assert(ggml_metal_sparse_select_cow_sources(
+            f.v2p.size(), f.refs.size(), f.v2p.data(), f.refs.data(), marked.data(),
+            selected.data(), retained.data(), copy_sources.data()) == GGML_METAL_SPARSE_PLAN_OK);
+    assert(retained[0] == expected_retained);
+    assert(f.v2p[expected_retained] == 0);
+    assert(writes.size() < aliases.size() ? !marked[expected_retained] : marked[expected_retained]);
+    for (size_t v : aliases) {
+        if (marked[v] && v != expected_retained) {
+            assert(copy_sources[v] == expected_retained);
+        } else {
+            assert(copy_sources[v] == UINT32_MAX);
+        }
+    }
+}
+
+static void test_stable_cow_sources() {
+    // Partial writes retain the lowest unselected alias.
+    check_cow_sources({ 0, 1 },       { 1 },       0);
+    check_cow_sources({ 0, 1, 2 },    { 1, 2 },    0);
+    check_cow_sources({ 0, 1, 2, 3 }, { 0, 2 },    1);
+
+    // All-selected writes retain the lowest selected alias and every other
+    // COW action reads it directly, never another new destination.
+    check_cow_sources({ 0, 1 },       { 0, 1 },       0);
+    check_cow_sources({ 0, 1, 2 },    { 0, 1, 2 },    0);
+    check_cow_sources({ 0, 1, 2, 3 }, { 0, 1, 2, 3 }, 0);
 }
 
 static void test_insufficient_is_immutable() {
@@ -237,6 +303,7 @@ static void test_quote_equals_commit() {
 int main() {
     test_unmapped_overlap_and_rounding();
     test_alias_cow_rules();
+    test_stable_cow_sources();
     test_insufficient_is_immutable();
     test_stale_rollback_and_cancel();
     test_multi_pool_failure_is_atomic();
