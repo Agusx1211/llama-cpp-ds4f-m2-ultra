@@ -123,6 +123,13 @@ llama_build_and_test(
 target_include_directories(test-server-scheduler PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_compile_features(test-server-scheduler PRIVATE cxx_std_17)
 
+llama_build_and_test(
+    test-server-request-registry.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-request-registry.cpp
+)
+target_include_directories(test-server-request-registry PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-request-registry PRIVATE cxx_std_17)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
@@ -205,6 +212,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-dsv4-amx-contract.cpp)
     llama_build_and_test(test-dsv4-comp-pool.cpp)
     target_include_directories(test-dsv4-comp-pool PRIVATE
+        ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-snapshot-store.cpp)
+    target_include_directories(test-snapshot-store PRIVATE
         ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-dsv4-sparse-accounting.cpp)
     target_include_directories(test-dsv4-sparse-accounting PRIVATE
