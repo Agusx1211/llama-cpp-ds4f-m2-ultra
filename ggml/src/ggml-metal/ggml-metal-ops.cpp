@@ -2159,6 +2159,7 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * k = op->src[1];
     const ggml_tensor * w = op->src[2];
     const ggml_tensor * m = op->src[3];
+    const ggml_tensor * segment_ids = op->src[4];
 
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0);
@@ -2170,10 +2171,12 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(q->ne[1] == 64);
 
     ggml_metal_kargs_lightning_indexer args = {
-        /*.n_kv      =*/ (int32_t) k->ne[2],
+        /*.n_kv      =*/ (int32_t) op->ne[0],
         /*.n_batch   =*/ (int32_t) q->ne[2],
         /*.kv_offset =*/ 0,
         /*.mask_ne3  =*/ (int32_t) m->ne[3],
+        /*.indexed   =*/ segment_ids != nullptr,
+        /*.n_pool_segments =*/ segment_ids ? (int32_t) (k->ne[1]/64) : 0,
         /*.nb1       =*/ op->nb[1],
         /*.nb3       =*/ op->nb[3],
         /*.nbq1      =*/ q->nb[1],
@@ -2181,6 +2184,9 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
         /*.nbq3      =*/ q->nb[3],
         /*.nbk2      =*/ k->nb[2],
         /*.nbk3      =*/ k->nb[3],
+        /*.nbk1      =*/ k->nb[1],
+        /*.nbsi0     =*/ segment_ids ? segment_ids->nb[0] : 0,
+        /*.nbsi1     =*/ segment_ids ? segment_ids->nb[1] : 0,
         /*.nbw1      =*/ w->nb[1],
         /*.nbw3      =*/ w->nb[3],
         /*.nbm1      =*/ m->nb[1],
@@ -2191,7 +2197,8 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(k),  2);
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w),  3);
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(m),  4);
-    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 5);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(segment_ids ? segment_ids : k), 5);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 6);
 
     constexpr int n_keys_simdgroup = 8;
     const int n_simdgroups = k->type == GGML_TYPE_F16 ? 4 : 8;

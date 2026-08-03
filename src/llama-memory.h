@@ -68,6 +68,11 @@ struct llama_memory_context_i {
         return true;
     }
 
+    // Complete the current ubatch after graph submission. Transactional
+    // memories publish on success and discard candidate state on failure.
+    virtual void finish(bool /* success */) {
+    }
+
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;
 

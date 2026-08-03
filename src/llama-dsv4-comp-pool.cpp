@@ -909,6 +909,21 @@ llama_dsv4_comp_directory llama_dsv4_comp_pool::ticket_directory(llama_dsv4_comp
     return make_directory(family, record->plan->graph_execution_ids, logical_segments, record->plan.get());
 }
 
+llama_dsv4_comp_directory llama_dsv4_comp_pool::ticket_directory_for(
+        llama_dsv4_comp_ticket        ticket,
+        llama_dsv4_comp_family        family,
+        const std::vector<uint32_t> & execution_ids,
+        uint32_t                      logical_segments) const {
+    const auto * record = pimpl->find_ticket(ticket);
+    if (record == nullptr || record->state != ticket_state::active || pimpl->active_ticket_id != ticket.id ||
+        execution_ids.size() > LLAMA_DSV4_COMP_GRAPH_STREAMS) {
+        llama_dsv4_comp_directory result;
+        result.status = llama_dsv4_comp_status::stale_ticket;
+        return result;
+    }
+    return make_directory(family, execution_ids, logical_segments, record->plan.get());
+}
+
 uint32_t llama_dsv4_comp_pool::zero_segment(llama_dsv4_comp_family family) const {
     return is_valid_family(family) ? ZERO_SEGMENT : LLAMA_DSV4_COMP_INVALID_SEGMENT;
 }

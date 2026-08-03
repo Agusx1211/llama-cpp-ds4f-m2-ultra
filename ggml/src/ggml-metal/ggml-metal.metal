@@ -12404,6 +12404,19 @@ constexpr constant short LI_N_KEY_SIMDGROUP = 8;
 constexpr constant short LI_N_SIMDGROUP = 8;
 constexpr constant short LI_N_BATCH_TG = 8;
 
+METAL_FUNC int lightning_indexer_physical_row(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device const char * segment_ids,
+        int logical_row,
+        int stream) {
+    if (!args.indexed) {
+        return logical_row;
+    }
+    const int segment = *(device const int *) (segment_ids +
+            (logical_row/64)*args.nbsi0 + stream*args.nbsi1);
+    return segment >= 0 && segment < args.n_pool_segments ? segment*64 + logical_row%64 : -1;
+}
+
 // Preserve the F32 query contract used by the reference Lightning Indexer. The
 // K cache remains F16, but both operands are staged as F32 before the matrix
 // multiply so near-boundary top-k membership is not changed by rounding Q.
@@ -12413,6 +12426,7 @@ kernel void kernel_lightning_indexer_f16(
         device const char * k,
         device const char * w,
         device const char * m,
+        device const char * segment_ids,
         device       char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiitg[[thread_index_in_threadgroup]],
@@ -12429,7 +12443,9 @@ kernel void kernel_lightning_indexer_f16(
     const int i_kv = args.kv_offset + tgpig.x*n_key_tg;
     const int n_key = min((int) n_key_tg, args.n_kv - i_kv);
 
-    device const char * k_base = k + i_kv*args.nbk2 + i_stream*args.nbk3;
+    const int physical_kv = lightning_indexer_physical_row(args, segment_ids, i_kv, i_stream);
+    device const char * k_base = args.indexed ? k + max(physical_kv, 0)*args.nbk1 :
+            k + i_kv*args.nbk2 + i_stream*args.nbk3;
 
     threadgroup float k_shared[n_key_tg*LI_N_EMBD];
     threadgroup float q_shared[n_head_tile*LI_N_EMBD];
@@ -12514,6 +12530,7 @@ kernel void kernel_lightning_indexer_tail(
         device const char * k,
         device const char * w,
         device const char * m,
+        device const char * segment_ids,
         device       char * dst,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]]) {
@@ -12522,7 +12539,9 @@ kernel void kernel_lightning_indexer_tail(
     const int n_key = args.n_kv - args.kv_offset;
 
     device const char * q_base = q + i_batch*args.nbq2 + i_stream*args.nbq3;
-    device const char * k_base = k + args.kv_offset*args.nbk2 + i_stream*args.nbk3;
+    const int physical_kv = lightning_indexer_physical_row(args, segment_ids, args.kv_offset, i_stream);
+    device const char * k_base = args.indexed ? k + max(physical_kv, 0)*args.nbk1 :
+            k + args.kv_offset*args.nbk2 + i_stream*args.nbk3;
     device const char * w_base = w + i_batch*args.nbw1 + i_stream*args.nbw3;
 
     float4 k4[LI_N_KEY_SIMDGROUP];
@@ -12569,6 +12588,7 @@ kernel void kernel_lightning_indexer_q8_0(
         device const char * k,
         device const char * w,
         device const char * m,
+        device const char * segment_ids,
         device       char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiitg[[thread_index_in_threadgroup]],
@@ -12583,7 +12603,9 @@ kernel void kernel_lightning_indexer_q8_0(
     const int i_stream = tgpig.z;
     const int i_kv = args.kv_offset + tgpig.x*n_key_tg + sgitg*LI_N_KEY_SIMDGROUP;
 
-    device const char * k_base = k + i_kv*args.nbk2 + i_stream*args.nbk3;
+    const int physical_kv = lightning_indexer_physical_row(args, segment_ids, i_kv, i_stream);
+    device const char * k_base = args.indexed ? k + max(physical_kv, 0)*args.nbk1 :
+            k + i_kv*args.nbk2 + i_stream*args.nbk3;
 
     simdgroup_half8x8 mk[n_embd8];
     threadgroup half k_shared[LI_N_SIMDGROUP*LI_N_KEY_SIMDGROUP*LI_N_KEY_SIMDGROUP];
