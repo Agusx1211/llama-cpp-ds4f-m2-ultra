@@ -332,7 +332,7 @@ struct server_slot {
     double t_prompt_processing = 0.0; // ms
     double t_token_generation = 0.0;  // ms
 
-    std::function<void(int /* id_slot */)> callback_on_release;
+    std::function<void(int /* id_slot */, int /* id_task */)> callback_on_release;
 
     // Speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
@@ -549,6 +549,8 @@ struct server_slot {
         if (is_processing()) {
             GGML_ASSERT(task);
 
+            const int id_task = task->id;
+
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
             t_last_used        =  ggml_time_us();
@@ -564,7 +566,7 @@ struct server_slot {
 
             reset();
 
-            callback_on_release(id);
+            callback_on_release(id, id_task);
         }
     }
 
@@ -1405,7 +1407,8 @@ private:
 
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
-            slot.callback_on_release = [this](int id_slot) {
+            slot.callback_on_release = [this](int id_slot, int id_task) {
+                queue_tasks.release_slot(id_task, id_slot);
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -1898,6 +1901,12 @@ private:
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
 
+        if (!queue_tasks.bind_slot(slot.task->id, slot.id)) {
+            send_error(slot, "failed to bind durable request state", ERROR_TYPE_SERVER);
+            slot.release();
+            return false;
+        }
+
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
@@ -2103,6 +2112,8 @@ private:
 
     void send_error(const int id_task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER, const int32_t n_prompt_tokens = 0, const int32_t n_ctx = 0) {
         SRV_ERR("task id = %d, error: %s\n", id_task, error.c_str());
+
+        queue_tasks.fail_task(id_task);
 
         if (type == ERROR_TYPE_EXCEED_CONTEXT_SIZE) {
             GGML_ASSERT(n_ctx > 0 && n_prompt_tokens > 0);
