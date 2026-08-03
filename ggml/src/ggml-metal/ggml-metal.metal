@@ -12446,6 +12446,7 @@ kernel void kernel_lightning_indexer_f16(
     const int physical_kv = lightning_indexer_physical_row(args, segment_ids, i_kv, i_stream);
     device const char * k_base = args.indexed ? k + max(physical_kv, 0)*args.nbk1 :
             k + i_kv*args.nbk2 + i_stream*args.nbk3;
+    const uint64_t k_row_stride = args.indexed ? args.nbk1 : args.nbk2;
 
     threadgroup float k_shared[n_key_tg*LI_N_EMBD];
     threadgroup float q_shared[n_head_tile*LI_N_EMBD];
@@ -12455,7 +12456,7 @@ kernel void kernel_lightning_indexer_f16(
     for (short i = tiitg; i < n_key*n_embd4; i += ntg.x*ntg.y) {
         const short ik = i/n_embd4;
         const short i4 = i - ik*n_embd4;
-        device const half4 * k4 = (device const half4 *) (k_base + ik*args.nbk2);
+        device const half4 * k4 = (device const half4 *) (k_base + ik*k_row_stride);
         *(threadgroup float4 *) (k_shared + ik*LI_N_EMBD + 4*i4) = float4(k4[i4]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -12542,13 +12543,14 @@ kernel void kernel_lightning_indexer_tail(
     const int physical_kv = lightning_indexer_physical_row(args, segment_ids, args.kv_offset, i_stream);
     device const char * k_base = args.indexed ? k + max(physical_kv, 0)*args.nbk1 :
             k + args.kv_offset*args.nbk2 + i_stream*args.nbk3;
+    const uint64_t k_row_stride = args.indexed ? args.nbk1 : args.nbk2;
     device const char * w_base = w + i_batch*args.nbw1 + i_stream*args.nbw3;
 
     float4 k4[LI_N_KEY_SIMDGROUP];
     float score[LI_N_KEY_SIMDGROUP] = { 0.0f };
 
     for (short ik = 0; ik < n_key; ++ik) {
-        device const k4_t * row = (device const k4_t *) (k_base + ik*args.nbk2);
+        device const k4_t * row = (device const k4_t *) (k_base + ik*k_row_stride);
         dequantize_func(row + tiisg/nl, tiisg%nl, k4[ik]);
     }
 
@@ -12606,6 +12608,7 @@ kernel void kernel_lightning_indexer_q8_0(
     const int physical_kv = lightning_indexer_physical_row(args, segment_ids, i_kv, i_stream);
     device const char * k_base = args.indexed ? k + max(physical_kv, 0)*args.nbk1 :
             k + i_kv*args.nbk2 + i_stream*args.nbk3;
+    const uint64_t k_row_stride = args.indexed ? args.nbk1 : args.nbk2;
 
     simdgroup_half8x8 mk[n_embd8];
     threadgroup half k_shared[LI_N_SIMDGROUP*LI_N_KEY_SIMDGROUP*LI_N_KEY_SIMDGROUP];
@@ -12613,7 +12616,7 @@ kernel void kernel_lightning_indexer_q8_0(
 
     const short ik = tiisg/4;
     const short ie2 = 2*(tiisg%4);
-    device const block_q8_0 * row = (device const block_q8_0 *) (k_base + ik*args.nbk2);
+    device const block_q8_0 * row = (device const block_q8_0 *) (k_base + ik*k_row_stride);
 
     FOR_UNROLL (short i = 0; i < n_embd8; ++i) {
         const short ie = 8*i + ie2;
