@@ -1315,12 +1315,16 @@ static bool test_dsv4_restore_long_compressed_history(size_t seed, ggml_backend_
     GGML_ASSERT(llama_memory_seq_pos_max(memory, dest_seq) == (llama_pos) n_history - 1);
 
     const auto rows_after_restore = dsv4_page_rows(memory->memory_usage_snapshot());
-    for (size_t family = 0; family < rows_after_restore.size(); ++family) {
-        if (rows_after_restore[family][dest_seq] != checkpoint_rows[family][source_seq]) {
-            fprintf(stderr, "DSV4 long restore family %zu destination rows: %" PRIu64 " != %" PRIu64 "\n",
-                    family, rows_after_restore[family][dest_seq], checkpoint_rows[family][source_seq]);
-        }
+    for (size_t family = LLAMA_DSV4_MEMORY_CSA; family < rows_after_restore.size(); ++family) {
         GGML_ASSERT(rows_after_restore[family][dest_seq] == checkpoint_rows[family][source_seq]);
+    }
+    // A running full-size ISWA cache retains historical raw bookkeeping, while
+    // restore reconstructs only its semantically live sliding-attention rows.
+    // Continuation logits are the oracle for the intentionally compact layout.
+    GGML_ASSERT(rows_after_restore[LLAMA_DSV4_MEMORY_RAW][dest_seq] > 0);
+    GGML_ASSERT(rows_after_restore[LLAMA_DSV4_MEMORY_RAW][dest_seq] <=
+            checkpoint_rows[LLAMA_DSV4_MEMORY_RAW][source_seq]);
+    for (size_t family = 0; family < rows_after_restore.size(); ++family) {
         GGML_ASSERT(rows_after_restore[family][source_seq] == resident_rows_after_reference[family][source_seq]);
         GGML_ASSERT(rows_after_restore[family][survivor_seq] == resident_rows_after_reference[family][survivor_seq]);
     }
@@ -1335,8 +1339,13 @@ static bool test_dsv4_restore_long_compressed_history(size_t seed, ggml_backend_
     test.clear_batch();
 
     const auto rows_after_continuation = dsv4_page_rows(memory->memory_usage_snapshot());
-    for (size_t family = 0; family < rows_after_continuation.size(); ++family) {
+    for (size_t family = LLAMA_DSV4_MEMORY_CSA; family < rows_after_continuation.size(); ++family) {
         GGML_ASSERT(rows_after_continuation[family][dest_seq] == resident_rows_after_reference[family][source_seq]);
+    }
+    GGML_ASSERT(rows_after_continuation[LLAMA_DSV4_MEMORY_RAW][dest_seq] > 0);
+    GGML_ASSERT(rows_after_continuation[LLAMA_DSV4_MEMORY_RAW][dest_seq] <=
+            resident_rows_after_reference[LLAMA_DSV4_MEMORY_RAW][source_seq]);
+    for (size_t family = 0; family < rows_after_continuation.size(); ++family) {
         GGML_ASSERT(rows_after_continuation[family][source_seq] == resident_rows_after_reference[family][source_seq]);
         GGML_ASSERT(rows_after_continuation[family][survivor_seq] == resident_rows_after_reference[family][survivor_seq]);
     }
@@ -1345,8 +1354,13 @@ static bool test_dsv4_restore_long_compressed_history(size_t seed, ggml_backend_
 
     const bool logits_ok = compare_dsv4_trace(
             "restore-2048", "next", reference_logits, restored_logits);
-    printf("DSV4 long compressed restore (%s): %s, state = %zu bytes, rows CSA/HCA/LID = %" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
+    printf("DSV4 long compressed restore (%s): %s, state = %zu bytes, "
+           "rows raw source/restored/continued = %" PRIu64 "/%" PRIu64 "/%" PRIu64
+           ", CSA/HCA/LID = %" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
             ggml_backend_dev_description(dev), logits_ok ? "OK" : "FAIL", checkpoint_state.size(),
+            checkpoint_rows[LLAMA_DSV4_MEMORY_RAW][source_seq],
+            rows_after_restore[LLAMA_DSV4_MEMORY_RAW][dest_seq],
+            rows_after_continuation[LLAMA_DSV4_MEMORY_RAW][dest_seq],
             checkpoint_rows[LLAMA_DSV4_MEMORY_CSA][source_seq],
             checkpoint_rows[LLAMA_DSV4_MEMORY_HCA][source_seq],
             checkpoint_rows[LLAMA_DSV4_MEMORY_LID][source_seq]);
