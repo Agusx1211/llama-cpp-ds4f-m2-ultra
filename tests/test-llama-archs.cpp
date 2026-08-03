@@ -1415,7 +1415,8 @@ static bool test_dsv4_transactional_restore(size_t seed, ggml_backend_dev_t dev)
 
     // The file API is deliberately a bounded wrapper around the same oracle.
     const auto file_path = std::filesystem::temp_directory_path() /
-            format("llama-dsv4-phase2-%zu-%" PRIuPTR ".bin", seed, (uintptr_t) dev);
+            ("llama-dsv4-phase2-" + std::to_string(seed) + "-" +
+             std::to_string((uintptr_t) dev) + ".bin");
     const std::array<llama_token, 4> file_tokens = { 1, 2, 3, 4 };
     const size_t file_size = llama_state_seq_save_file(
             test.lctx.get(), file_path.string().c_str(), source_seq,
