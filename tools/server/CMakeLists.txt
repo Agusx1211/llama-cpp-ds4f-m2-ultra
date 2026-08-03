@@ -29,6 +29,8 @@ add_library(${TARGET} STATIC
     server-request-registry.h
     server-request-runtime.cpp
     server-request-runtime.h
+    server-prefix-cache.cpp
+    server-prefix-cache.h
 )
 
 if (BUILD_SHARED_LIBS)

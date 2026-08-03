@@ -144,6 +144,13 @@ target_include_directories(test-server-queue-runtime PRIVATE ${PROJECT_SOURCE_DI
 target_link_libraries(test-server-queue-runtime PRIVATE server-context)
 target_compile_features(test-server-queue-runtime PRIVATE cxx_std_17)
 
+llama_build_and_test(
+    test-server-prefix-cache.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-prefix-cache.cpp
+)
+target_include_directories(test-server-prefix-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-prefix-cache PRIVATE cxx_std_17)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
@@ -257,6 +264,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             NAME test-dsv4-amx-full-model-gate-parser
             WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
             ARGS tests/test-dsv4-amx-full-model-gate-parser.py
+        )
+        llama_test_cmd(
+            ${Python3_EXECUTABLE}
+            NAME test-m2-release-manager
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            ARGS tools/m2-deploy/tests/test_release_manager.py
         )
     endif()
 
