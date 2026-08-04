@@ -18,12 +18,13 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
-#include <cstdlib>
-#include <cstdio>
-#include <cstring>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -849,6 +850,138 @@ static bool dsv4_usage_snapshot_equal(
     return true;
 }
 
+class dsv4_page_delta_audit_scope {
+  public:
+    dsv4_page_delta_audit_scope() {
+        llama_kv_cache_dsv4_test_reset_page_delta_audit();
+        llama_kv_cache_dsv4_test_enable_page_delta_audit(true);
+    }
+
+    ~dsv4_page_delta_audit_scope() { llama_kv_cache_dsv4_test_enable_page_delta_audit(false); }
+};
+
+static bool dsv4_page_quote_equal(const llama_dsv4_sparse_page_quote_test_audit & lhs,
+                                  const llama_dsv4_sparse_page_quote_test_audit & rhs) {
+    return lhs.generation == rhs.generation && lhs.target_mappings == rhs.target_mappings &&
+           lhs.new_pages == rhs.new_pages && lhs.cow_pages == rhs.cow_pages &&
+           lhs.required_pages == rhs.required_pages && lhs.free_pages == rhs.free_pages &&
+           lhs.reserved_pages == rhs.reserved_pages && lhs.feasible == rhs.feasible;
+}
+
+static llama_dsv4_sparse_page_delta_test_audit dsv4_assert_page_delta_audit(bool committed, bool cancelled) {
+    const auto audit = llama_kv_cache_dsv4_test_get_page_delta_audit();
+    GGML_ASSERT(audit.observed && audit.dry_quoted && audit.reserved);
+    GGML_ASSERT(audit.committed == committed && audit.cancelled == cancelled);
+    GGML_ASSERT(!audit.pools.empty());
+    std::set<uintptr_t> physical_pools;
+    for (const auto & pool : audit.pools) {
+        GGML_ASSERT(pool.pool_id != 0 && physical_pools.insert(pool.pool_id).second);
+        GGML_ASSERT(pool.family_mask != 0);
+        GGML_ASSERT(pool.before.pool_id == pool.pool_id && pool.after.pool_id == pool.pool_id);
+        GGML_ASSERT(dsv4_page_quote_equal(pool.dry_quote, pool.reserved_quote));
+        GGML_ASSERT(pool.dry_quote.required_pages == pool.dry_quote.new_pages + pool.dry_quote.cow_pages);
+        GGML_ASSERT(pool.dry_quote.generation == pool.before.generation);
+        GGML_ASSERT(pool.dry_quote.free_pages == pool.before.free_pages);
+        GGML_ASSERT(pool.dry_quote.reserved_pages == pool.before.reserved_pages);
+        GGML_ASSERT(pool.after.reserved_pages == pool.before.reserved_pages);
+        if (committed) {
+            GGML_ASSERT(pool.before.free_pages >= pool.after.free_pages);
+            GGML_ASSERT(pool.after.unique_physical_pages >= pool.before.unique_physical_pages);
+            GGML_ASSERT(pool.after.mapped_mappings >= pool.before.mapped_mappings);
+            GGML_ASSERT(pool.after.cow_pages >= pool.before.cow_pages);
+            GGML_ASSERT(pool.after.cow_allocations >= pool.before.cow_allocations);
+            GGML_ASSERT(pool.after.generation >= pool.before.generation);
+            GGML_ASSERT(pool.before.free_pages - pool.after.free_pages == pool.dry_quote.required_pages);
+            GGML_ASSERT(pool.after.unique_physical_pages - pool.before.unique_physical_pages ==
+                        pool.dry_quote.required_pages);
+            GGML_ASSERT(pool.after.mapped_mappings - pool.before.mapped_mappings == pool.dry_quote.new_pages);
+            GGML_ASSERT(pool.after.cow_pages - pool.before.cow_pages == pool.dry_quote.cow_pages);
+            GGML_ASSERT(pool.after.cow_allocations - pool.before.cow_allocations ==
+                        (pool.dry_quote.cow_pages > 0 ? 1 : 0));
+            GGML_ASSERT(pool.after.generation - pool.before.generation == (pool.dry_quote.required_pages > 0 ? 1 : 0));
+        } else {
+            GGML_ASSERT(dsv4_sparse_usage_equal(pool.before, pool.after));
+        }
+    }
+    return audit;
+}
+
+static bool dsv4_audit_has_family_range(const llama_dsv4_sparse_page_delta_test_audit & audit,
+                                        llama_dsv4_memory_family                        family,
+                                        bool                                            zero_offset) {
+    for (const auto & pool : audit.pools) {
+        if (pool.family_range_count[family] > 0 && (!zero_offset || pool.family_zero_offset_ranges[family] > 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool test_dsv4_page_delta_boundaries(size_t seed, ggml_backend_dev_t dev) {
+    if (!dsv4_test_has_elastic_pages(dev, 2)) {
+        return true;
+    }
+
+    scoped_env_override disable_aggregate("LLAMA_DSV4_AGGREGATE_POOL_DISABLE", "1");
+    scoped_env_override clear_force_aggregate("LLAMA_DSV4_AGGREGATE_POOL_FORCE", nullptr);
+    dsv4_test_context   test(seed, dev, 2, true, 129, 1, 512, 129);
+    auto *              memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(test.lctx.get()));
+    GGML_ASSERT(memory != nullptr && !memory->is_aggregate_compressed());
+    const auto tokens = get_tokens(129, 128, seed + 63);
+
+    dsv4_page_delta_audit_scope audit_scope;
+    const auto                  decode_span = [&](uint32_t first, uint32_t end, const char * label) {
+        llama_kv_cache_dsv4_test_reset_page_delta_audit();
+        for (uint32_t pos = first; pos < end; ++pos) {
+            test.add(tokens[pos], pos, { 0 });
+        }
+        test.decode(label);
+        test.clear_batch();
+        return dsv4_assert_page_delta_audit(true, false);
+    };
+    const auto mapped_rows = [&](llama_dsv4_memory_family family) {
+        const auto usage = memory->memory_usage_snapshot();
+        GGML_ASSERT(usage.families[family].sequence_mapped_rows.size() == 2);
+        return usage.families[family].sequence_mapped_rows[0];
+    };
+
+    const auto token_3 = decode_span(0, 3, "page-delta token-count 3");
+    GGML_ASSERT(dsv4_audit_has_family_range(token_3, LLAMA_DSV4_MEMORY_RAW, true));
+    GGML_ASSERT(!dsv4_audit_has_family_range(token_3, LLAMA_DSV4_MEMORY_CSA, true));
+    GGML_ASSERT(!dsv4_audit_has_family_range(token_3, LLAMA_DSV4_MEMORY_LID, true));
+    GGML_ASSERT(!dsv4_audit_has_family_range(token_3, LLAMA_DSV4_MEMORY_HCA, false));
+    GGML_ASSERT(mapped_rows(LLAMA_DSV4_MEMORY_CSA) == 0);
+    GGML_ASSERT(mapped_rows(LLAMA_DSV4_MEMORY_LID) == 0);
+
+    const auto token_4 = decode_span(3, 4, "page-delta token-count 4");
+    GGML_ASSERT(dsv4_audit_has_family_range(token_4, LLAMA_DSV4_MEMORY_CSA, true));
+    GGML_ASSERT(dsv4_audit_has_family_range(token_4, LLAMA_DSV4_MEMORY_LID, true));
+    GGML_ASSERT(mapped_rows(LLAMA_DSV4_MEMORY_CSA) == 1);
+    GGML_ASSERT(mapped_rows(LLAMA_DSV4_MEMORY_LID) == 1);
+
+    const auto token_5 = decode_span(4, 5, "page-delta token-count 5");
+    GGML_ASSERT(!dsv4_audit_has_family_range(token_5, LLAMA_DSV4_MEMORY_CSA, true));
+    GGML_ASSERT(!dsv4_audit_has_family_range(token_5, LLAMA_DSV4_MEMORY_LID, true));
+    GGML_ASSERT(mapped_rows(LLAMA_DSV4_MEMORY_CSA) == 1);
+    GGML_ASSERT(mapped_rows(LLAMA_DSV4_MEMORY_LID) == 1);
+
+    const auto token_127 = decode_span(5, 127, "page-delta token-count 127");
+    GGML_ASSERT(!dsv4_audit_has_family_range(token_127, LLAMA_DSV4_MEMORY_HCA, false));
+    GGML_ASSERT(mapped_rows(LLAMA_DSV4_MEMORY_HCA) == 0);
+
+    const auto token_128 = decode_span(127, 128, "page-delta token-count 128");
+    GGML_ASSERT(dsv4_audit_has_family_range(token_128, LLAMA_DSV4_MEMORY_HCA, true));
+    GGML_ASSERT(mapped_rows(LLAMA_DSV4_MEMORY_HCA) == 1);
+
+    const auto token_129 = decode_span(128, 129, "page-delta token-count 129");
+    GGML_ASSERT(!dsv4_audit_has_family_range(token_129, LLAMA_DSV4_MEMORY_HCA, false));
+    GGML_ASSERT(mapped_rows(LLAMA_DSV4_MEMORY_HCA) == 1);
+
+    printf("DSV4 Metal sparse page-delta boundaries (%s): raw, CSA, HCA, and indexer exact\n",
+           ggml_backend_dev_description(dev));
+    return true;
+}
+
 static bool test_dsv4_physical_pressure(size_t seed, ggml_backend_dev_t dev) {
     if (!dsv4_test_has_elastic_pages(dev, 2)) {
         return true;
@@ -890,10 +1023,12 @@ static bool test_dsv4_physical_pressure(size_t seed, ggml_backend_dev_t dev) {
     const std::array<int8_t, 2> batch_outputs = { test.batch.logits[0], test.batch.logits[1] };
 
     graph_nodes = 0;
+    dsv4_page_delta_audit_scope page_delta_audit_scope;
     llama_kv_cache_dsv4_test_inject_physical_pressure(1);
     const int32_t pressure_result = llama_decode(test.lctx.get(), test.batch);
     GGML_ASSERT(pressure_result == LLAMA_DECODE_KV_PHYSICAL_PRESSURE);
     GGML_ASSERT(graph_nodes == 0 && "physical pressure reached graph submission");
+    dsv4_assert_page_delta_audit(false, true);
 
     llama_kv_pressure_info pressure = {};
     GGML_ASSERT(llama_get_last_kv_pressure(test.lctx.get(), &pressure));
@@ -927,7 +1062,9 @@ static bool test_dsv4_physical_pressure(size_t seed, ggml_backend_dev_t dev) {
     test.append_logits(1, logits_after);
     GGML_ASSERT(logits_before == logits_after);
 
+    llama_kv_cache_dsv4_test_reset_page_delta_audit();
     GGML_ASSERT(llama_decode(test.lctx.get(), test.batch) == LLAMA_DECODE_SUCCESS);
+    dsv4_assert_page_delta_audit(true, false);
     GGML_ASSERT(!llama_get_last_kv_pressure(test.lctx.get(), &pressure));
     GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 0) == 2);
     GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 1) == 0);
@@ -1146,10 +1283,14 @@ static dsv4_parallel_result run_dsv4_shared_prefix(
             const llama_pos aggregate_pos_b_before = llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 1);
 
             graph_nodes = 0;
+            dsv4_page_delta_audit_scope page_delta_audit_scope;
             llama_kv_cache_dsv4_test_reset_cow_preflight_stats();
             llama_kv_cache_dsv4_test_inject_physical_pressure(1);
             GGML_ASSERT(llama_decode(test.lctx.get(), test.batch) == LLAMA_DECODE_KV_PHYSICAL_PRESSURE);
             GGML_ASSERT(graph_nodes == 0 && "aggregate COW pressure reached graph submission");
+            const auto cancelled_audit = dsv4_assert_page_delta_audit(false, true);
+            GGML_ASSERT(dsv4_audit_has_family_range(cancelled_audit, LLAMA_DSV4_MEMORY_CSA, false));
+            GGML_ASSERT(dsv4_audit_has_family_range(cancelled_audit, LLAMA_DSV4_MEMORY_LID, false));
 
             const auto preflight = llama_kv_cache_dsv4_test_get_cow_preflight_stats();
             GGML_ASSERT(preflight.source_ranges_submitted > 0);
@@ -1185,7 +1326,11 @@ static dsv4_parallel_result run_dsv4_shared_prefix(
             GGML_ASSERT(aggregate_logits_after == aggregate_logits_before);
 
             graph_nodes = 0;
+            llama_kv_cache_dsv4_test_reset_page_delta_audit();
             test.decode("shared-prefix aggregate COW pressure retry");
+            const auto committed_audit = dsv4_assert_page_delta_audit(true, false);
+            GGML_ASSERT(dsv4_audit_has_family_range(committed_audit, LLAMA_DSV4_MEMORY_CSA, false));
+            GGML_ASSERT(dsv4_audit_has_family_range(committed_audit, LLAMA_DSV4_MEMORY_LID, false));
             const auto committed = llama_kv_cache_dsv4_test_get_cow_preflight_stats();
             GGML_ASSERT(committed.copy_operations > 0);
             GGML_ASSERT(graph_nodes > 0);
@@ -2024,6 +2169,7 @@ static int test_dsv4_aggregate(size_t seed) {
         }
         tested = true;
         printf("DSV4 aggregate lifecycle on %s\n", ggml_backend_dev_description(dev));
+        all_ok = test_dsv4_page_delta_boundaries(seed, dev) && all_ok;
         all_ok = test_dsv4_aggregate_device(seed, dev) && all_ok;
     }
     GGML_ASSERT(tested && "no target backend exposes DSV4 aggregate storage");

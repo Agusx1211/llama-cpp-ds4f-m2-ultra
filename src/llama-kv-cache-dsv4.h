@@ -97,6 +97,48 @@ struct llama_dsv4_batch_quote {
     bool feasible = true;
 };
 
+struct llama_dsv4_sparse_page_quote_test_audit {
+    uint64_t generation      = 0;
+    uint64_t target_mappings = 0;
+    uint64_t new_pages       = 0;
+    uint64_t cow_pages       = 0;
+    uint64_t required_pages  = 0;
+    uint64_t free_pages      = 0;
+    uint64_t reserved_pages  = 0;
+    bool     feasible        = false;
+};
+
+struct llama_dsv4_sparse_pool_delta_test_audit {
+    // Physical deltas belong to this stable Metal pool exactly once. The mask
+    // and range arrays describe every logical DSV4 family that submitted a
+    // tensor range to the pool; callers must not sum duplicate family views.
+    uintptr_t                                            pool_id                   = 0;
+    uint32_t                                             family_mask               = 0;
+    std::array<uint64_t, LLAMA_DSV4_MEMORY_FAMILY_COUNT> family_range_count        = {};
+    std::array<uint64_t, LLAMA_DSV4_MEMORY_FAMILY_COUNT> family_range_bytes        = {};
+    std::array<uint64_t, LLAMA_DSV4_MEMORY_FAMILY_COUNT> family_zero_offset_ranges = {};
+    llama_dsv4_sparse_page_quote_test_audit              dry_quote;
+    llama_dsv4_sparse_page_quote_test_audit              reserved_quote;
+    llama_dsv4_sparse_pool_usage                         before;
+    llama_dsv4_sparse_pool_usage                         after;
+};
+
+struct llama_dsv4_sparse_page_delta_test_audit {
+    bool                                                 observed   = false;
+    bool                                                 dry_quoted = false;
+    bool                                                 reserved   = false;
+    bool                                                 committed  = false;
+    bool                                                 cancelled  = false;
+    std::vector<llama_dsv4_sparse_pool_delta_test_audit> pools;
+};
+
+// Opt-in test-only audit of the real Metal dry-quote, reservation, and final
+// pool accounting boundaries. Disabled operation performs no extra quote or
+// usage snapshot work.
+void                                    llama_kv_cache_dsv4_test_enable_page_delta_audit(bool enabled);
+void                                    llama_kv_cache_dsv4_test_reset_page_delta_audit();
+llama_dsv4_sparse_page_delta_test_audit llama_kv_cache_dsv4_test_get_page_delta_audit();
+
 class llama_dsv4_comp_state {
 public:
     using stream_copy_info = llama_kv_cache::stream_copy_info;
