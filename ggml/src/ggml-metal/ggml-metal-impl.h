@@ -1352,6 +1352,8 @@ typedef struct {
     int32_t  n_batch;
     int32_t  kv_offset;
     int32_t  mask_ne3;
+    int32_t  indexed;
+    int32_t  n_pool_segments;
     uint64_t nb1;
     uint64_t nb3;
     uint64_t nbq1;
@@ -1359,6 +1361,9 @@ typedef struct {
     uint64_t nbq3;
     uint64_t nbk2;
     uint64_t nbk3;
+    uint64_t nbk1;
+    uint64_t nbsi0;
+    uint64_t nbsi1;
     uint64_t nbw1;
     uint64_t nbw3;
     uint64_t nbm1;

@@ -7667,6 +7667,63 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+struct test_dsv4_indexed_lightning_indexer : public test_case {
+    const int64_t kv;
+    const int64_t nb;
+    const int64_t ns;
+
+    test_dsv4_indexed_lightning_indexer(int64_t kv, int64_t nb, int64_t ns) : kv(kv), nb(nb), ns(ns) {}
+
+    std::string vars() override { return VARS_TO_STR3(kv, nb, ns); }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_INDEXED_LIGHTNING_INDEXER";
+    }
+    double max_nmse_err() override { return 1e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_segments = (kv + 63)/64;
+        const int64_t pool_segments = n_segments + ns + 2;
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 64, nb, ns);
+        ggml_tensor * pool = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 128, pool_segments*64);
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, nb, 1, ns);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_segments, ns);
+        ggml_set_name(q, "q");
+        ggml_set_name(pool, "pool");
+        ggml_set_name(w, "w");
+        ggml_set_name(m, "m");
+        ggml_set_name(ids, "segment_ids");
+
+        ggml_tensor * out = ggml_dsv4_indexed_lightning_indexer(ctx, q, pool, w, m, ids);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_get_tensor(ctx, "q");
+        ggml_tensor * pool = ggml_get_tensor(ctx, "pool");
+        ggml_tensor * w = ggml_get_tensor(ctx, "w");
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        ggml_tensor * ids = ggml_get_tensor(ctx, "segment_ids");
+        init_tensor_uniform(q, -1.0f, 1.0f);
+        init_tensor_uniform(pool, -1.0f, 1.0f);
+        init_tensor_uniform(w, -1.0f, 1.0f);
+        init_tensor_kq_mask(m);
+
+        const int64_t n_segments = ids->ne[0];
+        const int64_t pool_segments = pool->ne[1]/64;
+        std::vector<int32_t> directory(ggml_nelements(ids));
+        for (int64_t stream = 0; stream < ns; ++stream) {
+            for (int64_t segment = 0; segment < n_segments; ++segment) {
+                directory[stream*n_segments + segment] =
+                        (int32_t) ((segment*3 + stream*5 + 1) % pool_segments);
+            }
+        }
+        ggml_backend_tensor_set(ids, directory.data(), 0, directory.size()*sizeof(directory[0]));
+    }
+};
+
 struct test_lightning_indexer_top_k : public test_lightning_indexer {
     const int64_t n_top_k;
     const bool near_tie;
@@ -10932,6 +10989,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 1, 4, 1, type_K));
         }
+    }
+    for (int kv : { 63, 64, 65, 256 }) {
+        test_cases.emplace_back(new test_dsv4_indexed_lightning_indexer(kv, kv == 256 ? 4 : 1, 4));
     }
     for (int kv : { 7, 63, 65 }) {
         test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 9, 4, 1, GGML_TYPE_Q8_0));

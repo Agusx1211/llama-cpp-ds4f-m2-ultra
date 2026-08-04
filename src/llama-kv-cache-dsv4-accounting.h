@@ -3,11 +3,66 @@
 #include "llama-kv-cache-dsv4.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <map>
 #include <utility>
 
 // Pure-host aggregation helpers kept separate from backend usage collection so
 // shared placement-sparse pools can be tested without Metal.
+
+// M2 Ultra has 192 GiB of unified memory. Below this declared compressed-K
+// footprint, the affine per-stream layout is intentionally preferred because
+// it avoids the placement-sparse mapping/submission cost while consuming less
+// than 5% of target memory. Larger layouts need the aggregate pool to preserve
+// high-context/high-concurrency feasibility.
+static constexpr uint64_t LLAMA_DSV4_MAX_AFFINE_COMPRESSED_BYTES = UINT64_C(8)*1024*1024*1024;
+
+struct llama_dsv4_aggregate_selector {
+    bool     unified                   = false;
+    bool     sparse_supported          = false;
+    bool     f16                       = false;
+    bool     disabled                  = false;
+    bool     forced                    = false;
+    bool     affine_footprint_overflow = false;
+    uint32_t n_seq_max                 = 0;
+    uint64_t affine_compressed_bytes   = 0;
+};
+
+static inline bool dsv4_select_aggregate_compressed(
+        const llama_dsv4_aggregate_selector & selector) {
+    if (selector.disabled || !selector.unified || selector.n_seq_max <= 1 ||
+            !selector.sparse_supported || !selector.f16) {
+        return false;
+    }
+
+    return selector.forced || selector.affine_footprint_overflow ||
+            selector.affine_compressed_bytes > LLAMA_DSV4_MAX_AFFINE_COMPRESSED_BYTES;
+}
+
+// Add count tensors with the supplied row geometry to an exact declared-byte
+// total. Saturation makes overflow select the memory-saving aggregate layout.
+static inline bool dsv4_affine_compressed_bytes_add(
+        uint64_t & total,
+        uint64_t   row_bytes,
+        uint64_t   rows,
+        uint64_t   n_stream,
+        uint64_t   count = 1) {
+    uint64_t value = row_bytes;
+    for (uint64_t factor : { rows, n_stream, count }) {
+        if (factor != 0 && value > std::numeric_limits<uint64_t>::max()/factor) {
+            total = std::numeric_limits<uint64_t>::max();
+            return false;
+        }
+        value *= factor;
+    }
+    if (total > std::numeric_limits<uint64_t>::max() - value) {
+        total = std::numeric_limits<uint64_t>::max();
+        return false;
+    }
+    total += value;
+    return true;
+}
 
 static inline uint32_t dsv4_state_n_used_k_rows(
         llama_pos pos_max,

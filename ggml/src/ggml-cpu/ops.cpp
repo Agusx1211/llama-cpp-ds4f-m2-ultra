@@ -12203,6 +12203,7 @@ void ggml_compute_forward_lightning_indexer(
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * w = dst->src[2]; // weights
     const ggml_tensor * m = dst->src[3]; // mask
+    const ggml_tensor * segment_ids = dst->src[4];
 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(   q->type == GGML_TYPE_F32);
@@ -12230,7 +12231,7 @@ void ggml_compute_forward_lightning_indexer(
     const int n_head    = q->ne[1];
     const int n_tokens  = q->ne[2];
     const int n_stream  = q->ne[3];
-    const int n_kv      = k->ne[2];
+    const int n_kv      = dst->ne[0];
 
     ggml_to_float_t const k_to_float = ggml_get_type_traits(k->type)->to_float;
     GGML_ASSERT((k->type == GGML_TYPE_F32 || k_to_float) && "lightning indexer: unsupported K-type");
@@ -12255,7 +12256,15 @@ void ggml_compute_forward_lightning_indexer(
             const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3);
             float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
             for (int ik = ir0; ik < ir1; ++ik) {
-                char * k_row = (char *) k->data + ik*nbk2 + s*nbk3;
+                char * k_row;
+                if (segment_ids != nullptr) {
+                    const int32_t segment = *(const int32_t *) ((const char *) segment_ids->data +
+                            (ik/64)*segment_ids->nb[0] + s*segment_ids->nb[1]);
+                    GGML_ASSERT(segment >= 0 && (int64_t) segment < k->ne[1]/64);
+                    k_row = (char *) k->data + ((int64_t) segment*64 + ik%64)*nbk1;
+                } else {
+                    k_row = (char *) k->data + ik*nbk2 + s*nbk3;
+                }
                 if (k_to_float) {
                     k_to_float(k_row, k_row_f32, n_embd);
                 } else {

@@ -703,7 +703,7 @@ static void dsv4_set_i64(ggml_tensor * dst, const std::vector<int64_t> & src) {
         return;
     }
 
-    GGML_ASSERT(dst->ne[0] == (int64_t) src.size());
+    GGML_ASSERT(ggml_nelements(dst) == (int64_t) src.size());
     ggml_backend_tensor_set(dst, src.data(), 0, src.size()*ggml_element_size(dst));
 }
 
@@ -712,7 +712,7 @@ static void dsv4_set_i32(ggml_tensor * dst, const std::vector<int32_t> & src) {
         return;
     }
 
-    GGML_ASSERT(dst->ne[0] == (int64_t) src.size());
+    GGML_ASSERT(ggml_nelements(dst) == (int64_t) src.size());
     ggml_backend_tensor_set(dst, src.data(), 0, src.size()*ggml_element_size(dst));
 }
 
@@ -840,6 +840,7 @@ static void dsv4_set_comp_inputs(
     dsv4_set_i32(inp.state_read_idxs, plan.state_read_idxs);
     dsv4_set_i64(inp.state_write_idxs, plan.state_write_idxs);
     dsv4_set_i32(inp.state_write_pos, plan.state_write_pos);
+    dsv4_set_i32(inp.segment_ids, plan.segment_ids);
     dsv4_set_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
 
     if (debug || dsv4_compress_debug()) {
@@ -888,6 +889,9 @@ static bool dsv4_can_reuse_comp_input(
     res &= dsv4_can_reuse_tensor_1d(inp.state_read_idxs, plan.state_read_idxs.size());
     res &= dsv4_can_reuse_tensor_1d(inp.state_write_idxs, plan.state_write_idxs.size());
     res &= dsv4_can_reuse_tensor_1d(inp.state_write_pos, plan.state_write_pos.size());
+    res &= (inp.segment_ids == nullptr && plan.segment_ids.empty()) ||
+           (inp.segment_ids != nullptr && inp.segment_ids->ne[0] == (plan.n_kv + 63)/64 &&
+            inp.segment_ids->ne[1] == n_stream);
     res &= dsv4_can_reuse_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
 
     return res;
@@ -927,13 +931,21 @@ static void dsv4_build_comp_inputs(
     inp.state_write_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I64, plan.state_write_idxs.size(), std::string("dsv4_") + name + "_state_write_idxs");
     inp.state_write_pos = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_write_pos.size(), std::string("dsv4_") + name + "_state_write_pos");
 
+    if (!plan.segment_ids.empty()) {
+        inp.segment_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, (plan.n_kv + 63)/64, n_stream);
+        ggml_set_input(inp.segment_ids);
+        ggml_set_name(inp.segment_ids, (std::string("dsv4_") + name + "_segment_ids").c_str());
+    }
+
     if (plan.n_kv > 0) {
         const int64_t n_tokens = (int64_t) plan.n_visible.size();
+        const bool is_lid = strcmp(name, "lid") == 0;
+        const bool use_f16_mask = is_lid ? cparams.fused_lid || !plan.segment_ids.empty() : cparams.flash_attn;
 
         GGML_ASSERT(n_stream > 0);
         GGML_ASSERT(n_tokens%n_stream == 0);
 
-        inp.kq_mask = ggml_new_tensor_4d(ctx, (strcmp(name, "lid") != 0 && cparams.flash_attn) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
+        inp.kq_mask = ggml_new_tensor_4d(ctx, use_f16_mask ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
         ggml_set_input(inp.kq_mask);
         ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
     }
