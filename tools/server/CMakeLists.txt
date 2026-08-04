@@ -47,6 +47,8 @@ add_library(${TARGET} STATIC
     server-kv-store.h
     server-capture.cpp
     server-capture.h
+    server-capture-store.cpp
+    server-capture-store.h
 )
 
 if (BUILD_SHARED_LIBS)
