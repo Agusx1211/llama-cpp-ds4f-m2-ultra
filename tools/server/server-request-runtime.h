@@ -102,6 +102,10 @@ class request_runtime {
     explicit request_runtime(runtime_config config = {});
 
     admission_result admit(const request_metadata & request, bool scheduled = true);
+    admission_result validate_dispatch_family(
+            server_scheduler::lane priority,
+            const std::array<size_t, server_scheduler::lane_count> & demand,
+            size_t physical_slot_capacity) const;
     dispatch_result  take_next(uint64_t now_us, size_t physical_slot_capacity = 64);
     bool             mark_deferred(uint64_t request_id, uint64_t at_us);
     admission_result resume(uint64_t request_id, uint64_t at_us);
@@ -117,6 +121,7 @@ class request_runtime {
     bool fail(uint64_t request_id, uint64_t at_us);
 
     bool                                                   contains(uint64_t request_id) const;
+    bool                                                   family_has_bindings(uint64_t request_id) const;
     size_t                                                 queued_total() const;
     std::vector<server_request_registry::request_snapshot> snapshot() const;
     server_request_registry::event_log_snapshot            events() const;
@@ -142,6 +147,16 @@ class request_runtime {
         permit_state                                        permit            = permit_state::none;
     };
 
+    // A cohort closes after its initial fill opportunity and stays closed
+    // across staggered releases. It resets only after every permit drains;
+    // each higher lane may reopen it once as a bounded priority upgrade.
+    struct cohort_epoch {
+        bool                   active   = false;
+        bool                   open     = false;
+        server_scheduler::lane dominant = server_scheduler::lane::low;
+        size_t                 limit    = 0;
+    };
+
     admission_result enqueue(record & request, uint64_t at_us);
     expiration       expire(std::map<uint64_t, record>::iterator it, deadline_kind kind, uint64_t at_us);
     expiration       expire_if_due(std::map<uint64_t, record>::iterator it, uint64_t at_us);
@@ -164,6 +179,7 @@ class request_runtime {
     uint64_t                                  default_run_timeout_us;
     uint32_t                                  overload_retry_after_seconds;
     dispatch_permit_snapshot                  permit_counts;
+    cohort_epoch                              cohort;
 };
 
 }  // namespace server_request_runtime

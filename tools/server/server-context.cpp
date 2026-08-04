@@ -2548,13 +2548,9 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
-                    // release slot linked with the task id
-                    for (auto & slot : slots) {
-                        if (slot.task && slot.task->id == task.id_target) {
-                            slot.release();
-                            break;
-                        }
-                    }
+                    // Parent cancellation and failure controls retire every
+                    // bound child in the same serialized server-loop turn.
+                    release_server_task_family_slots(slots, task.id_target);
                 } break;
             case SERVER_TASK_TYPE_CONTROL:
                 {

@@ -85,6 +85,33 @@ request_runtime::request_runtime(runtime_config config) :
                                                                 config.default_run_timeout_us),
     overload_retry_after_seconds(bounded_retry_after(config.overload_retry_after_seconds)) {}
 
+admission_result request_runtime::validate_dispatch_family(
+        lane priority,
+        const std::array<size_t, lane_count> & demand,
+        size_t physical_slot_capacity) const {
+    if (priority == lane::count) {
+        return { result_code::invalid_request, server_scheduler::reason_code::reject_invalid_request };
+    }
+
+    size_t total = 0;
+    for (size_t i = 0; i < lane_count; ++i) {
+        const size_t cap = scheduler.config().lanes[i].decode_cap;
+        if (demand[i] > cap) {
+            return { result_code::capacity_impossible,
+                     server_scheduler::reason_code::reject_capacity_impossible };
+        }
+        total += demand[i];
+    }
+    const size_t cohort_cap = scheduler.config().lanes[lane_index(priority)].decode_cap;
+    if (total == 0 || total > cohort_cap || total > physical_slot_capacity) {
+        return { result_code::capacity_impossible, server_scheduler::reason_code::reject_capacity_impossible };
+    }
+    if (priority == lane::low && scheduler.choose_decode_width(lane::low, total, total, false).width < total) {
+        return { result_code::capacity_impossible, server_scheduler::reason_code::reject_capacity_impossible };
+    }
+    return { result_code::ok, server_scheduler::reason_code::admission_ready };
+}
+
 admission_result request_runtime::admit(const request_metadata & request, bool scheduled) {
     const bool duplicate = records.count(request.id) != 0;
     if (request.id == 0 || duplicate || to_registry_lane(request.lane) == trusted_lane::count) {
@@ -197,6 +224,12 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
         }
     }
 
+    if (permit_counts.total == 0) {
+        cohort = {};
+    } else if (!cohort.active) {
+        throw std::logic_error("live permits exist without a cohort epoch");
+    }
+
     const auto cohort_limit_for = [this, physical_slot_capacity, &queued_demand](lane priority) {
         size_t limit = scheduler.config().lanes[lane_index(priority)].decode_cap;
         if (priority == lane::low) {
@@ -208,28 +241,48 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
         return std::min(limit, physical_slot_capacity);
     };
 
-    const bool has_cohort = permit_counts.total != 0;
-    lane       dominant_lane = lane::low;
+    const bool has_cohort = cohort.active;
+    lane       eligible_lane = cohort.dominant;
+    size_t     eligible_limit = cohort.limit;
+    bool       upgrading        = false;
+    bool       allow_new_members = !has_cohort || cohort.open;
     if (has_cohort) {
-        dominant_lane = permit_counts.claimed[lane_index(lane::fast)] != 0   ? lane::fast :
-                        permit_counts.claimed[lane_index(lane::normal)] != 0 ? lane::normal :
-                                                                              lane::low;
-        if (dominant_lane != lane::fast && queued_demand.lanes[lane_index(lane::fast)] != 0) {
-            dominant_lane = lane::fast;
-        } else if (dominant_lane == lane::low && queued_demand.lanes[lane_index(lane::normal)] != 0) {
-            dominant_lane = lane::normal;
+        const bool permit_reentry = std::any_of(records.begin(), records.end(), [](const auto & entry) {
+            return entry.second.scheduler_queued && entry.second.permit != record::permit_state::none;
+        });
+        lane higher = lane::count;
+        if (cohort.dominant != lane::fast && scheduler.queued(lane::fast) != 0) {
+            higher = lane::fast;
+        } else if (cohort.dominant == lane::low && scheduler.queued(lane::normal) != 0) {
+            higher = lane::normal;
+        }
+
+        if (higher != lane::count) {
+            const size_t higher_limit = cohort_limit_for(higher);
+            if (permit_counts.total >= higher_limit) {
+                allow_new_members = false;
+                cohort.open      = false;
+                if (!permit_reentry) {
+                    return {};
+                }
+            } else {
+                eligible_lane     = higher;
+                eligible_limit    = higher_limit;
+                upgrading         = true;
+                allow_new_members = true;
+            }
+        } else if (!allow_new_members && !permit_reentry) {
+            return {};
         }
     }
 
-    const auto evaluate = [this, physical_slot_capacity, has_cohort, dominant_lane, &cohort_limit_for,
-                           &demand_for](const server_scheduler::request & request) {
+    const auto evaluate = [this, physical_slot_capacity, has_cohort, eligible_lane, eligible_limit,
+                           allow_new_members, &cohort_limit_for, &demand_for](const server_scheduler::request & request) {
         candidate_evaluation result;
         const auto           it = records.find(request.id);
         if (it != records.end()) {
-            // The first request in an empty cohort remains an HDRR decision.
-            // A live wider cohort accepts only its dominant lane, which may be
-            // upgraded by newly queued higher-priority work.
-            if (has_cohort && physical_slot_capacity > 1 && request.priority != dominant_lane) {
+            const bool owns_permit = it->second.permit != record::permit_state::none;
+            if (has_cohort && !owns_permit && (!allow_new_members || request.priority != eligible_lane)) {
                 result.state = feasibility::temporarily_blocked;
                 return result;
             }
@@ -243,7 +296,7 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
                 result.state = feasibility::temporarily_blocked;
                 return result;
             }
-            const size_t cohort_limit = cohort_limit_for(has_cohort ? dominant_lane : request.priority);
+            const size_t cohort_limit = has_cohort ? eligible_limit : cohort_limit_for(request.priority);
             if (demand.total > cohort_limit || permit_counts.total > cohort_limit - demand.total) {
                 result.state = feasibility::temporarily_blocked;
                 return result;
@@ -261,6 +314,9 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
 
     const service_decision decision = scheduler.select_next(now_us, evaluate);
     if (!decision.selected) {
+        if (has_cohort) {
+            cohort.open = false;
+        }
         return {};
     }
 
@@ -280,7 +336,8 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
         }
         return {};
     }
-    const uint64_t charged_us = std::max<uint64_t>(1, decision.predicted_gpu_us);
+    const bool     claims_new_permit = request.permit == record::permit_state::none;
+    const uint64_t charged_us        = std::max<uint64_t>(1, decision.predicted_gpu_us);
     if (!scheduler.complete_service(decision.decision_id, charged_us, service_disposition::complete).completed) {
         throw std::logic_error("failed to commit scheduler selection");
     }
@@ -291,10 +348,17 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
         permit_counts.total > physical_slot_capacity - selected_demand.total) {
         throw std::logic_error("scheduler selected work without physical permit capacity");
     }
-    const size_t selected_cohort_limit = cohort_limit_for(has_cohort ? dominant_lane : decision.selected_lane);
+    const size_t selected_cohort_limit = has_cohort ? eligible_limit : cohort_limit_for(decision.selected_lane);
     if (selected_demand.total > selected_cohort_limit ||
         permit_counts.total > selected_cohort_limit - selected_demand.total) {
         throw std::logic_error("scheduler selected work beyond dominant lane cohort limit");
+    }
+    if (!has_cohort) {
+        cohort = { true, true, decision.selected_lane, selected_cohort_limit };
+    } else if (upgrading && claims_new_permit) {
+        cohort.dominant = decision.selected_lane;
+        cohort.limit    = selected_cohort_limit;
+        cohort.open     = true;
     }
     for (auto & entry : records) {
         record & current = entry.second;
@@ -308,6 +372,9 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
             ++permit_counts.claimed[index];
             ++permit_counts.total;
         }
+    }
+    if (permit_counts.total >= cohort.limit) {
+        cohort.open = false;
     }
     request.metadata.virtual_runtime_us = saturating_add(request.metadata.virtual_runtime_us, charged_us);
     request_progress progress;
@@ -612,10 +679,20 @@ void request_runtime::release_permit(record & request) {
         --permit_counts.bound[index];
     }
     request.permit = record::permit_state::none;
+    if (permit_counts.total == 0) {
+        cohort = {};
+    }
 }
 
 bool request_runtime::contains(uint64_t request_id) const {
     return records.count(request_id) != 0;
+}
+
+bool request_runtime::family_has_bindings(uint64_t request_id) const {
+    return std::any_of(records.begin(), records.end(), [request_id](const auto & entry) {
+        return (entry.first == request_id || entry.second.metadata.parent_id == request_id) &&
+               !entry.second.bindings.empty();
+    });
 }
 
 size_t request_runtime::queued_total() const {

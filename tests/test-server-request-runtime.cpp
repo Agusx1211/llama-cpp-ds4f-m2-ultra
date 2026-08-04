@@ -170,11 +170,12 @@ void test_dispatch_permits_cover_selection_defer_and_caps() {
     permits = fast.permits();
     require(permits.total == 2 && permits.bound[static_cast<size_t>(lane::fast)] == 2,
             "bind converts permits without double accounting");
-    require(fast.release_slot(1, 0, 18) && fast.take_next(19).request_id == 3,
-            "terminal release makes exactly one fast permit reusable");
-    require(fast.fail(3, 20), "selected-unbound failure releases its permit");
-    require(fast.release_slot(2, 1, 21) && fast.permits().total == 0,
-            "deferred and bound permit lifecycle retires without leaks");
+    require(fast.release_slot(1, 0, 18) && !fast.take_next(19).selected,
+            "closed fast cohort cannot refill after one staggered release");
+    require(fast.release_slot(2, 1, 20) && fast.take_next(21).request_id == 3,
+            "fast refill waits for the prior cohort to drain completely");
+    require(fast.fail(3, 22) && fast.permits().total == 0,
+            "deferred and selected permit lifecycle retires without leaks");
 
     for (lane priority : { lane::normal, lane::low }) {
         request_runtime capped;
@@ -182,17 +183,24 @@ void test_dispatch_permits_cover_selection_defer_and_caps() {
         for (size_t i = 0; i <= cap; ++i) {
             require(capped.admit(make_request(i + 1, priority, i + 1)), "admit lane-cap request");
         }
+        std::vector<std::pair<uint64_t, slot_id>> bound;
         for (size_t i = 0; i < cap; ++i) {
             const dispatch_result selected = capped.take_next(100 + i, 64);
             require(selected.selected && capped.bind_slot(selected.request_id, static_cast<slot_id>(i), 200 + i),
                     "claim and bind lane-cap permit");
+            bound.emplace_back(selected.request_id, static_cast<slot_id>(i));
         }
         require(!capped.take_next(1000, 64).selected, "live lane ceiling blocks one excess request");
         permits = capped.permits();
         require(permits.claimed[static_cast<size_t>(priority)] == cap && permits.total == cap,
                 "live lane ceiling is exact");
-        require(capped.release_slot(1, 0, 1001), "release first lane-cap request");
-        require(capped.take_next(1002, 64).selected, "released lane permit is immediately reusable");
+        require(capped.release_slot(bound[0].first, bound[0].second, 1001), "release first lane-cap request");
+        require(!capped.take_next(1002, 64).selected, "closed cohort rejects staggered same-lane refill");
+        for (size_t i = 1; i < bound.size(); ++i) {
+            require(capped.release_slot(bound[i].first, bound[i].second, 1002 + i),
+                    "drain remaining lane-cap request");
+        }
+        require(capped.take_next(2000, 64).selected, "same-lane refill resumes after complete cohort drain");
     }
 
     request_runtime physical;

@@ -187,6 +187,7 @@ private:
     static uint64_t runtime_id(int id_task);
     uint64_t now_us() const;
     server_request_runtime::request_metadata make_request_metadata(server_task & task, uint64_t at_us);
+    server_request_runtime::admission_result validate_user_family(const server_task & task) const;
     server_request_runtime::admission_result enqueue_user_task(server_task && task, uint64_t at_us);
     server_queue_expiration record_expiration_locked(const server_request_runtime::expiration & event);
     void enqueue_expiration_cancel_locked(const server_request_runtime::expiration & event);
