@@ -1111,38 +1111,40 @@ static dsv4_parallel_result run_dsv4_shared_prefix(
     const bool validate_aggregate_cow = setup == dsv4_prefix_setup::COPIED &&
             dsv4_memory->is_aggregate_compressed();
     llama_dsv4_comp_memory_usage aggregate_before_divergence;
-    llama_dsv4_comp_handle_id        aggregate_handle_a = 0;
-    llama_dsv4_comp_handle_id        aggregate_handle_b = 0;
-    llama_dsv4_comp_handle_info      aggregate_owner_a;
-    llama_dsv4_comp_handle_info      aggregate_owner_b;
-    llama_dsv4_memory_usage_snapshot aggregate_sparse_before;
-    std::vector<uint8_t>             aggregate_source_before;
-    std::vector<float>               aggregate_logits_before;
-    llama_pos                        aggregate_pos_a_before = -1;
-    llama_pos                        aggregate_pos_b_before = -1;
     if (validate_aggregate_cow) {
-        auto * pool                 = dsv4_memory->get_comp_pool();
-        aggregate_before_divergence = pool->memory_usage_snapshot();
+        aggregate_before_divergence = dsv4_memory->get_comp_pool()->memory_usage_snapshot();
         GGML_ASSERT(aggregate_before_divergence.c4.shared_segments == 1);
         GGML_ASSERT(aggregate_before_divergence.c4.cow_segments == 0);
-        GGML_ASSERT(pool->get_binding(0, aggregate_handle_a) == llama_dsv4_comp_status::ok);
-        GGML_ASSERT(pool->get_binding(1, aggregate_handle_b) == llama_dsv4_comp_status::ok);
-        GGML_ASSERT(pool->get_handle(aggregate_handle_a, aggregate_owner_a) == llama_dsv4_comp_status::ok);
-        GGML_ASSERT(pool->get_handle(aggregate_handle_b, aggregate_owner_b) == llama_dsv4_comp_status::ok);
-        GGML_ASSERT(aggregate_owner_a.c4_segment_ids == aggregate_owner_b.c4_segment_ids);
-        aggregate_sparse_before = dsv4_memory->memory_usage_snapshot();
-        aggregate_source_before = dsv4_aggregate_source_bytes(*dsv4_memory, aggregate_owner_a);
-        GGML_ASSERT(!aggregate_source_before.empty());
-        aggregate_logits_before = dsv4_logits_ith(test, n_prompt - 1);
-        aggregate_pos_a_before  = llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 0);
-        aggregate_pos_b_before  = llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 1);
     }
 
     for (uint32_t pos = n_prompt; pos < tokens_a.size(); ++pos) {
         test.clear_batch();
         test.add(tokens_a[pos], pos, {0});
         test.add(tokens_b[pos], pos, {1});
-        if (validate_aggregate_cow && pos == n_prompt) {
+        const bool inject_cow_pressure =
+            validate_aggregate_cow && pos == n_prompt + LLAMA_DSV4_COMP_C4_TOKENS_PER_ROW - 1;
+        if (inject_cow_pressure) {
+            auto *                      pool               = dsv4_memory->get_comp_pool();
+            llama_dsv4_comp_handle_id   aggregate_handle_a = 0;
+            llama_dsv4_comp_handle_id   aggregate_handle_b = 0;
+            llama_dsv4_comp_handle_info aggregate_owner_a;
+            llama_dsv4_comp_handle_info aggregate_owner_b;
+            GGML_ASSERT(pool->get_binding(0, aggregate_handle_a) == llama_dsv4_comp_status::ok);
+            GGML_ASSERT(pool->get_binding(1, aggregate_handle_b) == llama_dsv4_comp_status::ok);
+            GGML_ASSERT(pool->get_handle(aggregate_handle_a, aggregate_owner_a) == llama_dsv4_comp_status::ok);
+            GGML_ASSERT(pool->get_handle(aggregate_handle_b, aggregate_owner_b) == llama_dsv4_comp_status::ok);
+            GGML_ASSERT(aggregate_owner_a.c4_segment_ids == aggregate_owner_b.c4_segment_ids);
+
+            const auto aggregate_sparse_before = dsv4_memory->memory_usage_snapshot();
+            const auto aggregate_source_before = dsv4_aggregate_source_bytes(*dsv4_memory, aggregate_owner_a);
+            GGML_ASSERT(!aggregate_source_before.empty());
+            std::vector<float> aggregate_logits_before;
+            aggregate_logits_before.reserve(2 * test.n_vocab);
+            test.append_logits(0, aggregate_logits_before);
+            test.append_logits(1, aggregate_logits_before);
+            const llama_pos aggregate_pos_a_before = llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 0);
+            const llama_pos aggregate_pos_b_before = llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 1);
+
             graph_nodes = 0;
             llama_kv_cache_dsv4_test_reset_cow_preflight_stats();
             llama_kv_cache_dsv4_test_inject_physical_pressure(1);
@@ -1164,7 +1166,6 @@ static dsv4_parallel_result run_dsv4_shared_prefix(
             llama_dsv4_comp_handle_id   handle_b_after = 0;
             llama_dsv4_comp_handle_info owner_a_after;
             llama_dsv4_comp_handle_info owner_b_after;
-            auto *                      pool = dsv4_memory->get_comp_pool();
             GGML_ASSERT(pool->get_binding(0, handle_a_after) == llama_dsv4_comp_status::ok);
             GGML_ASSERT(pool->get_binding(1, handle_b_after) == llama_dsv4_comp_status::ok);
             GGML_ASSERT(handle_a_after == aggregate_handle_a && handle_b_after == aggregate_handle_b);
@@ -1176,7 +1177,11 @@ static dsv4_parallel_result run_dsv4_shared_prefix(
             GGML_ASSERT(dsv4_aggregate_source_bytes(*dsv4_memory, owner_a_after) == aggregate_source_before);
             GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 0) == aggregate_pos_a_before);
             GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 1) == aggregate_pos_b_before);
-            GGML_ASSERT(dsv4_logits_ith(test, n_prompt - 1) == aggregate_logits_before);
+            std::vector<float> aggregate_logits_after;
+            aggregate_logits_after.reserve(aggregate_logits_before.size());
+            test.append_logits(0, aggregate_logits_after);
+            test.append_logits(1, aggregate_logits_after);
+            GGML_ASSERT(aggregate_logits_after == aggregate_logits_before);
 
             graph_nodes = 0;
             test.decode("shared-prefix aggregate COW pressure retry");
