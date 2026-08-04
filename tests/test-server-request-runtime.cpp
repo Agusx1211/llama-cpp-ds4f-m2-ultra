@@ -214,6 +214,299 @@ void test_dispatch_permits_cover_selection_defer_and_caps() {
             "physical permits are claimed at selection, before binding");
 }
 
+void test_bounded_same_fast_cohort_refill() {
+    runtime_config config;
+    config.fast_refill_max_members_per_epoch = 4;
+    config.fast_refill_window_us              = 1000;
+    request_runtime runtime(config);
+
+    require(runtime.admit(make_request(1, lane::low, 1)), "admit long low refill anchor");
+    require(runtime.take_next(10, 2).request_id == 1 && runtime.bind_slot(1, 0, 11),
+            "bind long low refill anchor");
+    for (uint64_t id = 2; id <= 6; ++id) {
+        require(runtime.admit(make_request(id, lane::fast, id)), "admit ordered fast refill member");
+    }
+
+    for (uint64_t id = 2; id <= 5; ++id) {
+        const uint64_t        at_us    = 20 + id;
+        const dispatch_result selected = runtime.take_next(at_us, 2);
+        require(selected.selected && selected.request_id == id && selected.lane == lane::fast,
+                "bounded refill preserves fast FIFO order");
+        require(runtime.bind_slot(id, 1, at_us + 1) && runtime.permits().total == 2,
+                "refilled fast work preserves the total width-two ceiling");
+        require(runtime.release_slot(id, 1, at_us + 2) && runtime.permits().total == 1,
+                "sequential fast completion returns only its reusable permit");
+    }
+    require(!runtime.take_next(100, 2).selected && runtime.contains(1) && runtime.contains(6),
+            "fifth fast member cannot exceed the four-member epoch budget");
+    require(runtime.cancel(6, 101) && runtime.release_slot(1, 0, 102) && runtime.permits().total == 0 &&
+                runtime.summary().active_requests == 0,
+            "exhausted refill epoch cancels and drains without permit leaks");
+
+    request_runtime ordinary(config);
+    for (uint64_t id = 11; id <= 13; ++id) {
+        require(ordinary.admit(make_request(id, lane::normal, id)), "admit ordinary non-refill request");
+    }
+    require(ordinary.take_next(110, 2).request_id == 11 && ordinary.bind_slot(11, 0, 111) &&
+                ordinary.take_next(112, 2).request_id == 12 && ordinary.bind_slot(12, 1, 113) &&
+                ordinary.release_slot(11, 0, 114) && !ordinary.take_next(115, 2).selected,
+            "fast refill opt-in does not reopen an ordinary closed cohort");
+    require(ordinary.release_slot(12, 1, 116) && ordinary.cancel(13, 117) &&
+                ordinary.permits().total == 0 && ordinary.summary().active_requests == 0,
+            "ordinary closed cohort drains without leaks");
+}
+
+void test_fast_refill_window_and_terminal_boundaries() {
+    runtime_config config;
+    config.fast_refill_max_members_per_epoch = 6;
+    config.fast_refill_window_us              = 1000;
+    request_runtime runtime(config);
+
+    require(runtime.admit(make_request(1, lane::low, 1)) && runtime.take_next(2, 2).request_id == 1 &&
+                runtime.bind_slot(1, 0, 3),
+            "bind refill-window low anchor");
+    for (uint64_t id = 2; id <= 4; ++id) {
+        require(runtime.admit(make_request(id, lane::fast, id)), "admit refill-window fast request");
+    }
+    require(runtime.take_next(10, 2).request_id == 2 && runtime.bind_slot(2, 1, 11) &&
+                runtime.release_slot(2, 1, 12),
+            "first fast member starts the refill window");
+    require(runtime.take_next(1009, 2).request_id == 3 && runtime.bind_slot(3, 1, 1009) &&
+                runtime.release_slot(3, 1, 1009),
+            "same-fast refill remains eligible immediately before its wall-time limit");
+    require(!runtime.take_next(1010, 2).selected,
+            "same-fast refill closes at the exact wall-time limit");
+    require(runtime.cancel(4, 1011) && runtime.release_slot(1, 0, 1012) && runtime.permits().total == 0,
+            "wall-time exhaustion retires without permit leaks");
+
+    runtime_config open_config;
+    open_config.scheduler.lanes[static_cast<size_t>(lane::fast)].decode_cap = 8;
+    open_config.fast_refill_max_members_per_epoch                           = 6;
+    open_config.fast_refill_window_us                                      = 1000;
+    request_runtime open(open_config);
+    for (uint64_t id = 21; id <= 23; ++id) {
+        require(open.admit(make_request(id, lane::fast, id)), "admit open-window fast member");
+    }
+    require(open.take_next(10, 8).request_id == 21 && open.take_next(1009, 8).request_id == 22 &&
+                !open.take_next(1010, 8).selected && open.permits().total == 2,
+            "open initial fast fill also closes at the exact refill-window boundary");
+    for (uint64_t id = 21; id <= 23; ++id) {
+        require(open.cancel(id, 1011), "clean open-window fast member");
+    }
+    require(open.permits().total == 0 && open.summary().active_requests == 0,
+            "open-window boundary fixture leaves no permits");
+
+    runtime_config terminal_config;
+    terminal_config.default_queue_timeout_us          = 50;
+    terminal_config.fast_refill_max_members_per_epoch = 4;
+    terminal_config.fast_refill_window_us              = 1000;
+    request_runtime terminal(terminal_config);
+    require(terminal.admit(make_request(11, lane::low, 100)) && terminal.take_next(100, 2).request_id == 11 &&
+                terminal.bind_slot(11, 0, 101),
+            "bind terminal-boundary low anchor");
+    require(terminal.admit(make_request(12, lane::fast, 101)) &&
+                terminal.admit(make_request(13, lane::fast, 101)) &&
+                terminal.admit(make_request(14, lane::fast, 104)) &&
+                terminal.admit(make_request(15, lane::fast, 150)),
+            "admit terminal-boundary fast requests");
+    require(terminal.take_next(102, 2).request_id == 12 && terminal.bind_slot(12, 1, 103),
+            "bind cancellable first fast member");
+    require(terminal.cancel(12, 104) && terminal.permits().total == 2 &&
+                terminal.release_slot(12, 1, 105) && terminal.permits().total == 1,
+            "bound cancellation keeps then releases exactly one fast permit");
+    require(terminal.take_next(106, 2).request_id == 13 && terminal.bind_slot(13, 1, 107) &&
+                terminal.release_slot(13, 1, 108),
+            "cancellation opens one bounded refill opportunity");
+    const auto expired = terminal.expire_due(154);
+    require(expired.size() == 1 && expired.front().request_id == 14 &&
+                expired.front().kind == deadline_kind::queue,
+            "queued refill candidate expires at its original-arrival deadline");
+    require(terminal.take_next(155, 2).request_id == 15 && terminal.bind_slot(15, 1, 156),
+            "timed-out candidate does not leak a permit or consume the epoch member budget");
+    require(terminal.cancel(15, 157) && terminal.release_slot(15, 1, 158) &&
+                terminal.release_slot(11, 0, 159) && terminal.permits().total == 0 &&
+                terminal.summary().active_requests == 0,
+            "timeout and cancellation boundaries leave no refill permits or requests");
+}
+
+void test_fast_member_budget_covers_initial_fill_and_upgrade() {
+    runtime_config config;
+    config.scheduler.lanes[static_cast<size_t>(lane::fast)].decode_cap = 8;
+    config.fast_refill_max_members_per_epoch                           = 3;
+    config.fast_refill_window_us                                      = 1000;
+
+    request_runtime initial(config);
+    for (uint64_t id = 1; id <= 4; ++id) {
+        require(initial.admit(make_request(id, lane::fast, id)), "admit wide initial fast member");
+    }
+    require(initial.take_next(10, 8).request_id == 1 && initial.take_next(11, 8).request_id == 2 &&
+                initial.take_next(12, 8).request_id == 3 && !initial.take_next(13, 8).selected &&
+                initial.permits().total == 3,
+            "configured member budget bounds the open initial fast fill below decode cap");
+    for (uint64_t id = 1; id <= 4; ++id) {
+        require(initial.cancel(id, 14), "clean bounded initial fast member");
+    }
+    require(initial.permits().total == 0 && initial.summary().active_requests == 0,
+            "initial-fill budget fixture leaves no permits");
+
+    request_runtime upgraded(config);
+    require(upgraded.admit(make_request(11, lane::low, 20)) && upgraded.take_next(20, 8).request_id == 11 &&
+                upgraded.bind_slot(11, 0, 21),
+            "bind low member before wide fast upgrade");
+    for (uint64_t id = 12; id <= 15; ++id) {
+        require(upgraded.admit(make_request(id, lane::fast, id)), "admit wide fast upgrade member");
+    }
+    require(upgraded.take_next(30, 8).request_id == 12 && upgraded.take_next(31, 8).request_id == 13 &&
+                upgraded.take_next(32, 8).request_id == 14 && !upgraded.take_next(33, 8).selected &&
+                upgraded.permits().claimed[static_cast<size_t>(lane::fast)] == 3,
+            "configured member budget bounds a low-to-fast upgrade below decode cap");
+    for (uint64_t id = 12; id <= 15; ++id) {
+        require(upgraded.cancel(id, 34), "clean bounded upgrade fast member");
+    }
+    require(upgraded.release_slot(11, 0, 35) && upgraded.permits().total == 0 &&
+                upgraded.summary().active_requests == 0,
+            "upgrade budget fixture leaves no permits");
+
+    request_runtime families(config);
+    std::array<size_t, lane_count> mixed = {};
+    mixed[static_cast<size_t>(lane::normal)] = 1;
+    mixed[static_cast<size_t>(lane::fast)]   = 1;
+    const auto mixed_validation = families.validate_dispatch_family(lane::normal, mixed, 8);
+    require(!mixed_validation && mixed_validation.code == server_request_runtime::result_code::invalid_request,
+            "mixed-lane family is rejected before it can start a fast window");
+    std::array<size_t, lane_count> oversized_fast = {};
+    oversized_fast[static_cast<size_t>(lane::fast)] = 4;
+    require(families.validate_dispatch_family(lane::fast, oversized_fast, 8).code ==
+                server_request_runtime::result_code::capacity_impossible,
+            "fast family wider than the total member budget is rejected");
+    require(families.admit(make_request(21, lane::normal, 40)), "admit direct-runtime family parent");
+    request_metadata mixed_child = make_request(22, lane::fast, 40);
+    mixed_child.parent_id         = 21;
+    require(families.admit(mixed_child, false).code == server_request_runtime::result_code::invalid_request &&
+                families.cancel(21, 41) && families.summary().active_requests == 0,
+            "direct-runtime mixed-lane child is rejected without durable residue");
+
+    request_runtime sealed(config);
+    require(sealed.admit(make_request(31, lane::fast, 50)) && sealed.take_next(51, 8).request_id == 31 &&
+                sealed.mark_deferred(31, 52),
+            "select and defer fast parent before late family admission");
+    request_metadata late_child = make_request(32, lane::fast, 50);
+    late_child.parent_id         = 31;
+    require(sealed.admit(late_child, false).code == server_request_runtime::result_code::invalid_request &&
+                !sealed.contains(32) && sealed.summary().active_requests == 1,
+            "late same-fast child is rejected after parent family membership seals");
+    require(sealed.resume(31, 53) && sealed.cancel(31, 54) && sealed.permits().total == 0 &&
+                sealed.summary().active_requests == 0,
+            "sealed late-child fixture resumes and cancels without residue");
+
+    request_runtime disabled;
+    const auto disabled_mixed = disabled.validate_dispatch_family(lane::normal, mixed, 2);
+    require(disabled_mixed, "default-off runtime preserves prior mixed-family validation");
+    require(disabled.admit(make_request(41, lane::normal, 60)), "admit default-off mixed parent");
+    request_metadata default_mixed_child = make_request(42, lane::fast, 60);
+    default_mixed_child.parent_id         = 41;
+    require(disabled.admit(default_mixed_child, false) && disabled.take_next(61, 2).request_id == 41 &&
+                disabled.permits().total == 2 && disabled.bind_slot(41, 0, 62) &&
+                disabled.bind_slot(42, 1, 62) && disabled.release_slot(42, 1, 63) &&
+                disabled.release_slot(41, 0, 63) && disabled.summary().active_requests == 0,
+            "default-off runtime preserves dispatch and cleanup of an accepted mixed family");
+
+    request_runtime default_late;
+    require(default_late.admit(make_request(51, lane::fast, 70)) &&
+                default_late.take_next(71, 2).request_id == 51 && default_late.mark_deferred(51, 72),
+            "defer default-off parent before prior-compatible late child admission");
+    request_metadata default_late_child = make_request(52, lane::fast, 70);
+    default_late_child.parent_id         = 51;
+    require(default_late.admit(default_late_child, false) && default_late.resume(51, 73) &&
+                default_late.take_next(74, 2).request_id == 51 && default_late.bind_slot(51, 0, 75) &&
+                default_late.bind_slot(52, 1, 75) && default_late.release_slot(52, 1, 76) &&
+                default_late.release_slot(51, 0, 76) && default_late.summary().active_requests == 0,
+            "default-off runtime preserves late same-lane family membership behavior");
+
+    request_runtime epochs(config);
+    require(epochs.admit(make_request(61, lane::low, 100)) && epochs.take_next(100, 8).request_id == 61 &&
+                epochs.bind_slot(61, 0, 101),
+            "bind family-budget low anchor");
+    require(epochs.admit(make_request(62, lane::fast, 102)), "admit homogeneous fast family parent");
+    request_metadata homogeneous_child = make_request(63, lane::fast, 102);
+    homogeneous_child.parent_id         = 62;
+    require(epochs.admit(homogeneous_child, false) && epochs.admit(make_request(64, lane::fast, 103)) &&
+                epochs.admit(make_request(65, lane::fast, 104)),
+            "admit homogeneous family and two independent fast members");
+    require(epochs.take_next(110, 8).request_id == 62 && epochs.permits().total == 3 &&
+                epochs.bind_slot(62, 1, 111) && epochs.bind_slot(63, 2, 111) &&
+                epochs.release_slot(63, 2, 112) && epochs.release_slot(62, 1, 112),
+            "homogeneous two-member family consumes two cumulative fast members");
+    require(epochs.take_next(113, 8).request_id == 64 && epochs.fail(64, 114) &&
+                !epochs.take_next(115, 8).selected,
+            "only one independent fast member remains in the max-three epoch budget");
+    require(epochs.cancel(65, 116) && epochs.release_slot(61, 0, 117) && epochs.permits().total == 0,
+            "final anchored permit drain closes the family-budget epoch");
+
+    for (uint64_t id = 71; id <= 74; ++id) {
+        require(epochs.admit(make_request(id, lane::fast, 5000)), "admit fresh-epoch fast member");
+    }
+    require(epochs.take_next(5000, 8).request_id == 71 && epochs.take_next(5001, 8).request_id == 72 &&
+                epochs.take_next(5002, 8).request_id == 73 && !epochs.take_next(5003, 8).selected &&
+                epochs.permits().total == 3,
+            "full permit drain resets the cumulative budget and starts a fresh refill window");
+    for (uint64_t id = 71; id <= 74; ++id) {
+        require(epochs.cancel(id, 5004), "clean fresh-epoch fast member");
+    }
+    require(epochs.permits().total == 0 && epochs.summary().active_requests == 0,
+            "fresh epoch fixture drains without residue");
+}
+
+void test_fast_refill_reentry_and_unbound_terminal_budget() {
+    runtime_config config;
+    config.fast_refill_max_members_per_epoch = 3;
+    config.fast_refill_window_us              = 1000;
+
+    request_runtime reentry(config);
+    require(reentry.admit(make_request(1, lane::low, 1)) && reentry.take_next(2, 2).request_id == 1 &&
+                reentry.bind_slot(1, 0, 3),
+            "bind reentry low anchor");
+    require(reentry.admit(make_request(2, lane::fast, 2)) && reentry.admit(make_request(3, lane::fast, 3)) &&
+                reentry.take_next(10, 2).request_id == 2 && reentry.mark_deferred(2, 11),
+            "select and defer first fast epoch member");
+    require(reentry.resume(2, 1010) && reentry.take_next(1010, 2).request_id == 2 &&
+                reentry.bind_slot(2, 1, 1011) && reentry.release_slot(2, 1, 1012),
+            "permit reentry survives the exact refill-window boundary without a new claim");
+    require(!reentry.take_next(1013, 2).selected,
+            "genuinely new fast work remains blocked after the reentry window expires");
+    require(reentry.cancel(3, 1014) && reentry.release_slot(1, 0, 1015) && reentry.permits().total == 0 &&
+                reentry.summary().active_requests == 0,
+            "expired-window reentry fixture drains without leaks");
+
+    request_runtime terminal(config);
+    require(terminal.admit(make_request(11, lane::low, 100)) && terminal.take_next(100, 2).request_id == 11 &&
+                terminal.bind_slot(11, 0, 100),
+            "bind unbound-terminal low anchor");
+    request_metadata expiring = make_request(12, lane::fast, 100);
+    expiring.queue_timeout_us  = 5;
+    require(terminal.admit(expiring), "admit expiring selected-unbound fast member");
+    for (uint64_t id = 13; id <= 15; ++id) {
+        request_metadata fast = make_request(id, lane::fast, 101);
+        fast.queue_timeout_us  = std::numeric_limits<uint64_t>::max();
+        require(terminal.admit(fast), "admit persistent unbound-terminal fast member");
+    }
+    require(terminal.take_next(101, 2).request_id == 12 && terminal.permits().total == 2,
+            "claim expiring selected-unbound fast permit");
+    const auto expired = terminal.expire_due(105);
+    require(expired.size() == 1 && expired.front().request_id == 12 && !expired.front().was_running &&
+                terminal.permits().total == 1,
+            "selected-unbound expiry releases its live permit");
+    require(terminal.take_next(106, 2).request_id == 13 && terminal.fail(13, 107) &&
+                terminal.permits().total == 1 && terminal.take_next(108, 2).request_id == 14 &&
+                terminal.fail(14, 109) && terminal.permits().total == 1,
+            "selected-unbound failures release their live permits");
+    require(!terminal.take_next(110, 2).selected,
+            "expiry and failure do not refund the cumulative fast member budget");
+    require(terminal.cancel(15, 111) && terminal.release_slot(11, 0, 112) && terminal.permits().total == 0 &&
+                terminal.summary().active_requests == 0,
+            "unbound-terminal budget fixture drains without leaks");
+}
+
 void test_profiled_exclusive_low_widths() {
     for (const auto & fixture : std::vector<std::pair<size_t, size_t>>({
              { 20, 8  },
@@ -428,6 +721,10 @@ int main() {
         { "cancel while bound",         test_cancel_while_bound                },
         { "passive child binding",      test_passive_child_binding             },
         { "dispatch permit lifecycle",  test_dispatch_permits_cover_selection_defer_and_caps },
+        { "bounded fast refill",        test_bounded_same_fast_cohort_refill                  },
+        { "fast refill boundaries",     test_fast_refill_window_and_terminal_boundaries       },
+        { "fast refill total budget",   test_fast_member_budget_covers_initial_fill_and_upgrade },
+        { "fast refill reentry",        test_fast_refill_reentry_and_unbound_terminal_budget    },
         { "profiled low widths",        test_profiled_exclusive_low_widths                   },
         { "queue deadlines",            test_queue_deadlines_and_exact_capacity_reuse  },
         { "run deadline races",         test_run_deadline_and_first_terminal_wins      },

@@ -4,10 +4,13 @@
 #include "log.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
+#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <optional>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -27,11 +30,70 @@
 
 namespace {
 
+constexpr const char * fast_refill_members_environment =
+    "LLAMA_SERVER_TRUSTED_FAST_REFILL_MAX_MEMBERS";
+constexpr const char * fast_refill_window_environment =
+    "LLAMA_SERVER_TRUSTED_FAST_REFILL_WINDOW_MS";
+
+bool parse_bounded_decimal(const char * value, uint64_t minimum, uint64_t maximum, uint64_t & parsed) {
+    if (value == nullptr) {
+        return false;
+    }
+    const std::string_view text(value);
+    if (text.empty()) {
+        return false;
+    }
+    uint64_t next = 0;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), next);
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || next < minimum || next > maximum) {
+        return false;
+    }
+    parsed = next;
+    return true;
+}
+
 server_request_runtime::runtime_config live_runtime_config() {
     server_request_runtime::runtime_config config;
     // Live admission must preserve the server's existing context validation
     // until the allocator supplies a full prompt-plus-runway quote.
     config.scheduler.context_tokens = std::numeric_limits<uint64_t>::max();
+
+    const char * members_value = std::getenv(fast_refill_members_environment);
+    const char * window_value  = std::getenv(fast_refill_window_environment);
+    if (members_value == nullptr && window_value == nullptr) {
+        return config;
+    }
+    if (members_value == nullptr || window_value == nullptr) {
+        QUE_WRN("trusted fast refill disabled: set both %s and %s\n",
+                fast_refill_members_environment, fast_refill_window_environment);
+        return config;
+    }
+
+    uint64_t members   = 0;
+    uint64_t window_ms = 0;
+    const bool valid_members = parse_bounded_decimal(
+        members_value, server_request_runtime::runtime_config::fast_refill_min_members,
+        server_request_runtime::runtime_config::fast_refill_max_members, members);
+    const bool valid_window = parse_bounded_decimal(
+        window_value, server_request_runtime::runtime_config::fast_refill_min_window_us / 1000,
+        server_request_runtime::runtime_config::fast_refill_max_window_us / 1000, window_ms);
+    if (!valid_members || !valid_window) {
+        QUE_WRN("trusted fast refill disabled: %s must be [%zu, %zu] and %s must be [%llu, %llu] ms\n",
+                fast_refill_members_environment,
+                server_request_runtime::runtime_config::fast_refill_min_members,
+                server_request_runtime::runtime_config::fast_refill_max_members,
+                fast_refill_window_environment,
+                static_cast<unsigned long long>(
+                    server_request_runtime::runtime_config::fast_refill_min_window_us / 1000),
+                static_cast<unsigned long long>(
+                    server_request_runtime::runtime_config::fast_refill_max_window_us / 1000));
+        return config;
+    }
+
+    config.fast_refill_max_members_per_epoch = static_cast<size_t>(members);
+    config.fast_refill_window_us              = window_ms * 1000;
+    QUE_INF("trusted fast refill enabled: at most %zu fast members within %llu ms per cohort\n",
+            config.fast_refill_max_members_per_epoch, static_cast<unsigned long long>(window_ms));
     return config;
 }
 

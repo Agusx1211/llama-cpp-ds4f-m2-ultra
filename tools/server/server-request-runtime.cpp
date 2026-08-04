@@ -96,7 +96,31 @@ request_runtime::request_runtime(runtime_config config) :
                                                                     config.default_queue_timeout_us),
     default_run_timeout_us(config.default_run_timeout_us == 0 ? runtime_config::run_timeout_default_us :
                                                                 config.default_run_timeout_us),
-    overload_retry_after_seconds(bounded_retry_after(config.overload_retry_after_seconds)) {}
+    overload_retry_after_seconds(bounded_retry_after(config.overload_retry_after_seconds)) {
+    const bool valid_fast_refill =
+        config.fast_refill_max_members_per_epoch >= runtime_config::fast_refill_min_members &&
+        config.fast_refill_max_members_per_epoch <= runtime_config::fast_refill_max_members &&
+        config.fast_refill_window_us >= runtime_config::fast_refill_min_window_us &&
+        config.fast_refill_window_us <= runtime_config::fast_refill_max_window_us;
+    if (valid_fast_refill) {
+        fast_refill_max_members_per_epoch = config.fast_refill_max_members_per_epoch;
+        fast_refill_window_us              = config.fast_refill_window_us;
+    }
+}
+
+bool request_runtime::fast_refill_enabled() const {
+    return fast_refill_max_members_per_epoch != 0;
+}
+
+bool request_runtime::fast_claim_within_epoch(size_t members, uint64_t now_us) const {
+    if (!fast_refill_enabled() || members == 0) {
+        return true;
+    }
+    const size_t prior_members = cohort.active ? cohort.fast_members : 0;
+    return prior_members < fast_refill_max_members_per_epoch &&
+           members <= fast_refill_max_members_per_epoch - prior_members &&
+           (prior_members == 0 || now_us < cohort.fast_refill_deadline_us);
+}
 
 admission_result request_runtime::validate_dispatch_family(
         lane priority,
@@ -108,6 +132,9 @@ admission_result request_runtime::validate_dispatch_family(
 
     size_t total = 0;
     for (size_t i = 0; i < lane_count; ++i) {
+        if (fast_refill_enabled() && i != lane_index(priority) && demand[i] != 0) {
+            return { result_code::invalid_request, server_scheduler::reason_code::reject_invalid_request };
+        }
         const size_t cap = scheduler.config().lanes[i].decode_cap;
         if (demand[i] > cap) {
             return { result_code::capacity_impossible,
@@ -119,6 +146,10 @@ admission_result request_runtime::validate_dispatch_family(
     if (total == 0 || total > cohort_cap || total > physical_slot_capacity) {
         return { result_code::capacity_impossible, server_scheduler::reason_code::reject_capacity_impossible };
     }
+    if (priority == lane::fast && fast_refill_max_members_per_epoch != 0 &&
+        total > fast_refill_max_members_per_epoch) {
+        return { result_code::capacity_impossible, server_scheduler::reason_code::reject_capacity_impossible };
+    }
     if (priority == lane::low && scheduler.choose_decode_width(lane::low, total, total, false).width < total) {
         return { result_code::capacity_impossible, server_scheduler::reason_code::reject_capacity_impossible };
     }
@@ -127,7 +158,13 @@ admission_result request_runtime::validate_dispatch_family(
 
 admission_result request_runtime::admit(const request_metadata & request, bool scheduled) {
     const bool duplicate = records.count(request.id) != 0;
-    if (request.id == 0 || duplicate || to_registry_lane(request.lane) == trusted_lane::count) {
+    const auto parent = request.parent_id == 0 ? records.end() : records.find(request.parent_id);
+    const bool invalid_parent = fast_refill_enabled() && request.parent_id != 0 &&
+        (parent == records.end() || parent->second.metadata.parent_id != 0 ||
+         parent->second.metadata.lane != request.lane || parent->second.terminal != lifecycle::completed ||
+         !parent->second.scheduler_queued || parent->second.permit != record::permit_state::none ||
+         !parent->second.bindings.empty());
+    if (request.id == 0 || duplicate || invalid_parent || to_registry_lane(request.lane) == trusted_lane::count) {
         return { duplicate ? result_code::duplicate_request : result_code::invalid_request,
                  duplicate ? server_scheduler::reason_code::reject_duplicate_id :
                              server_scheduler::reason_code::reject_invalid_request };
@@ -257,7 +294,7 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
     const bool has_cohort = cohort.active;
     lane       eligible_lane = cohort.dominant;
     size_t     eligible_limit = cohort.limit;
-    bool       upgrading        = false;
+    bool       upgrading         = false;
     bool       allow_new_members = !has_cohort || cohort.open;
     if (has_cohort) {
         const bool permit_reentry = std::any_of(records.begin(), records.end(), [](const auto & entry) {
@@ -285,11 +322,17 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
                 allow_new_members = true;
             }
         } else if (!allow_new_members && !permit_reentry) {
-            return {};
+            const bool can_refill_fast = fast_refill_enabled() && cohort.dominant == lane::fast &&
+                                         scheduler.queued(lane::fast) != 0 && permit_counts.total < cohort.limit &&
+                                         fast_claim_within_epoch(1, now_us);
+            if (!can_refill_fast) {
+                return {};
+            }
+            allow_new_members = true;
         }
     }
 
-    const auto evaluate = [this, physical_slot_capacity, has_cohort, eligible_lane, eligible_limit,
+    const auto evaluate = [this, now_us, physical_slot_capacity, has_cohort, eligible_lane, eligible_limit,
                            allow_new_members, &cohort_limit_for, &demand_for](const server_scheduler::request & request) {
         candidate_evaluation result;
         const auto           it = records.find(request.id);
@@ -305,7 +348,21 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
                 result.restore_cost_us  = it->second.metadata.estimates.predicted_cache_restore_us;
             }
 
-            const permit_demand demand = demand_for(request.id);
+            const permit_demand demand      = demand_for(request.id);
+            const size_t        fast_demand = demand.lanes[lane_index(lane::fast)];
+            bool mixed_lane_family = false;
+            for (size_t i = 0; i < lane_count; ++i) {
+                mixed_lane_family = mixed_lane_family ||
+                    (i != lane_index(request.priority) && demand.lanes[i] != 0);
+            }
+            if (fast_refill_enabled() && mixed_lane_family) {
+                result.state = feasibility::impossible;
+                return result;
+            }
+            if (!owns_permit && !fast_claim_within_epoch(fast_demand, now_us)) {
+                result.state = feasibility::temporarily_blocked;
+                return result;
+            }
             if (demand.total > physical_slot_capacity || permit_counts.total > physical_slot_capacity - demand.total) {
                 result.state = feasibility::temporarily_blocked;
                 return result;
@@ -368,11 +425,24 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
         throw std::logic_error("scheduler selected work beyond dominant lane cohort limit");
     }
     if (!has_cohort) {
-        cohort = { true, true, decision.selected_lane, selected_cohort_limit };
+        cohort = { true, true, decision.selected_lane, selected_cohort_limit, 0, 0 };
     } else if (upgrading && claims_new_permit) {
         cohort.dominant = decision.selected_lane;
         cohort.limit    = selected_cohort_limit;
         cohort.open     = true;
+    }
+    const size_t selected_fast_members = selected_demand.lanes[lane_index(lane::fast)];
+    if (fast_refill_enabled() && claims_new_permit && selected_fast_members != 0) {
+        if (decision.selected_lane != lane::fast) {
+            throw std::logic_error("scheduler selected a mixed-lane dispatch family");
+        }
+        if (!fast_claim_within_epoch(selected_fast_members, now_us)) {
+            throw std::logic_error("scheduler selected fast refill beyond epoch member limit");
+        }
+        if (cohort.fast_members == 0) {
+            cohort.fast_refill_deadline_us = saturating_add(now_us, fast_refill_window_us);
+        }
+        cohort.fast_members += selected_fast_members;
     }
     for (auto & entry : records) {
         record & current = entry.second;

@@ -95,14 +95,23 @@ struct dispatch_result {
 };
 
 struct runtime_config {
-    static constexpr uint64_t queue_timeout_default_us = 30ULL * 1000 * 1000;
-    static constexpr uint64_t run_timeout_default_us   = 10ULL * 60 * 1000 * 1000;
+    static constexpr uint64_t queue_timeout_default_us  = 30ULL * 1000 * 1000;
+    static constexpr uint64_t run_timeout_default_us    = 10ULL * 60 * 1000 * 1000;
+    static constexpr size_t   fast_refill_min_members   = 3;
+    static constexpr size_t   fast_refill_max_members   = 16;
+    static constexpr uint64_t fast_refill_min_window_us = 1000;
+    static constexpr uint64_t fast_refill_max_window_us = 30ULL * 1000 * 1000;
 
     server_scheduler::scheduler_config       scheduler;
     server_request_registry::registry_config registry;
     uint64_t                                 default_queue_timeout_us     = queue_timeout_default_us;
     uint64_t                                 default_run_timeout_us       = run_timeout_default_us;
     uint32_t                                 overload_retry_after_seconds = 1;
+    // Both fields must be in range to opt into bounded same-fast-lane refill.
+    // The member limit counts every fast permit first claimed in one cohort,
+    // while the window starts when that cohort first becomes fast-dominant.
+    size_t                                   fast_refill_max_members_per_epoch = 0;
+    uint64_t                                 fast_refill_window_us              = 0;
 };
 
 bool is_overload(result_code code);
@@ -168,14 +177,18 @@ class request_runtime {
         permit_state                                        permit            = permit_state::none;
     };
 
-    // A cohort closes after its initial fill opportunity and stays closed
-    // across staggered releases. It resets only after every permit drains;
-    // each higher lane may reopen it once as a bounded priority upgrade.
+    // A cohort normally closes after its initial fill opportunity and stays
+    // closed across staggered releases. An explicitly configured fast epoch
+    // may refill only its fast member within the bounded member/time budget.
+    // Every cohort resets after all permits drain, and each higher lane may
+    // otherwise reopen it once as a bounded priority upgrade.
     struct cohort_epoch {
-        bool                   active   = false;
-        bool                   open     = false;
-        server_scheduler::lane dominant = server_scheduler::lane::low;
-        size_t                 limit    = 0;
+        bool                   active                  = false;
+        bool                   open                    = false;
+        server_scheduler::lane dominant                = server_scheduler::lane::low;
+        size_t                 limit                   = 0;
+        size_t                 fast_members            = 0;
+        uint64_t               fast_refill_deadline_us = 0;
     };
 
     admission_result enqueue(record & request, uint64_t at_us);
@@ -192,6 +205,8 @@ class request_runtime {
     bool                  fail_one(uint64_t request_id, uint64_t at_us);
     std::vector<uint64_t> terminal_targets(uint64_t request_id) const;
     void                  release_permit(record & request);
+    bool                  fast_refill_enabled() const;
+    bool                  fast_claim_within_epoch(size_t members, uint64_t now_us) const;
 
     server_scheduler::scheduler               scheduler;
     server_request_registry::request_registry registry;
@@ -199,6 +214,8 @@ class request_runtime {
     uint64_t                                  default_queue_timeout_us;
     uint64_t                                  default_run_timeout_us;
     uint32_t                                  overload_retry_after_seconds;
+    size_t                                    fast_refill_max_members_per_epoch = 0;
+    uint64_t                                  fast_refill_window_us              = 0;
     dispatch_permit_snapshot                  permit_counts;
     cohort_epoch                              cohort;
 };

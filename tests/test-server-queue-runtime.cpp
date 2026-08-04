@@ -8,10 +8,12 @@
 #include <array>
 
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdio>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
@@ -29,6 +31,30 @@ void require(bool condition, const char * message) {
 void require_posted(const server_queue_post_result & result, int task_id, const char * message) {
     require(result && result.task_id == task_id, message);
 }
+
+struct scoped_environment {
+    explicit scoped_environment(const char * name) : name(name) {
+        const char * value = std::getenv(name);
+        if (value != nullptr) {
+            had_value = true;
+            prior     = value;
+        }
+    }
+
+    ~scoped_environment() {
+        const int result = had_value ? ::setenv(name.c_str(), prior.c_str(), 1) : ::unsetenv(name.c_str());
+        (void) result;
+    }
+
+    void assign(const char * value) {
+        const int result = value == nullptr ? ::unsetenv(name.c_str()) : ::setenv(name.c_str(), value, 1);
+        require(result == 0, "set test environment");
+    }
+
+    std::string name;
+    std::string prior;
+    bool        had_value = false;
+};
 
 server_request_runtime::runtime_config test_runtime_config() {
     server_request_runtime::runtime_config config;
@@ -2206,6 +2232,185 @@ void test_staggered_cohorts_drain_before_same_lane_refill() {
             "staggered cohort fixture drains and cancels without permit leaks");
 }
 
+void test_bounded_fast_refill_reuses_one_live_slot() {
+    auto config = test_runtime_config();
+    config.fast_refill_max_members_per_epoch = 4;
+    config.fast_refill_window_us              = 1000;
+    uint64_t     now_us = 100;
+    server_queue queue(config, [&] { return now_us; });
+    queue.set_physical_slot_capacity(2);
+
+    server_task low    = make_user(queue, server_task::trusted_lane::low, now_us);
+    const int   low_id = low.id;
+    require_posted(queue.post(std::move(low)), low_id, "post refill low anchor");
+
+    std::vector<int> fast_ids;
+    std::vector<int> fast_order;
+    std::unordered_set<int> queued_fast;
+    queue.on_new_task([&](server_task && selected) {
+        require(selected.type == SERVER_TASK_TYPE_COMPLETION, "refill fixture dispatches only user work");
+        if (selected.id == low_id) {
+            require(queue.bind_slot(selected.id, 0), "bind refill low anchor");
+            for (int i = 0; i < 5; ++i) {
+                server_task fast = make_user(queue, server_task::trusted_lane::fast, now_us + i + 1);
+                fast_ids.push_back(fast.id);
+                queued_fast.insert(fast.id);
+                require_posted(queue.post(std::move(fast)), fast_ids.back(), "post sequential fast refill work");
+            }
+            return;
+        }
+
+        require(queued_fast.erase(selected.id) == 1 && queue.bind_slot(selected.id, 1),
+                "bind the unique reusable fast slot");
+        fast_order.push_back(selected.id);
+        require(queue.dispatch_permits().total == 2 && queue.release_slot(selected.id, 1),
+                "fast refill never widens beyond low plus one fast permit");
+        now_us += 10;
+    });
+    queue.on_update_slots([&] {
+        require(fast_order == std::vector<int>(fast_ids.begin(), fast_ids.begin() + 4) &&
+                    queued_fast == std::unordered_set<int>({ fast_ids.back() }) &&
+                    queue.dispatch_permits().total == 1 && queue.request_summary().active_requests == 2,
+                "four-member refill is FIFO and closes at exact epoch exhaustion");
+        server_task cancel(SERVER_TASK_TYPE_CANCEL);
+        cancel.id        = queue.get_new_id();
+        cancel.id_target = fast_ids.back();
+        require(queue.post(std::move(cancel), true) && queue.release_slot(low_id, 0) &&
+                    queue.dispatch_permits().total == 0 && queue.request_summary().active_requests == 0,
+                "exhausted live refill fixture cancels and releases without leaks");
+        queue.terminate();
+    });
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+}
+
+void test_fast_refill_timeout_and_cancel_boundaries() {
+    auto config = test_runtime_config();
+    config.fast_refill_max_members_per_epoch = 4;
+    config.fast_refill_window_us              = 1000;
+    uint64_t     now_us = 200;
+    server_queue queue(config, [&] { return now_us; });
+    queue.set_physical_slot_capacity(2);
+
+    server_task low    = make_user(queue, server_task::trusted_lane::low, now_us);
+    const int   low_id = low.id;
+    require_posted(queue.post(std::move(low)), low_id, "post terminal-boundary low anchor");
+
+    std::vector<int> fast_ids;
+    std::vector<int> fast_order;
+    std::vector<int> expired_ids;
+    int              terminal_controls = 0;
+    queue.on_request_expired([&](server_queue_expiration event) {
+        require(event.kind == server_request_runtime::deadline_kind::queue,
+                "refill boundary emits a queue timeout");
+        expired_ids.push_back(event.task_id);
+    });
+    queue.on_new_task([&](server_task && selected) {
+        if (selected.type == SERVER_TASK_TYPE_CANCEL) {
+            ++terminal_controls;
+            return;
+        }
+        if (selected.id == low_id) {
+            require(queue.bind_slot(selected.id, 0), "bind terminal-boundary low anchor");
+            for (int i = 0; i < 3; ++i) {
+                server_task fast = make_user(queue, server_task::trusted_lane::fast, now_us);
+                if (i == 1) {
+                    fast.scheduling.queue_timeout_us = 5;
+                }
+                fast_ids.push_back(fast.id);
+                require_posted(queue.post(std::move(fast)), fast_ids.back(), "post terminal-boundary fast work");
+            }
+            return;
+        }
+
+        fast_order.push_back(selected.id);
+        require(queue.bind_slot(selected.id, 1), "bind terminal-boundary fast work");
+        if (selected.id == fast_ids.front()) {
+            server_task cancel(SERVER_TASK_TYPE_CANCEL);
+            cancel.id        = queue.get_new_id();
+            cancel.id_target = selected.id;
+            require(queue.post(std::move(cancel), true), "cancel first fast member while bound");
+            now_us = 205;
+        }
+        require(queue.release_slot(selected.id, 1), "release terminal-boundary fast permit");
+    });
+    queue.on_update_slots([&] {
+        require(fast_order == std::vector<int>({ fast_ids[0], fast_ids[2] }) &&
+                    expired_ids == std::vector<int>({ fast_ids[1] }) && terminal_controls == 1 &&
+                    queue.dispatch_permits().total == 1 && queue.request_summary().active_requests == 1,
+                "exact timeout and bound cancellation preserve the next FIFO-eligible refill");
+        require(queue.release_slot(low_id, 0) && queue.dispatch_permits().total == 0 &&
+                    queue.request_summary().active_requests == 0,
+                "terminal-boundary refill fixture drains without permit leaks");
+        queue.terminate();
+    });
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+}
+
+void test_live_fast_refill_environment_is_atomic_and_bounded() {
+    constexpr const char * members_name = "LLAMA_SERVER_TRUSTED_FAST_REFILL_MAX_MEMBERS";
+    constexpr const char * window_name  = "LLAMA_SERVER_TRUSTED_FAST_REFILL_WINDOW_MS";
+    scoped_environment members_environment(members_name);
+    scoped_environment window_environment(window_name);
+
+    const auto run_fixture = [&](const char * members, const char * window, size_t expected_fast) {
+        members_environment.assign(members);
+        window_environment.assign(window);
+        server_queue queue;
+        queue.set_physical_slot_capacity(2);
+
+        server_task low    = make_user(queue, server_task::trusted_lane::low, 1);
+        const int   low_id = low.id;
+        require_posted(queue.post(std::move(low)), low_id, "post environment refill low anchor");
+
+        std::vector<int>              fast_ids;
+        std::vector<int>              fast_order;
+        std::unordered_set<int>       queued_fast;
+        queue.on_new_task([&](server_task && selected) {
+            if (selected.id == low_id) {
+                require(queue.bind_slot(selected.id, 0), "bind environment refill low anchor");
+                for (int i = 0; i < 2; ++i) {
+                    server_task fast = make_user(queue, server_task::trusted_lane::fast, i + 2);
+                    fast_ids.push_back(fast.id);
+                    queued_fast.insert(fast.id);
+                    require_posted(queue.post(std::move(fast)), fast_ids.back(), "post environment fast work");
+                }
+                return;
+            }
+            require(queued_fast.erase(selected.id) == 1 && queue.bind_slot(selected.id, 1) &&
+                        queue.release_slot(selected.id, 1),
+                    "environment fast member reuses only the free slot");
+            fast_order.push_back(selected.id);
+        });
+        queue.on_update_slots([&] {
+            require(fast_order.size() == expected_fast &&
+                        std::equal(fast_order.begin(), fast_order.end(), fast_ids.begin()),
+                    "environment configuration preserves FIFO and expected refill state");
+            std::vector<server_task> cancellations;
+            for (int id : queued_fast) {
+                server_task cancel(SERVER_TASK_TYPE_CANCEL);
+                cancel.id_target = id;
+                cancellations.push_back(std::move(cancel));
+            }
+            require((cancellations.empty() || queue.post(std::move(cancellations), true)) &&
+                        queue.release_slot(low_id, 0) && queue.dispatch_permits().total == 0 &&
+                        queue.request_summary().active_requests == 0,
+                    "environment refill fixture cleanup");
+            queue.terminate();
+        });
+        queue.on_sleeping_state([](bool) {});
+        queue.start_loop();
+    };
+
+    run_fixture(nullptr, nullptr, 1);
+    run_fixture("3", nullptr, 1);
+    run_fixture("0", "1", 1);
+    run_fixture("17", "30001", 1);
+    run_fixture("three", "1", 1);
+    run_fixture("3", "30000", 2);
+}
+
 void test_live_aging() {
     uint64_t     now_us = 20001;
     server_queue queue(test_runtime_config(), [&] { return now_us; });
@@ -2341,6 +2546,9 @@ int main() {
         { "sustained live HDRR",            test_live_hdrr_under_sustained_mixed_queues             },
         { "sustained wide HDRR cohorts",    test_live_hdrr_starts_sustained_wide_cohorts            },
         { "staggered draining HDRR cohorts", test_staggered_cohorts_drain_before_same_lane_refill   },
+        { "bounded fast cohort refill",      test_bounded_fast_refill_reuses_one_live_slot           },
+        { "fast refill terminal boundaries", test_fast_refill_timeout_and_cancel_boundaries         },
+        { "fast refill environment",         test_live_fast_refill_environment_is_atomic_and_bounded },
         { "live aging",                     test_live_aging                                         },
         { "bound stream timeout",         test_bound_stream_timeout_and_cancel_race     },
     };
