@@ -12,6 +12,15 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <type_traits>
+
+namespace {
+thread_local int llama_kv_stream_copy_fail_after = -1;
+}
+
+void llama_kv_cache_fail_stream_copy_after_for_test(int successful_cache_updates) {
+    llama_kv_stream_copy_fail_after = successful_cache_updates;
+}
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -128,9 +137,11 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-    ggml_backend_buffer_type_t buft_override) :
+    ggml_backend_buffer_type_t buft_override,
+                uint32_t n_resident) :
     model(model), hparams(hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_resident(n_resident),
+    n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
@@ -163,7 +174,8 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(2u*(1 + n_stream + (n_resident > 0 ? 1 + n_resident : 0))*
+                                           n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -284,20 +296,36 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
+        ggml_tensor * k_resident = has_k && n_resident > 0 ?
+                ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_resident) : nullptr;
+        ggml_tensor * v_resident = has_v && n_resident > 0 ?
+                ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_resident) : nullptr;
+
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
+        k_resident && ggml_format_name(k_resident, "cache_k_resident_l%d", il);
+        v_resident && ggml_format_name(v_resident, "cache_v_resident_l%d", il);
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+        std::vector<ggml_tensor *> k_resident_stream;
+        std::vector<ggml_tensor *> v_resident_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
             k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
+        for (uint32_t s = 0; s < n_resident; ++s) {
+            k_resident_stream.push_back(has_k ? ggml_view_2d(
+                    ctx, k_resident, n_embd_k_gqa, kv_size, k_resident->nb[1], s*k_resident->nb[2]) : nullptr);
+            v_resident_stream.push_back(has_v ? ggml_view_2d(
+                    ctx, v_resident, n_embd_v_gqa, kv_size, v_resident->nb[1], s*v_resident->nb[2]) : nullptr);
+        }
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_resident, v_resident,
+                           k_stream, v_stream, k_resident_stream, v_resident_stream, });
     }
 
     if (reuse) {
@@ -417,6 +445,12 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    [[maybe_unused]] auto resident_scope = resident_lock();
+    if (data && resident_guard && resident_guard->parked_handles != 0) {
+        throw std::runtime_error("cannot clear backing storage with resident handles");
+    }
+    resident_note_mutation();
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -434,6 +468,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (other) {
         return true;
     }
+
+    [[maybe_unused]] auto resident_scope = resident_lock();
+    resident_note_mutation();
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
@@ -503,6 +540,9 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
         return;
     }
 
+    [[maybe_unused]] auto resident_scope = resident_lock();
+    resident_note_mutation();
+
     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
 
@@ -555,6 +595,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     GGML_ASSERT(is_full && "seq_cp() is only supported for full KV buffers");
 
     // enqueue the copy operation - the buffer copy will be performed during the next update
+    // Reserve both sides first so allocation failure cannot leave a malformed
+    // half-entry that would escape the resident quiescence check.
+    sc_info.ssrc.reserve(sc_info.ssrc.size() + 1);
+    sc_info.sdst.reserve(sc_info.sdst.size() + 1);
     sc_info.ssrc.push_back(s0);
     sc_info.sdst.push_back(s1);
 
@@ -595,6 +639,9 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
         return;
     }
 
+    [[maybe_unused]] auto resident_scope = resident_lock();
+    resident_note_mutation();
+
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
@@ -622,6 +669,8 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         return;
     }
 
+    [[maybe_unused]] auto resident_scope = resident_lock();
+
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
 
@@ -631,6 +680,8 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     if (shift == 0) {
         return;
     }
+
+    resident_note_mutation();
 
     uint32_t new_head = cells.size();
 
@@ -672,6 +723,8 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         return;
     }
 
+    [[maybe_unused]] auto resident_scope = resident_lock();
+
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
 
@@ -680,6 +733,8 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     if (d == 1) {
         return;
     }
+
+    resident_note_mutation();
 
     if (p0 < 0) {
         p0 = 0;
@@ -794,10 +849,11 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 
     bool do_shift = get_has_shift();
 
-    return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info));
+    return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift);
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    [[maybe_unused]] auto resident_scope = resident_lock();
     llama_kv_cache::slot_info_vec_t res;
 
     struct state_t {
@@ -869,14 +925,29 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         return true;
     }
 
+    [[maybe_unused]] auto resident_scope = resident_lock();
+    if (!sc_info.empty() || do_shift) {
+        resident_note_mutation();
+    }
+
     bool updated = false;
 
-    auto * sched = lctx->get_sched();
+    auto * sched = lctx != nullptr ? lctx->get_sched() : nullptr;
 
     if (!sc_info.empty()) {
         assert(n_stream > 1 && "stream copy should never happen with a single stream");
 
-        llama_synchronize(lctx);
+        if (llama_kv_stream_copy_fail_after == 0) {
+            llama_kv_stream_copy_fail_after = -1;
+            throw std::runtime_error("injected KV stream-copy failure");
+        }
+        if (llama_kv_stream_copy_fail_after > 0) {
+            --llama_kv_stream_copy_fail_after;
+        }
+
+        if (lctx != nullptr) {
+            llama_synchronize(lctx);
+        }
 
         const size_t n_copy = sc_info.ssrc.size();
 
@@ -914,6 +985,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     }
 
     if (do_shift) {
+        GGML_ASSERT(lctx != nullptr && sched != nullptr);
         if (!get_can_shift()) {
             GGML_ABORT("The current KV cache / model configuration does not support K-shift");
         }
@@ -1159,6 +1231,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         return;
     }
 
+    [[maybe_unused]] auto resident_scope = resident_lock();
+    resident_note_mutation();
+
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
     llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];
@@ -1291,6 +1366,125 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     return v_cells[seq_to_stream[seq_id]];
+}
+
+void llama_kv_cache::resident_bind_guard(
+        std::shared_ptr<llama_kv_cache_resident_guard> guard,
+        uint32_t plane) {
+    GGML_ASSERT(guard != nullptr);
+    GGML_ASSERT(plane < 2);
+    GGML_ASSERT(resident_guard == nullptr);
+    resident_guard = std::move(guard);
+    resident_plane = plane;
+}
+
+std::unique_lock<std::recursive_mutex> llama_kv_cache::resident_lock() const {
+    if (resident_guard) {
+        return std::unique_lock<std::recursive_mutex>(resident_guard->mutex);
+    }
+    return {};
+}
+
+void llama_kv_cache::resident_note_mutation() {
+    if (!resident_guard) {
+        return;
+    }
+    uint64_t & version = resident_guard->version[resident_plane];
+    if (++version == 0) {
+        version = 1;
+    }
+}
+
+void llama_kv_cache::resident_finish_update(size_t copied_streams, bool applied) {
+    [[maybe_unused]] auto resident_scope = resident_lock();
+    GGML_ASSERT(resident_guard != nullptr);
+    GGML_ASSERT(resident_guard->update_active[resident_plane]);
+    GGML_ASSERT(sc_info.ssrc.size() == sc_info.sdst.size());
+
+    if (copied_streams > 0) {
+        GGML_ASSERT(resident_guard->pending_updates[resident_plane] > 0);
+    }
+    if (applied && copied_streams > 0) {
+        GGML_ASSERT(copied_streams <= sc_info.ssrc.size());
+        sc_info.ssrc.erase(sc_info.ssrc.begin(), sc_info.ssrc.begin() + copied_streams);
+        sc_info.sdst.erase(sc_info.sdst.begin(), sc_info.sdst.begin() + copied_streams);
+    }
+    if (copied_streams > 0) {
+        --resident_guard->pending_updates[resident_plane];
+    }
+    resident_guard->update_active[resident_plane] = false;
+    resident_note_mutation();
+}
+
+bool llama_kv_cache::resident_execution_layout(llama_seq_id seq_id) const {
+    if (other != nullptr || n_stream <= 1 || n_resident != n_stream ||
+            seq_id < 0 || (uint32_t) seq_id >= n_stream ||
+            seq_to_stream[seq_id] != (uint32_t) seq_id) {
+        return false;
+    }
+    const auto & cells = v_cells[seq_id];
+    if (cells.get_has_shift()) {
+        return false;
+    }
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) &&
+                (cells.seq_count(i) != 1 || !cells.seq_has(i, seq_id))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::resident_execution_empty(llama_seq_id seq_id) const {
+    return resident_execution_layout(seq_id) && v_cells[seq_id].get_used() == 0;
+}
+
+llama_kv_cells llama_kv_cache::resident_copy_cells(llama_seq_id seq_id) const {
+    GGML_ASSERT(resident_execution_layout(seq_id));
+    return v_cells[seq_id].cp(0, v_cells[seq_id].size());
+}
+
+uint32_t llama_kv_cache::resident_copy_head(llama_seq_id seq_id) const {
+    GGML_ASSERT(resident_execution_layout(seq_id));
+    return v_heads[seq_id];
+}
+
+void llama_kv_cache::resident_clear_execution(llama_seq_id seq_id) {
+    GGML_ASSERT(resident_execution_layout(seq_id));
+    resident_note_mutation();
+    v_cells[seq_id].reset();
+    v_heads[seq_id] = 0;
+}
+
+void llama_kv_cache::resident_restore_execution(
+        llama_seq_id seq_id,
+        llama_kv_cells cells,
+        uint32_t head) {
+    GGML_ASSERT(resident_execution_empty(seq_id));
+    GGML_ASSERT(cells.size() == v_cells[seq_id].size());
+    // find_slot() accepts this one-past-end ring sentinel and wraps it to zero.
+    GGML_ASSERT(head <= cells.size());
+    static_assert(std::is_nothrow_move_assignable_v<llama_kv_cells>);
+    resident_note_mutation();
+    v_cells[seq_id] = std::move(cells);
+    v_heads[seq_id] = head;
+}
+
+void llama_kv_cache::resident_append_views(
+        uint32_t slot,
+        bool resident,
+        std::vector<ggml_tensor *> & views) const {
+    GGML_ASSERT(slot < (resident ? n_resident : n_stream));
+    for (const auto & layer : layers) {
+        ggml_tensor * k = resident ? layer.k_resident_stream[slot] : layer.k_stream[slot];
+        ggml_tensor * v = resident ? layer.v_resident_stream[slot] : layer.v_stream[slot];
+        if (k != nullptr) {
+            views.push_back(k);
+        }
+        if (v != nullptr) {
+            views.push_back(v);
+        }
+    }
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
@@ -2092,6 +2286,11 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
+    [[maybe_unused]] auto resident_scope = resident_lock();
+    if (seq_id < 0 && resident_guard && resident_guard->parked_handles != 0) {
+        throw std::runtime_error("resident handles are not serializable");
+    }
+
     GGML_UNUSED(flags);
 
     io.write(&n_stream, sizeof(n_stream));
@@ -2161,6 +2360,12 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     if (other) {
         return;
     }
+
+    [[maybe_unused]] auto resident_scope = resident_lock();
+    if (seq_id < 0 && resident_guard && resident_guard->parked_handles != 0) {
+        throw std::runtime_error("resident handles cannot survive whole-cache restore");
+    }
+    resident_note_mutation();
 
     GGML_UNUSED(flags);
 
@@ -2649,8 +2854,30 @@ llama_kv_cache_context::llama_kv_cache_context(
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_context * lctx,
-        bool do_shift,
-        stream_copy_info sc_info) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)) {
+        bool do_shift) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift) {
+    [[maybe_unused]] auto resident_scope = kv->resident_lock();
+    if (kv->resident_guard) {
+        if (!do_shift && kv->sc_info.empty()) {
+            status = LLAMA_MEMORY_STATUS_NO_UPDATE;
+            return;
+        }
+        if (kv->resident_guard->update_active[kv->resident_plane]) {
+            status = LLAMA_MEMORY_STATUS_FAILED_PREPARE;
+            return;
+        }
+        // Copy rather than remove queued work. The queue itself is the fail-
+        // closed marker if this context is abandoned before apply().
+        sc_info = kv->sc_info;
+        resident_copied_streams = sc_info.ssrc.size();
+        kv->resident_guard->update_active[kv->resident_plane] = true;
+        resident_update_owned = true;
+        if (resident_copied_streams > 0) {
+            ++kv->resident_guard->pending_updates[kv->resident_plane];
+            kv->resident_note_mutation();
+        }
+    } else {
+        sc_info = std::move(kv->sc_info);
+    }
     if (!do_shift && this->sc_info.empty()) {
         status = LLAMA_MEMORY_STATUS_NO_UPDATE;
     }
@@ -2662,7 +2889,11 @@ llama_kv_cache_context::llama_kv_cache_context(
         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
 }
 
-llama_kv_cache_context::~llama_kv_cache_context() = default;
+llama_kv_cache_context::~llama_kv_cache_context() {
+    if (kv != nullptr && resident_update_owned) {
+        kv->resident_finish_update(resident_copied_streams, false);
+    }
+}
 
 bool llama_kv_cache_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
@@ -2679,7 +2910,15 @@ bool llama_kv_cache_context::apply() {
 
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
+        if (update_apply_consumed) {
+            return true;
+        }
         kv->update(lctx, do_shift, sc_info);
+        if (resident_update_owned) {
+            kv->resident_finish_update(resident_copied_streams, true);
+            resident_update_owned = false;
+        }
+        update_apply_consumed = true;
 
         return true;
     }

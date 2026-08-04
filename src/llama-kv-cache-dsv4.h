@@ -185,9 +185,11 @@ struct llama_dsv4_resident_detach_quote {
 };
 
 // Host-testable policy used by llama_kv_cache_dsv4::quote_resident_detach.
-// Current raw/SWA and compressor tensors are sequence-indexed ordinary
-// buffers, so aggregate compressed ownership alone can never make this quote
-// succeed. No sequence ID is reserved or parked by this function.
+// This static policy assumes the default sequence-indexed raw/SWA layout.
+// llama_kv_cache_dsv4::quote_resident_detach separately adds the opt-in target
+// raw/SWA aperture when its backend quote succeeds. Compressor/state planes
+// still keep the whole-sequence capability fail-closed. No sequence ID is
+// reserved or parked by this function.
 llama_dsv4_resident_detach_quote llama_dsv4_quote_resident_detach_layout(llama_dsv4_resident_detach_request request,
                                                                          uint32_t                           n_seq_max,
                                                                          uint32_t rollback_index,
@@ -399,6 +401,8 @@ public:
             std::vector<llama_ubatch> ubatches,
             std::vector<llama_ubatch> ubatches_write);
 
+    ~llama_kv_cache_dsv4_raw_context() override = default;
+
     bool next() override;
     bool apply() override;
     const slot_info_vec_t::value_type & get_base_write_slot() const;
@@ -429,6 +433,8 @@ private:
 
     llama_kv_cache * kv_base = nullptr;
     llama_kv_cache * kv_swa  = nullptr;
+
+    const std::shared_ptr<void> resident_batch_lease;
 
     slot_info_vec_t sinfos_base_write;
     slot_info_vec_t sinfos_write;

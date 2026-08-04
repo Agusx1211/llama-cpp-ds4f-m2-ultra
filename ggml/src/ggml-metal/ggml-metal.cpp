@@ -1,5 +1,7 @@
 #include "ggml-metal.h"
 
+#include "ggml-dsv4-sparse.h"
+
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -10,10 +12,19 @@
 #include <mutex>
 #include <map>
 #include <memory>
+#include <new>
+#include <stdexcept>
 #include <string>
 
 #define GGML_METAL_NAME "MTL"
 #define GGML_METAL_MAX_DEVICES 16
+
+static_assert((int) GGML_DSV4_SPARSE_OK          == (int) GGML_METAL_SPARSE_RESERVATION_OK);
+static_assert((int) GGML_DSV4_SPARSE_PRESSURE    == (int) GGML_METAL_SPARSE_RESERVATION_PRESSURE);
+static_assert((int) GGML_DSV4_SPARSE_STALE       == (int) GGML_METAL_SPARSE_RESERVATION_STALE);
+static_assert((int) GGML_DSV4_SPARSE_INVALID     == (int) GGML_METAL_SPARSE_RESERVATION_INVALID);
+static_assert((int) GGML_DSV4_SPARSE_OOM         == (int) GGML_METAL_SPARSE_RESERVATION_OOM);
+static_assert((int) GGML_DSV4_SPARSE_UNSUPPORTED == (int) GGML_METAL_SPARSE_RESERVATION_UNSUPPORTED);
 
 // number of Metal devices
 // note: can be overridden with GGML_METAL_DEVICES env to simulate virtual devices
@@ -704,6 +715,129 @@ static void ggml_backend_metal_dsv4_sparse_reservation_free(void * reservation) 
     ggml_metal_sparse_reservation_free((ggml_metal_sparse_reservation_t) reservation);
 }
 
+enum ggml_backend_metal_dsv4_sparse_move_test_failure {
+    GGML_METAL_DSV4_MOVE_FAIL_NONE = -1,
+    GGML_METAL_DSV4_MOVE_FAIL_RESERVE_ALLOC,
+    GGML_METAL_DSV4_MOVE_FAIL_PUSH_ALLOC,
+    GGML_METAL_DSV4_MOVE_FAIL_PUBLISH_ALLOC,
+    GGML_METAL_DSV4_MOVE_FAIL_LENGTH,
+    GGML_METAL_DSV4_MOVE_FAIL_PUBLISH_UNEXPECTED,
+};
+
+static thread_local int ggml_backend_metal_dsv4_sparse_move_fail_stage =
+        GGML_METAL_DSV4_MOVE_FAIL_NONE;
+
+// Test stages 0/1/2 inject allocation failures at reserve/push/publication;
+// stage 3 injects length_error at reserve and stage 4 an unexpected exception
+// after the backend quote exists, exercising the final cleanup barrier.
+static void ggml_backend_metal_dsv4_sparse_move_fail_for_test(int stage) {
+    ggml_backend_metal_dsv4_sparse_move_fail_stage = stage;
+}
+
+static void ggml_backend_metal_dsv4_sparse_move_maybe_fail(int point) {
+    const int failure = ggml_backend_metal_dsv4_sparse_move_fail_stage;
+    if (failure == point ||
+            (failure == GGML_METAL_DSV4_MOVE_FAIL_LENGTH &&
+             point == GGML_METAL_DSV4_MOVE_FAIL_RESERVE_ALLOC) ||
+            (failure == GGML_METAL_DSV4_MOVE_FAIL_PUBLISH_UNEXPECTED &&
+             point == GGML_METAL_DSV4_MOVE_FAIL_PUBLISH_ALLOC)) {
+        ggml_backend_metal_dsv4_sparse_move_fail_stage = GGML_METAL_DSV4_MOVE_FAIL_NONE;
+        if (failure == GGML_METAL_DSV4_MOVE_FAIL_LENGTH) {
+            throw std::length_error("injected sparse move length failure");
+        }
+        if (failure == GGML_METAL_DSV4_MOVE_FAIL_PUBLISH_UNEXPECTED) {
+            throw std::runtime_error("injected sparse move unexpected failure");
+        }
+        throw std::bad_alloc();
+    }
+}
+
+static int ggml_backend_metal_dsv4_sparse_move_tensor_rows_quote(
+        ggml_tensor * const * sources,
+        ggml_tensor * const * destinations,
+        size_t n_tensors,
+        void ** quote) {
+    if (quote != nullptr) {
+        *quote = nullptr;
+    }
+    if (sources == nullptr || n_tensors == 0 || quote == nullptr) {
+        return GGML_DSV4_SPARSE_INVALID;
+    }
+
+    using move_vector = std::vector<ggml_metal_sparse_buffer_move>;
+    move_vector moves;
+    if (n_tensors > SIZE_MAX / sizeof(move_vector::value_type) || n_tensors > moves.max_size()) {
+        return GGML_DSV4_SPARSE_INVALID;
+    }
+
+    ggml_metal_sparse_move_t result = nullptr;
+    const auto fail = [&](int status) {
+        if (result != nullptr) {
+            ggml_metal_sparse_move_free(result);
+            result = nullptr;
+        }
+        *quote = nullptr;
+        return status;
+    };
+    try {
+        ggml_backend_metal_dsv4_sparse_move_maybe_fail(0);
+        moves.reserve(n_tensors);
+        for (size_t i = 0; i < n_tensors; ++i) {
+            ggml_tensor * source = sources[i];
+            ggml_tensor * destination = destinations != nullptr ? destinations[i] : nullptr;
+            if (source == nullptr || source->buffer == nullptr ||
+                    !ggml_backend_buffer_is_metal(source->buffer) ||
+                    (destination != nullptr &&
+                     (destination->buffer != source->buffer ||
+                      ggml_nbytes(destination) != ggml_nbytes(source)))) {
+                return GGML_DSV4_SPARSE_INVALID;
+            }
+            ggml_metal_buffer_t buffer = (ggml_metal_buffer_t) source->buffer->context;
+            if (!ggml_metal_buffer_is_sparse(buffer)) {
+                return GGML_DSV4_SPARSE_UNSUPPORTED;
+            }
+            const ggml_metal_buffer_id source_id = ggml_metal_buffer_get_id(buffer, source);
+            ggml_metal_sparse_buffer_range destination_range = {};
+            if (destination != nullptr) {
+                const ggml_metal_buffer_id destination_id = ggml_metal_buffer_get_id(buffer, destination);
+                destination_range = { buffer, destination_id.offs, ggml_nbytes(destination) };
+            }
+            ggml_backend_metal_dsv4_sparse_move_maybe_fail(1);
+            moves.push_back({
+                { buffer, source_id.offs, ggml_nbytes(source) },
+                destination_range,
+            });
+        }
+
+        const auto status = ggml_metal_buffers_sparse_move_quote(
+                moves.data(), moves.size(), &result);
+        if (status == GGML_METAL_SPARSE_RESERVATION_OK && result != nullptr) {
+            ggml_backend_metal_dsv4_sparse_move_maybe_fail(2);
+            *quote = result;
+            return GGML_DSV4_SPARSE_OK;
+        }
+        return fail(status == GGML_METAL_SPARSE_RESERVATION_OK ?
+                GGML_DSV4_SPARSE_INVALID : (int) status);
+    } catch (const std::length_error &) {
+        return fail(GGML_DSV4_SPARSE_INVALID);
+    } catch (const std::bad_array_new_length &) {
+        return fail(GGML_DSV4_SPARSE_INVALID);
+    } catch (const std::bad_alloc &) {
+        return fail(GGML_DSV4_SPARSE_OOM);
+    } catch (...) {
+        return fail(GGML_DSV4_SPARSE_INVALID);
+    }
+}
+
+static int ggml_backend_metal_dsv4_sparse_move_tensor_rows_commit(
+        void * quote) {
+    return (int) ggml_metal_sparse_move_commit((ggml_metal_sparse_move_t) quote);
+}
+
+static void ggml_backend_metal_dsv4_sparse_move_tensor_rows_free(void * quote) {
+    ggml_metal_sparse_move_free((ggml_metal_sparse_move_t) quote);
+}
+
 // Returns 0 for a non-sparse tensor, 1 on success, and -1 on a sparse error.
 static int ggml_backend_metal_dsv4_sparse_alias_tensor_rows(
         const ggml_tensor * src,
@@ -1258,6 +1392,18 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_dsv4_sparse_reservation_free") == 0) {
         return (void *)ggml_backend_metal_dsv4_sparse_reservation_free;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_move_tensor_rows_quote") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_move_tensor_rows_quote;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_move_tensor_rows_commit") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_move_tensor_rows_commit;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_move_tensor_rows_free") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_move_tensor_rows_free;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_move_fail_for_test") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_move_fail_for_test;
     }
     if (strcmp(name, "ggml_backend_metal_dsv4_sparse_alias_tensor_rows") == 0) {
         return (void *)ggml_backend_metal_dsv4_sparse_alias_tensor_rows;

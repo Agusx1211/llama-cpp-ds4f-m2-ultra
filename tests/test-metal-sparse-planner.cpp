@@ -390,6 +390,108 @@ static void test_quote_equals_commit() {
     assert(f.reserved_pages == 0);
 }
 
+static void test_resident_page_move_refcounts_and_reuse() {
+    fixture f(12, 6);
+    f.alias({ 0, 4 }, 0);
+    f.alias({ 1 }, 1);
+    f.alias({ 2 }, 2);
+
+    // Move an execution aperture to a disjoint resident aperture. Shared page
+    // zero survives through virtual page four and retains the same refcount.
+    const ggml_metal_sparse_page_move detach[] = {
+        { 0, 6 },
+        { 1, 7 },
+        { 2, 8 },
+    };
+    uint32_t source_physical[3] = {};
+    std::vector<uint8_t> selected(f.v2p.size());
+    assert(ggml_metal_sparse_plan_page_move(
+            f.v2p.size(), f.refs.size(), f.v2p.data(), f.refs.data(),
+            detach, 3, source_physical, selected.data()) == GGML_METAL_SPARSE_PLAN_OK);
+    const auto refs_before = f.refs;
+    const size_t free_before = f.free_pages;
+    std::vector<uint32_t> free_stack(f.refs.size(), UINT32_MAX);
+    ggml_metal_sparse_apply_page_move(
+            f.refs.size(), f.v2p.data(), f.refs.data(), free_stack.data(),
+            &f.free_pages, detach, source_physical, 3);
+    assert(f.v2p[0] == UINT32_MAX && f.v2p[1] == UINT32_MAX && f.v2p[2] == UINT32_MAX);
+    assert(f.v2p[6] == 0 && f.v2p[7] == 1 && f.v2p[8] == 2);
+    assert(f.v2p[4] == 0 && f.refs == refs_before && f.free_pages == free_before);
+
+    // Reusing a free execution aperture moves the resident mappings back and
+    // atomically drops stale destination mappings.
+    f.alias({ 3 }, 3);
+    const ggml_metal_sparse_page_move attach[] = {
+        { 6, 0 },
+        { 7, 1 },
+        { 8, 3 },
+    };
+    assert(ggml_metal_sparse_plan_page_move(
+            f.v2p.size(), f.refs.size(), f.v2p.data(), f.refs.data(),
+            attach, 3, source_physical, selected.data()) == GGML_METAL_SPARSE_PLAN_OK);
+    ggml_metal_sparse_apply_page_move(
+            f.refs.size(), f.v2p.data(), f.refs.data(), free_stack.data(),
+            &f.free_pages, attach, source_physical, 3);
+    assert(f.v2p[0] == 0 && f.v2p[1] == 1 && f.v2p[3] == 2);
+    assert(f.v2p[6] == UINT32_MAX && f.v2p[7] == UINT32_MAX && f.v2p[8] == UINT32_MAX);
+    assert(f.refs[3] == 0 && free_stack[f.free_pages - 1] == 3);
+
+    // The survivor and reattached execution still share page zero, so the
+    // ordinary write planner quotes one COW page.
+    std::vector<uint8_t> marked;
+    std::vector<uint32_t> per_physical;
+    const auto cow = f.quote({ { 0, 1 } }, marked, per_physical);
+    assert(cow.status == GGML_METAL_SPARSE_PLAN_OK && cow.cow_pages == 1);
+}
+
+static void test_resident_page_release_and_failed_plan_rollback() {
+    fixture f(8, 4);
+    f.alias({ 0, 4 }, 0);
+    f.alias({ 1 }, 1);
+    const auto before_v2p = f.v2p;
+    const auto before_refs = f.refs;
+    const size_t before_free = f.free_pages;
+
+    // Crossed and duplicate endpoints are rejected before any ownership
+    // mutation, giving the composite caller a rollback-free failure boundary.
+    const ggml_metal_sparse_page_move invalid[] = {
+        { 0, 4 },
+        { 4, 5 },
+    };
+    uint32_t source_physical[2] = {};
+    std::vector<uint8_t> selected(f.v2p.size());
+    assert(ggml_metal_sparse_plan_page_move(
+            f.v2p.size(), f.refs.size(), f.v2p.data(), f.refs.data(),
+            invalid, 2, source_physical, selected.data()) == GGML_METAL_SPARSE_PLAN_INVALID_RANGE);
+    assert(f.v2p == before_v2p && f.refs == before_refs && f.free_pages == before_free);
+
+    const ggml_metal_sparse_page_move detach[] = {
+        { 0, 6 },
+        { 1, 7 },
+    };
+    std::vector<uint32_t> free_stack(f.refs.size(), UINT32_MAX);
+    assert(ggml_metal_sparse_plan_page_move(
+            f.v2p.size(), f.refs.size(), f.v2p.data(), f.refs.data(),
+            detach, 2, source_physical, selected.data()) == GGML_METAL_SPARSE_PLAN_OK);
+    ggml_metal_sparse_apply_page_move(
+            f.refs.size(), f.v2p.data(), f.refs.data(), free_stack.data(),
+            &f.free_pages, detach, source_physical, 2);
+
+    const ggml_metal_sparse_page_move release[] = {
+        { 6, SIZE_MAX },
+        { 7, SIZE_MAX },
+    };
+    assert(ggml_metal_sparse_plan_page_move(
+            f.v2p.size(), f.refs.size(), f.v2p.data(), f.refs.data(),
+            release, 2, source_physical, selected.data()) == GGML_METAL_SPARSE_PLAN_OK);
+    ggml_metal_sparse_apply_page_move(
+            f.refs.size(), f.v2p.data(), f.refs.data(), free_stack.data(),
+            &f.free_pages, release, source_physical, 2);
+    assert(f.v2p[6] == UINT32_MAX && f.v2p[7] == UINT32_MAX);
+    assert(f.refs[0] == 1 && f.v2p[4] == 0); // shared survivor owns page zero
+    assert(f.refs[1] == 0 && f.free_pages == before_free + 1);
+}
+
 int main() {
     test_diagnostic_status_names();
     test_unmapped_overlap_and_rounding();
@@ -401,6 +503,8 @@ int main() {
     test_commit_compatibility_including_zero_pages();
     test_multi_pool_failure_is_atomic();
     test_quote_equals_commit();
+    test_resident_page_move_refcounts_and_reuse();
+    test_resident_page_release_and_failed_plan_rollback();
     std::cout << "metal sparse planner tests passed\n";
     return 0;
 }
