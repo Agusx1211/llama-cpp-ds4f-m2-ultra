@@ -11,6 +11,12 @@ The checked-in example requires four samples per request and mode, rejects
 coefficient of variation above 20%, and declares dashboard overhead meaningful
 when connected median TTFT or elapsed time is more than 5% above disconnected.
 Do not call a run an exit-gate pass if the sample count or variance gate fails.
+Each request applies the same strong bias to a known ordinary DeepSeek V4 token
+and requires every returned token to match it. This deterministic serving
+sentinel keeps exact-output equality meaningful when natural greedy choices can
+vary between otherwise identical concurrent sparse batches. The identical bias
+is present in both measured modes; this gate measures observer overhead, not
+unbiased output quality.
 
 ## Contract and security
 

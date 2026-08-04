@@ -64,6 +64,7 @@ def reject_json_constant(value: str) -> None:
 class RequestResult:
     tag: str
     requested_tokens: int
+    forced_token: int | None = None
     status: int = 0
     start_ns: int = 0
     first_token_ns: int = 0
@@ -82,6 +83,9 @@ class RequestResult:
         if len(self.tokens) != self.requested_tokens:
             raise GateError(
                 f"{self.tag}: returned {len(self.tokens)} token IDs, expected={self.requested_tokens}")
+        if self.forced_token is not None and self.tokens != [self.forced_token] * self.requested_tokens:
+            raise GateError(
+                f"{self.tag}: deterministic sentinel did not return forced token {self.forced_token}")
         if not self.content:
             raise GateError(f"{self.tag}: output content is empty")
         if not self.first_token_ns or self.first_token_ns < self.start_ns or self.end_ns < self.first_token_ns:
@@ -104,6 +108,7 @@ class RequestResult:
             "tag": self.tag,
             "status": self.status,
             "requested_tokens": self.requested_tokens,
+            "forced_token": self.forced_token,
             "reported_tokens": self.reported_tokens,
             "returned_token_ids": len(self.tokens),
             "token_ids": self.tokens,
@@ -284,6 +289,8 @@ def validate_workload(value: Any) -> list[dict[str, Any]]:
         raise GateError(f"total predicted tokens must not exceed {MAX_TOTAL_PREDICT_TOKENS}")
     for item in value:
         bounded_number(f"{item['tag']}.offset_ms", item.get("offset_ms", 0), 0, 900_000)
+        if "forced_token" in item:
+            bounded_integer(f"{item['tag']}.forced_token", item["forced_token"], 0, 2 ** 31 - 1)
         if item.get("lane") not in {None, "low", "normal", "fast"}:
             raise GateError(f"{item['tag']}: lane must be low, normal, or fast")
     return value
@@ -319,7 +326,13 @@ def run_request(
     requested_tokens = int(specification["n_predict"])
     if requested_tokens < 1 or requested_tokens > MAX_PREDICT_TOKENS:
         raise GateError(f"{tag}: n_predict must be from 1 through {MAX_PREDICT_TOKENS}")
-    result = RequestResult(tag=tag, requested_tokens=requested_tokens, start_ns=time.monotonic_ns())
+    forced_token = specification.get("forced_token")
+    result = RequestResult(
+        tag=tag,
+        requested_tokens=requested_tokens,
+        forced_token=forced_token,
+        start_ns=time.monotonic_ns(),
+    )
     body = {
         "prompt": numeric_prompt(int(specification["prompt_tokens"]), int(specification.get("salt", 1001))),
         "n_predict": requested_tokens,
@@ -331,6 +344,8 @@ def run_request(
         "cache": False,
         "cache_prompt": False,
     }
+    if forced_token is not None:
+        body["logit_bias"] = [[forced_token, 100.0]]
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",

@@ -127,6 +127,24 @@ class TargetGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ab_gate.GateError, "exact output differs"):
             ab_gate.verify_exact_outputs([artifact, changed])
 
+    def test_deterministic_sentinel_requires_every_forced_token(self):
+        result = ab_gate.RequestResult(
+            tag="sentinel",
+            requested_tokens=3,
+            forced_token=378,
+            status=200,
+            start_ns=1,
+            first_token_ns=2,
+            end_ns=3,
+            reported_tokens=3,
+            tokens=[378, 378, 378],
+            content="sentinel",
+        )
+        result.validate()
+        result.tokens[-1] = 379
+        with self.assertRaisesRegex(ab_gate.GateError, "forced token 378"):
+            result.validate()
+
     def test_swap_parser_and_artifact_scanner(self):
         samples = [{
             "phase": "connected",

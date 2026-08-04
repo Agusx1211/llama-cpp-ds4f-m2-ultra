@@ -80,6 +80,7 @@
         "lane": "low",
         "prompt_tokens": 8192,
         "n_predict": 8,
+        "forced_token": 378,
         "salt": 1001,
         "seed": 42,
         "offset_ms": 0
@@ -89,6 +90,7 @@
         "lane": "fast",
         "prompt_tokens": 128,
         "n_predict": 4,
+        "forced_token": 378,
         "salt": 5001,
         "seed": 42,
         "offset_ms": 1000
@@ -98,6 +100,7 @@
         "lane": "fast",
         "prompt_tokens": 128,
         "n_predict": 4,
+        "forced_token": 378,
         "salt": 5002,
         "seed": 42,
         "offset_ms": 11000
@@ -107,6 +110,7 @@
         "lane": "fast",
         "prompt_tokens": 128,
         "n_predict": 4,
+        "forced_token": 378,
         "salt": 5003,
         "seed": 42,
         "offset_ms": 21000
@@ -116,6 +120,7 @@
         "lane": "fast",
         "prompt_tokens": 128,
         "n_predict": 4,
+        "forced_token": 378,
         "salt": 5004,
         "seed": 42,
         "offset_ms": 28000
