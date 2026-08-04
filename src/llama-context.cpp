@@ -2287,7 +2287,7 @@ llama_kv_admission_status llama_context::kv_admission_prepare_ranges(
     id = 0;
 
     auto * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
-    if (dsv4 == nullptr || dsv4->is_aggregate_compressed() || cparams.kv_unified || cparams.n_seq_max != 2) {
+    if (dsv4 == nullptr || dsv4->is_aggregate_compressed() || !cparams.kv_unified || cparams.n_seq_max != 2) {
         quote.status = LLAMA_KV_ADMISSION_UNSUPPORTED;
         return quote.status;
     }

@@ -1086,7 +1086,7 @@ static bool test_dsv4_admission_lifecycle(size_t seed, ggml_backend_dev_t dev) {
 
     scoped_env_override disable_aggregate("LLAMA_DSV4_AGGREGATE_POOL_DISABLE", "1");
     scoped_env_override clear_force_aggregate("LLAMA_DSV4_AGGREGATE_POOL_FORCE", nullptr);
-    dsv4_test_context test(seed, dev, 2, false, 16, 1, 512, 16);
+    dsv4_test_context test(seed, dev, 2, true, 16, 1, 512, 16);
     auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(test.lctx.get()));
     GGML_ASSERT(memory != nullptr && !memory->is_aggregate_compressed());
     const auto baseline = memory->memory_usage_snapshot();

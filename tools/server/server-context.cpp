@@ -1455,8 +1455,8 @@ private:
         }
 
         if (SERVER_DSV4_ADMISSION_VERTICAL) {
-            if (params_base.n_parallel != 2 || params_base.kv_unified || params_base.ctx_shift || has_mmproj) {
-                SRV_ERR("%s", "LLAMA_DSV4_ADMISSION_VERTICAL requires exactly two split-KV text slots with context shift disabled\n");
+            if (params_base.n_parallel != 2 || !params_base.kv_unified || params_base.ctx_shift || has_mmproj) {
+                SRV_ERR("%s", "LLAMA_DSV4_ADMISSION_VERTICAL requires exactly two unified elastic-KV text slots with context shift disabled\n");
                 return false;
             }
             const llama_kv_admission_span probe_span = { 0, 0, 1 };
@@ -1466,7 +1466,7 @@ private:
             if (probe_status == LLAMA_KV_ADMISSION_UNSUPPORTED ||
                     probe_status == LLAMA_KV_ADMISSION_INVALID ||
                     probe_status == LLAMA_KV_ADMISSION_ERROR) {
-                SRV_ERR("%s", "LLAMA_DSV4_ADMISSION_VERTICAL requires target Metal sparse DSV4 split-KV storage\n");
+                SRV_ERR("%s", "LLAMA_DSV4_ADMISSION_VERTICAL requires target Metal sparse DSV4 unified storage\n");
                 return false;
             }
             params_base.cache_prompt = false;

@@ -5,7 +5,7 @@ request starts prefill. It is intentionally restricted to the measured M2
 Ultra geometry:
 
 - DeepSeek V4 on the target sparse Metal allocator;
-- exactly two server slots with split KV (`-np 2 --no-kv-unified`);
+- exactly two server slots with unified elastic KV (`-np 2 -kvu`);
 - context shifting and multimodal input disabled;
 - full uncached prompts (the vertical forces `cache_prompt=false`);
 - no global or per-request LoRA adapters; and
@@ -17,7 +17,7 @@ Enable it in addition to the normal target launch command:
 ```sh
 LLAMA_DSV4_ADMISSION_VERTICAL=1 ./build/bin/llama-server \
   -m /path/to/DeepSeek-V4-Flash.gguf \
-  -c 32768 -np 2 --no-kv-unified --no-context-shift
+  -c 32768 -np 2 -kvu --no-context-shift
 ```
 
 For each real family member, the server derives `[0, prompt + runway)` from the
@@ -35,9 +35,12 @@ last-safe point before graph submission. Destroying the ticket before that
 preflight cancels the reservation; after consumption, ordinary sequence clear
 owns the committed mappings.
 
-The range planner is O(layers × family members), not O(prompt tokens). Aggregate
+The range planner is O(layers × family members), not O(prompt tokens). The
+unified runtime must select affine compressed sparse storage; aggregate
 compressed pools, prompt reuse, context shift, mixed active/admitted batches,
-and configurations wider than two slots remain outside this vertical.
+and configurations wider than two slots remain outside this vertical. Fixed
+split KV is fully allocated at startup and therefore cannot exercise the
+physical sparse-page admission contract.
 
 Host validation:
 

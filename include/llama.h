@@ -977,9 +977,10 @@ extern "C" {
 
     // Target-specific, prefill admission contract for DeepSeek V4. A span is
     // one contiguous future logical range for one execution sequence. The
-    // server currently uses [0, prompt + decode runway) spans in split-KV
-    // mode, with prompt reuse disabled, so the allocator can quote the exact
-    // virtual destinations before any family member starts prefill.
+    // server currently uses [0, prompt + decode runway) spans in the target
+    // unified elastic KV mode, with prompt reuse disabled, so the allocator
+    // can quote the exact virtual destinations before any family member starts
+    // prefill.
     struct llama_kv_admission_span {
         llama_seq_id seq_id;
         llama_pos    pos_begin;
