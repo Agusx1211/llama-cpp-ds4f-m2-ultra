@@ -120,6 +120,23 @@ request completes. Burst 03 must complete before the exact low response; the
 runner does not require an impossible post-teardown prompt frame after a finite
 low prompt has already reached its final token.
 
+Clean commit `129fb3bba9d7706437439562b858f85f8f127c52` passed this
+horizontal gate on the M2 Ultra with the pinned UD-Q8_K_XL model and exact
+commands above. All four burst outputs matched the isolated oracle, the mixed
+low output matched its isolated oracle, and reference-before matched
+reference-after. Burst elapsed/TTFT times were 9.901/6.706 s, 10.436/7.227 s,
+8.364/5.135 s, and 6.609/6.429 s; launch lag was 0.183--0.274 ms. The 35.405 s
+mixed low response ended 92.810 ms after burst 03. A preceding run of the same
+runtime and workload measured 35.410 s and a 92.500 ms final completion lead;
+its only failure was the since-removed impossible final prompt-frame check.
+The passing 106-event lossless trace recorded nine low commits during active
+fast decode, three aligned low yields, and one prefill owner maximum. It used no
+new swapouts, saw no critical memory pressure or runtime pressure/error metric,
+and left no target process after teardown. The retained passing artifact is
+`/private/tmp/phase3-fast-refill-pipeline-r2-129fb3bba9d7-20260804T122639Z`;
+the SHA-256 of its verified manifest is
+`9e37facf74cf64104b45ce22338867d9a973da8f9cc40a6f4580e666aff67f6e`.
+
 `PASS` requires exact `tokens_predicted` and token-ID cardinality for every
 request, identical token IDs and content for deterministic reference/fast
 pairs, fast output before low completion, a low commit while fast decode is
