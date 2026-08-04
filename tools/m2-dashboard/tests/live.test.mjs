@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+    createGatewayDashboardTransport,
     createLiveDashboardTransport,
     CONTROL_PATH,
     CSRF_HEADER,
     DETAIL_PATH,
     EVENTS_PATH,
     normalizeLoopbackBaseUrl,
+    normalizeGatewayOrigin,
     OPERATOR_TOKEN_HEADER,
     SNAPSHOT_PATH,
 } from "../lib/live.mjs";
@@ -23,6 +25,34 @@ test("live transport accepts explicit loopback bases and rejects secret-bearing 
     assert.throws(() => normalizeLoopbackBaseUrl("http://user:secret@127.0.0.1:8080"), /credentials/);
     assert.throws(() => normalizeLoopbackBaseUrl("http://127.0.0.1:8080?token=secret"), /query/);
     assert.throws(() => normalizeLoopbackBaseUrl("file:///tmp/socket"), /HTTP or HTTPS/);
+});
+
+test("gateway transport is exact-origin HTTPS and never sends an operator or lane header", async () => {
+    assert.equal(normalizeGatewayOrigin("https://admin.example.com").origin, "https://admin.example.com");
+    assert.throws(() => normalizeGatewayOrigin("http://admin.example.com"), /HTTPS/);
+    assert.throws(() => normalizeGatewayOrigin("https://admin.example.com/path"), /path/);
+    assert.throws(() => normalizeGatewayOrigin("https://user:secret@admin.example.com"), /credentials/);
+
+    const calls = [];
+    const transport = createGatewayDashboardTransport({
+        pageOrigin: "https://admin.example.com",
+        apiKey,
+        fetchImpl: async (url, options) => {
+            calls.push({ url, options });
+            return new Response(JSON.stringify({ schema_version: 1 }), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+            });
+        },
+    });
+    await transport.getSnapshot();
+    assert.equal(calls[0].url, `https://admin.example.com${SNAPSHOT_PATH}`);
+    assert.equal(calls[0].options.headers.get("Authorization"), `Bearer ${apiKey}`);
+    assert.equal(calls[0].options.headers.has(OPERATOR_TOKEN_HEADER), false);
+    assert.equal(calls[0].options.headers.has("X-Llama-Trusted-Lane"), false);
+    assert.equal(calls[0].options.credentials, "omit");
+    transport.clear();
+    await assert.rejects(() => transport.getSnapshot(), /credentials were cleared/);
 });
 
 test("live snapshot sends both credentials in headers with no ambient browser credentials", async () => {

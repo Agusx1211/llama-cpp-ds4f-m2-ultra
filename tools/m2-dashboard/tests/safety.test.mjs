@@ -105,6 +105,7 @@ test("dashboard sources avoid HTML injection and browser persistence primitives"
     assert.doesNotMatch(index, /javascript:/iu);
     assert.match(index, /<form[^>]+autocomplete="off"/u);
     assert.match(index, /id="api-key"[^>]+autocomplete="off"/u);
+    assert.match(index, /id="gateway-api-key"[^>]+autocomplete="off"/u);
     assert.match(index, /id="operator-token"[^>]+autocomplete="off"/u);
 
     const networkMethods = [...combined.matchAll(/method:\s*"([A-Z]+)"/g)].map((match) => match[1]);

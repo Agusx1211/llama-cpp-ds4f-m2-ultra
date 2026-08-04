@@ -1,0 +1,81 @@
+{
+	admin off
+	auto_https disable_redirects
+	email {$M2_GATEWAY_ACME_EMAIL}
+	# Required-argument guard set only by validate_gateway.py --run. Without the
+	# launcher Caddyfile adaptation fails instead of treating an empty path as *.
+	shutdown_delay {$M2_GATEWAY_LAUNCH_GUARD}
+	skip_install_trust
+}
+
+(m2_api_lane) {
+	reverse_proxy {$M2_GATEWAY_BACKEND} {
+		# Delete every client-controlled scheduling input before installing the
+		# gateway's exact credential and host-selected lane. Keep these explicit:
+		# they are security boundaries, not generic forwarding cleanup.
+		header_up -X-Llama-Benchmark-Tag
+		header_up X-Llama-Trusted-Scheduling-Token {$M2_GATEWAY_TRUSTED_TOKEN}
+		header_up X-Llama-Trusted-Lane {args[0]}
+	}
+}
+
+(m2_tls) {
+	tls {$M2_GATEWAY_TLS_MODE}
+}
+
+{$M2_GATEWAY_LOW_HOST} {
+	import m2_tls
+	@low_unauthorized not header Authorization "Bearer {$M2_GATEWAY_LOW_API_KEY}"
+	respond @low_unauthorized "unauthorized" 401
+	import m2_api_lane low
+}
+
+{$M2_GATEWAY_NORMAL_HOST} {
+	import m2_tls
+	@normal_unauthorized not header Authorization "Bearer {$M2_GATEWAY_NORMAL_API_KEY}"
+	respond @normal_unauthorized "unauthorized" 401
+	import m2_api_lane normal
+}
+
+{$M2_GATEWAY_FAST_HOST} {
+	import m2_tls
+	@fast_unauthorized not header Authorization "Bearer {$M2_GATEWAY_FAST_API_KEY}"
+	respond @fast_unauthorized "unauthorized" 401
+	import m2_api_lane fast
+}
+
+{$M2_GATEWAY_ADMIN_HOST} {
+	import m2_tls
+
+	header {
+		-Server
+		Cache-Control "no-store"
+		Content-Security-Policy "default-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+		Cross-Origin-Opener-Policy "same-origin"
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+	}
+
+	handle /internal/admin/* {
+		@admin_unauthorized not header Authorization "Bearer {$M2_GATEWAY_ADMIN_API_KEY}"
+		respond @admin_unauthorized "unauthorized" 401
+		reverse_proxy {$M2_GATEWAY_BACKEND} {
+			header_up -X-Llama-Trusted-Lane
+			header_up -X-Llama-Benchmark-Tag
+			header_up X-Llama-Trusted-Scheduling-Token {$M2_GATEWAY_TRUSTED_TOKEN}
+			# The server accepts browser mutations only from loopback origins. The
+			# gateway has already authenticated the exact admin host and retains
+			# Sec-Fetch-Site, so cross-site requests still fail at the server.
+			header_up Origin {$M2_GATEWAY_BACKEND}
+		}
+	}
+
+	handle {
+		# This launcher-only value is the validated canonical release path. A
+		# direct Caddy invocation intentionally has no usable static root.
+		root * {$M2_GATEWAY_PINNED_DASHBOARD_ROOT}
+		try_files {path} /index.html
+		file_server
+	}
+}

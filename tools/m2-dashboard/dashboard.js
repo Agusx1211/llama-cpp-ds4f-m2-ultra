@@ -1,7 +1,7 @@
 import { AdminStateClient } from "./lib/client.mjs";
 import { confirmAndCancel } from "./lib/admin.mjs";
 import { ControlIntentBuffer, createControlIntent } from "./lib/controls.mjs";
-import { createLiveDashboardTransport } from "./lib/live.mjs";
+import { createGatewayDashboardTransport, createLiveDashboardTransport } from "./lib/live.mjs";
 import { renderFastRefill } from "./lib/refill.mjs";
 import {
     contentForDisplay,
@@ -635,6 +635,24 @@ async function main() {
         } catch (error) {
             apiKeyInput.value = "";
             operatorInput.value = "";
+            showConnectionError(error);
+        }
+    });
+    document.querySelector("#gateway-form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        const apiKeyInput = document.querySelector("#gateway-api-key");
+        try {
+            const transport = createGatewayDashboardTransport({
+                pageOrigin: globalThis.location.origin,
+                apiKey: apiKeyInput.value,
+            });
+            apiKeyInput.value = "";
+            void startClient(transport, "live").catch((error) => {
+                transport.clear();
+                showConnectionError(error);
+            });
+        } catch (error) {
+            apiKeyInput.value = "";
             showConnectionError(error);
         }
     });

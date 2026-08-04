@@ -23,11 +23,19 @@
     <section class="panel connection-panel" aria-labelledby="connection-title">
       <div class="panel-heading">
         <div>
-          <p class="eyebrow">Authenticated loopback connection</p>
+          <p class="eyebrow">Authenticated gateway or loopback connection</p>
           <h2 id="connection-title">Live registry and cancel</h2>
         </div>
         <button id="fixture-button" type="button">Use fixture</button>
       </div>
+      <form id="gateway-form" class="gateway-form" autocomplete="off">
+        <label>
+          <span class="metric-label">Admin gateway API key</span>
+          <input id="gateway-api-key" name="gateway-api-key" type="password" required autocomplete="off" spellcheck="false">
+        </label>
+        <button type="submit">Connect this HTTPS gateway</button>
+      </form>
+      <p class="notice">Gateway mode uses this page's exact HTTPS origin. The gateway supplies the operator credential and never accepts a lane from the browser.</p>
       <form id="live-form" class="credential-form" autocomplete="off">
         <label>
           <span class="metric-label">Server URL</span>
@@ -43,7 +51,7 @@
         </label>
         <button type="submit">Connect live</button>
       </form>
-      <p class="notice">Credentials are sent only as headers, retained only in this page's memory, and cleared on disconnect. Live cancel also requires an explicit confirmation, loopback Origin, JSON content type, and CSRF proof header.</p>
+      <p class="notice">Direct mode is loopback-only. Credentials are sent only as headers, retained only in this page's memory, and cleared on disconnect. Live cancel also requires an explicit confirmation, same-site Origin, JSON content type, and CSRF proof header.</p>
     </section>
 
     <section aria-label="system summary">

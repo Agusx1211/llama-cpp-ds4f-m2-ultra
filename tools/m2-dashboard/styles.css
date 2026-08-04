@@ -254,6 +254,14 @@ footer {
   gap: 0.65rem;
 }
 
+.gateway-form {
+  display: grid;
+  grid-template-columns: minmax(14rem, 1fr) auto;
+  align-items: end;
+  gap: 0.65rem;
+  margin-bottom: 0.5rem;
+}
+
 .credential-form label {
   min-width: 0;
 }

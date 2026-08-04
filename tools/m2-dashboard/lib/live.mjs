@@ -58,6 +58,22 @@ export function normalizeLoopbackBaseUrl(value) {
     return url;
 }
 
+export function normalizeGatewayOrigin(value) {
+    let url;
+    try {
+        url = new URL(value);
+    } catch {
+        throw new TypeError("gateway origin must be an absolute URL");
+    }
+    if (url.protocol !== "https:") {
+        throw new RangeError("gateway origin must use HTTPS");
+    }
+    if (url.username || url.password || url.search || url.hash || url.pathname !== "/") {
+        throw new RangeError("gateway origin cannot contain credentials, a path, query parameters, or a fragment");
+    }
+    return url;
+}
+
 function endpointUrl(base, path) {
     const result = new URL(base.href);
     const prefix = base.pathname === "/" ? "" : base.pathname;
@@ -105,34 +121,26 @@ function canonicalRequestId(value) {
     return value;
 }
 
-export function createLiveDashboardTransport({
-    baseUrl,
-    apiKey,
-    operatorToken,
-    fetchImpl = globalThis.fetch,
-    parserOptions = {},
-}) {
+function createDashboardTransport({ base, apiKey, operatorToken, fetchImpl, parserOptions }) {
     if (typeof fetchImpl !== "function") {
         throw new Error("fetch is unavailable");
     }
-    const base = normalizeLoopbackBaseUrl(baseUrl);
     const secrets = {
         apiKey: credential(apiKey, "API key", 1, MAX_API_KEY_BYTES),
-        operatorToken: credential(
-            operatorToken,
-            "operator token",
-            MIN_OPERATOR_TOKEN_BYTES,
-            MAX_OPERATOR_TOKEN_BYTES,
-        ),
+        operatorToken,
     };
 
     const credentialedFetch = (url, options = {}) => {
-        if (secrets.apiKey === "" || secrets.operatorToken === "") {
-            throw new Error("live dashboard credentials were cleared");
+        if (secrets.apiKey === "") {
+            throw new Error("dashboard credentials were cleared");
         }
         const headers = new Headers(options.headers ?? {});
         headers.set("Authorization", `Bearer ${secrets.apiKey}`);
-        headers.set(OPERATOR_TOKEN_HEADER, secrets.operatorToken);
+        if (secrets.operatorToken === null) {
+            headers.delete(OPERATOR_TOKEN_HEADER);
+        } else {
+            headers.set(OPERATOR_TOKEN_HEADER, secrets.operatorToken);
+        }
         headers.delete("X-Llama-Trusted-Lane");
         headers.delete("X-Llama-Benchmark-Tag");
         return fetchImpl(url, {
@@ -208,8 +216,44 @@ export function createLiveDashboardTransport({
         openEvents: createFetchSseTransport(eventsUrl, credentialedFetch, boundedParserOptions),
         clear() {
             secrets.apiKey = "";
-            secrets.operatorToken = "";
+            secrets.operatorToken = null;
         },
         endpoints: Object.freeze({ snapshotUrl, eventsUrl, detailUrl, controlUrl }),
     };
+}
+
+export function createLiveDashboardTransport({
+    baseUrl,
+    apiKey,
+    operatorToken,
+    fetchImpl = globalThis.fetch,
+    parserOptions = {},
+}) {
+    return createDashboardTransport({
+        base: normalizeLoopbackBaseUrl(baseUrl),
+        apiKey,
+        operatorToken: credential(
+            operatorToken,
+            "operator token",
+            MIN_OPERATOR_TOKEN_BYTES,
+            MAX_OPERATOR_TOKEN_BYTES,
+        ),
+        fetchImpl,
+        parserOptions,
+    });
+}
+
+export function createGatewayDashboardTransport({
+    pageOrigin,
+    apiKey,
+    fetchImpl = globalThis.fetch,
+    parserOptions = {},
+}) {
+    return createDashboardTransport({
+        base: normalizeGatewayOrigin(pageOrigin),
+        apiKey,
+        operatorToken: null,
+        fetchImpl,
+        parserOptions,
+    });
 }
