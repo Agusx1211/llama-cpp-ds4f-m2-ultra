@@ -143,7 +143,8 @@ class AdaptivePrefillSmokeTests(unittest.TestCase):
         self.assertEqual([timing["launch_lag_ms"] for timing in timings], [0.00001] * 4)
         self.assertEqual([timing["ttft_ms"] for timing in timings], [0.00002] * 4)
         self.assertEqual(
-            [timing["low_progress_after_ns"] for timing in timings], [225, 325, 425, 475])
+            [timing.get("low_progress_during_next_burst_ns") for timing in timings],
+            [225, 325, 425, None])
 
     def test_sticky_or_handoff_only_progress_is_rejected(self) -> None:
         for timestamp in (149, 150, 199, 200):
@@ -161,11 +162,17 @@ class AdaptivePrefillSmokeTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     SMOKE.validate_sequential_burst_results(results, 4)
 
-    def test_missing_or_out_of_window_final_progress_is_rejected(self) -> None:
-        for timestamp in (450, 1000, 1001):
-            with self.subTest(timestamp=timestamp):
+    def test_final_burst_needs_no_post_teardown_prompt_progress(self) -> None:
+        results = sequential_results()
+        results["low-8k"].progress.pop()
+        timings = SMOKE.validate_sequential_burst_results(results, 4)
+        self.assertNotIn("low_progress_during_next_burst_ns", timings[-1])
+
+    def test_missing_transition_progress_is_rejected(self) -> None:
+        for ordinal in range(3):
+            with self.subTest(ordinal=ordinal):
                 results = sequential_results()
-                results["low-8k"].progress[-1]["client_monotonic_ns"] = timestamp
+                results["low-8k"].progress.pop(ordinal)
                 with self.assertRaises(RuntimeError):
                     SMOKE.validate_sequential_burst_results(results, 4)
 
@@ -203,19 +210,6 @@ class AdaptivePrefillSmokeTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     SMOKE.require_result(burst)
 
-    def test_low_done_requires_a_newer_recorded_progress_sample(self) -> None:
-        smoke = SMOKE.Smoke.__new__(SMOKE.Smoke)
-        smoke.low_progress_condition = threading.Condition()
-        smoke.low_done = threading.Event()
-        smoke.low_done.set()
-
-        smoke.low_latest_progress_ns = 10
-        with self.assertRaises(RuntimeError):
-            smoke.wait_for_low_progress_after(10, "burst-03")
-
-        smoke.low_latest_progress_ns = 11
-        smoke.wait_for_low_progress_after(10, "burst-03")
-
     def test_pipelined_loop_has_no_wait_between_teardown_and_next_launch(self) -> None:
         smoke = SMOKE.Smoke.__new__(SMOKE.Smoke)
         smoke.low_done = threading.Event()
@@ -237,7 +231,6 @@ class AdaptivePrefillSmokeTests(unittest.TestCase):
 
         smoke.run_request = run_request
         smoke.wait_before_low_done = unexpected_wait
-        smoke.wait_for_low_progress_after = unexpected_wait
         bursts = {"count": 4, "prompt_tokens": 128, "n_predict": 4, "salt": 5001, "seed": 42}
         last = smoke.run_pipelined_bursts(bursts)
         self.assertEqual(last.tag, "burst-03")

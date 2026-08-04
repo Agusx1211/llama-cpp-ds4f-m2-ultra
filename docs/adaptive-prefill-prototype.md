@@ -99,9 +99,10 @@ Before sending any workload request it requires an empty trace and
 checks the server's advertised capacity against a worst-case per-token event
 budget. It records each intended and actual launch time, launch lag, and TTFT.
 Every burst must fully return before the mixed low request completes, exactly
-match the isolated burst's token IDs and content, and be followed by a fresh
-low prompt-progress frame before the next burst completes. The mixed low result
-must likewise exactly match its isolated oracle. The reference before/after,
+match the isolated burst's token IDs and content, and, across each of the three
+burst handoffs, receive a fresh low prompt-progress frame after the successor
+starts and before it completes. The mixed low result must likewise exactly
+match its isolated oracle. The reference before/after,
 stage/commit, one-owner, aligned-yield, active-fast chunk, trace overflow,
 cardinality, and output-hash gates remain enabled.
 
@@ -114,8 +115,10 @@ budget is cumulative for the live cohort: cancellation, timeout, or failure
 releases physical width but does not refund a claimed member. Trace `cohort_id`
 identifies prefill ownership, not a runtime permit epoch; the runner's refill
 proof is the completed burst followed by new mixed-low progress before the next
-request completes; the final burst must likewise be followed by new low
-progress before low completion.
+request completes. Burst 03 must complete before the exact low response; the
+02-to-03 handoff already proves low progress while burst 03 is active, so the
+runner does not require an impossible post-teardown prompt frame after a finite
+low prompt has already reached its final token.
 
 `PASS` requires exact `tokens_predicted` and token-ID cardinality for every
 request, identical token IDs and content for deterministic reference/fast

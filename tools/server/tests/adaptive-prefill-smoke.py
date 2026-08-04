@@ -183,21 +183,19 @@ def validate_sequential_burst_results(results: dict[str, Result], count: int) ->
             raise RuntimeError(f"{tag}: first output did not precede low completion")
         if not burst.end_ns or burst.end_ns < burst.first_token_ns or burst.end_ns >= low.end_ns:
             raise RuntimeError(f"{tag}: HTTP request did not complete before low completion")
+        progress_after = None
         if ordinal + 1 < count:
             next_burst = results[f"burst-{ordinal + 1:02d}"]
             if next_burst.start_ns < burst.end_ns:
                 raise RuntimeError(f"{tag}: next burst launched before HTTP teardown")
             progress_cutoff_ns = max(burst.end_ns, next_burst.start_ns)
             progress_deadline_ns = next_burst.end_ns
-        else:
-            progress_cutoff_ns = burst.end_ns
-            progress_deadline_ns = low.end_ns
-        progress_after = next(
-            (timestamp for timestamp in progress_times
-             if progress_cutoff_ns < timestamp < progress_deadline_ns), None)
-        if progress_after is None:
-            raise RuntimeError(f"{tag}: no fresh low prompt progress followed completed burst")
-        timings.append({
+            progress_after = next(
+                (timestamp for timestamp in progress_times
+                 if progress_cutoff_ns < timestamp < progress_deadline_ns), None)
+            if progress_after is None:
+                raise RuntimeError(f"{tag}: no fresh low prompt progress during next burst")
+        timing = {
             "tag": tag,
             "intended_launch_ns": burst.intended_launch_ns,
             "actual_launch_ns": burst.start_ns,
@@ -206,8 +204,10 @@ def validate_sequential_burst_results(results: dict[str, Result], count: int) ->
             "ttft_ms": (burst.first_token_ns - burst.start_ns) / 1e6,
             "overlap_lead_ms": (low.end_ns - burst.first_token_ns) / 1e6,
             "completion_lead_ms": (low.end_ns - burst.end_ns) / 1e6,
-            "low_progress_after_ns": progress_after,
-        })
+        }
+        if progress_after is not None:
+            timing["low_progress_during_next_burst_ns"] = progress_after
+        timings.append(timing)
     return timings
 
 
@@ -226,8 +226,6 @@ class Smoke:
         self.results_lock = threading.Lock()
         self.low_progress = threading.Event()
         self.low_done = threading.Event()
-        self.low_progress_condition = threading.Condition()
-        self.low_latest_progress_ns = 0
         self.sustained_first_token = threading.Event()
         self.ordinary_request_id = 0
         self.trace_preflight: dict[str, int] | None = None
@@ -363,9 +361,6 @@ class Smoke:
                                 result.progress.append(saved)
                                 self.emit("prompt_progress", tag=tag, **progress)
                                 if tag == "low-8k":
-                                    with self.low_progress_condition:
-                                        self.low_latest_progress_ns = timestamp
-                                        self.low_progress_condition.notify_all()
                                     self.low_progress.set()
                                 continue
                             tokens = item.get("tokens") or []
@@ -391,8 +386,6 @@ class Smoke:
             result.end_ns = now_ns()
             if tag == "low-8k":
                 self.low_done.set()
-                with self.low_progress_condition:
-                    self.low_progress_condition.notify_all()
             with self.results_lock:
                 self.results[tag] = result
             self.emit("request_end", **result.summary(retain_ids=False))
@@ -411,17 +404,6 @@ class Smoke:
             if self.low_done.is_set():
                 raise RuntimeError(f"low completed before {label}")
         raise RuntimeError(f"timeout waiting for {label}")
-
-    def wait_for_low_progress_after(self, after_ns: int, label: str) -> None:
-        deadline = time.monotonic() + 300
-        with self.low_progress_condition:
-            while self.low_latest_progress_ns <= after_ns:
-                if self.low_done.is_set():
-                    raise RuntimeError(f"low completed before fresh progress after {label}")
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise RuntimeError(f"timeout waiting for fresh low progress after {label}")
-                self.low_progress_condition.wait(min(0.05, remaining))
 
     def run_pipelined_bursts(self, bursts: dict[str, Any]) -> Result:
         last: Result | None = None
@@ -483,8 +465,7 @@ class Smoke:
                                     n_predict=low["n_predict"], salt=low["salt"], seed=low["seed"])
             try:
                 self.wait_before_low_done(self.low_progress, "low prompt progress")
-                burst = self.run_pipelined_bursts(bursts)
-                self.wait_for_low_progress_after(burst.end_ns, burst.tag)
+                self.run_pipelined_bursts(bursts)
             finally:
                 low_thread.join()
             self.run_request(tag="reference-after", lane="fast", prompt_count=ref["prompt_tokens"],
@@ -638,7 +619,7 @@ class Smoke:
                     "credential_composition": True,
                     "ordinary_json_forgery_normal": True,
                     "every_burst_completed_before_low_completion": True,
-                    "low_progress_after_every_burst": True,
+                    "low_progress_across_three_burst_handoffs": True,
                     "exact_tokens_predicted_and_id_cardinality": True,
                     "exact_reference_burst_and_low_outputs": True,
                     "exact_stage_commit_pairs": True,
