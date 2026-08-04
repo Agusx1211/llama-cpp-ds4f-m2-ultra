@@ -1,6 +1,8 @@
 #include "llama-dsv4-comp-pool.h"
 
 #include <algorithm>
+#include <atomic>
+#include <exception>
 #include <limits>
 #include <map>
 #include <set>
@@ -50,6 +52,8 @@ struct resident_handle {
     uint64_t                  visible_hca_rows = 0;
     std::vector<uint32_t>     c4_segment_ids;
     std::vector<uint32_t>     hca_segment_ids;
+    uint64_t                  resident_generation = 0;
+    bool                      resident_owned      = false;
 };
 
 struct planned_candidate {
@@ -68,7 +72,22 @@ struct planned_reservation {
     uint64_t                   expected_segment_generation = 0;
 };
 
-struct pool_identity {};
+uint64_t allocate_pool_id() {
+    static std::atomic<uint64_t> next{ 1 };
+    uint64_t                     current = next.load(std::memory_order_relaxed);
+    while (true) {
+        if (current == 0 || current == std::numeric_limits<uint64_t>::max()) {
+            throw std::overflow_error("DSV4 compressed-pool identity space exhausted");
+        }
+        if (next.compare_exchange_weak(current, current + 1, std::memory_order_relaxed)) {
+            return current;
+        }
+    }
+}
+
+struct pool_identity {
+    uint64_t id = allocate_pool_id();
+};
 
 enum class ticket_state : uint8_t {
     active,
@@ -138,6 +157,16 @@ struct llama_dsv4_comp_quote_plan {
     std::vector<planned_reservation>     reservations;
 };
 
+struct llama_dsv4_comp_detach_plan {
+    std::shared_ptr<const pool_identity> owner;
+    llama_dsv4_comp_status               status                       = llama_dsv4_comp_status::invalid_argument;
+    uint64_t                             pool_epoch                   = 0;
+    uint32_t                             execution_id                 = UINT32_MAX;
+    llama_dsv4_comp_handle_id            handle                       = 0;
+    uint64_t                             expected_handle_generation   = 0;
+    uint64_t                             expected_resident_generation = 0;
+};
+
 struct llama_dsv4_comp_pool::impl {
     struct ticket_record {
         uint64_t                                          generation = 0;
@@ -181,6 +210,24 @@ struct llama_dsv4_comp_pool::impl {
     }
 
     bool busy() const { return active_ticket_id != 0; }
+
+    bool has_resident_handles() const {
+        return std::any_of(handles.begin(), handles.end(),
+                           [](const auto & item) { return item.second.resident_owned; });
+    }
+
+    bool is_bound(llama_dsv4_comp_handle_id handle) const {
+        return std::any_of(bindings.begin(), bindings.end(),
+                           [&](const auto & binding) { return binding.second == handle; });
+    }
+
+    bool releasable(const std::vector<uint32_t> & ids, llama_dsv4_comp_family value) const {
+        const auto & state = family(value);
+        return std::all_of(ids.begin(), ids.end(), [&](uint32_t id) {
+            return id < state.segments.size() && state.segments[id].state == segment_state::mapped &&
+                   state.segments[id].refs > 0;
+        });
+    }
 
     void retain(const std::vector<uint32_t> & ids, llama_dsv4_comp_family value) {
         auto & state = family(value);
@@ -281,10 +328,14 @@ const char * llama_dsv4_comp_status_name(llama_dsv4_comp_status status) {
             return "invalid_argument";
         case llama_dsv4_comp_status::handle_not_found:
             return "handle_not_found";
+        case llama_dsv4_comp_status::stale_handle:
+            return "stale_handle";
         case llama_dsv4_comp_status::binding_not_found:
             return "binding_not_found";
         case llama_dsv4_comp_status::capacity_exhausted:
             return "capacity_exhausted";
+        case llama_dsv4_comp_status::generation_exhausted:
+            return "generation_exhausted";
         case llama_dsv4_comp_status::stale_quote:
             return "stale_quote";
         case llama_dsv4_comp_status::stale_ticket:
@@ -295,6 +346,8 @@ const char * llama_dsv4_comp_status_name(llama_dsv4_comp_status status) {
             return "slot_occupied";
         case llama_dsv4_comp_status::handle_bound:
             return "handle_bound";
+        case llama_dsv4_comp_status::handle_resident:
+            return "handle_resident";
     }
     return "unknown";
 }
@@ -328,9 +381,22 @@ uint64_t llama_dsv4_comp_physical_row(uint32_t physical_segment, uint64_t logica
 
 llama_dsv4_comp_pool::llama_dsv4_comp_pool(llama_dsv4_comp_pool_config config) : pimpl(new impl(config)) {}
 
-llama_dsv4_comp_pool::~llama_dsv4_comp_pool()                                            = default;
-llama_dsv4_comp_pool::llama_dsv4_comp_pool(llama_dsv4_comp_pool &&) noexcept             = default;
-llama_dsv4_comp_pool & llama_dsv4_comp_pool::operator=(llama_dsv4_comp_pool &&) noexcept = default;
+llama_dsv4_comp_pool::~llama_dsv4_comp_pool() {
+    if (pimpl && pimpl->has_resident_handles()) {
+        std::terminate();
+    }
+}
+llama_dsv4_comp_pool::llama_dsv4_comp_pool(llama_dsv4_comp_pool &&) noexcept = default;
+
+llama_dsv4_comp_pool & llama_dsv4_comp_pool::operator=(llama_dsv4_comp_pool && other) noexcept {
+    if (this != &other) {
+        if (pimpl && pimpl->has_resident_handles()) {
+            std::terminate();
+        }
+        pimpl = std::move(other.pimpl);
+    }
+    return *this;
+}
 
 static llama_dsv4_comp_family_usage family_usage_for(const family_state & family, uint32_t scratch_rows_in_use) {
     llama_dsv4_comp_family_usage result;
@@ -426,6 +492,8 @@ llama_dsv4_comp_memory_usage llama_dsv4_comp_pool::memory_usage_snapshot() const
     result.epoch                   = pimpl->epoch;
     result.handles                 = static_cast<uint32_t>(pimpl->handles.size());
     result.bindings                = static_cast<uint32_t>(pimpl->bindings.size());
+    result.resident_handles        = static_cast<uint32_t>(std::count_if(
+        pimpl->handles.begin(), pimpl->handles.end(), [](const auto & item) { return item.second.resident_owned; }));
     result.active_tickets          = pimpl->active_ticket_id == 0 ? 0 : 1;
     result.retained_ticket_records = static_cast<uint32_t>(pimpl->tickets.size());
     return result;
@@ -435,8 +503,12 @@ llama_dsv4_comp_handle_result llama_dsv4_comp_pool::create_handle() {
     if (pimpl->busy()) {
         return { llama_dsv4_comp_status::busy, 0 };
     }
+    if (pimpl->next_handle_id == 0) {
+        return { llama_dsv4_comp_status::generation_exhausted, 0 };
+    }
     resident_handle handle;
-    handle.id = pimpl->next_handle_id++;
+    handle.id             = pimpl->next_handle_id;
+    pimpl->next_handle_id = handle.id == std::numeric_limits<llama_dsv4_comp_handle_id>::max() ? 0 : handle.id + 1;
     pimpl->handles.emplace(handle.id, handle);
     ++pimpl->epoch;
     return { llama_dsv4_comp_status::ok, handle.id };
@@ -450,9 +522,18 @@ llama_dsv4_comp_handle_result llama_dsv4_comp_pool::copy_handle(llama_dsv4_comp_
     if (source_it == pimpl->handles.end()) {
         return { llama_dsv4_comp_status::handle_not_found, 0 };
     }
+    if (source_it->second.resident_owned) {
+        return { llama_dsv4_comp_status::handle_resident, 0 };
+    }
+    if (pimpl->next_handle_id == 0) {
+        return { llama_dsv4_comp_status::generation_exhausted, 0 };
+    }
     resident_handle copy = source_it->second;
-    copy.id              = pimpl->next_handle_id++;
+    copy.id                  = pimpl->next_handle_id;
+    pimpl->next_handle_id    = copy.id == std::numeric_limits<llama_dsv4_comp_handle_id>::max() ? 0 : copy.id + 1;
     copy.generation      = 1;
+    copy.resident_generation = 0;
+    copy.resident_owned      = false;
     pimpl->retain(copy.c4_segment_ids, llama_dsv4_comp_family::c4);
     pimpl->retain(copy.hca_segment_ids, llama_dsv4_comp_family::hca);
     pimpl->handles.emplace(copy.id, copy);
@@ -468,9 +549,15 @@ llama_dsv4_comp_status llama_dsv4_comp_pool::remove_handle(llama_dsv4_comp_handl
     if (it == pimpl->handles.end()) {
         return llama_dsv4_comp_status::handle_not_found;
     }
-    if (std::any_of(pimpl->bindings.begin(), pimpl->bindings.end(),
-                    [&](const auto & binding) { return binding.second == handle; })) {
+    if (it->second.resident_owned) {
+        return llama_dsv4_comp_status::handle_resident;
+    }
+    if (pimpl->is_bound(handle)) {
         return llama_dsv4_comp_status::handle_bound;
+    }
+    if (!pimpl->releasable(it->second.c4_segment_ids, llama_dsv4_comp_family::c4) ||
+        !pimpl->releasable(it->second.hca_segment_ids, llama_dsv4_comp_family::hca)) {
+        return llama_dsv4_comp_status::stale_handle;
     }
     pimpl->release(it->second.c4_segment_ids, llama_dsv4_comp_family::c4);
     pimpl->release(it->second.hca_segment_ids, llama_dsv4_comp_family::hca);
@@ -496,8 +583,12 @@ llama_dsv4_comp_status llama_dsv4_comp_pool::bind(uint32_t execution_id, llama_d
     if (execution_id >= LLAMA_DSV4_COMP_GRAPH_STREAMS) {
         return llama_dsv4_comp_status::invalid_argument;
     }
-    if (pimpl->handles.count(handle) == 0) {
+    const auto handle_it = pimpl->handles.find(handle);
+    if (handle_it == pimpl->handles.end()) {
         return llama_dsv4_comp_status::handle_not_found;
+    }
+    if (handle_it->second.resident_owned) {
+        return llama_dsv4_comp_status::handle_resident;
     }
     if (pimpl->bindings.count(execution_id) != 0) {
         return llama_dsv4_comp_status::slot_occupied;
@@ -527,6 +618,159 @@ llama_dsv4_comp_status llama_dsv4_comp_pool::get_binding(uint32_t               
         return llama_dsv4_comp_status::binding_not_found;
     }
     handle = it->second;
+    return llama_dsv4_comp_status::ok;
+}
+
+llama_dsv4_comp_detach_quote llama_dsv4_comp_pool::quote_detach(uint32_t execution_id) const {
+    llama_dsv4_comp_detach_quote result;
+    auto                         plan = std::make_shared<llama_dsv4_comp_detach_plan>();
+    plan->owner                       = pimpl->identity;
+    plan->pool_epoch                  = pimpl->epoch;
+    plan->execution_id                = execution_id;
+    result.execution_id               = execution_id;
+    result.pool_epoch                 = pimpl->epoch;
+    result.plan                       = plan;
+
+    if (pimpl->busy()) {
+        result.status = plan->status = llama_dsv4_comp_status::busy;
+        return result;
+    }
+    if (execution_id >= LLAMA_DSV4_COMP_GRAPH_STREAMS) {
+        result.status = plan->status = llama_dsv4_comp_status::invalid_argument;
+        return result;
+    }
+    const auto binding_it = pimpl->bindings.find(execution_id);
+    if (binding_it == pimpl->bindings.end()) {
+        result.status = plan->status = llama_dsv4_comp_status::binding_not_found;
+        return result;
+    }
+    const auto handle_it = pimpl->handles.find(binding_it->second);
+    if (handle_it == pimpl->handles.end() || handle_it->second.resident_owned) {
+        result.status = plan->status = llama_dsv4_comp_status::stale_handle;
+        return result;
+    }
+    if (handle_it->second.resident_generation == std::numeric_limits<uint64_t>::max()) {
+        result.status = plan->status = llama_dsv4_comp_status::generation_exhausted;
+        return result;
+    }
+    if (std::count_if(pimpl->bindings.begin(), pimpl->bindings.end(),
+                      [&](const auto & binding) { return binding.second == binding_it->second; }) != 1) {
+        result.status = plan->status = llama_dsv4_comp_status::handle_bound;
+        return result;
+    }
+
+    plan->handle                       = handle_it->first;
+    plan->expected_handle_generation   = handle_it->second.generation;
+    plan->expected_resident_generation = handle_it->second.resident_generation;
+    result.resident                    = {
+        pimpl->identity->id,
+        handle_it->first,
+        handle_it->second.generation,
+        handle_it->second.resident_generation + 1,
+    };
+    result.status = plan->status = llama_dsv4_comp_status::ok;
+    return result;
+}
+
+llama_dsv4_comp_resident_result llama_dsv4_comp_pool::detach(const llama_dsv4_comp_detach_quote & quote) {
+    llama_dsv4_comp_resident_result result;
+    if (!quote.plan || quote.plan->owner != pimpl->identity) {
+        result.status = llama_dsv4_comp_status::stale_quote;
+        return result;
+    }
+    if (quote.plan->status != llama_dsv4_comp_status::ok) {
+        result.status = quote.plan->status;
+        return result;
+    }
+    if (pimpl->busy()) {
+        result.status = llama_dsv4_comp_status::busy;
+        return result;
+    }
+    if (quote.plan->pool_epoch != pimpl->epoch) {
+        result.status = llama_dsv4_comp_status::stale_quote;
+        return result;
+    }
+    const auto binding_it = pimpl->bindings.find(quote.plan->execution_id);
+    const auto handle_it  = pimpl->handles.find(quote.plan->handle);
+    if (binding_it == pimpl->bindings.end() || binding_it->second != quote.plan->handle ||
+        handle_it == pimpl->handles.end() || handle_it->second.resident_owned ||
+        handle_it->second.generation != quote.plan->expected_handle_generation ||
+        handle_it->second.resident_generation != quote.plan->expected_resident_generation) {
+        result.status = llama_dsv4_comp_status::stale_quote;
+        return result;
+    }
+
+    pimpl->bindings.erase(binding_it);
+    handle_it->second.resident_owned = true;
+    ++handle_it->second.resident_generation;
+    ++pimpl->epoch;
+    result.status   = llama_dsv4_comp_status::ok;
+    result.resident = {
+        pimpl->identity->id,
+        handle_it->first,
+        handle_it->second.generation,
+        handle_it->second.resident_generation,
+    };
+    return result;
+}
+
+llama_dsv4_comp_status llama_dsv4_comp_pool::attach(llama_dsv4_comp_resident_handle resident, uint32_t execution_id) {
+    if (pimpl->busy()) {
+        return llama_dsv4_comp_status::busy;
+    }
+    if (execution_id >= LLAMA_DSV4_COMP_GRAPH_STREAMS || resident.pool_id == 0 || resident.id == 0) {
+        return llama_dsv4_comp_status::invalid_argument;
+    }
+    if (resident.pool_id != pimpl->identity->id) {
+        return llama_dsv4_comp_status::stale_handle;
+    }
+    const auto handle_it = pimpl->handles.find(resident.id);
+    if (handle_it == pimpl->handles.end() || !handle_it->second.resident_owned ||
+        handle_it->second.generation != resident.handle_generation ||
+        handle_it->second.resident_generation != resident.lease_generation) {
+        return llama_dsv4_comp_status::stale_handle;
+    }
+    if (pimpl->bindings.count(execution_id) != 0) {
+        return llama_dsv4_comp_status::slot_occupied;
+    }
+    if (pimpl->is_bound(resident.id)) {
+        return llama_dsv4_comp_status::handle_bound;
+    }
+
+    pimpl->bindings.emplace(execution_id, resident.id);
+    handle_it->second.resident_owned = false;
+    ++pimpl->epoch;
+    return llama_dsv4_comp_status::ok;
+}
+
+llama_dsv4_comp_status llama_dsv4_comp_pool::release(llama_dsv4_comp_resident_handle resident) {
+    if (pimpl->busy()) {
+        return llama_dsv4_comp_status::busy;
+    }
+    if (resident.pool_id == 0 || resident.id == 0) {
+        return llama_dsv4_comp_status::invalid_argument;
+    }
+    if (resident.pool_id != pimpl->identity->id) {
+        return llama_dsv4_comp_status::stale_handle;
+    }
+    const auto handle_it = pimpl->handles.find(resident.id);
+    if (handle_it == pimpl->handles.end() || !handle_it->second.resident_owned ||
+        handle_it->second.generation != resident.handle_generation ||
+        handle_it->second.resident_generation != resident.lease_generation) {
+        return llama_dsv4_comp_status::stale_handle;
+    }
+    if (pimpl->is_bound(resident.id)) {
+        return llama_dsv4_comp_status::handle_bound;
+    }
+    if (!pimpl->releasable(handle_it->second.c4_segment_ids, llama_dsv4_comp_family::c4) ||
+        !pimpl->releasable(handle_it->second.hca_segment_ids, llama_dsv4_comp_family::hca)) {
+        return llama_dsv4_comp_status::stale_handle;
+    }
+
+    pimpl->release(handle_it->second.c4_segment_ids, llama_dsv4_comp_family::c4);
+    pimpl->release(handle_it->second.hca_segment_ids, llama_dsv4_comp_family::hca);
+    pimpl->handles.erase(handle_it);
+    ++pimpl->epoch;
     return llama_dsv4_comp_status::ok;
 }
 
@@ -577,6 +821,11 @@ llama_dsv4_comp_quote llama_dsv4_comp_pool::quote_batch(const llama_dsv4_comp_ba
         const auto handle_it = pimpl->handles.find(change.handle);
         if (handle_it == pimpl->handles.end()) {
             result.status = llama_dsv4_comp_status::handle_not_found;
+            plan->status  = result.status;
+            return result;
+        }
+        if (handle_it->second.resident_owned) {
+            result.status = llama_dsv4_comp_status::handle_resident;
             plan->status  = result.status;
             return result;
         }

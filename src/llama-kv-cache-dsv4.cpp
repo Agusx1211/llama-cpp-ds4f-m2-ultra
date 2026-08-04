@@ -1834,6 +1834,62 @@ size_t llama_dsv4_comp_state::total_size() const {
 // llama_kv_cache_dsv4
 //
 
+const char * llama_dsv4_resident_status_name(llama_dsv4_resident_status status) {
+    switch (status) {
+        case llama_dsv4_resident_status::ok:
+            return "ok";
+        case llama_dsv4_resident_status::invalid_scope:
+            return "invalid_scope";
+        case llama_dsv4_resident_status::invalid_sequence:
+            return "invalid_sequence";
+        case llama_dsv4_resident_status::unsupported_components:
+            return "unsupported_components";
+    }
+    return "unknown";
+}
+
+llama_dsv4_resident_detach_quote llama_dsv4_quote_resident_detach_layout(llama_dsv4_resident_detach_request request,
+                                                                         uint32_t                           n_seq_max,
+                                                                         uint32_t rollback_index,
+                                                                         bool     aggregate_compressed) {
+    llama_dsv4_resident_detach_quote result;
+    result.seq_id              = request.seq_id;
+    result.scope               = request.scope;
+    result.rollback_index      = rollback_index;
+    result.required_components = LLAMA_DSV4_RESIDENT_RAW_SWA | LLAMA_DSV4_RESIDENT_COMPRESSED |
+                                 LLAMA_DSV4_RESIDENT_CSA_STATE | LLAMA_DSV4_RESIDENT_HCA_STATE |
+                                 LLAMA_DSV4_RESIDENT_LID_STATE | LLAMA_DSV4_RESIDENT_ROLLBACK_INDEX;
+    if (request.scope == llama_dsv4_resident_scope::target_draft_pair) {
+        result.required_components |= LLAMA_DSV4_RESIDENT_PAIRED_CONTEXT;
+    }
+
+    if (request.scope != llama_dsv4_resident_scope::single_context &&
+        request.scope != llama_dsv4_resident_scope::target_draft_pair) {
+        result.status                 = llama_dsv4_resident_status::invalid_scope;
+        result.unsupported_components = result.required_components;
+        return result;
+    }
+
+    if (request.seq_id < 0 || (uint32_t) request.seq_id >= n_seq_max) {
+        result.status                 = llama_dsv4_resident_status::invalid_sequence;
+        result.unsupported_components = result.required_components;
+        return result;
+    }
+
+    // The scalar rollback selector can travel in a future resident handle.
+    // Aggregate compressed roots already have an execution-independent owner.
+    // Raw/SWA and every state plane remain fixed to ordinary per-sequence
+    // tensor slices, and paired target/draft ownership needs a coordinator.
+    result.detachable_components = LLAMA_DSV4_RESIDENT_ROLLBACK_INDEX;
+    if (aggregate_compressed) {
+        result.detachable_components |= LLAMA_DSV4_RESIDENT_COMPRESSED;
+    }
+    result.unsupported_components = result.required_components & ~result.detachable_components;
+    result.status                 = result.unsupported_components == 0 ? llama_dsv4_resident_status::ok :
+                                                                         llama_dsv4_resident_status::unsupported_components;
+    return result;
+}
+
 llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         const llama_model & model,
                 ggml_type   type_k,
@@ -2607,6 +2663,13 @@ uint32_t llama_kv_cache_dsv4::get_hca_logical_rows() const {
 
 llama_dsv4_comp_pool * llama_kv_cache_dsv4::get_comp_pool() const {
     return comp_pool.get();
+}
+
+llama_dsv4_resident_detach_quote llama_kv_cache_dsv4::quote_resident_detach(
+    llama_dsv4_resident_detach_request request) const {
+    const uint32_t rollback_index =
+        request.seq_id >= 0 && (uint32_t) request.seq_id < n_seq_max ? rs_idx[request.seq_id] : 0;
+    return llama_dsv4_quote_resident_detach_layout(request, n_seq_max, rollback_index, aggregate_compressed);
 }
 
 uint32_t llama_kv_cache_dsv4::get_n_rs_seq() const {

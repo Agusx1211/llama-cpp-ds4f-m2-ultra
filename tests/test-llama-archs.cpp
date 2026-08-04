@@ -2036,6 +2036,12 @@ static bool test_dsv4_aggregate_device(size_t seed, ggml_backend_dev_t dev) {
         GGML_ASSERT(memory != nullptr);
         GGML_ASSERT(memory->is_aggregate_compressed() &&
                 "forced target unified multi-slot DSV4 did not select aggregate compressed storage");
+        const auto resident_quote = memory->quote_resident_detach({ 0, llama_dsv4_resident_scope::single_context });
+        GGML_ASSERT(resident_quote.status == llama_dsv4_resident_status::unsupported_components &&
+                    (resident_quote.detachable_components & LLAMA_DSV4_RESIDENT_COMPRESSED) != 0 &&
+                    (resident_quote.unsupported_components & LLAMA_DSV4_RESIDENT_RAW_SWA) != 0 &&
+                    (resident_quote.unsupported_components & LLAMA_DSV4_RESIDENT_CSA_STATE) != 0 &&
+                    "aggregate compressed ownership incorrectly satisfied whole-sequence detach");
     }
 
     static constexpr uint32_t n_vocab  = 128;
