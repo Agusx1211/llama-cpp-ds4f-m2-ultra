@@ -64,6 +64,10 @@ struct faults {
     // Deterministic failure after creating a new object directory but before
     // its class-directory durability fence.
     bool                  fail_object_parent_fsync = false;
+    // Deterministic crash seams around the pool-wide durable deletion intent.
+    // Both leave reconciliation to complete the authorized deletion on restart.
+    bool                  fail_after_delete_intent = false;
+    bool                  fail_after_delete_unlink = false;
 };
 
 struct stats {
@@ -81,6 +85,9 @@ struct write_result {
     status                  store_status    = status::invalid_argument;
     llama_snapshot_status   snapshot_status = llama_snapshot_status::invalid_argument;
     int                     os_error        = 0;
+    // The store assigns this pool-wide, durable generation. The generation in
+    // the input metadata is only a placeholder and is never used as an ABA
+    // token; callers must use this returned value for compare-and-delete.
     uint64_t                generation      = 0;
     uint64_t                charged_bytes   = 0;
     bool                    committed       = false;
@@ -166,10 +173,13 @@ class store {
                         object_class                    storage_class,
                         const llama_snapshot_identity & expected_identity);
 
-    // Generation equality is a compare-and-delete fence. A durable tombstone
-    // makes generations for a key permanently monotonic across deletion and
+    // Generation equality is a compare-and-delete fence. Store-assigned
+    // generations are pool-wide and permanently monotonic across deletion and
     // restart, so a stale completion cannot erase a recreated continuation.
-    erase_result erase(const object_key & key, object_class storage_class, uint64_t expected_generation);
+    erase_result erase(const object_key & key,
+                       object_class       storage_class,
+                       uint64_t           expected_generation,
+                       const faults &     injected = {});
 
   private:
     std::shared_ptr<shared_state> state_;

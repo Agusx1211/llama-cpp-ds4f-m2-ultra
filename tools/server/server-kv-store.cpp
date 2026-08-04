@@ -13,6 +13,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -36,12 +37,16 @@ struct object_record {
     llama_snapshot_identity        identity;
 };
 
-struct tombstone_record {
+struct delete_intent_record {
     object_class storage_class = object_class::live;
-    uint64_t     generation    = 0;
+    object_key   key{};
+    uint64_t     generation = 0;
 };
 
-constexpr const char * AUTHORITY_LOCK_NAME = ".server-kv.lock";
+constexpr const char * AUTHORITY_LOCK_NAME        = ".server-kv.lock";
+constexpr const char * GENERATION_CLOCK_NAME      = ".server-kv-generation";
+constexpr const char * GENERATION_CLOCK_NEXT_NAME = ".server-kv-generation.next";
+constexpr const char * DELETE_INTENT_NAME         = ".server-kv-delete-intent";
 
 bool key_is_zero(const object_key & key) {
     return std::all_of(key.begin(), key.end(), [](uint8_t byte) { return byte == 0; });
@@ -62,27 +67,105 @@ bool is_chunk_name(const std::string & value) {
            is_lower_hex(value.substr(6, 8), 8);
 }
 
-bool parse_generation_suffix(const std::string & value, const std::string & prefix, uint64_t & generation) {
-    if (value.size() != prefix.size() + 16 || value.rfind(prefix, 0) != 0 ||
-        !is_lower_hex(value.substr(prefix.size()), 16)) {
+bool parse_hex_u64(const std::string & value, uint64_t & parsed) {
+    if (!is_lower_hex(value, 16)) {
         return false;
     }
-    generation = 0;
-    for (size_t index = prefix.size(); index < value.size(); ++index) {
-        const char byte = value[index];
-        generation      = generation * 16 + static_cast<uint64_t>(byte <= '9' ? byte - '0' : byte - 'a' + 10);
+    parsed = 0;
+    for (char byte : value) {
+        parsed = parsed * 16 + static_cast<uint64_t>(byte <= '9' ? byte - '0' : byte - 'a' + 10);
+    }
+    return true;
+}
+
+bool parse_generation_suffix(const std::string & value, const std::string & prefix, uint64_t & generation) {
+    if (value.size() != prefix.size() + 16 || value.rfind(prefix, 0) != 0 ||
+        !parse_hex_u64(value.substr(prefix.size()), generation)) {
+        return false;
     }
     return generation != 0;
 }
 
-bool tombstone_generation(const std::string & value, uint64_t & generation) {
-    return parse_generation_suffix(value, ".deleted-generation-", generation);
+object_key parse_key(const std::string & text);
+
+std::string encode_generation_clock(uint64_t generation) {
+    char buffer[128];
+    std::snprintf(buffer, sizeof(buffer), "server-kv-generation-v1\nvalue=%016llx\ninverse=%016llx\n",
+                  static_cast<unsigned long long>(generation), static_cast<unsigned long long>(~generation));
+    return buffer;
 }
 
-std::string tombstone_name(uint64_t generation) {
-    char buffer[64];
-    std::snprintf(buffer, sizeof(buffer), ".deleted-generation-%016llx", static_cast<unsigned long long>(generation));
+bool decode_generation_clock(const std::string & value, uint64_t & generation) {
+    constexpr const char * prefix = "server-kv-generation-v1\nvalue=";
+    constexpr const char * middle = "\ninverse=";
+    if (value.rfind(prefix, 0) != 0) {
+        return false;
+    }
+    const size_t value_offset = std::char_traits<char>::length(prefix);
+    const size_t middle_at    = value_offset + 16;
+    if (value.size() != middle_at + std::char_traits<char>::length(middle) + 16 + 1 ||
+        value.compare(middle_at, std::char_traits<char>::length(middle), middle) != 0 || value.back() != '\n') {
+        return false;
+    }
+    uint64_t inverse = 0;
+    if (!parse_hex_u64(value.substr(value_offset, 16), generation) ||
+        !parse_hex_u64(value.substr(middle_at + std::char_traits<char>::length(middle), 16), inverse) ||
+        inverse != ~generation) {
+        return false;
+    }
+    return value == encode_generation_clock(generation);
+}
+
+std::string encode_delete_intent(const delete_intent_record & intent) {
+    char buffer[256];
+    std::snprintf(
+        buffer, sizeof(buffer), "server-kv-delete-v1\nclass=%s\nkey=%s\ngeneration=%016llx\ninverse=%016llx\n",
+        intent.storage_class == object_class::live ? "live" : "prefix", llama_snapshot_digest_hex(intent.key).c_str(),
+        static_cast<unsigned long long>(intent.generation), static_cast<unsigned long long>(~intent.generation));
     return buffer;
+}
+
+bool decode_delete_intent(const std::string & value, delete_intent_record & intent) {
+    constexpr const char * prefix = "server-kv-delete-v1\nclass=";
+    if (value.rfind(prefix, 0) != 0) {
+        return false;
+    }
+    const size_t class_at = std::char_traits<char>::length(prefix);
+    size_t       key_at   = 0;
+    if (value.compare(class_at, 9, "live\nkey=") == 0) {
+        intent.storage_class = object_class::live;
+        key_at               = class_at + 9;
+    } else if (value.compare(class_at, 11, "prefix\nkey=") == 0) {
+        intent.storage_class = object_class::prefix;
+        key_at               = class_at + 11;
+    } else {
+        return false;
+    }
+    if (key_at + 64 > value.size() || !is_lower_hex(value.substr(key_at, 64), 64)) {
+        return false;
+    }
+    intent.key                            = parse_key(value.substr(key_at, 64));
+    constexpr const char * generation_tag = "\ngeneration=";
+    const size_t           generation_at  = key_at + 64;
+    if (value.compare(generation_at, std::char_traits<char>::length(generation_tag), generation_tag) != 0) {
+        return false;
+    }
+    const size_t           generation_value_at = generation_at + std::char_traits<char>::length(generation_tag);
+    constexpr const char * inverse_tag         = "\ninverse=";
+    const size_t           inverse_at          = generation_value_at + 16;
+    if (value.compare(inverse_at, std::char_traits<char>::length(inverse_tag), inverse_tag) != 0) {
+        return false;
+    }
+    const size_t inverse_value_at = inverse_at + std::char_traits<char>::length(inverse_tag);
+    if (value.size() != inverse_value_at + 16 + 1 || value.back() != '\n') {
+        return false;
+    }
+    uint64_t inverse = 0;
+    if (!parse_hex_u64(value.substr(generation_value_at, 16), intent.generation) || intent.generation == 0 ||
+        !parse_hex_u64(value.substr(inverse_value_at, 16), inverse) || inverse != ~intent.generation) {
+        return false;
+    }
+    return value == encode_delete_intent(intent);
 }
 
 object_key parse_key(const std::string & text) {
@@ -139,6 +222,83 @@ status fsync_directory(const fs::path & path, int * os_error = nullptr) {
     return error == 0 ? status::ok : status::io_error;
 }
 
+status read_small_file(const fs::path & path, std::string & contents, bool & exists, int * os_error = nullptr) {
+    exists               = false;
+    const int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        if (errno == ENOENT) {
+            return status::ok;
+        }
+        if (os_error != nullptr) {
+            *os_error = errno;
+        }
+        return status::io_error;
+    }
+    struct stat file_status{};
+    int         error = 0;
+    if (::fstat(descriptor, &file_status) != 0) {
+        error = errno;
+    } else if (!S_ISREG(file_status.st_mode) || file_status.st_size < 0 || file_status.st_size > 512) {
+        error = EIO;
+    }
+    if (error == 0) {
+        contents.assign(static_cast<size_t>(file_status.st_size), '\0');
+        size_t offset = 0;
+        while (offset < contents.size()) {
+            const ssize_t amount = ::read(descriptor, contents.data() + offset, contents.size() - offset);
+            if (amount < 0 && errno == EINTR) {
+                continue;
+            }
+            if (amount <= 0) {
+                error = amount < 0 ? errno : EIO;
+                break;
+            }
+            offset += static_cast<size_t>(amount);
+        }
+    }
+    if (::close(descriptor) != 0 && error == 0) {
+        error = errno;
+    }
+    if (os_error != nullptr) {
+        *os_error = error;
+    }
+    exists = error == 0;
+    return error == 0 ? status::ok : status::io_error;
+}
+
+status write_new_file_synced(const fs::path & path, const std::string & contents, int * os_error = nullptr) {
+    const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (descriptor < 0) {
+        if (os_error != nullptr) {
+            *os_error = errno;
+        }
+        return status::io_error;
+    }
+    int    error  = 0;
+    size_t offset = 0;
+    while (offset < contents.size()) {
+        const ssize_t amount = ::write(descriptor, contents.data() + offset, contents.size() - offset);
+        if (amount < 0 && errno == EINTR) {
+            continue;
+        }
+        if (amount <= 0) {
+            error = amount < 0 ? errno : EIO;
+            break;
+        }
+        offset += static_cast<size_t>(amount);
+    }
+    if (error == 0 && ::fsync(descriptor) != 0) {
+        error = errno;
+    }
+    if (::close(descriptor) != 0 && error == 0) {
+        error = errno;
+    }
+    if (os_error != nullptr) {
+        *os_error = error;
+    }
+    return error == 0 ? status::ok : status::io_error;
+}
+
 status ensure_directory(const fs::path & path, bool fail_parent_fsync) {
     std::error_code       error;
     const fs::file_status existing = fs::symlink_status(path, error);
@@ -146,7 +306,15 @@ status ensure_directory(const fs::path & path, bool fail_parent_fsync) {
         if (!fs::is_directory(existing) || fs::is_symlink(existing)) {
             return status::io_error;
         }
-        return fsync_directory(path);
+        const status child_synced = fsync_directory(path);
+        if (child_synced != status::ok) {
+            return child_synced;
+        }
+        if (fail_parent_fsync) {
+            return status::commit_uncertain;
+        }
+        const fs::path parent = path.parent_path();
+        return parent.empty() ? status::io_error : fsync_directory(parent);
     }
     if (error && error != std::errc::no_such_file_or_directory) {
         return status::io_error;
@@ -190,7 +358,6 @@ struct scanned_object {
     llama_snapshot_status   snapshot_status = llama_snapshot_status::invalid_argument;
     int                     os_error        = 0;
     uint64_t                charged_bytes   = 0;
-    uint64_t                tombstone       = 0;
     bool                    layout_valid    = false;
     llama_snapshot_manifest manifest;
 };
@@ -262,13 +429,8 @@ scanned_object scan_object(const config & cfg, object_class storage_class, const
                 return result;
             }
         } else {
-            uint64_t tombstone = 0;
-            if (!tombstone_generation(name, tombstone) || !fs::is_regular_file(file_status) ||
-                iterator->file_size(error) != 0 || error) {
-                result.os_error = error.value();
-                return result;
-            }
-            result.tombstone = std::max(result.tombstone, tombstone);
+            result.os_error = error.value();
+            return result;
         }
     }
     if (error) {
@@ -300,10 +462,7 @@ scanned_object scan_object(const config & cfg, object_class storage_class, const
     return result;
 }
 
-status prune_object(const fs::path & root,
-                    uint64_t         keep_generation,
-                    uint64_t         keep_tombstone,
-                    int *            os_error = nullptr) {
+status prune_object(const fs::path & root, uint64_t keep_generation, int * os_error = nullptr) {
     std::error_code error;
     bool            changed = false;
     for (fs::directory_iterator iterator(root, error), end; !error && iterator != end; iterator.increment(error)) {
@@ -312,8 +471,6 @@ status prune_object(const fs::path & root,
         uint64_t          generation = 0;
         if (parse_generation_suffix(name, "generation-", generation)) {
             remove = generation != keep_generation;
-        } else if (tombstone_generation(name, generation)) {
-            remove = generation != keep_tombstone;
         }
         if (!remove) {
             continue;
@@ -332,41 +489,6 @@ status prune_object(const fs::path & root,
     }
     if (!changed) {
         return status::ok;
-    }
-    const status synced = fsync_directory(root, os_error);
-    return synced == status::ok ? status::ok : status::commit_uncertain;
-}
-
-status publish_tombstone(const fs::path & root, uint64_t generation, int * os_error) {
-    const fs::path path       = root / tombstone_name(generation);
-    const int      descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (descriptor < 0 && errno != EEXIST) {
-        if (os_error != nullptr) {
-            *os_error = errno;
-        }
-        return status::io_error;
-    }
-    int error = 0;
-    if (descriptor >= 0) {
-        if (::fsync(descriptor) != 0) {
-            error = errno;
-        }
-        if (::close(descriptor) != 0 && error == 0) {
-            error = errno;
-        }
-    } else {
-        struct stat file_status{};
-        if (::lstat(path.c_str(), &file_status) != 0) {
-            error = errno;
-        } else if (!S_ISREG(file_status.st_mode) || file_status.st_size != 0) {
-            error = EIO;
-        }
-    }
-    if (error != 0) {
-        if (os_error != nullptr) {
-            *os_error = error;
-        }
-        return status::io_error;
     }
     const status synced = fsync_directory(root, os_error);
     return synced == status::ok ? status::ok : status::commit_uncertain;
@@ -400,14 +522,14 @@ struct shared_state {
         }
     }
 
-    config                                  cfg;
-    mutable std::mutex                      mutex;
-    std::map<std::string, object_record>    objects;
-    std::map<std::string, tombstone_record> tombstones;
-    stats                                   counters;
-    status                                  ready        = status::reconciliation_required;
-    uint64_t                                access_clock = 0;
-    int                                     authority_fd = -1;
+    config                               cfg;
+    mutable std::mutex                   mutex;
+    std::map<std::string, object_record> objects;
+    stats                                counters;
+    status                               ready              = status::reconciliation_required;
+    uint64_t                             access_clock       = 0;
+    uint64_t                             durable_generation = 0;
+    int                                  authority_fd       = -1;
 };
 
 namespace {
@@ -504,38 +626,186 @@ status acquire_authority(shared_state & state) {
     return status::ok;
 }
 
+status persist_generation_clock(shared_state & state, uint64_t generation, int * os_error = nullptr) {
+    const fs::path root    = pool_path(state.cfg);
+    const fs::path next    = root / GENERATION_CLOCK_NEXT_NAME;
+    const status   written = write_new_file_synced(next, encode_generation_clock(generation), os_error);
+    if (written != status::ok) {
+        return written;
+    }
+    if (::rename(next.c_str(), (root / GENERATION_CLOCK_NAME).c_str()) != 0) {
+        if (os_error != nullptr) {
+            *os_error = errno;
+        }
+        return status::io_error;
+    }
+    const status synced = fsync_directory(root, os_error);
+    if (synced != status::ok) {
+        return status::commit_uncertain;
+    }
+    state.durable_generation = generation;
+    return status::ok;
+}
+
+status recover_generation_clock(shared_state & state) {
+    const fs::path root = pool_path(state.cfg);
+    std::string    current_contents;
+    std::string    next_contents;
+    bool           current_exists = false;
+    bool           next_exists    = false;
+    if (read_small_file(root / GENERATION_CLOCK_NAME, current_contents, current_exists) != status::ok ||
+        read_small_file(root / GENERATION_CLOCK_NEXT_NAME, next_contents, next_exists) != status::ok) {
+        return status::reconciliation_required;
+    }
+    uint64_t current = 0;
+    uint64_t next    = 0;
+    if ((current_exists && !decode_generation_clock(current_contents, current)) ||
+        (next_exists && !decode_generation_clock(next_contents, next))) {
+        return status::reconciliation_required;
+    }
+    if (!current_exists && !next_exists) {
+        return persist_generation_clock(state, 0);
+    }
+    if (next_exists) {
+        std::error_code error;
+        if (!current_exists || next >= current) {
+            fs::rename(root / GENERATION_CLOCK_NEXT_NAME, root / GENERATION_CLOCK_NAME, error);
+            current = next;
+        } else {
+            fs::remove(root / GENERATION_CLOCK_NEXT_NAME, error);
+        }
+        if (error || fsync_directory(root) != status::ok) {
+            return status::reconciliation_required;
+        }
+    }
+    state.durable_generation = current;
+    return status::ok;
+}
+
+status allocate_generation(shared_state & state, uint64_t & generation, int * os_error = nullptr) {
+    if (state.durable_generation == std::numeric_limits<uint64_t>::max()) {
+        return status::object_limit;
+    }
+    generation = state.durable_generation + 1;
+    return persist_generation_clock(state, generation, os_error);
+}
+
+status publish_delete_intent(const shared_state &         state,
+                             const delete_intent_record & intent,
+                             int *                        os_error = nullptr) {
+    const status written =
+        write_new_file_synced(pool_path(state.cfg) / DELETE_INTENT_NAME, encode_delete_intent(intent), os_error);
+    if (written != status::ok) {
+        return written;
+    }
+    const status synced = fsync_directory(pool_path(state.cfg), os_error);
+    return synced == status::ok ? status::ok : status::commit_uncertain;
+}
+
+status remove_object_directory(const shared_state &         state,
+                               const delete_intent_record & intent,
+                               int *                        os_error = nullptr) {
+    const fs::path        path = object_path(state.cfg, intent.storage_class, intent.key);
+    std::error_code       error;
+    const fs::file_status existing = fs::symlink_status(path, error);
+    if (error && error != std::errc::no_such_file_or_directory) {
+        if (os_error != nullptr) {
+            *os_error = error.value();
+        }
+        return status::io_error;
+    }
+    if (!error && fs::exists(existing)) {
+        if (!fs::is_directory(existing) || fs::is_symlink(existing)) {
+            return status::reconciliation_required;
+        }
+        fs::remove_all(path, error);
+        if (error) {
+            if (os_error != nullptr) {
+                *os_error = error.value();
+            }
+            return status::io_error;
+        }
+    }
+    const status synced = fsync_directory(class_path(state.cfg, intent.storage_class), os_error);
+    return synced == status::ok ? status::ok : status::commit_uncertain;
+}
+
+status clear_delete_intent(const shared_state & state, int * os_error = nullptr) {
+    std::error_code error;
+    const bool      removed = fs::remove(pool_path(state.cfg) / DELETE_INTENT_NAME, error);
+    if (error || !removed) {
+        if (os_error != nullptr) {
+            *os_error = error ? error.value() : ENOENT;
+        }
+        return status::io_error;
+    }
+    const status synced = fsync_directory(pool_path(state.cfg), os_error);
+    return synced == status::ok ? status::ok : status::commit_uncertain;
+}
+
+status recover_delete_intent(shared_state & state) {
+    std::string contents;
+    bool        exists = false;
+    if (read_small_file(pool_path(state.cfg) / DELETE_INTENT_NAME, contents, exists) != status::ok) {
+        return status::reconciliation_required;
+    }
+    if (!exists) {
+        return status::ok;
+    }
+    delete_intent_record intent;
+    if (!decode_delete_intent(contents, intent) || intent.generation > state.durable_generation) {
+        return status::reconciliation_required;
+    }
+    if (remove_object_directory(state, intent) != status::ok || clear_delete_intent(state) != status::ok) {
+        return status::reconciliation_required;
+    }
+    return status::ok;
+}
+
+status delete_object_locked(shared_state &                                 state,
+                            std::map<std::string, object_record>::iterator object,
+                            const faults &                                 injected,
+                            int *                                          os_error = nullptr) {
+    const delete_intent_record intent{ object->second.storage_class, parse_key(object->first),
+                                       object->second.generation };
+    const status               published = publish_delete_intent(state, intent, os_error);
+    if (published != status::ok) {
+        return published;
+    }
+    if (injected.fail_after_delete_intent) {
+        if (os_error != nullptr) {
+            *os_error = EIO;
+        }
+        return status::commit_uncertain;
+    }
+    const status removed = remove_object_directory(state, intent, os_error);
+    if (removed != status::ok) {
+        return removed;
+    }
+    if (injected.fail_after_delete_unlink) {
+        if (os_error != nullptr) {
+            *os_error = EIO;
+        }
+        return status::commit_uncertain;
+    }
+    return clear_delete_intent(state, os_error);
+}
+
 status erase_prefix_locked(shared_state &                                 state,
                            std::map<std::string, object_record>::iterator victim,
-                           bool                                           inject_failure,
+                           const faults &                                 injected,
                            int *                                          os_error = nullptr) {
-    if (inject_failure) {
+    if (injected.fail_prefix_delete) {
         if (os_error != nullptr) {
             *os_error = EIO;
         }
         return status::io_error;
     }
-    const object_key key        = parse_key(victim->first);
-    const fs::path   path       = object_path(state.cfg, object_class::prefix, key);
-    const uint64_t   generation = victim->second.generation;
-    const status     published  = publish_tombstone(path, generation, os_error);
-    if (published != status::ok) {
+    const status removed = delete_object_locked(state, victim, injected, os_error);
+    if (removed != status::ok) {
         state.ready                          = status::reconciliation_required;
         state.counters.reconciliation_needed = true;
-        return published;
-    }
-    state.tombstones[victim->first] = { object_class::prefix, generation };
-    const status pruned             = prune_object(path, 0, generation, os_error);
-    if (pruned != status::ok) {
-        state.ready                          = status::reconciliation_required;
-        state.counters.reconciliation_needed = true;
-        return pruned;
-    }
-    const scanned_object tombstone = scan_object(state.cfg, object_class::prefix, key);
-    if (!tombstone.layout_valid || tombstone.store_status != status::not_found || tombstone.charged_bytes != 0 ||
-        tombstone.tombstone != generation) {
-        state.ready                          = status::reconciliation_required;
-        state.counters.reconciliation_needed = true;
-        return status::reconciliation_required;
+        return removed;
     }
     if (!remove_record(state.counters, victim->second)) {
         state.ready                          = status::reconciliation_required;
@@ -547,12 +817,15 @@ status erase_prefix_locked(shared_state &                                 state,
     return status::ok;
 }
 
-std::map<std::string, object_record>::iterator oldest_disposable_prefix(shared_state &      state,
-                                                                        const std::string & excluded_key) {
+std::map<std::string, object_record>::iterator oldest_disposable_prefix(
+    shared_state &                state,
+    const std::string &           excluded_key,
+    const std::set<std::string> * excluded = nullptr) {
     auto best = state.objects.end();
     for (auto iterator = state.objects.begin(); iterator != state.objects.end(); ++iterator) {
         const object_record & candidate = iterator->second;
-        if (iterator->first == excluded_key || candidate.storage_class != object_class::prefix ||
+        if (iterator->first == excluded_key || (excluded != nullptr && excluded->count(iterator->first) != 0) ||
+            candidate.storage_class != object_class::prefix ||
             candidate.leases->value.load(std::memory_order_acquire) != 0) {
             continue;
         }
@@ -588,6 +861,23 @@ bool release(stats & counters, object_class storage_class, uint64_t bytes) {
     }
     reserved -= bytes;
     return true;
+}
+
+status remove_empty_object_directory(const config &     cfg,
+                                     object_class       storage_class,
+                                     const object_key & key,
+                                     int *              os_error = nullptr) {
+    const fs::path  path = object_path(cfg, storage_class, key);
+    std::error_code error;
+    const bool      removed = fs::remove(path, error);
+    if (error || !removed) {
+        if (os_error != nullptr) {
+            *os_error = error ? error.value() : ENOTEMPTY;
+        }
+        return status::io_error;
+    }
+    const status synced = fsync_directory(class_path(cfg, storage_class), os_error);
+    return synced == status::ok ? status::ok : status::commit_uncertain;
 }
 
 }  // namespace
@@ -703,6 +993,11 @@ status store::reconcile() {
         state_->ready = live_ready != status::ok ? live_ready : prefix_ready;
         return state_->ready;
     }
+    if (recover_generation_clock(*state_) != status::ok || recover_delete_intent(*state_) != status::ok) {
+        state_->ready                          = status::reconciliation_required;
+        state_->counters.reconciliation_needed = true;
+        return state_->ready;
+    }
 
     std::error_code error;
     for (fs::directory_iterator iterator(pool_path(state_->cfg), error), end; !error && iterator != end;
@@ -711,8 +1006,10 @@ status store::reconcile() {
         const fs::file_status file_status    = iterator->symlink_status(error);
         const bool            authority_lock = name == AUTHORITY_LOCK_NAME && fs::is_regular_file(file_status) &&
                                     iterator->file_size(error) == 0 && !error;
+        const bool generation_clock = name == GENERATION_CLOCK_NAME && fs::is_regular_file(file_status) && !error;
         if (error || fs::is_symlink(file_status) ||
-            (!authority_lock && (!fs::is_directory(file_status) || (name != "live" && name != "prefix")))) {
+            (!authority_lock && !generation_clock &&
+             (!fs::is_directory(file_status) || (name != "live" && name != "prefix")))) {
             state_->ready                          = status::reconciliation_required;
             state_->counters.reconciliation_needed = true;
             return state_->ready;
@@ -723,9 +1020,8 @@ status store::reconcile() {
         return state_->ready;
     }
 
-    std::map<std::string, object_record>    scanned;
-    std::map<std::string, tombstone_record> tombstones;
-    stats                                   counters;
+    std::map<std::string, object_record> scanned;
+    stats                                counters;
     counters.prefix_evictions = state_->counters.prefix_evictions;
     uint64_t clock            = 0;
     for (object_class storage_class : { object_class::live, object_class::prefix }) {
@@ -739,7 +1035,7 @@ status store::reconcile() {
                 return state_->ready;
             }
             const object_key key = parse_key(name);
-            if (scanned.find(name) != scanned.end() || tombstones.find(name) != tombstones.end()) {
+            if (scanned.find(name) != scanned.end()) {
                 state_->ready                          = status::class_conflict;
                 state_->counters.reconciliation_needed = true;
                 return state_->ready;
@@ -753,50 +1049,33 @@ status store::reconcile() {
             uint64_t keep_generation = 0;
             if (object.store_status == status::ok) {
                 keep_generation = object.manifest.snapshot_generation;
-                if (object.tombstone > keep_generation) {
-                    state_->ready                          = status::reconciliation_required;
-                    state_->counters.reconciliation_needed = true;
-                    return state_->ready;
-                }
-                if (object.tombstone == keep_generation) {
-                    keep_generation = 0;
-                }
-            } else if (object.tombstone != 0 && object.manifest.snapshot_generation == object.tombstone) {
-                keep_generation = 0;
             } else if (object.store_status != status::not_found) {
                 state_->ready                          = status::reconciliation_required;
                 state_->counters.reconciliation_needed = true;
                 return state_->ready;
             }
-            const status pruned = prune_object(iterator->path(), keep_generation, object.tombstone);
+            const status pruned = prune_object(iterator->path(), keep_generation);
             if (pruned != status::ok) {
                 state_->ready                          = status::reconciliation_required;
                 state_->counters.reconciliation_needed = true;
                 return state_->ready;
             }
             if (keep_generation == 0) {
-                if (object.tombstone == 0) {
-                    std::error_code remove_error;
-                    fs::remove(iterator->path(), remove_error);
-                    if (remove_error || fsync_directory(root) != status::ok) {
-                        state_->ready                          = status::reconciliation_required;
-                        state_->counters.reconciliation_needed = true;
-                        return state_->ready;
-                    }
-                } else {
-                    tombstones.emplace(name, tombstone_record{ storage_class, object.tombstone });
+                std::error_code remove_error;
+                fs::remove(iterator->path(), remove_error);
+                if (remove_error || fsync_directory(root) != status::ok) {
+                    state_->ready                          = status::reconciliation_required;
+                    state_->counters.reconciliation_needed = true;
+                    return state_->ready;
                 }
                 continue;
             }
             object = scan_object(state_->cfg, storage_class, key);
             if (object.store_status != status::ok || object.manifest.snapshot_generation != keep_generation ||
-                object.tombstone >= keep_generation) {
+                keep_generation > state_->durable_generation) {
                 state_->ready                          = status::reconciliation_required;
                 state_->counters.reconciliation_needed = true;
                 return state_->ready;
-            }
-            if (object.tombstone != 0) {
-                tombstones.emplace(name, tombstone_record{ storage_class, object.tombstone });
             }
             object_record record;
             record.storage_class = storage_class;
@@ -818,7 +1097,6 @@ status store::reconcile() {
         }
     }
     state_->objects      = std::move(scanned);
-    state_->tombstones   = std::move(tombstones);
     state_->counters     = counters;
     state_->access_clock = clock;
 
@@ -832,7 +1110,7 @@ status store::reconcile() {
            committed_total(state_->counters) > state_->cfg.live_quota_bytes ||
            state_->counters.prefix_objects > state_->cfg.max_prefix_objects) {
         auto victim = oldest_disposable_prefix(*state_, "");
-        if (victim == state_->objects.end() || erase_prefix_locked(*state_, victim, false) != status::ok) {
+        if (victim == state_->objects.end() || erase_prefix_locked(*state_, victim, {}) != status::ok) {
             state_->ready                          = status::reconciliation_required;
             state_->counters.reconciliation_needed = true;
             return state_->ready;
@@ -866,8 +1144,7 @@ write_result store::write_generation_streamed(const object_key &                
                                               const llama_snapshot_cancel_check & cancelled,
                                               const faults &                      injected,
                                               const llama_snapshot_commit_fence & commit_fence) {
-    write_result result;
-    result.generation = metadata.snapshot_generation;
+    write_result                result;
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->ready != status::ok) {
         result.store_status =
@@ -880,13 +1157,8 @@ write_result store::write_generation_streamed(const object_key &                
         return result;
     }
 
-    const std::string key_text  = llama_snapshot_digest_hex(key);
-    auto              existing  = state_->objects.find(key_text);
-    const auto        tombstone = state_->tombstones.find(key_text);
-    if (tombstone != state_->tombstones.end() && tombstone->second.storage_class != storage_class) {
-        result.store_status = status::class_conflict;
-        return result;
-    }
+    const std::string key_text = llama_snapshot_digest_hex(key);
+    auto              existing = state_->objects.find(key_text);
     if (existing != state_->objects.end()) {
         if (existing->second.storage_class != storage_class) {
             result.store_status = status::class_conflict;
@@ -896,29 +1168,23 @@ write_result store::write_generation_streamed(const object_key &                
             result.store_status = status::object_in_use;
             return result;
         }
-        if (metadata.snapshot_generation <= existing->second.generation) {
-            result.store_status    = metadata.snapshot_generation < existing->second.generation ?
-                                         status::stale_generation :
-                                         status::snapshot_error;
-            result.snapshot_status = metadata.snapshot_generation < existing->second.generation ?
-                                         llama_snapshot_status::stale_generation :
-                                         llama_snapshot_status::generation_exists;
-            return result;
-        }
         if (metadata.identity != existing->second.identity) {
             result.store_status    = status::snapshot_error;
             result.snapshot_status = llama_snapshot_status::identity_mismatch;
             return result;
         }
-    } else if (tombstone != state_->tombstones.end() && metadata.snapshot_generation <= tombstone->second.generation) {
-        result.store_status    = status::stale_generation;
-        result.snapshot_status = llama_snapshot_status::stale_generation;
+    }
+
+    if (state_->durable_generation == std::numeric_limits<uint64_t>::max()) {
+        result.store_status = status::object_limit;
         return result;
     }
+    llama_snapshot_metadata assigned_metadata = metadata;
+    assigned_metadata.snapshot_generation     = state_->durable_generation + 1;
 
     const llama_snapshot_store_config     snapshot_cfg = object_config(state_->cfg, storage_class, key);
     const llama_snapshot_storage_estimate estimate =
-        llama_snapshot_estimate_storage(snapshot_cfg, metadata, total_payload_bytes);
+        llama_snapshot_estimate_storage(snapshot_cfg, assigned_metadata, total_payload_bytes);
     result.snapshot_status = estimate.status;
     if (estimate.status != llama_snapshot_status::ok) {
         result.store_status = estimate.status == llama_snapshot_status::invalid_argument ? status::invalid_argument :
@@ -944,6 +1210,43 @@ write_result store::write_generation_streamed(const object_key &                
         return result;
     }
 
+    const auto needs_eviction = [&](const stats & counters) {
+        const uint64_t total_used = saturating_add(committed_total(counters), reserved_total(counters));
+        const bool     total_over =
+            candidate > state_->cfg.live_quota_bytes || total_used > state_->cfg.live_quota_bytes - candidate;
+        const uint64_t prefix_used = saturating_add(counters.prefix_committed_bytes, counters.prefix_reserved_bytes);
+        const bool     prefix_over =
+            storage_class == object_class::prefix && prefix_used > state_->cfg.prefix_quota_bytes - candidate;
+        return total_over || prefix_over;
+    };
+    const auto prefix_count_over = [&](const stats & counters) {
+        return existing == state_->objects.end() && storage_class == object_class::prefix &&
+               counters.prefix_objects >= state_->cfg.max_prefix_objects;
+    };
+
+    stats                    projected = state_->counters;
+    std::set<std::string>    planned_set;
+    std::vector<std::string> planned_evictions;
+    while (prefix_count_over(projected) || needs_eviction(projected)) {
+        auto victim = oldest_disposable_prefix(*state_, key_text, &planned_set);
+        if (victim == state_->objects.end()) {
+            result.store_status = has_leased_prefix(*state_, key_text) ?
+                                      status::blocked_by_prefix_lease :
+                                      (storage_class == object_class::prefix ? status::prefix_quota_exceeded :
+                                                                               status::live_quota_exceeded);
+            return result;
+        }
+        if (!remove_record(projected, victim->second)) {
+            state_->ready                          = status::reconciliation_required;
+            state_->counters.reconciliation_needed = true;
+            result.store_status                    = status::reconciliation_required;
+            return result;
+        }
+        planned_set.insert(victim->first);
+        planned_evictions.push_back(victim->first);
+    }
+
+    const bool   new_object   = existing == state_->objects.end();
     const status object_ready = ensure_directory(fs::u8path(snapshot_cfg.root_path), injected.fail_object_parent_fsync);
     if (object_ready != status::ok) {
         state_->ready                          = status::reconciliation_required;
@@ -952,32 +1255,45 @@ write_result store::write_generation_streamed(const object_key &                
         return result;
     }
 
-    const auto needs_eviction = [&]() {
-        const uint64_t total_used = saturating_add(committed_total(state_->counters), reserved_total(state_->counters));
-        const bool     total_over =
-            candidate > state_->cfg.live_quota_bytes || total_used > state_->cfg.live_quota_bytes - candidate;
-        const uint64_t prefix_used =
-            saturating_add(state_->counters.prefix_committed_bytes, state_->counters.prefix_reserved_bytes);
-        const bool prefix_over =
-            storage_class == object_class::prefix && prefix_used > state_->cfg.prefix_quota_bytes - candidate;
-        return total_over || prefix_over;
-    };
-    const auto prefix_count_over = [&]() {
-        return existing == state_->objects.end() && storage_class == object_class::prefix &&
-               state_->counters.prefix_objects >= state_->cfg.max_prefix_objects;
-    };
-    while (prefix_count_over() || needs_eviction()) {
-        auto victim = oldest_disposable_prefix(*state_, key_text);
+    const status generation_allocated = allocate_generation(*state_, result.generation, &result.os_error);
+    if (generation_allocated != status::ok) {
+        if (new_object) {
+            (void) remove_empty_object_directory(state_->cfg, storage_class, key, &result.os_error);
+        }
+        state_->ready                          = status::reconciliation_required;
+        state_->counters.reconciliation_needed = true;
+        result.store_status                    = generation_allocated;
+        return result;
+    }
+    assigned_metadata.snapshot_generation = result.generation;
+
+    for (const std::string & victim_key : planned_evictions) {
+        auto victim = state_->objects.find(victim_key);
         if (victim == state_->objects.end()) {
-            result.store_status = has_leased_prefix(*state_, key_text) ?
-                                      status::blocked_by_prefix_lease :
-                                      (storage_class == object_class::prefix ? status::prefix_quota_exceeded :
-                                                                               status::live_quota_exceeded);
+            // The planning pass and execution pass are serialized by the pool
+            // mutex, but an out-of-band filesystem mutation can still remove
+            // a planned victim.  Never leave the candidate directory behind
+            // when that happens: publication cannot proceed and reconciliation
+            // must observe a bounded, explicit state.
+            if (new_object &&
+                remove_empty_object_directory(state_->cfg, storage_class, key, &result.os_error) != status::ok) {
+                result.os_error = result.os_error == 0 ? EIO : result.os_error;
+            }
+            state_->ready                          = status::reconciliation_required;
+            state_->counters.reconciliation_needed = true;
+            result.store_status                    = status::reconciliation_required;
             return result;
         }
         const object_key evicted_key = parse_key(victim->first);
-        const status     erased = erase_prefix_locked(*state_, victim, injected.fail_prefix_delete, &result.os_error);
+        const status     erased      = erase_prefix_locked(*state_, victim, injected, &result.os_error);
         if (erased != status::ok) {
+            if (new_object &&
+                remove_empty_object_directory(state_->cfg, storage_class, key, &result.os_error) != status::ok) {
+                state_->ready                          = status::reconciliation_required;
+                state_->counters.reconciliation_needed = true;
+                result.store_status                    = status::reconciliation_required;
+                return result;
+            }
             result.store_status = erased;
             return result;
         }
@@ -985,6 +1301,10 @@ write_result store::write_generation_streamed(const object_key &                
     }
 
     if (!reserve(state_->counters, storage_class, candidate)) {
+        if (new_object &&
+            remove_empty_object_directory(state_->cfg, storage_class, key, &result.os_error) != status::ok) {
+            result.os_error = result.os_error == 0 ? EIO : result.os_error;
+        }
         state_->ready                          = status::reconciliation_required;
         state_->counters.reconciliation_needed = true;
         result.store_status                    = status::reconciliation_required;
@@ -992,7 +1312,7 @@ write_result store::write_generation_streamed(const object_key &                
     }
     llama_snapshot_store              snapshot(snapshot_cfg);
     const llama_snapshot_write_result written = snapshot.write_generation_streamed(
-        metadata, total_payload_bytes, source, cancelled, injected.snapshot, commit_fence);
+        assigned_metadata, total_payload_bytes, source, cancelled, injected.snapshot, commit_fence);
     result.snapshot_status = written.status;
     result.os_error        = written.os_error;
     result.committed       = written.committed;
@@ -1009,20 +1329,16 @@ write_result store::write_generation_streamed(const object_key &                
         const bool expected_existing = existing != state_->objects.end() && after_failure.store_status == status::ok &&
                                        after_failure.charged_bytes == existing->second.charged_bytes &&
                                        after_failure.manifest.snapshot_generation == existing->second.generation;
-        const bool expected_empty =
-            existing == state_->objects.end() && after_failure.layout_valid &&
-            after_failure.store_status == status::not_found && after_failure.charged_bytes == 0 &&
-            after_failure.tombstone == (tombstone == state_->tombstones.end() ? 0 : tombstone->second.generation);
+        const bool expected_empty = existing == state_->objects.end() && after_failure.layout_valid &&
+                                    after_failure.store_status == status::not_found && after_failure.charged_bytes == 0;
         if (!expected_existing && !expected_empty) {
             state_->ready                          = status::reconciliation_required;
             state_->counters.reconciliation_needed = true;
             result.store_status                    = status::reconciliation_required;
             return result;
         }
-        if (expected_empty && tombstone == state_->tombstones.end()) {
-            std::error_code remove_error;
-            fs::remove(fs::u8path(snapshot_cfg.root_path), remove_error);
-            if (remove_error || fsync_directory(class_path(state_->cfg, storage_class)) != status::ok) {
+        if (expected_empty) {
+            if (remove_empty_object_directory(state_->cfg, storage_class, key, &result.os_error) != status::ok) {
                 state_->ready                          = status::reconciliation_required;
                 state_->counters.reconciliation_needed = true;
                 result.store_status                    = status::reconciliation_required;
@@ -1040,7 +1356,7 @@ write_result store::write_generation_streamed(const object_key &                
     }
 
     const scanned_object scanned = scan_object(state_->cfg, storage_class, key);
-    if (scanned.store_status != status::ok) {
+    if (scanned.store_status != status::ok || scanned.manifest.snapshot_generation != result.generation) {
         state_->ready                          = status::reconciliation_required;
         state_->counters.reconciliation_needed = true;
         result.store_status                    = status::commit_uncertain;
@@ -1121,7 +1437,10 @@ open_result store::acquire(const object_key &              key,
     return result;
 }
 
-erase_result store::erase(const object_key & key, object_class storage_class, uint64_t expected_generation) {
+erase_result store::erase(const object_key & key,
+                          object_class       storage_class,
+                          uint64_t           expected_generation,
+                          const faults &     injected) {
     erase_result                result;
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->ready != status::ok) {
@@ -1149,26 +1468,9 @@ erase_result store::erase(const object_key & key, object_class storage_class, ui
         result.store_status = status::object_in_use;
         return result;
     }
-    const fs::path path      = object_path(state_->cfg, storage_class, key);
-    const status   published = publish_tombstone(path, expected_generation, &result.os_error);
-    if (published != status::ok) {
-        result.store_status                    = published;
-        state_->ready                          = status::reconciliation_required;
-        state_->counters.reconciliation_needed = true;
-        return result;
-    }
-    state_->tombstones[key_text] = { storage_class, expected_generation };
-    const status pruned          = prune_object(path, 0, expected_generation, &result.os_error);
-    if (pruned != status::ok) {
-        result.store_status                    = pruned;
-        state_->ready                          = status::reconciliation_required;
-        state_->counters.reconciliation_needed = true;
-        return result;
-    }
-    const scanned_object tombstone = scan_object(state_->cfg, storage_class, key);
-    if (!tombstone.layout_valid || tombstone.store_status != status::not_found || tombstone.charged_bytes != 0 ||
-        tombstone.tombstone != expected_generation) {
-        result.store_status                    = status::reconciliation_required;
+    const status removed = delete_object_locked(*state_, object, injected, &result.os_error);
+    if (removed != status::ok) {
+        result.store_status                    = removed;
         state_->ready                          = status::reconciliation_required;
         state_->counters.reconciliation_needed = true;
         return result;
