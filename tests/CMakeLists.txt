@@ -152,6 +152,15 @@ target_include_directories(test-server-prefix-cache PRIVATE ${PROJECT_SOURCE_DIR
 target_compile_features(test-server-prefix-cache PRIVATE cxx_std_17)
 
 llama_build_and_test(
+    test-server-prefix-trace-replay.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-prefix-cache.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-scheduler.cpp
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/server-prefix-trace-v1.csv
+)
+target_include_directories(test-server-prefix-trace-replay PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-prefix-trace-replay PRIVATE cxx_std_17)
+
+llama_build_and_test(
     test-server-capture.cpp
     ${PROJECT_SOURCE_DIR}/tools/server/server-capture.cpp
 )
