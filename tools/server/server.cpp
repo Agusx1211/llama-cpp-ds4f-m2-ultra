@@ -222,6 +222,15 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
         routes.get_models                  = models_routes->get_router_models;
+        routes.get_benchmark_scheduler_trace = [](const server_http_req &) {
+            auto res = std::make_unique<server_http_res>();
+            const auto error = format_error_response(
+                    "trusted scheduling trace is supported only by direct single-model llama-server",
+                    ERROR_TYPE_PERMISSION);
+            res->status = json_value(error, "code", 403);
+            res->data = safe_json_to_str({{ "error", error }});
+            return res;
+        };
 
         ctx_http.post("/models",               ex_wrapper(models_routes->post_router_models));
         ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
@@ -233,6 +242,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
+    ctx_http.get ("/internal/benchmark/scheduler-trace", ex_wrapper(routes.get_benchmark_scheduler_trace));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models)); // public endpoint (no API key check)

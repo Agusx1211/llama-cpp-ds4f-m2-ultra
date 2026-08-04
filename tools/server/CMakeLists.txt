@@ -31,6 +31,12 @@ add_library(${TARGET} STATIC
     server-resident-request.h
     server-request-runtime.cpp
     server-request-runtime.h
+    server-prefill.cpp
+    server-prefill.h
+    server-trusted-ingress.cpp
+    server-trusted-ingress.h
+    server-trusted-scheduling.cpp
+    server-trusted-scheduling.h
     server-prefix-cache.cpp
     server-prefix-cache.h
     server-capture.cpp

@@ -6,6 +6,8 @@
 
 #include <cpp-httplib/httplib.h>
 
+#include <algorithm>
+#include <cctype>
 #include <functional>
 #include <future>
 #include <memory>
@@ -523,6 +525,35 @@ static std::map<std::string, std::string> get_headers(const httplib::Request & r
     return headers;
 }
 
+static bool header_name_equals(const std::string & left, const char * right) {
+    const size_t right_size = std::char_traits<char>::length(right);
+    return left.size() == right_size && std::equal(
+        left.begin(), left.end(), right,
+        [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); });
+}
+
+static bool has_ambiguous_trusted_scheduling_headers(const httplib::Request & req) {
+    size_t token_count = 0;
+    size_t lane_count  = 0;
+    size_t tag_count   = 0;
+    for (const auto & header : req.headers) {
+        if (header_name_equals(header.first, "X-Llama-Trusted-Scheduling-Token")) {
+            if (++token_count > 1) {
+                return true;
+            }
+        } else if (header_name_equals(header.first, "X-Llama-Trusted-Lane")) {
+            if (++lane_count > 1) {
+                return true;
+            }
+        } else if (header_name_equals(header.first, "X-Llama-Benchmark-Tag")) {
+            if (++tag_count > 1) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static std::string build_query_string(const httplib::Request & req) {
     std::string qs;
     for (const auto & [key, value] : req.params) {
@@ -587,7 +618,9 @@ void server_http_context::get(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
-            req.is_connection_closed
+            req.is_connection_closed,
+            req.remote_addr,
+            has_ambiguous_trusted_scheduling_headers(req)
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -634,7 +667,9 @@ void server_http_context::post(const std::string & path, const server_http_conte
             build_query_string(req),
             body,
             std::move(files),
-            req.is_connection_closed
+            req.is_connection_closed,
+            req.remote_addr,
+            has_ambiguous_trusted_scheduling_headers(req)
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -651,7 +686,9 @@ void server_http_context::del(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
-            req.is_connection_closed
+            req.is_connection_closed,
+            req.remote_addr,
+            has_ambiguous_trusted_scheduling_headers(req)
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -807,6 +844,8 @@ void server_http_context::register_gcp_compat() const {
                         payload.dump(),
                         {},
                         req.should_stop,
+                        req.remote_addr,
+                        req.ambiguous_trusted_scheduling_headers,
                     };
 
                     server_http_res_ptr internal_res = handlers.at(dispatch_path)(internal_req);

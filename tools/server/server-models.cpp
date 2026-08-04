@@ -3,6 +3,7 @@
 #include "server-models.h"
 #include "server-context.h"
 #include "server-stream.h"
+#include "server-trusted-scheduling.h"
 
 #include "build-info.h"
 #include "preset.h"
@@ -1564,6 +1565,12 @@ void server_models_routes::init_routes() {
         std::string name = req.get_param("model");
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
+        if (server_trusted_scheduling::has_reserved_headers(req.headers)) {
+            res_err(error_res, format_error_response(
+                    "trusted scheduling is supported only by direct single-model llama-server",
+                    ERROR_TYPE_PERMISSION));
+            return error_res;
+        }
         if (!router_validate_model(name, models, autoload, error_res)) {
             return error_res;
         }
@@ -1579,6 +1586,12 @@ void server_models_routes::init_routes() {
         std::string name = json_value(body, "model", std::string());
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
+        if (server_trusted_scheduling::has_reserved_headers(req.headers)) {
+            res_err(error_res, format_error_response(
+                    "trusted scheduling is supported only by direct single-model llama-server",
+                    ERROR_TYPE_PERMISSION));
+            return error_res;
+        }
         if (!router_validate_model(name, models, autoload, error_res)) {
             return error_res;
         }

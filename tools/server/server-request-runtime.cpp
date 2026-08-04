@@ -431,30 +431,58 @@ expiration request_runtime::expire(std::map<uint64_t, record>::iterator it, dead
     return result;
 }
 
-std::vector<expiration> request_runtime::expire_due(uint64_t now_us) {
+expiration request_runtime::expiration_due(uint64_t request_id, uint64_t at_us) const {
+    const auto it = records.find(request_id);
+    if (it == records.end() || it->second.terminal != lifecycle::completed) {
+        return {};
+    }
+    const record & request     = it->second;
+    const bool     run_started = request.run_deadline_us != 0;
+    const uint64_t deadline    = run_started ? request.run_deadline_us : request.queue_deadline_us;
+    if (at_us < deadline) {
+        return {};
+    }
+    return { request.metadata.id,
+             run_started ? deadline_kind::run : deadline_kind::queue,
+             !request.bindings.empty() };
+}
+
+std::vector<expiration> request_runtime::expirations_due(uint64_t at_us) const {
     std::vector<expiration> result;
-    auto                    it = records.begin();
-    while (it != records.end()) {
-        const record & request = it->second;
-        if (request.terminal != lifecycle::completed) {
-            ++it;
-            continue;
-        }
-
-        const bool     run_started = request.run_deadline_us != 0;
-        const uint64_t deadline    = run_started ? request.run_deadline_us : request.queue_deadline_us;
-        if (now_us < deadline) {
-            ++it;
-            continue;
-        }
-
-        const auto current = it++;
-        expiration expired = expire(current, run_started ? deadline_kind::run : deadline_kind::queue, now_us);
-        if (expired.request_id != 0) {
-            result.push_back(expired);
+    result.reserve(records.size());
+    for (const auto & entry : records) {
+        const expiration planned = expiration_due(entry.first, at_us);
+        if (planned.request_id != 0) {
+            result.push_back(planned);
         }
     }
     return result;
+}
+
+expiration request_runtime::expire_prepared(const expiration & planned, uint64_t at_us) {
+    if (planned.request_id == 0) {
+        return {};
+    }
+    const auto it = records.find(planned.request_id);
+    const expiration current = expiration_due(planned.request_id, at_us);
+    if (it == records.end() || current.request_id == 0 || current.kind != planned.kind ||
+        current.was_running != planned.was_running) {
+        return {};
+    }
+    return expire(it, planned.kind, at_us);
+}
+
+std::vector<expiration> request_runtime::expire_due(uint64_t now_us) {
+    auto planned = expirations_due(now_us);
+    size_t committed = 0;
+    for (const expiration & current : planned) {
+        const expiration expired = expire_prepared(current, now_us);
+        if (expired.request_id != 0) {
+            planned[committed++] = expired;
+        }
+    }
+    planned.resize(committed);
+    return planned;
 }
 
 expiration request_runtime::expire_if_due(std::map<uint64_t, record>::iterator it, uint64_t at_us) {
@@ -622,6 +650,35 @@ bool request_runtime::fail(uint64_t request_id, uint64_t at_us) {
     return failed;
 }
 
+failure_publication_result request_runtime::failure_publication_status(uint64_t request_id) const {
+    const auto requested = records.find(request_id);
+    if (requested == records.end()) {
+        return { failure_publication_code::unknown_request };
+    }
+    if (requested->second.terminal != lifecycle::completed) {
+        return { failure_publication_code::already_terminal };
+    }
+    return { failure_publication_code::first_terminal };
+}
+
+failure_publication_result request_runtime::fail_for_publication(uint64_t request_id, uint64_t at_us) {
+    const auto status = failure_publication_status(request_id);
+    if (!status) {
+        return status;
+    }
+    return { fail(request_id, at_us) ? failure_publication_code::first_terminal :
+                                       failure_publication_code::transition_failed };
+}
+
+failure_publication_result request_runtime::fail_one_for_publication(uint64_t request_id, uint64_t at_us) {
+    const auto status = failure_publication_status(request_id);
+    if (!status) {
+        return status;
+    }
+    return { fail_one(request_id, at_us) ? failure_publication_code::first_terminal :
+                                          failure_publication_code::transition_failed };
+}
+
 bool request_runtime::fail_one(uint64_t request_id, uint64_t at_us) {
     auto it = records.find(request_id);
     if (it == records.end()) {
@@ -700,6 +757,11 @@ void request_runtime::release_permit(record & request) {
 
 bool request_runtime::contains(uint64_t request_id) const {
     return records.count(request_id) != 0;
+}
+
+bool request_runtime::is_family_member(uint64_t request_id, uint64_t family_id) const {
+    const auto it = records.find(request_id);
+    return it != records.end() && (it->first == family_id || it->second.metadata.parent_id == family_id);
 }
 
 bool request_runtime::family_has_bindings(uint64_t request_id) const {

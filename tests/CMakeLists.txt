@@ -147,6 +147,21 @@ llama_build_and_test(
 target_include_directories(test-server-request-runtime PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_compile_features(test-server-request-runtime PRIVATE cxx_std_17)
 
+llama_build_and_test(
+    test-server-prefill.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-prefill.cpp
+)
+target_include_directories(test-server-prefill PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-prefill PRIVATE cxx_std_17)
+
+llama_build_and_test(test-server-trusted-scheduling.cpp)
+target_include_directories(test-server-trusted-scheduling PRIVATE
+    ${PROJECT_SOURCE_DIR}
+    ${PROJECT_SOURCE_DIR}/tools/mtmd
+    ${PROJECT_SOURCE_DIR}/tools/server)
+target_link_libraries(test-server-trusted-scheduling PRIVATE server-context)
+target_compile_features(test-server-trusted-scheduling PRIVATE cxx_std_17)
+
 llama_build_and_test(test-server-queue-runtime.cpp)
 target_include_directories(test-server-queue-runtime PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_link_libraries(test-server-queue-runtime PRIVATE server-context)
