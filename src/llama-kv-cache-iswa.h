@@ -182,9 +182,13 @@ public:
     // irreversible atomic success and must follow all reversible component
     // commits. release drops the resident page references.
     llama_kv_iswa_resident_detach_quote quote_resident_detach(llama_seq_id execution_id) const;
+    llama_kv_iswa_resident_status validate_resident_detach(
+            const llama_kv_iswa_resident_detach_quote & quote) const;
     llama_kv_iswa_resident_result detach_resident(const llama_kv_iswa_resident_detach_quote & quote);
     llama_kv_iswa_resident_attach_quote quote_resident_attach(llama_kv_iswa_resident_handle resident,
                                                               llama_seq_id execution_id) const;
+    llama_kv_iswa_resident_status validate_resident_attach(
+            const llama_kv_iswa_resident_attach_quote & quote) const;
     llama_kv_iswa_resident_status commit_resident_attach_final(
             const llama_kv_iswa_resident_attach_quote & quote,
             llama_kv_iswa_resident_final_step final_step);
@@ -201,6 +205,13 @@ public:
     // residency fail-closed from preparation through graph completion or
     // rollback; destruction releases it.
     std::shared_ptr<void> acquire_resident_batch_lease() const;
+
+    // A composite DSV4 ownership transaction takes this exclusive lease only
+    // after all component quotes exist. It requires quiescence and prevents a
+    // new graph lease from beginning until the composite reaches a terminal
+    // commit or rollback boundary.
+    bool begin_resident_transaction() const;
+    void end_resident_transaction() const;
     bool has_resident_handles() const;
 
 private:

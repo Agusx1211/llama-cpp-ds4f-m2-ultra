@@ -363,7 +363,27 @@ std::shared_ptr<void> llama_kv_cache_iswa::acquire_resident_batch_lease() const 
     if (!resident) {
         return {};
     }
+    if (resident->guard->resident_transaction_active) {
+        throw std::runtime_error("cannot begin ISWA graph while a resident transaction is active");
+    }
     return std::make_shared<llama_kv_iswa_batch_lease>(resident->guard);
+}
+
+bool llama_kv_cache_iswa::begin_resident_transaction() const {
+    [[maybe_unused]] auto resident_scope = lock_resident();
+    if (!resident || resident->guard->resident_transaction_active || !resident_is_quiescent()) {
+        return false;
+    }
+    resident->guard->resident_transaction_active = true;
+    return true;
+}
+
+void llama_kv_cache_iswa::end_resident_transaction() const {
+    [[maybe_unused]] auto resident_scope = lock_resident();
+    if (!resident || !resident->guard->resident_transaction_active) {
+        std::terminate();
+    }
+    resident->guard->resident_transaction_active = false;
 }
 
 bool llama_kv_cache_iswa::has_resident_handles() const {
@@ -685,6 +705,20 @@ llama_kv_iswa_resident_result llama_kv_cache_iswa::detach_resident(const llama_k
     }
 }
 
+llama_kv_iswa_resident_status llama_kv_cache_iswa::validate_resident_detach(
+        const llama_kv_iswa_resident_detach_quote & quote) const {
+    [[maybe_unused]] auto resident_scope = lock_resident();
+    if (!resident || !quote.plan || quote.plan->owner != resident->identity ||
+        quote.plan->epoch != resident->epoch || quote.plan->resident.id != resident->next_handle_id ||
+        quote.plan->version[0] != resident->guard->version[0] ||
+        quote.plan->version[1] != resident->guard->version[1] || !resident_is_quiescent() ||
+        quote.plan->resident_slot >= resident->slots.size() || resident->slots[quote.plan->resident_slot] ||
+        quote.plan->prepared.empty()) {
+        return llama_kv_iswa_resident_status::stale_quote;
+    }
+    return llama_kv_iswa_resident_status::ok;
+}
+
 llama_kv_iswa_resident_attach_quote llama_kv_cache_iswa::quote_resident_attach(
         llama_kv_iswa_resident_handle handle,
         llama_seq_id                  execution_id) const {
@@ -806,6 +840,27 @@ llama_kv_iswa_resident_status llama_kv_cache_iswa::commit_resident_attach_final(
     --resident->guard->parked_handles;
     ++resident->epoch;
     quote.plan->state = llama_kv_iswa_resident_attach_state::committed;
+    return llama_kv_iswa_resident_status::ok;
+}
+
+llama_kv_iswa_resident_status llama_kv_cache_iswa::validate_resident_attach(
+        const llama_kv_iswa_resident_attach_quote & quote) const {
+    [[maybe_unused]] auto resident_scope = lock_resident();
+    if (!resident || !quote.plan || quote.plan->owner != resident->identity ||
+        quote.plan->state != llama_kv_iswa_resident_attach_state::prepared ||
+        quote.plan->epoch != resident->epoch || quote.plan->version[0] != resident->guard->version[0] ||
+        quote.plan->version[1] != resident->guard->version[1] || !resident_is_quiescent() ||
+        quote.plan->execution_id < 0 || (uint32_t) quote.plan->execution_id >= kv_base->get_n_stream() ||
+        !kv_base->resident_execution_empty(quote.plan->execution_id) ||
+        !kv_swa->resident_execution_empty(quote.plan->execution_id)) {
+        return llama_kv_iswa_resident_status::stale_quote;
+    }
+    const auto it = resident->handles.find(quote.plan->resident.id);
+    if (it == resident->handles.end() || it->second.generation != quote.plan->resident.generation ||
+        it->second.slot != quote.plan->resident_slot || quote.plan->resident_slot >= resident->slots.size() ||
+        !resident->slots[quote.plan->resident_slot]) {
+        return llama_kv_iswa_resident_status::stale_quote;
+    }
     return llama_kv_iswa_resident_status::ok;
 }
 
