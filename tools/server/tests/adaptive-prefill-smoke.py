@@ -183,9 +183,18 @@ def validate_sequential_burst_results(results: dict[str, Result], count: int) ->
             raise RuntimeError(f"{tag}: first output did not precede low completion")
         if not burst.end_ns or burst.end_ns < burst.first_token_ns or burst.end_ns >= low.end_ns:
             raise RuntimeError(f"{tag}: HTTP request did not complete before low completion")
-        progress_deadline_ns = results[f"burst-{ordinal + 1:02d}"].start_ns if ordinal + 1 < count else low.end_ns
+        if ordinal + 1 < count:
+            next_burst = results[f"burst-{ordinal + 1:02d}"]
+            if next_burst.start_ns < burst.end_ns:
+                raise RuntimeError(f"{tag}: next burst launched before HTTP teardown")
+            progress_cutoff_ns = max(burst.end_ns, next_burst.start_ns)
+            progress_deadline_ns = next_burst.end_ns
+        else:
+            progress_cutoff_ns = burst.end_ns
+            progress_deadline_ns = low.end_ns
         progress_after = next(
-            (timestamp for timestamp in progress_times if burst.end_ns < timestamp < progress_deadline_ns), None)
+            (timestamp for timestamp in progress_times
+             if progress_cutoff_ns < timestamp < progress_deadline_ns), None)
         if progress_after is None:
             raise RuntimeError(f"{tag}: no fresh low prompt progress followed completed burst")
         timings.append({
@@ -414,6 +423,24 @@ class Smoke:
                     raise RuntimeError(f"timeout waiting for fresh low progress after {label}")
                 self.low_progress_condition.wait(min(0.05, remaining))
 
+    def run_pipelined_bursts(self, bursts: dict[str, Any]) -> Result:
+        last: Result | None = None
+        for ordinal in range(int(bursts["count"])):
+            if self.low_done.is_set():
+                raise RuntimeError(f"low completed before burst-{ordinal:02d} launch")
+            intended = now_ns()
+            burst = self.run_request(
+                tag=f"burst-{ordinal:02d}", lane="fast", prompt_count=bursts["prompt_tokens"],
+                n_predict=bursts["n_predict"], salt=bursts["salt"], seed=bursts["seed"],
+                intended_launch_ns=intended)
+            require_result(burst)
+            if ordinal + 1 < int(bursts["count"]) and self.low_done.is_set():
+                raise RuntimeError(f"low completed before burst-{ordinal + 1:02d} launch")
+            last = burst
+        if last is None:
+            raise RuntimeError("sequential burst mode requires at least one burst")
+        return last
+
     def ordinary_probe(self) -> None:
         before = self.fetch_trace()
         result = self.run_request(
@@ -456,22 +483,8 @@ class Smoke:
                                     n_predict=low["n_predict"], salt=low["salt"], seed=low["seed"])
             try:
                 self.wait_before_low_done(self.low_progress, "low prompt progress")
-                origin = now_ns()
-                for ordinal in range(int(bursts["count"])):
-                    intended = origin + ordinal * int(bursts["interval_seconds"]) * 1_000_000_000
-                    while True:
-                        if self.low_done.is_set():
-                            raise RuntimeError(f"low completed before burst-{ordinal:02d} launch")
-                        remaining_ns = intended - now_ns()
-                        if remaining_ns <= 0:
-                            break
-                        time.sleep(min(0.05, remaining_ns / 1e9))
-                    burst = self.run_request(
-                        tag=f"burst-{ordinal:02d}", lane="fast", prompt_count=bursts["prompt_tokens"],
-                        n_predict=bursts["n_predict"], salt=bursts["salt"], seed=bursts["seed"],
-                        intended_launch_ns=intended)
-                    require_result(burst)
-                    self.wait_for_low_progress_after(burst.end_ns, burst.tag)
+                burst = self.run_pipelined_bursts(bursts)
+                self.wait_for_low_progress_after(burst.end_ns, burst.tag)
             finally:
                 low_thread.join()
             self.run_request(tag="reference-after", lane="fast", prompt_count=ref["prompt_tokens"],
@@ -763,8 +776,8 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.sequential_bursts:
         if args.burst_count != SEQUENTIAL_BURST_COUNT:
             raise ValueError(f"sequential burst mode requires --burst-count {SEQUENTIAL_BURST_COUNT}")
-        if args.burst_interval_seconds <= 0:
-            raise ValueError("sequential burst mode requires a positive --burst-interval-seconds")
+        if args.burst_interval_seconds != 0:
+            raise ValueError("sequential burst mode requires --burst-interval-seconds 0")
     elif args.burst_count != 0:
         raise ValueError("--burst-count requires --sequential-bursts")
 

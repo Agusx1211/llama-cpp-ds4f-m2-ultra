@@ -59,8 +59,8 @@ two-slot proof above.
 
 The opt-in horizontal runner keeps the same two split-KV slots but replaces the
 isolated/sustained 512-token pair with the shortest useful burst workload: an
-isolated 8K low oracle, an isolated 128/16 fast oracle, then the identical 8K
-low request alongside exactly four sequential 128/16 fast requests. Restart the
+isolated 8K low oracle, an isolated 128/4 fast oracle, then the identical 8K
+low request alongside exactly four sequential 128/4 fast requests. Restart the
 server after setting the larger trace and bounded-refill policy in the server's
 environment:
 
@@ -84,17 +84,23 @@ python3 tools/server/tests/adaptive-prefill-smoke.py \
   --base-url http://127.0.0.1:18130 \
   --api-key "$LLAMA_API_KEY" \
   --scheduling-token "$LLAMA_SERVER_TRUSTED_SCHEDULING_TOKEN" \
-  --sequential-bursts --burst-count 4 --burst-interval-seconds 2 \
+  --sequential-bursts --burst-count 4 --burst-interval-seconds 0 \
+  --burst-n-predict 4 \
   --artifact "/tmp/adaptive-prefill-bursts-$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
-Sequential-burst mode requires exactly four requests and a positive interval.
+Sequential-burst mode requires exactly four requests with no intentional gap.
+Each next request launches only after the previous HTTP response fully closes;
+the zero interval prevents the low owner from staging a large idle-window chunk
+before the next fast arrival. The four-token turns prove bounded interactive
+refill, not sustained-generation throughput; the default vertical workload's
+512-token isolated/sustained pair remains the longer-generation proof.
 Before sending any workload request it requires an empty trace and
 checks the server's advertised capacity against a worst-case per-token event
 budget. It records each intended and actual launch time, launch lag, and TTFT.
 Every burst must fully return before the mixed low request completes, exactly
 match the isolated burst's token IDs and content, and be followed by a fresh
-low prompt-progress frame before the next burst launches. The mixed low result
+low prompt-progress frame before the next burst completes. The mixed low result
 must likewise exactly match its isolated oracle. The reference before/after,
 stage/commit, one-owner, aligned-yield, active-fast chunk, trace overflow,
 cardinality, and output-hash gates remain enabled.
@@ -107,8 +113,9 @@ not required for this two-slot low-plus-one-fast-at-a-time geometry. The member
 budget is cumulative for the live cohort: cancellation, timeout, or failure
 releases physical width but does not refund a claimed member. Trace `cohort_id`
 identifies prefill ownership, not a runtime permit epoch; the runner's refill
-proof is the completed burst followed by new mixed-low progress before it
-launches the next request.
+proof is the completed burst followed by new mixed-low progress before the next
+request completes; the final burst must likewise be followed by new low
+progress before low completion.
 
 `PASS` requires exact `tokens_predicted` and token-ID cardinality for every
 request, identical token IDs and content for deterministic reference/fast
