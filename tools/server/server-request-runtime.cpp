@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 #include <utility>
 
 namespace server_request_runtime {
@@ -10,6 +11,10 @@ namespace {
 
 using namespace server_request_registry;
 using namespace server_scheduler;
+
+constexpr size_t lane_index(lane value) {
+    return static_cast<size_t>(value);
+}
 
 trusted_lane to_registry_lane(lane value) {
     switch (value) {
@@ -158,14 +163,76 @@ admission_result request_runtime::enqueue(record & request, uint64_t at_us) {
     return { result_code::ok, admitted.reason };
 }
 
-dispatch_result request_runtime::take_next(uint64_t now_us) {
-    const auto evaluate = [this](const server_scheduler::request & request) {
+dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot_capacity) {
+    struct permit_demand {
+        std::array<size_t, lane_count> lanes = {};
+        size_t                         total = 0;
+    };
+
+    std::map<uint64_t, permit_demand> demand_by_parent;
+    for (const auto & entry : records) {
+        const record & current = entry.second;
+        if (current.terminal != lifecycle::completed || current.permit != record::permit_state::none) {
+            continue;
+        }
+        const uint64_t  owner  = current.metadata.parent_id == 0 ? current.metadata.id : current.metadata.parent_id;
+        permit_demand & demand = demand_by_parent[owner];
+        ++demand.lanes[lane_index(current.metadata.lane)];
+        ++demand.total;
+    }
+
+    const auto demand_for = [&demand_by_parent](uint64_t request_id) {
+        const auto found = demand_by_parent.find(request_id);
+        return found == demand_by_parent.end() ? permit_demand{} : found->second;
+    };
+
+    permit_demand queued_demand;
+    for (const auto & entry : records) {
+        if (!entry.second.scheduler_queued) {
+            continue;
+        }
+        const permit_demand current = demand_for(entry.first);
+        for (size_t i = 0; i < lane_count; ++i) {
+            queued_demand.lanes[i] += current.lanes[i];
+        }
+    }
+
+    const bool exclusively_low = permit_counts.claimed[lane_index(lane::normal)] == 0 &&
+                                 permit_counts.claimed[lane_index(lane::fast)] == 0 &&
+                                 scheduler.queued(lane::normal) == 0 && scheduler.queued(lane::fast) == 0;
+    uint32_t low_width = scheduler.config().lanes[lane_index(lane::low)].decode_cap;
+    if (exclusively_low) {
+        const size_t runnable_low =
+            std::min(permit_counts.claimed[lane_index(lane::low)] + queued_demand.lanes[lane_index(lane::low)],
+                     physical_slot_capacity);
+        low_width = scheduler.choose_decode_width(lane::low, runnable_low, runnable_low, false).width;
+    }
+
+    const auto evaluate = [this, physical_slot_capacity, low_width, exclusively_low,
+                           &demand_for](const server_scheduler::request & request) {
         candidate_evaluation result;
         const auto           it = records.find(request.id);
         if (it != records.end()) {
             result.predicted_gpu_us = std::max<uint64_t>(1, it->second.metadata.estimates.predicted_gpu_us);
             if (it->second.metadata.counts.cached_prompt_tokens != 0) {
                 result.cached_prefix_us = it->second.metadata.estimates.predicted_prefill_us;
+            }
+
+            const permit_demand demand = demand_for(request.id);
+            if (demand.total > physical_slot_capacity || permit_counts.total > physical_slot_capacity - demand.total) {
+                result.state = feasibility::temporarily_blocked;
+                return result;
+            }
+            for (size_t i = 0; i < lane_count; ++i) {
+                const size_t cap = scheduler.config().lanes[i].decode_cap;
+                if (demand.lanes[i] > cap || permit_counts.claimed[i] > cap - demand.lanes[i]) {
+                    result.state = feasibility::temporarily_blocked;
+                    return result;
+                }
+            }
+            if (exclusively_low &&
+                permit_counts.claimed[lane_index(lane::low)] + demand.lanes[lane_index(lane::low)] > low_width) {
+                result.state = feasibility::temporarily_blocked;
             }
         }
         return result;
@@ -178,20 +245,43 @@ dispatch_result request_runtime::take_next(uint64_t now_us) {
 
     auto it = records.find(decision.request_id);
     if (it == records.end() || !it->second.scheduler_queued) {
-        scheduler.complete_service(decision.decision_id, 0, service_disposition::cancelled);
+        if (!scheduler.complete_service(decision.decision_id, 0, service_disposition::cancelled).completed) {
+            throw std::logic_error("failed to cancel inconsistent scheduler selection");
+        }
         return {};
     }
 
-    record & request          = it->second;
-    request.scheduler_queued  = false;
+    record &   request = it->second;
+    const auto before  = registry.get(request.handle);
+    if (!before) {
+        if (!scheduler.complete_service(decision.decision_id, 0, service_disposition::cancelled).completed) {
+            throw std::logic_error("failed to cancel selection with missing registry state");
+        }
+        return {};
+    }
     const uint64_t charged_us = std::max<uint64_t>(1, decision.predicted_gpu_us);
     if (!scheduler.complete_service(decision.decision_id, charged_us, service_disposition::complete).completed) {
-        return {};
+        throw std::logic_error("failed to commit scheduler selection");
     }
+    request.scheduler_queued = false;
 
-    const auto before = registry.get(request.handle);
-    if (!before) {
-        return {};
+    const permit_demand selected_demand = demand_for(decision.request_id);
+    if (selected_demand.total > physical_slot_capacity ||
+        permit_counts.total > physical_slot_capacity - selected_demand.total) {
+        throw std::logic_error("scheduler selected work without physical permit capacity");
+    }
+    for (auto & entry : records) {
+        record & current = entry.second;
+        if ((current.metadata.id == decision.request_id || current.metadata.parent_id == decision.request_id) &&
+            current.terminal == lifecycle::completed && current.permit == record::permit_state::none) {
+            const size_t index = lane_index(current.metadata.lane);
+            if (permit_counts.claimed[index] >= scheduler.config().lanes[index].decode_cap) {
+                throw std::logic_error("scheduler selected work without lane permit capacity");
+            }
+            current.permit = record::permit_state::selected_unbound;
+            ++permit_counts.claimed[index];
+            ++permit_counts.total;
+        }
     }
     request.metadata.virtual_runtime_us = saturating_add(request.metadata.virtual_runtime_us, charged_us);
     request_progress progress;
@@ -199,9 +289,12 @@ dispatch_result request_runtime::take_next(uint64_t now_us) {
     progress.debt_us                = request.metadata.debt_us;
     progress.observed_output_tokens = before->counts.observed_output_tokens;
     progress.estimates              = request.metadata.estimates;
-    registry.update_progress(request.handle, progress, server_request_registry::reason_code::progress_observed, now_us);
-    registry.set_queue_state(request.handle, queue_state::none, server_request_registry::reason_code::dispatched,
-                             now_us);
+    if (!registry.update_progress(request.handle, progress, server_request_registry::reason_code::progress_observed,
+                                  now_us) ||
+        !registry.set_queue_state(request.handle, queue_state::none,
+                                  server_request_registry::reason_code::dispatched, now_us)) {
+        throw std::logic_error("failed to publish committed dispatch state");
+    }
 
     return { true, decision.request_id, decision.selected_lane, decision.reason, decision.lane_reason };
 }
@@ -274,6 +367,7 @@ bool request_runtime::mark_deferred(uint64_t request_id, uint64_t at_us) {
     const auto it = records.find(request_id);
     return it != records.end() && it->second.terminal == lifecycle::completed && at_us < it->second.queue_deadline_us &&
            !it->second.scheduler_queued && it->second.bindings.empty() &&
+           it->second.permit == record::permit_state::selected_unbound &&
            registry.set_queue_state(it->second.handle, queue_state::blocked,
                                     server_request_registry::reason_code::capacity_blocked, at_us);
 }
@@ -295,6 +389,7 @@ admission_result request_runtime::resume(uint64_t request_id, uint64_t at_us) {
 bool request_runtime::bind_slot(uint64_t request_id, slot_id slot, uint64_t at_us) {
     const auto it = records.find(request_id);
     if (it == records.end() || it->second.terminal != lifecycle::completed || it->second.scheduler_queued ||
+        it->second.permit != record::permit_state::selected_unbound ||
         (it->second.run_deadline_us == 0 && at_us >= it->second.queue_deadline_us)) {
         return false;
     }
@@ -304,6 +399,8 @@ bool request_runtime::bind_slot(uint64_t request_id, slot_id slot, uint64_t at_u
         return false;
     }
     it->second.bindings.push_back(result.lease);
+    it->second.permit = record::permit_state::bound;
+    ++permit_counts.bound[lane_index(it->second.metadata.lane)];
     if (it->second.run_deadline_us == 0) {
         it->second.run_deadline_us = deadline_from(at_us, it->second.run_timeout_us);
     }
@@ -358,6 +455,8 @@ bool request_runtime::release_bound_slot(std::map<uint64_t, record>::iterator it
     if (!bindings.empty()) {
         return true;
     }
+
+    release_permit(request);
 
     const auto terminal_reason =
         request.terminal == lifecycle::cancelled ? server_request_registry::reason_code::client_cancel :
@@ -419,8 +518,28 @@ bool request_runtime::finish(std::map<uint64_t, record>::iterator it,
     if (!registry.mark_terminal(handle, terminal, reason, at_us) || !registry.remove_terminal(handle, reason, at_us)) {
         return false;
     }
+    release_permit(it->second);
     records.erase(it);
     return true;
+}
+
+void request_runtime::release_permit(record & request) {
+    if (request.permit == record::permit_state::none) {
+        return;
+    }
+    const size_t index = lane_index(request.metadata.lane);
+    if (permit_counts.claimed[index] == 0 || permit_counts.total == 0) {
+        throw std::logic_error("dispatch permit accounting underflow");
+    }
+    --permit_counts.claimed[index];
+    --permit_counts.total;
+    if (request.permit == record::permit_state::bound) {
+        if (permit_counts.bound[index] == 0) {
+            throw std::logic_error("bound dispatch permit accounting underflow");
+        }
+        --permit_counts.bound[index];
+    }
+    request.permit = record::permit_state::none;
 }
 
 bool request_runtime::contains(uint64_t request_id) const {
@@ -441,6 +560,10 @@ event_log_snapshot request_runtime::events() const {
 
 registry_summary request_runtime::summary() const {
     return registry.summary();
+}
+
+dispatch_permit_snapshot request_runtime::permits() const {
+    return permit_counts;
 }
 
 }  // namespace server_request_runtime

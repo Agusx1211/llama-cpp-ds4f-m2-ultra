@@ -134,11 +134,93 @@ void test_cancel_while_bound() {
 
 void test_passive_child_binding() {
     request_runtime runtime;
-    require(runtime.admit(make_request(31, lane::normal, 50), false), "register passive child");
-    require(runtime.queued_total() == 0 && find_request(runtime, 31).queue == queue_state::ready,
+    require(runtime.admit(make_request(30, lane::normal, 50)), "register child owner");
+    request_metadata child = make_request(31, lane::normal, 50);
+    child.parent_id        = 30;
+    require(runtime.admit(child, false), "register passive child");
+    require(runtime.queued_total() == 1 && find_request(runtime, 31).queue == queue_state::ready,
             "child is durable without a second scheduler admission");
+    require(!runtime.take_next(50, 1).selected && runtime.permits().total == 0,
+            "parent and child never acquire a partial physical permit group");
+    require(runtime.take_next(50, 2).request_id == 30 && runtime.permits().total == 2,
+            "parent selection transactionally claims both family permits");
     require(runtime.bind_slot(31, 4, 51), "bind passive child");
+    require(runtime.bind_slot(30, 3, 51), "bind child owner");
     require(runtime.release_slot(31, 4, 52), "complete passive child");
+    require(runtime.release_slot(30, 3, 52), "complete child owner");
+}
+
+void test_dispatch_permits_cover_selection_defer_and_caps() {
+    request_runtime fast;
+    for (uint64_t id = 1; id <= 3; ++id) {
+        require(fast.admit(make_request(id, lane::fast, id)), "admit fast permit request");
+    }
+    require(fast.take_next(10).request_id == 1, "select first fast permit");
+    require(fast.take_next(11).request_id == 2, "select second fast permit");
+    auto permits = fast.permits();
+    require(permits.total == 2 && permits.claimed[static_cast<size_t>(lane::fast)] == 2 &&
+                permits.bound[static_cast<size_t>(lane::fast)] == 0,
+            "selected-unbound work consumes the exact fast ceiling");
+    require(!fast.take_next(12).selected, "third fast request cannot pass selected-unbound permits");
+
+    require(fast.bind_slot(1, 0, 13), "first fast permit converts on bind");
+    require(fast.mark_deferred(2, 14) && fast.resume(2, 15), "second fast permit survives defer and resume");
+    require(fast.take_next(16).request_id == 2 && fast.bind_slot(2, 1, 17),
+            "resumed request reuses its original permit");
+    permits = fast.permits();
+    require(permits.total == 2 && permits.bound[static_cast<size_t>(lane::fast)] == 2,
+            "bind converts permits without double accounting");
+    require(fast.release_slot(1, 0, 18) && fast.take_next(19).request_id == 3,
+            "terminal release makes exactly one fast permit reusable");
+    require(fast.fail(3, 20), "selected-unbound failure releases its permit");
+    require(fast.release_slot(2, 1, 21) && fast.permits().total == 0,
+            "deferred and bound permit lifecycle retires without leaks");
+
+    for (lane priority : { lane::normal, lane::low }) {
+        request_runtime capped;
+        const size_t    cap = priority == lane::normal ? 8 : 64;
+        for (size_t i = 0; i <= cap; ++i) {
+            require(capped.admit(make_request(i + 1, priority, i + 1)), "admit lane-cap request");
+        }
+        for (size_t i = 0; i < cap; ++i) {
+            const dispatch_result selected = capped.take_next(100 + i, 64);
+            require(selected.selected && capped.bind_slot(selected.request_id, static_cast<slot_id>(i), 200 + i),
+                    "claim and bind lane-cap permit");
+        }
+        require(!capped.take_next(1000, 64).selected, "live lane ceiling blocks one excess request");
+        permits = capped.permits();
+        require(permits.claimed[static_cast<size_t>(priority)] == cap && permits.total == cap,
+                "live lane ceiling is exact");
+        require(capped.release_slot(1, 0, 1001), "release first lane-cap request");
+        require(capped.take_next(1002, 64).selected, "released lane permit is immediately reusable");
+    }
+
+    request_runtime physical;
+    for (uint64_t id = 1; id <= 3; ++id) {
+        require(physical.admit(make_request(id, lane::normal, id)), "admit physical-cap request");
+    }
+    require(physical.take_next(1, 2).selected && physical.take_next(2, 2).selected &&
+                !physical.take_next(3, 2).selected && physical.permits().total == 2,
+            "physical permits are claimed at selection, before binding");
+}
+
+void test_profiled_exclusive_low_widths() {
+    for (const auto & fixture : std::vector<std::pair<size_t, size_t>>({
+             { 20, 8  },
+             { 24, 24 }
+    })) {
+        request_runtime runtime;
+        for (size_t i = 0; i < fixture.first; ++i) {
+            require(runtime.admit(make_request(i + 1, lane::low, i + 1)), "admit low-width request");
+        }
+        for (size_t i = 0; i < fixture.second; ++i) {
+            const dispatch_result selected = runtime.take_next(100 + i, 64);
+            require(selected.selected && runtime.bind_slot(selected.request_id, static_cast<slot_id>(i), 200 + i),
+                    "bind profiled low-width request");
+        }
+        require(!runtime.take_next(1000, 64).selected && runtime.permits().total == fixture.second,
+                "exclusive low permits stop at the profiled shape");
+    }
 }
 
 bool has_terminal_event(const request_runtime &              runtime,
@@ -280,6 +362,8 @@ int main() {
         { "defer, resume, and cancel",  test_defer_resume_and_cancel           },
         { "cancel while bound",         test_cancel_while_bound                },
         { "passive child binding",      test_passive_child_binding             },
+        { "dispatch permit lifecycle",  test_dispatch_permits_cover_selection_defer_and_caps },
+        { "profiled low widths",        test_profiled_exclusive_low_widths                   },
         { "queue deadlines",            test_queue_deadlines_and_exact_capacity_reuse  },
         { "run deadline races",         test_run_deadline_and_first_terminal_wins      },
         { "zero timeout defaults",      test_zero_configuration_keeps_bounded_defaults },

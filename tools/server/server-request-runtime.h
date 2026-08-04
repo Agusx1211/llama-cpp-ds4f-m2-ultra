@@ -3,6 +3,7 @@
 #include "server-request-registry.h"
 #include "server-scheduler.h"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <vector>
@@ -53,8 +54,15 @@ struct request_metadata {
     int64_t                                    debt_us            = 0;
     server_request_registry::request_counts    counts;
     server_request_registry::request_estimates estimates;
+    uint64_t                                   parent_id        = 0;
     uint64_t                                   queue_timeout_us = 0;
     uint64_t                                   run_timeout_us   = 0;
+};
+
+struct dispatch_permit_snapshot {
+    std::array<size_t, server_scheduler::lane_count> claimed = {};
+    std::array<size_t, server_scheduler::lane_count> bound   = {};
+    size_t                                           total   = 0;
 };
 
 struct admission_result {
@@ -94,7 +102,7 @@ class request_runtime {
     explicit request_runtime(runtime_config config = {});
 
     admission_result admit(const request_metadata & request, bool scheduled = true);
-    dispatch_result  take_next(uint64_t now_us);
+    dispatch_result  take_next(uint64_t now_us, size_t physical_slot_capacity = 64);
     bool             mark_deferred(uint64_t request_id, uint64_t at_us);
     admission_result resume(uint64_t request_id, uint64_t at_us);
     std::vector<expiration> expire_due(uint64_t now_us);
@@ -113,9 +121,16 @@ class request_runtime {
     std::vector<server_request_registry::request_snapshot> snapshot() const;
     server_request_registry::event_log_snapshot            events() const;
     server_request_registry::registry_summary              summary() const;
+    dispatch_permit_snapshot                               permits() const;
 
   private:
     struct record {
+        enum class permit_state : uint8_t {
+            none = 0,
+            selected_unbound,
+            bound,
+        };
+
         request_metadata                                    metadata;
         server_request_registry::request_handle             handle;
         std::vector<server_request_registry::binding_lease> bindings;
@@ -124,6 +139,7 @@ class request_runtime {
         uint64_t                                            queue_deadline_us = 0;
         uint64_t                                            run_timeout_us    = 0;
         uint64_t                                            run_deadline_us   = 0;
+        permit_state                                        permit            = permit_state::none;
     };
 
     admission_result enqueue(record & request, uint64_t at_us);
@@ -136,6 +152,7 @@ class request_runtime {
                             server_request_registry::lifecycle   terminal,
                             server_request_registry::reason_code reason,
                             uint64_t                             at_us);
+    void             release_permit(record & request);
 
     server_scheduler::scheduler               scheduler;
     server_request_registry::request_registry registry;
@@ -143,6 +160,7 @@ class request_runtime {
     uint64_t                                  default_queue_timeout_us;
     uint64_t                                  default_run_timeout_us;
     uint32_t                                  overload_retry_after_seconds;
+    dispatch_permit_snapshot                  permit_counts;
 };
 
 }  // namespace server_request_runtime

@@ -66,6 +66,7 @@ private:
 
     server_request_runtime::request_runtime request_runtime;
     std::function<uint64_t()>               monotonic_us;
+    size_t                                  physical_slot_capacity = 64;
 
     std::mutex mutex_tasks;
     std::condition_variable condition_tasks;
@@ -124,6 +125,9 @@ public:
      */
     void start_loop(int64_t idle_sleep_ms = -1);
 
+    // Must be set from the authoritative server slot vector before start_loop.
+    void set_physical_slot_capacity(size_t capacity);
+
     // for metrics
     size_t queue_tasks_deferred_size() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
@@ -143,6 +147,7 @@ public:
     std::vector<server_request_registry::request_snapshot> request_snapshot();
     server_request_registry::event_log_snapshot request_events();
     server_request_registry::registry_summary request_summary();
+    server_request_runtime::dispatch_permit_snapshot dispatch_permits();
 
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called

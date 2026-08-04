@@ -84,6 +84,7 @@ server_request_runtime::request_metadata server_queue::make_request_metadata(ser
     result.estimates.predicted_gpu_us        = task.scheduling.predicted_gpu_us;
     result.estimates.predicted_memory_bytes  = task.scheduling.predicted_memory_bytes;
     result.estimates.predicted_output_tokens = task.scheduling.predicted_output_tokens;
+    result.parent_id                         = task.id_parent >= 0 ? runtime_id(task.id_parent) : 0;
     result.queue_timeout_us                  = task.scheduling.queue_timeout_us;
     result.run_timeout_us                    = task.scheduling.run_timeout_us;
     switch (task.scheduling.lane) {
@@ -362,6 +363,12 @@ void server_queue::terminate() {
     condition_tasks.notify_all();
 }
 
+void server_queue::set_physical_slot_capacity(size_t capacity) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    GGML_ASSERT(!running && capacity > 0);
+    physical_slot_capacity = capacity;
+}
+
 void server_queue::start_loop(int64_t idle_sleep_ms) {
     running = true;
     time_last_task = ggml_time_ms();
@@ -400,7 +407,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 task = std::move(queue_tasks.front());
                 queue_tasks.pop_front();
             } else {
-                const auto decision = request_runtime.take_next(now_us());
+                const auto decision = request_runtime.take_next(now_us(), physical_slot_capacity);
                 if (!decision.selected) {
                     lock.unlock();
                     break;
@@ -595,6 +602,11 @@ server_request_registry::event_log_snapshot server_queue::request_events() {
 server_request_registry::registry_summary server_queue::request_summary() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     return request_runtime.summary();
+}
+
+server_request_runtime::dispatch_permit_snapshot server_queue::dispatch_permits() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    return request_runtime.permits();
 }
 
 //

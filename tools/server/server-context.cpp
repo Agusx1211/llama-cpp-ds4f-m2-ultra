@@ -1415,6 +1415,10 @@ private:
             slot.reset();
         }
 
+        if (!is_resume) {
+            queue_tasks.set_physical_slot_capacity(slots.size());
+        }
+
         {
             const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
             trace = LLAMA_TRACE ? atoi(LLAMA_TRACE) : 0;
