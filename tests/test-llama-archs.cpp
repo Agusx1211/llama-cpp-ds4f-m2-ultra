@@ -78,8 +78,40 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 
 static void usage(char ** argv) {
     printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] "
-           "[--dsv4-restore-only] [--dsv4-aggregate-only]\n", argv[0]);
+           "[--dsv4-restore-only] [--dsv4-aggregate-only] [--dsv4-selector-only]\n", argv[0]);
 }
+
+class scoped_env_override {
+public:
+    scoped_env_override(const char * name, const char * value) : name(name) {
+        if (const char * old = std::getenv(name)) {
+            was_present = true;
+            old_value = old;
+        }
+        set(value);
+    }
+
+    ~scoped_env_override() {
+        set(was_present ? old_value.c_str() : nullptr);
+    }
+
+private:
+    void set(const char * value) const {
+#if defined(_WIN32)
+        _putenv_s(name.c_str(), value ? value : "");
+#else
+        if (value) {
+            setenv(name.c_str(), value, 1);
+        } else {
+            unsetenv(name.c_str());
+        }
+#endif
+    }
+
+    std::string name;
+    std::string old_value;
+    bool was_present = false;
+};
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
     std::mt19937 gen(seed);
@@ -1716,6 +1748,9 @@ static bool test_dsv4_aggregate_device(size_t seed, ggml_backend_dev_t dev) {
         return true;
     }
 
+    scoped_env_override disable_clear("LLAMA_DSV4_AGGREGATE_POOL_DISABLE", nullptr);
+    scoped_env_override force_clear("LLAMA_DSV4_AGGREGATE_POOL_FORCE", nullptr);
+
     {
         dsv4_test_context single(seed, dev, 1, true, 4);
         auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(single.lctx.get()));
@@ -1727,8 +1762,17 @@ static bool test_dsv4_aggregate_device(size_t seed, ggml_backend_dev_t dev) {
         dsv4_test_context multi(seed, dev, 2, true, 4);
         auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(multi.lctx.get()));
         GGML_ASSERT(memory != nullptr);
+        GGML_ASSERT(!memory->is_aggregate_compressed() &&
+                "small target unified multi-slot DSV4 did not select affine compressed storage");
+    }
+
+    scoped_env_override force_aggregate("LLAMA_DSV4_AGGREGATE_POOL_FORCE", "1");
+    {
+        dsv4_test_context multi(seed, dev, 2, true, 4);
+        auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(multi.lctx.get()));
+        GGML_ASSERT(memory != nullptr);
         GGML_ASSERT(memory->is_aggregate_compressed() &&
-                "target unified multi-slot DSV4 did not select aggregate compressed storage");
+                "forced target unified multi-slot DSV4 did not select aggregate compressed storage");
     }
 
     static constexpr uint32_t n_vocab  = 128;
@@ -1755,9 +1799,96 @@ static bool test_dsv4_aggregate_device(size_t seed, ggml_backend_dev_t dev) {
             "aggregate full-state limitation did not reject the size request");
 
     printf("DSV4 aggregate selection/alias matrix (%s): %s; single-slot = affine, "
-           "multi-slot = aggregate, full state = explicitly unsupported\n",
+           "small multi-slot = affine, forced multi-slot = aggregate, full state = explicitly unsupported\n",
             ggml_backend_dev_description(dev), all_ok ? "OK" : "FAIL");
     return all_ok;
+}
+
+static uint64_t dsv4_test_deepseek_affine_bytes(uint32_t kv_size, uint32_t n_seq_max) {
+    const uint64_t c4_rows  = GGML_PAD((kv_size + 3)/4, 256u);
+    const uint64_t hca_rows = GGML_PAD((kv_size + 127)/128, 256u);
+    uint64_t total = 0;
+    GGML_ASSERT(dsv4_affine_compressed_bytes_add(total, 2*512, c4_rows,  n_seq_max, 21));
+    GGML_ASSERT(dsv4_affine_compressed_bytes_add(total, 2*512, hca_rows, n_seq_max, 20));
+    GGML_ASSERT(dsv4_affine_compressed_bytes_add(total, 2*128, c4_rows,  n_seq_max, 21));
+    return total;
+}
+
+static int test_dsv4_aggregate_selector() {
+    static constexpr uint64_t MiB = UINT64_C(1024)*1024;
+    static constexpr uint64_t GiB = MiB*1024;
+
+    llama_dsv4_aggregate_selector selector;
+    selector.unified          = true;
+    selector.sparse_supported = true;
+    selector.f16              = true;
+    selector.n_seq_max        = 4;
+
+    selector.affine_compressed_bytes = LLAMA_DSV4_MAX_AFFINE_COMPRESSED_BYTES - 1;
+    GGML_ASSERT(!dsv4_select_aggregate_compressed(selector));
+    selector.affine_compressed_bytes = LLAMA_DSV4_MAX_AFFINE_COMPRESSED_BYTES;
+    GGML_ASSERT(!dsv4_select_aggregate_compressed(selector));
+    selector.affine_compressed_bytes = LLAMA_DSV4_MAX_AFFINE_COMPRESSED_BYTES + 1;
+    GGML_ASSERT(dsv4_select_aggregate_compressed(selector));
+
+    selector.n_seq_max = 1;
+    GGML_ASSERT(!dsv4_select_aggregate_compressed(selector));
+    selector.n_seq_max = 4;
+    selector.unified = false;
+    GGML_ASSERT(!dsv4_select_aggregate_compressed(selector));
+    selector.unified = true;
+    selector.f16 = false;
+    GGML_ASSERT(!dsv4_select_aggregate_compressed(selector));
+    selector.f16 = true;
+    selector.sparse_supported = false;
+    GGML_ASSERT(!dsv4_select_aggregate_compressed(selector));
+    selector.sparse_supported = true;
+
+    selector.affine_compressed_bytes = 1;
+    selector.forced = true;
+    GGML_ASSERT(dsv4_select_aggregate_compressed(selector));
+    selector.disabled = true;
+    GGML_ASSERT(!dsv4_select_aggregate_compressed(selector));
+    selector.disabled = false;
+    selector.forced = false;
+    selector.affine_footprint_overflow = true;
+    GGML_ASSERT(dsv4_select_aggregate_compressed(selector));
+
+    uint64_t overflow_total = std::numeric_limits<uint64_t>::max() - 1;
+    GGML_ASSERT(!dsv4_affine_compressed_bytes_add(overflow_total, 2, 1, 1));
+    GGML_ASSERT(overflow_total == std::numeric_limits<uint64_t>::max());
+
+    const uint64_t bytes_2k_4   = dsv4_test_deepseek_affine_bytes(2048, 4);
+    const uint64_t bytes_128k_4 = dsv4_test_deepseek_affine_bytes(128*1024, 4);
+    const uint64_t bytes_256k_4 = dsv4_test_deepseek_affine_bytes(256*1024, 4);
+    const uint64_t bytes_512k_4 = dsv4_test_deepseek_affine_bytes(512*1024, 4);
+    const uint64_t bytes_1m_64  = dsv4_test_deepseek_affine_bytes(1024*1024, 64);
+    GGML_ASSERT(bytes_2k_4   == UINT64_C(145)*MiB/2);
+    GGML_ASSERT(bytes_128k_4 == 3*GiB   + 368*MiB);
+    GGML_ASSERT(bytes_256k_4 == 6*GiB   + 736*MiB);
+    GGML_ASSERT(bytes_512k_4 == 13*GiB  + 448*MiB);
+    GGML_ASSERT(bytes_1m_64  == 430*GiB);
+
+    selector.affine_footprint_overflow = false;
+    selector.n_seq_max = 4;
+    selector.affine_compressed_bytes = bytes_2k_4;
+    GGML_ASSERT(!dsv4_select_aggregate_compressed(selector));
+    selector.affine_compressed_bytes = bytes_128k_4;
+    GGML_ASSERT(!dsv4_select_aggregate_compressed(selector));
+    selector.affine_compressed_bytes = bytes_256k_4;
+    GGML_ASSERT(!dsv4_select_aggregate_compressed(selector));
+    selector.affine_compressed_bytes = bytes_512k_4;
+    GGML_ASSERT(dsv4_select_aggregate_compressed(selector));
+    selector.n_seq_max = 64;
+    selector.affine_compressed_bytes = bytes_1m_64;
+    GGML_ASSERT(dsv4_select_aggregate_compressed(selector));
+
+    printf("DSV4 aggregate selector: OK; 2K/4=%.2f MiB affine, 128K/4=%.3f GiB affine, "
+           "256K/4=%.3f GiB affine, 512K/4=%.3f GiB aggregate, 1M/64=%.3f GiB aggregate\n",
+            bytes_2k_4/(1024.0*1024.0), bytes_128k_4/(1024.0*1024.0*1024.0),
+            bytes_256k_4/(1024.0*1024.0*1024.0), bytes_512k_4/(1024.0*1024.0*1024.0),
+            bytes_1m_64/(1024.0*1024.0*1024.0));
+    return 0;
 }
 
 static int test_dsv4_parallel(size_t seed) {
@@ -1772,6 +1903,7 @@ static int test_dsv4_parallel(size_t seed) {
 }
 
 static int test_dsv4_aggregate(size_t seed) {
+    test_dsv4_aggregate_selector();
     bool all_ok = true;
     bool tested = false;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -2132,6 +2264,7 @@ int main(int argc, char ** argv) {
     std::string out;
     bool dsv4_restore_only = false;
     bool dsv4_aggregate_only = false;
+    bool dsv4_selector_only = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -2175,6 +2308,10 @@ int main(int argc, char ** argv) {
             dsv4_aggregate_only = true;
             continue;
         }
+        if (strcmp(argv[i], "--dsv4-selector-only") == 0) {
+            dsv4_selector_only = true;
+            continue;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
@@ -2187,6 +2324,9 @@ int main(int argc, char ** argv) {
         }
         if (dsv4_aggregate_only) {
             return test_dsv4_aggregate(seed);
+        }
+        if (dsv4_selector_only) {
+            return test_dsv4_aggregate_selector();
         }
         const int backends_result = test_backends(arch, seed, log_level);
         if (backends_result != 0) {

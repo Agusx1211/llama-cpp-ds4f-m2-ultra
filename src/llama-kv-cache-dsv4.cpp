@@ -130,6 +130,41 @@ static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
 }
 
+static uint64_t dsv4_affine_compressed_bytes(
+        const llama_model & model,
+                  ggml_type type_k,
+                   uint32_t n_seq_max,
+                   uint32_t c4_rows,
+                   uint32_t hca_rows,
+    const llama_memory_i::layer_filter_cb & filter,
+                       bool & overflow) {
+    uint64_t total = 0;
+    overflow = false;
+
+    auto add = [&](uint32_t width, uint32_t rows) {
+        if (!dsv4_affine_compressed_bytes_add(
+                    total, ggml_row_size(type_k, width), rows, n_seq_max)) {
+            overflow = true;
+        }
+    };
+
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        if (filter && !filter(il)) {
+            continue;
+        }
+
+        const uint32_t ratio = model.hparams.dsv4_compress_ratios[il];
+        if (ratio == DSV4_CSA_RATIO) {
+            add(model.hparams.n_embd_k_gqa(il), c4_rows);
+            add(model.hparams.indexer_head_size, c4_rows);
+        } else if (ratio == DSV4_HCA_RATIO) {
+            add(model.hparams.n_embd_k_gqa(il), hca_rows);
+        }
+    }
+
+    return total;
+}
+
 static void * dsv4_backend_proc(const ggml_tensor * tensor, const char * name) {
     if (tensor == nullptr || tensor->buffer == nullptr) {
         return nullptr;
@@ -1664,10 +1699,36 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     c4_logical_rows  = GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u);
     hca_logical_rows = GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u);
 
+    const bool aggregate_capable = unified && n_seq_max > 1 &&
+            sparse_buft != nullptr && type_k == GGML_TYPE_F16;
+    bool affine_footprint_overflow = false;
+    const uint64_t affine_compressed_bytes = aggregate_capable ?
+            dsv4_affine_compressed_bytes(
+                model, type_k, n_seq_max, c4_logical_rows, hca_logical_rows,
+                filter, affine_footprint_overflow) : 0;
+    const llama_dsv4_aggregate_selector selector {
+        /*.unified                   =*/ unified,
+        /*.sparse_supported          =*/ sparse_buft != nullptr,
+        /*.f16                       =*/ type_k == GGML_TYPE_F16,
+        /*.disabled                  =*/ std::getenv("LLAMA_DSV4_AGGREGATE_POOL_DISABLE") != nullptr,
+        /*.forced                    =*/ std::getenv("LLAMA_DSV4_AGGREGATE_POOL_FORCE") != nullptr,
+        /*.affine_footprint_overflow =*/ affine_footprint_overflow,
+        /*.n_seq_max                 =*/ n_seq_max,
+        /*.affine_compressed_bytes   =*/ affine_compressed_bytes,
+    };
+
     // The aggregate layout is target-only and currently requires the F16
-    // indexed concat path. Keep the affine layout for other cache formats.
-    aggregate_compressed = unified && n_seq_max > 1 && sparse_buft != nullptr && type_k == GGML_TYPE_F16 &&
-            std::getenv("LLAMA_DSV4_AGGREGATE_POOL_DISABLE") == nullptr;
+    // indexed concat path. Prefer affine storage while its exact declared K
+    // tensors fit the M2 Ultra product budget: Metal System Trace shows that
+    // aggregate sparse mapping fragments a four-stream request into thousands
+    // of Compute/Blit intervals even though GPU-active work is unchanged.
+    aggregate_compressed = dsv4_select_aggregate_compressed(selector);
+    if (selector.unified && selector.n_seq_max > 1 && selector.sparse_supported && selector.f16 &&
+            !selector.disabled && !aggregate_compressed) {
+        LLAMA_LOG_INFO("%s: affine DSV4 compressed storage selected: footprint=%.2f MiB, aggregate threshold=%.2f MiB\n",
+                __func__, affine_compressed_bytes/(1024.0*1024.0),
+                LLAMA_DSV4_MAX_AFFINE_COMPRESSED_BYTES/(1024.0*1024.0));
+    }
 
     uint32_t c4_storage_rows  = c4_logical_rows;
     uint32_t hca_storage_rows = hca_logical_rows;
@@ -1694,6 +1755,11 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         }
         LLAMA_LOG_INFO("%s: aggregate DSV4 compressed pool enabled: C4 logical=%u storage=%u rows, HCA logical=%u storage=%u rows, slots=%u\n",
                 __func__, c4_logical_rows, c4_storage_rows, hca_logical_rows, hca_storage_rows, n_seq_max);
+        LLAMA_LOG_INFO("%s: aggregate selection: affine footprint=%s%.2f MiB, threshold=%.2f MiB%s\n",
+                __func__, affine_footprint_overflow ? ">" : "",
+                affine_compressed_bytes/(1024.0*1024.0),
+                LLAMA_DSV4_MAX_AFFINE_COMPRESSED_BYTES/(1024.0*1024.0),
+                selector.forced ? ", forced" : "");
     }
 
     // Keep DSV4 KV/state streams per sequence even when public KV mode is unified.
