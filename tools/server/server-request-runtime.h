@@ -152,7 +152,10 @@ class request_runtime {
                             server_request_registry::lifecycle   terminal,
                             server_request_registry::reason_code reason,
                             uint64_t                             at_us);
-    void             release_permit(record & request);
+    bool                  cancel_one(uint64_t request_id, uint64_t at_us);
+    bool                  fail_one(uint64_t request_id, uint64_t at_us);
+    std::vector<uint64_t> terminal_targets(uint64_t request_id) const;
+    void                  release_permit(record & request);
 
     server_scheduler::scheduler               scheduler;
     server_request_registry::request_registry registry;

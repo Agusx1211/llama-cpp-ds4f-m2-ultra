@@ -197,22 +197,42 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
         }
     }
 
-    const bool exclusively_low = permit_counts.claimed[lane_index(lane::normal)] == 0 &&
-                                 permit_counts.claimed[lane_index(lane::fast)] == 0 &&
-                                 scheduler.queued(lane::normal) == 0 && scheduler.queued(lane::fast) == 0;
-    uint32_t low_width = scheduler.config().lanes[lane_index(lane::low)].decode_cap;
-    if (exclusively_low) {
-        const size_t runnable_low =
-            std::min(permit_counts.claimed[lane_index(lane::low)] + queued_demand.lanes[lane_index(lane::low)],
-                     physical_slot_capacity);
-        low_width = scheduler.choose_decode_width(lane::low, runnable_low, runnable_low, false).width;
+    const auto cohort_limit_for = [this, physical_slot_capacity, &queued_demand](lane priority) {
+        size_t limit = scheduler.config().lanes[lane_index(priority)].decode_cap;
+        if (priority == lane::low) {
+            const size_t runnable_low =
+                std::min(permit_counts.claimed[lane_index(lane::low)] + queued_demand.lanes[lane_index(lane::low)],
+                         physical_slot_capacity);
+            limit = scheduler.choose_decode_width(lane::low, runnable_low, runnable_low, false).width;
+        }
+        return std::min(limit, physical_slot_capacity);
+    };
+
+    const bool has_cohort = permit_counts.total != 0;
+    lane       dominant_lane = lane::low;
+    if (has_cohort) {
+        dominant_lane = permit_counts.claimed[lane_index(lane::fast)] != 0   ? lane::fast :
+                        permit_counts.claimed[lane_index(lane::normal)] != 0 ? lane::normal :
+                                                                              lane::low;
+        if (dominant_lane != lane::fast && queued_demand.lanes[lane_index(lane::fast)] != 0) {
+            dominant_lane = lane::fast;
+        } else if (dominant_lane == lane::low && queued_demand.lanes[lane_index(lane::normal)] != 0) {
+            dominant_lane = lane::normal;
+        }
     }
 
-    const auto evaluate = [this, physical_slot_capacity, low_width, exclusively_low,
+    const auto evaluate = [this, physical_slot_capacity, has_cohort, dominant_lane, &cohort_limit_for,
                            &demand_for](const server_scheduler::request & request) {
         candidate_evaluation result;
         const auto           it = records.find(request.id);
         if (it != records.end()) {
+            // The first request in an empty cohort remains an HDRR decision.
+            // A live wider cohort accepts only its dominant lane, which may be
+            // upgraded by newly queued higher-priority work.
+            if (has_cohort && physical_slot_capacity > 1 && request.priority != dominant_lane) {
+                result.state = feasibility::temporarily_blocked;
+                return result;
+            }
             result.predicted_gpu_us = std::max<uint64_t>(1, it->second.metadata.estimates.predicted_gpu_us);
             if (it->second.metadata.counts.cached_prompt_tokens != 0) {
                 result.cached_prefix_us = it->second.metadata.estimates.predicted_prefill_us;
@@ -223,16 +243,17 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
                 result.state = feasibility::temporarily_blocked;
                 return result;
             }
+            const size_t cohort_limit = cohort_limit_for(has_cohort ? dominant_lane : request.priority);
+            if (demand.total > cohort_limit || permit_counts.total > cohort_limit - demand.total) {
+                result.state = feasibility::temporarily_blocked;
+                return result;
+            }
             for (size_t i = 0; i < lane_count; ++i) {
                 const size_t cap = scheduler.config().lanes[i].decode_cap;
                 if (demand.lanes[i] > cap || permit_counts.claimed[i] > cap - demand.lanes[i]) {
                     result.state = feasibility::temporarily_blocked;
                     return result;
                 }
-            }
-            if (exclusively_low &&
-                permit_counts.claimed[lane_index(lane::low)] + demand.lanes[lane_index(lane::low)] > low_width) {
-                result.state = feasibility::temporarily_blocked;
             }
         }
         return result;
@@ -269,6 +290,11 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
     if (selected_demand.total > physical_slot_capacity ||
         permit_counts.total > physical_slot_capacity - selected_demand.total) {
         throw std::logic_error("scheduler selected work without physical permit capacity");
+    }
+    const size_t selected_cohort_limit = cohort_limit_for(has_cohort ? dominant_lane : decision.selected_lane);
+    if (selected_demand.total > selected_cohort_limit ||
+        permit_counts.total > selected_cohort_limit - selected_demand.total) {
+        throw std::logic_error("scheduler selected work beyond dominant lane cohort limit");
     }
     for (auto & entry : records) {
         record & current = entry.second;
@@ -467,6 +493,18 @@ bool request_runtime::release_bound_slot(std::map<uint64_t, record>::iterator it
 }
 
 bool request_runtime::cancel(uint64_t request_id, uint64_t at_us) {
+    const std::vector<uint64_t> targets = terminal_targets(request_id);
+    if (targets.empty()) {
+        return false;
+    }
+    bool cancelled = true;
+    for (uint64_t target : targets) {
+        cancelled = cancel_one(target, at_us) && cancelled;
+    }
+    return cancelled;
+}
+
+bool request_runtime::cancel_one(uint64_t request_id, uint64_t at_us) {
     auto it = records.find(request_id);
     if (it == records.end()) {
         return false;
@@ -492,6 +530,18 @@ bool request_runtime::cancel(uint64_t request_id, uint64_t at_us) {
 }
 
 bool request_runtime::fail(uint64_t request_id, uint64_t at_us) {
+    const std::vector<uint64_t> targets = terminal_targets(request_id);
+    if (targets.empty()) {
+        return false;
+    }
+    bool failed = true;
+    for (uint64_t target : targets) {
+        failed = fail_one(target, at_us) && failed;
+    }
+    return failed;
+}
+
+bool request_runtime::fail_one(uint64_t request_id, uint64_t at_us) {
     auto it = records.find(request_id);
     if (it == records.end()) {
         return false;
@@ -508,6 +558,28 @@ bool request_runtime::fail(uint64_t request_id, uint64_t at_us) {
     }
     return !it->second.bindings.empty() ||
            finish(it, lifecycle::failed, server_request_registry::reason_code::request_failed, at_us);
+}
+
+std::vector<uint64_t> request_runtime::terminal_targets(uint64_t request_id) const {
+    const auto requested = records.find(request_id);
+    if (requested == records.end()) {
+        return {};
+    }
+
+    // A child remains independently cancellable for per-result cancellation.
+    // Parent cancellation or setup failure retires its passive children in
+    // the same serialized operation.
+    if (requested->second.metadata.parent_id != 0) {
+        return { request_id };
+    }
+
+    std::vector<uint64_t> result;
+    for (const auto & entry : records) {
+        if (entry.first == request_id || entry.second.metadata.parent_id == request_id) {
+            result.push_back(entry.first);
+        }
+    }
+    return result;
 }
 
 bool request_runtime::finish(std::map<uint64_t, record>::iterator it,

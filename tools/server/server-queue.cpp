@@ -584,6 +584,9 @@ bool server_queue::fail_task(int id_task) {
     const uint64_t               at_us   = now_us();
     auto                         expired = expire_requests_locked(at_us);
     const bool                   failed  = id_task >= 0 && request_runtime.fail(runtime_id(id_task), at_us);
+    if (failed) {
+        erase_pending_payload(id_task);
+    }
     lock.unlock();
     notify_expired(expired);
     return failed;

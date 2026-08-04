@@ -2406,6 +2406,7 @@ private:
             int id_child = parent_task.child_tasks[idx].id;
             if (!launch_slot_with_task(*slot, std::move(parent_task.child_tasks[idx]))) {
                 SRV_ERR("failed to launch slot with child task, id_task = %d\n", id_child);
+                queue_tasks.fail_task(id_parent);
                 release_slots();
                 return false;
             }
