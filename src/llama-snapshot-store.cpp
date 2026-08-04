@@ -503,6 +503,47 @@ operation_result validate_manifest_shape(const llama_snapshot_store_config & con
     return {};
 }
 
+operation_result make_manifest(const llama_snapshot_store_config & config,
+                               const llama_snapshot_metadata &     metadata,
+                               uint64_t                            total_payload_bytes,
+                               llama_snapshot_manifest &           manifest) {
+    if (metadata.snapshot_generation == 0 || metadata.request_generation == 0 || !valid_identity(metadata.identity) ||
+        total_payload_bytes > config.max_snapshot_bytes) {
+        return { llama_snapshot_status::invalid_argument, 0 };
+    }
+    const uint64_t chunk_count = total_payload_bytes == 0 ?
+                                     0 :
+                                     total_payload_bytes / config.chunk_payload_bytes +
+                                         (total_payload_bytes % config.chunk_payload_bytes != 0);
+    if (chunk_count > config.max_chunks || chunk_count > UINT32_MAX) {
+        return { llama_snapshot_status::chunk_too_large, 0 };
+    }
+
+    manifest                            = {};
+    manifest.format_version             = LLAMA_SNAPSHOT_FORMAT_VERSION;
+    manifest.snapshot_generation        = metadata.snapshot_generation;
+    manifest.request_generation         = metadata.request_generation;
+    manifest.identity                   = metadata.identity;
+    manifest.physical_device_id         = config.physical_device_id;
+    manifest.physical_device_queues     = config.physical_device_queues;
+    manifest.chunk_payload_limit        = config.chunk_payload_bytes;
+    manifest.total_payload_bytes        = total_payload_bytes;
+    manifest.chunks.reserve(static_cast<size_t>(chunk_count));
+    uint64_t offset = 0;
+    for (uint32_t index = 0; index < chunk_count; ++index) {
+        llama_snapshot_chunk_info chunk;
+        chunk.index          = index;
+        chunk.logical_offset = offset;
+        chunk.payload_bytes  = std::min<uint64_t>(config.chunk_payload_bytes, total_payload_bytes - offset);
+        manifest.chunks.push_back(chunk);
+        offset += chunk.payload_bytes;
+    }
+    if (serialize_manifest(manifest).size() > config.max_manifest_bytes) {
+        return { llama_snapshot_status::manifest_too_large, 0 };
+    }
+    return {};
+}
+
 operation_result parse_manifest(const llama_snapshot_store_config & config,
                                 const std::vector<uint8_t> &        bytes,
                                 llama_snapshot_manifest &           manifest) {
@@ -778,6 +819,51 @@ const llama_snapshot_store_config & llama_snapshot_store::config() const {
     return cfg;
 }
 
+llama_snapshot_storage_estimate llama_snapshot_estimate_storage(
+        const llama_snapshot_store_config & config,
+        const llama_snapshot_metadata &     metadata,
+        uint64_t                            total_payload_bytes) {
+    llama_snapshot_storage_estimate result;
+    try {
+        const operation_result config_check = config_status(config);
+        if (config_check.status != llama_snapshot_status::ok) {
+            result.status = config_check.status;
+            return result;
+        }
+        llama_snapshot_manifest manifest;
+        const operation_result  made = make_manifest(config, metadata, total_payload_bytes, manifest);
+        if (made.status != llama_snapshot_status::ok) {
+            result.status = made.status;
+            return result;
+        }
+        const uint64_t manifest_bytes = serialize_manifest(manifest).size();
+        const uint64_t chunk_count    = manifest.chunks.size();
+        if (chunk_count > (UINT64_MAX - total_payload_bytes) / LLAMA_SNAPSHOT_CHUNK_ALIGNMENT) {
+            result.status = llama_snapshot_status::invalid_argument;
+            return result;
+        }
+        result.generation_bytes       = total_payload_bytes + chunk_count * LLAMA_SNAPSHOT_CHUNK_ALIGNMENT;
+        if (result.generation_bytes > UINT64_MAX - manifest_bytes ||
+            result.generation_bytes + manifest_bytes > UINT64_MAX - manifest_bytes) {
+            result.status = llama_snapshot_status::invalid_argument;
+            return result;
+        }
+        result.generation_bytes       += manifest_bytes;
+        result.current_manifest_bytes = manifest_bytes;
+        result.committed_bytes        = result.generation_bytes + manifest_bytes;
+        result.replacement_peak_bytes = result.committed_bytes;
+        result.chunk_count            = static_cast<uint32_t>(chunk_count);
+        result.status                 = llama_snapshot_status::ok;
+        return result;
+    } catch (const std::bad_alloc &) {
+        result.status = llama_snapshot_status::io_error;
+        return result;
+    } catch (...) {
+        result.status = llama_snapshot_status::io_error;
+        return result;
+    }
+}
+
 llama_snapshot_write_result llama_snapshot_store::write_generation(const llama_snapshot_metadata &     metadata,
                                                                    const std::vector<uint8_t> &        payload,
                                                                    const llama_snapshot_cancel_check & cancelled,
@@ -805,12 +891,10 @@ llama_snapshot_write_result llama_snapshot_store::write_generation_streamed(
             result.status = llama_snapshot_status::invalid_argument;
             return result;
         }
-        const uint64_t chunk_count = total_payload_bytes == 0 ?
-                                         0 :
-                                         total_payload_bytes / cfg.chunk_payload_bytes +
-                                             (total_payload_bytes % cfg.chunk_payload_bytes != 0);
-        if (chunk_count > cfg.max_chunks || chunk_count > UINT32_MAX) {
-            result.status = llama_snapshot_status::chunk_too_large;
+        llama_snapshot_manifest manifest;
+        const operation_result  made = make_manifest(cfg, metadata, total_payload_bytes, manifest);
+        if (made.status != llama_snapshot_status::ok) {
+            result.status = made.status;
             return result;
         }
         if (cancelled && cancelled(0)) {
@@ -850,30 +934,6 @@ llama_snapshot_write_result llama_snapshot_store::write_generation_streamed(
         }
         if (has_previous && previous.snapshot_generation > metadata.snapshot_generation) {
             result.status = llama_snapshot_status::stale_generation;
-            return result;
-        }
-
-        llama_snapshot_manifest manifest;
-        manifest.format_version         = LLAMA_SNAPSHOT_FORMAT_VERSION;
-        manifest.snapshot_generation    = metadata.snapshot_generation;
-        manifest.request_generation     = metadata.request_generation;
-        manifest.identity               = metadata.identity;
-        manifest.physical_device_id     = cfg.physical_device_id;
-        manifest.physical_device_queues = cfg.physical_device_queues;
-        manifest.chunk_payload_limit    = cfg.chunk_payload_bytes;
-        manifest.total_payload_bytes    = total_payload_bytes;
-        manifest.chunks.reserve(static_cast<size_t>(chunk_count));
-        uint64_t offset = 0;
-        for (uint32_t index = 0; index < chunk_count; ++index) {
-            llama_snapshot_chunk_info chunk;
-            chunk.index          = index;
-            chunk.logical_offset = offset;
-            chunk.payload_bytes  = std::min<uint64_t>(cfg.chunk_payload_bytes, total_payload_bytes - offset);
-            manifest.chunks.push_back(chunk);
-            offset += chunk.payload_bytes;
-        }
-        if (serialize_manifest(manifest).size() > cfg.max_manifest_bytes) {
-            result.status = llama_snapshot_status::manifest_too_large;
             return result;
         }
 
@@ -987,6 +1047,11 @@ llama_snapshot_write_result llama_snapshot_store::write_generation_streamed(
         }
         result.committed = true;
         cleanup.committed = true;
+        if (faults.fail_after_manifest_commit) {
+            result.status   = llama_snapshot_status::commit_uncertain;
+            result.os_error = EIO;
+            return result;
+        }
         operation = fsync_directory(root);
         if (operation.status != llama_snapshot_status::ok) {
             result.status   = llama_snapshot_status::commit_uncertain;
@@ -1010,9 +1075,23 @@ llama_snapshot_write_result llama_snapshot_store::write_generation_streamed(
 }
 
 llama_snapshot_open_result llama_snapshot_store::open_current(const llama_snapshot_identity & expected_identity) const {
+    if (!valid_identity(expected_identity)) {
+        return {};
+    }
+    llama_snapshot_open_result result = inspect_current();
+    if (result.status != llama_snapshot_status::ok) {
+        return result;
+    }
+    if (result.manifest.identity != expected_identity) {
+        result.status = llama_snapshot_status::identity_mismatch;
+    }
+    return result;
+}
+
+llama_snapshot_open_result llama_snapshot_store::inspect_current() const {
     llama_snapshot_open_result result;
     const operation_result     config_check = config_status(cfg);
-    if (config_check.status != llama_snapshot_status::ok || !valid_identity(expected_identity)) {
+    if (config_check.status != llama_snapshot_status::ok) {
         result.status = llama_snapshot_status::invalid_argument;
         return result;
     }
@@ -1026,10 +1105,6 @@ llama_snapshot_open_result llama_snapshot_store::open_current(const llama_snapsh
     if (result.manifest.physical_device_id != cfg.physical_device_id ||
         result.manifest.physical_device_queues != cfg.physical_device_queues) {
         result.status = llama_snapshot_status::device_mismatch;
-        return result;
-    }
-    if (result.manifest.identity != expected_identity) {
-        result.status = llama_snapshot_status::identity_mismatch;
         return result;
     }
     result.status = llama_snapshot_status::ok;

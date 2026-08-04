@@ -43,6 +43,8 @@ add_library(${TARGET} STATIC
     server-trusted-scheduling.h
     server-prefix-cache.cpp
     server-prefix-cache.h
+    server-kv-store.cpp
+    server-kv-store.h
     server-capture.cpp
     server-capture.h
 )
@@ -52,7 +54,7 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
-target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
 # llama-server-impl: server logic, reusable by app

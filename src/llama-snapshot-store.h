@@ -103,6 +103,10 @@ struct llama_snapshot_faults {
     uint64_t                   fail_after_bytes            = std::numeric_limits<uint64_t>::max();
     llama_snapshot_write_fault write_fault                 = llama_snapshot_write_fault::none;
     bool                       fail_before_manifest_commit = false;
+    // Test-only crash seam after current.manifest has been renamed but before
+    // the root directory durability fence. The returned commit_uncertain must
+    // be reconciled before a quota owner grants new reservations.
+    bool                       fail_after_manifest_commit = false;
     // Test-only deterministic race seams around the publication fence. The
     // store calls these after its final ordinary cancellation check.
     std::function<void()>      before_manifest_commit_fence;
@@ -186,6 +190,23 @@ struct llama_snapshot_cleanup_result {
     int                   os_error = 0;
 };
 
+struct llama_snapshot_storage_estimate {
+    llama_snapshot_status status                    = llama_snapshot_status::invalid_argument;
+    uint64_t              generation_bytes          = 0;
+    uint64_t              current_manifest_bytes    = 0;
+    uint64_t              committed_bytes           = 0;
+    uint64_t              replacement_peak_bytes    = 0;
+    uint32_t              chunk_count               = 0;
+};
+
+// Returns exact regular-file bytes for the format this store will serialize.
+// replacement_peak_bytes is the additional candidate charge while an older
+// committed generation remains readable; callers must reserve it in full.
+llama_snapshot_storage_estimate llama_snapshot_estimate_storage(
+        const llama_snapshot_store_config & config,
+        const llama_snapshot_metadata &     metadata,
+        uint64_t                            total_payload_bytes);
+
 class llama_snapshot_store {
   public:
     // Calls are serialized by the single physical-device owner. This core has
@@ -211,6 +232,10 @@ class llama_snapshot_store {
             const llama_snapshot_commit_fence & commit_fence = {});
 
     llama_snapshot_open_result    open_current(const llama_snapshot_identity & expected_identity) const;
+    // Reconciliation needs the durable identity and generation before a
+    // caller-supplied expected identity exists. This still validates format
+    // and physical-device ownership; it does not validate chunk payloads.
+    llama_snapshot_open_result    inspect_current() const;
     llama_snapshot_status         validate(const llama_snapshot_manifest & manifest, int * os_error = nullptr) const;
     llama_snapshot_read_result    read_chunk(const llama_snapshot_manifest & manifest, uint32_t chunk_index) const;
     llama_snapshot_read_into_result read_chunk_into(const llama_snapshot_manifest & manifest,
