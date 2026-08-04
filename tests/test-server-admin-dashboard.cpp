@@ -148,6 +148,12 @@ void test_snapshot_is_redacted_bounded_and_marks_unavailable_sources() {
     require(snapshot.at("sequence") == 3, "snapshot sequence acknowledges registry state");
     require(snapshot.at("registry").at("active_requests") == 2, "registry summary exposed");
     require(snapshot.at("registry").at("total_permits") == 1, "permit total exposed");
+    require(snapshot.at("availability").at("fast_refill") == true,
+            "authoritative refill source marked available");
+    require(snapshot.at("fast_refill").at("configuration").at("enabled") == false &&
+                snapshot.at("fast_refill").at("configuration").at("max_members") == 0 &&
+                snapshot.at("fast_refill").at("refill").at("deadline_at").is_null(),
+            "default-off refill configuration is explicit");
     require(snapshot.at("availability").at("allocator") == false, "allocator marked unavailable");
     require(snapshot.at("availability").at("dspark") == false, "DSpark marked unavailable");
     require(snapshot.at("allocator").at("pools").empty(), "allocator facts remain empty");
@@ -159,6 +165,55 @@ void test_snapshot_is_redacted_bounded_and_marks_unavailable_sources() {
     require(snapshot.at("lanes")[0].at("queued") == 1, "low queue aggregate derived");
     require(snapshot.at("lanes")[2].at("active") == 1, "fast active aggregate derived");
     require(snapshot.at("lanes")[2].at("bound_permits") == 1, "fast bound permit exposed");
+}
+
+void test_refill_status_propagates_and_closes_at_exact_deadline() {
+    auto source = source_state();
+    source.fast_refill.enabled                = true;
+    source.fast_refill.max_members_per_cohort = 4;
+    source.fast_refill.window_us              = 1000;
+    source.fast_refill.cohort_active          = true;
+    source.fast_refill.selection_open         = false;
+    source.fast_refill.dominant               = server_scheduler::lane::fast;
+    source.fast_refill.cohort_limit           = 2;
+    source.fast_refill.fast_members_used      = 1;
+    source.fast_refill.deadline_us            = 7000;
+
+    const json open = make_snapshot(source, 6000).at("fast_refill");
+    require(open.at("cohort").at("active") == true &&
+                open.at("cohort").at("selection_open") == false &&
+                open.at("cohort").at("dominant_lane") == "fast" && open.at("cohort").at("limit") == 2,
+            "snapshot preserves raw cohort selection state");
+    require(open.at("refill").at("fast_members_used") == 1 &&
+                open.at("refill").at("fast_members_remaining") == 3 &&
+                open.at("refill").at("deadline_at") == "monotonic:7000us" &&
+                open.at("refill").at("remaining_ms") == 1.0 &&
+                open.at("refill").at("deadline_expired") == false &&
+                open.at("refill").at("window_open") == true &&
+                open.at("refill").at("one_member_eligible_now") == true,
+            "snapshot derives an open refill window at dashboard sample time");
+
+    const json expired = make_snapshot(source, 7000).at("fast_refill").at("refill");
+    require(expired.at("remaining_ms") == 0.0 && expired.at("deadline_expired") == true &&
+                expired.at("window_open") == false &&
+                expired.at("one_member_eligible_now") == false,
+            "exact deadline serializes zero remaining time and closed eligibility");
+
+    const resume_batch batch = make_resume_batch(source, 2, 6000);
+    require(batch.status == resume_status::events && batch.frames.size() == 1,
+            "refill propagation event is resumable");
+    const json event_refill = frame_payload(batch.frames[0]).at("payload").at("fast_refill");
+    require(event_refill == open, "SSE request event carries the same authoritative refill status");
+
+    source.fast_refill.selection_open    = true;
+    source.fast_refill.fast_members_used = 4;
+    const json exhausted = make_snapshot(source, 6500).at("fast_refill");
+    require(exhausted.at("cohort").at("selection_open") == true &&
+                exhausted.at("refill").at("fast_members_remaining") == 0 &&
+                exhausted.at("refill").at("remaining_ms") == 0.5 &&
+                exhausted.at("refill").at("window_open") == false &&
+                exhausted.at("refill").at("one_member_eligible_now") == false,
+            "exhausted quota stays closed despite raw selection-open state");
 }
 
 void test_resumption_is_contiguous_and_uses_current_request_state() {
@@ -240,6 +295,8 @@ int main() {
         { "resume header is strict and bounded", test_resume_header_is_strict_and_bounded },
         { "snapshot is redacted bounded and marks unavailable sources",
           test_snapshot_is_redacted_bounded_and_marks_unavailable_sources },
+        { "refill status propagation and deadline closure",
+          test_refill_status_propagates_and_closes_at_exact_deadline },
         { "resumption is contiguous and uses current request state",
           test_resumption_is_contiguous_and_uses_current_request_state },
         { "gaps future cursors and chunk limits fail closed",

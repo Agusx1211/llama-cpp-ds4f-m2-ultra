@@ -59,6 +59,9 @@ test("request events refresh authoritative registry counters", async () => {
     const state = reduceDashboardEvent(createDashboardState(snapshot), event);
     assert.equal(state.snapshot.registry.total_events, snapshot.registry.total_events + 1);
     assert.equal(state.snapshot.registry.retained_events, snapshot.registry.retained_events + 1);
+    assert.equal(snapshot.fast_refill.refill.fast_members_used, 2);
+    assert.equal(state.snapshot.fast_refill.refill.fast_members_used, 3);
+    assert.equal(state.snapshot.fast_refill.refill.fast_members_remaining, 1);
 });
 
 test("a sequence gap forces a full resnapshot before applying later deltas", async () => {

@@ -78,6 +78,27 @@ struct dispatch_permit_snapshot {
     size_t                                           total   = 0;
 };
 
+struct fast_refill_status {
+    size_t                 fast_members_remaining = 0;
+    uint64_t               remaining_us           = 0;
+    bool                   window_open            = false;
+    bool                   one_member_eligible_now = false;
+};
+
+struct fast_refill_snapshot {
+    bool                   enabled                = false;
+    size_t                 max_members_per_cohort = 0;
+    uint64_t               window_us              = 0;
+    bool                   cohort_active          = false;
+    bool                   selection_open         = false;
+    server_scheduler::lane dominant               = server_scheduler::lane::count;
+    size_t                 cohort_limit           = 0;
+    size_t                 fast_members_used      = 0;
+    uint64_t               deadline_us            = 0;
+
+    fast_refill_status status_at(uint64_t now_us, size_t permit_width) const;
+};
+
 struct admission_result {
     result_code                   code   = result_code::ok;
     server_scheduler::reason_code reason = server_scheduler::reason_code::none;
@@ -157,6 +178,7 @@ class request_runtime {
     server_request_registry::event_log_snapshot            events() const;
     server_request_registry::registry_summary              summary() const;
     dispatch_permit_snapshot                               permits() const;
+    fast_refill_snapshot                                    fast_refill() const;
 
   private:
     struct record {

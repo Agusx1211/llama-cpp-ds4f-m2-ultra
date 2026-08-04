@@ -162,11 +162,41 @@ footer {
   background: #3a201d;
 }
 
+.badge-eligible {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.badge-width_full,
+.badge-quota_exhausted {
+  color: var(--warning);
+  background: #352d1d;
+}
+
+.badge-disabled,
+.badge-idle,
+.badge-expired,
+.badge-closed {
+  color: var(--muted);
+  background: #252a2b;
+}
+
 .health-strip {
   display: grid;
   grid-template-columns: repeat(8, minmax(9rem, 1fr));
   gap: 0.55rem;
   margin-bottom: 0.8rem;
+  overflow-x: auto;
+}
+
+.refill-panel {
+  padding-block: 0.8rem;
+}
+
+.refill-strip {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(9rem, 1fr));
+  gap: 0.55rem;
   overflow-x: auto;
 }
 
@@ -428,6 +458,10 @@ footer {
     grid-template-columns: repeat(4, minmax(9rem, 1fr));
   }
 
+  .refill-strip {
+    grid-template-columns: repeat(4, minmax(9rem, 1fr));
+  }
+
   .credential-form {
     grid-template-columns: 1fr 1fr;
   }
@@ -440,6 +474,10 @@ footer {
   }
 
   .health-strip {
+    grid-template-columns: repeat(2, minmax(9rem, 1fr));
+  }
+
+  .refill-strip {
     grid-template-columns: repeat(2, minmax(9rem, 1fr));
   }
 

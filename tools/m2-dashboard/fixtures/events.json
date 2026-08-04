@@ -1,6 +1,6 @@
 [
   {
-    "schema_version": 1,
+    "schema_version": 2,
     "id": "101",
     "sequence": 101,
     "wall_time": "2026-08-03T22:00:00.200Z",
@@ -43,11 +43,33 @@
           "output": "The service remains in a six-stream physical decode cohort.",
           "retained": false
         }
+      },
+      "fast_refill": {
+        "configuration": {
+          "enabled": true,
+          "max_members": 4,
+          "window_ms": 30000
+        },
+        "cohort": {
+          "active": true,
+          "selection_open": false,
+          "dominant_lane": "fast",
+          "limit": 6
+        },
+        "refill": {
+          "fast_members_used": 3,
+          "fast_members_remaining": 1,
+          "deadline_at": "monotonic:18450000000us",
+          "remaining_ms": 27600,
+          "deadline_expired": false,
+          "window_open": true,
+          "one_member_eligible_now": false
+        }
       }
     }
   },
   {
-    "schema_version": 1,
+    "schema_version": 2,
     "id": "102",
     "sequence": 102,
     "wall_time": "2026-08-03T22:00:00.400Z",
@@ -74,7 +96,7 @@
     }
   },
   {
-    "schema_version": 1,
+    "schema_version": 2,
     "id": "103",
     "sequence": 103,
     "wall_time": "2026-08-03T22:00:00.600Z",
@@ -127,7 +149,7 @@
     }
   },
   {
-    "schema_version": 1,
+    "schema_version": 2,
     "id": "104",
     "sequence": 104,
     "wall_time": "2026-08-03T22:00:00.800Z",
@@ -158,7 +180,7 @@
     }
   },
   {
-    "schema_version": 1,
+    "schema_version": 2,
     "id": "105",
     "sequence": 105,
     "wall_time": "2026-08-03T22:00:01.000Z",
@@ -186,7 +208,7 @@
     }
   },
   {
-    "schema_version": 1,
+    "schema_version": 2,
     "id": "106",
     "sequence": 106,
     "wall_time": "2026-08-03T22:00:01.200Z",

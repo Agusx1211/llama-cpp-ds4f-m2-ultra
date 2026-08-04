@@ -2268,10 +2268,18 @@ void test_bounded_fast_refill_reuses_one_live_slot() {
         now_us += 10;
     });
     queue.on_update_slots([&] {
+        const auto state  = queue.request_state();
+        const auto refill = state.fast_refill.status_at(now_us, state.permits.total);
         require(fast_order == std::vector<int>(fast_ids.begin(), fast_ids.begin() + 4) &&
                     queued_fast == std::unordered_set<int>({ fast_ids.back() }) &&
                     queue.dispatch_permits().total == 1 && queue.request_summary().active_requests == 2,
                 "four-member refill is FIFO and closes at exact epoch exhaustion");
+        require(state.fast_refill.enabled && state.fast_refill.cohort_active &&
+                    state.fast_refill.dominant == server_scheduler::lane::fast &&
+                    state.fast_refill.fast_members_used == 4 && state.fast_refill.deadline_us == 1100 &&
+                    refill.fast_members_remaining == 0 && !refill.window_open &&
+                    !refill.one_member_eligible_now,
+                "queue-locked request state propagates authoritative exhausted refill telemetry");
         server_task cancel(SERVER_TASK_TYPE_CANCEL);
         cancel.id        = queue.get_new_id();
         cancel.id_target = fast_ids.back();

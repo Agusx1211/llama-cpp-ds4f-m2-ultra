@@ -17,7 +17,7 @@ namespace server_admin_dashboard {
 
 using json = nlohmann::ordered_json;
 
-constexpr size_t schema_version             = 1;
+constexpr size_t schema_version             = 2;
 constexpr size_t maximum_snapshot_bytes     = 4 * 1024 * 1024;
 constexpr size_t maximum_sse_event_bytes    = 64 * 1024;
 constexpr size_t maximum_sse_chunk_bytes    = 256 * 1024;

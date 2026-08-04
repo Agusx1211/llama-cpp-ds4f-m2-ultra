@@ -132,11 +132,13 @@ function applyEvent(snapshot, event, timelineLimit) {
             next.requests = replaceById(snapshot.requests, event.payload.request);
             next.lanes = event.payload.lanes ?? requestAggregates(snapshot.lanes, next.requests);
             next.registry = event.payload.registry ?? snapshot.registry;
+            next.fast_refill = event.payload.fast_refill ?? snapshot.fast_refill;
             break;
         case "request.remove":
             next.requests = snapshot.requests.filter((request) => request.id !== event.payload.request_id);
             next.lanes = event.payload.lanes ?? requestAggregates(snapshot.lanes, next.requests);
             next.registry = event.payload.registry ?? snapshot.registry;
+            next.fast_refill = event.payload.fast_refill ?? snapshot.fast_refill;
             break;
         case "lane.replace":
             next.lanes = replaceById(snapshot.lanes, event.payload.lane);

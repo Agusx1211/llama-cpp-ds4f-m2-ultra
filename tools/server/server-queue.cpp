@@ -1070,6 +1070,7 @@ server_queue_request_state server_queue::request_state() {
         request_runtime.events(),
         request_runtime.summary(),
         request_runtime.permits(),
+        request_runtime.fast_refill(),
     };
 }
 

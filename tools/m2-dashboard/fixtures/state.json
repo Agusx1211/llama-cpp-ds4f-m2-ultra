@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "sequence": 100,
   "generated_at": "2026-08-03T22:00:00.000Z",
   "availability": {
@@ -13,7 +13,8 @@
     "cache": true,
     "disks": true,
     "dspark": true,
-    "capture": true
+    "capture": true,
+    "fast_refill": true
   },
   "registry": {
     "active_requests": 6,
@@ -25,6 +26,28 @@
     "claimed_permits": [2, 2, 2],
     "bound_permits": [1, 2, 2],
     "total_permits": 6
+  },
+  "fast_refill": {
+    "configuration": {
+      "enabled": true,
+      "max_members": 4,
+      "window_ms": 30000
+    },
+    "cohort": {
+      "active": true,
+      "selection_open": false,
+      "dominant_lane": "fast",
+      "limit": 6
+    },
+    "refill": {
+      "fast_members_used": 2,
+      "fast_members_remaining": 2,
+      "deadline_at": "monotonic:18450000000us",
+      "remaining_ms": 27800,
+      "deadline_expired": false,
+      "window_open": true,
+      "one_member_eligible_now": false
+    }
   },
   "server": {
     "health": "degraded",

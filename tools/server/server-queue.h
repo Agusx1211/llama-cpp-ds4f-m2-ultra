@@ -38,6 +38,7 @@ struct server_queue_request_state {
     server_request_registry::event_log_snapshot            events;
     server_request_registry::registry_summary              summary;
     server_request_runtime::dispatch_permit_snapshot       permits;
+    server_request_runtime::fast_refill_snapshot           fast_refill;
 };
 
 enum class server_queue_bind_code : uint8_t {

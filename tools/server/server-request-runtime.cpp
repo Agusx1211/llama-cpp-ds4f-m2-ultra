@@ -861,4 +861,30 @@ dispatch_permit_snapshot request_runtime::permits() const {
     return permit_counts;
 }
 
+fast_refill_status fast_refill_snapshot::status_at(uint64_t now_us, size_t permit_width) const {
+    fast_refill_status result;
+    result.fast_members_remaining = enabled && fast_members_used < max_members_per_cohort
+        ? max_members_per_cohort - fast_members_used
+        : 0;
+    result.remaining_us = deadline_us != 0 && now_us < deadline_us ? deadline_us - now_us : 0;
+    result.window_open = enabled && cohort_active && dominant == lane::fast && fast_members_used != 0 &&
+                         result.fast_members_remaining != 0 && deadline_us != 0 && now_us < deadline_us;
+    result.one_member_eligible_now = result.window_open && permit_width < cohort_limit;
+    return result;
+}
+
+fast_refill_snapshot request_runtime::fast_refill() const {
+    fast_refill_snapshot result;
+    result.enabled                = fast_refill_enabled();
+    result.max_members_per_cohort = fast_refill_max_members_per_epoch;
+    result.window_us              = fast_refill_window_us;
+    result.cohort_active          = cohort.active;
+    result.selection_open         = cohort.active && cohort.open;
+    result.dominant               = cohort.active ? cohort.dominant : lane::count;
+    result.cohort_limit           = cohort.active ? cohort.limit : 0;
+    result.fast_members_used      = cohort.active ? cohort.fast_members : 0;
+    result.deadline_us = cohort.active && cohort.fast_members != 0 ? cohort.fast_refill_deadline_us : 0;
+    return result;
+}
+
 }  // namespace server_request_runtime

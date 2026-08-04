@@ -16,7 +16,7 @@ import {
 } from "../lib/schema.mjs";
 import { clone, loadEvents, loadSnapshot } from "./helpers.mjs";
 
-test("deterministic snapshot and event fixtures satisfy schema version 1", async () => {
+test("deterministic snapshot and event fixtures satisfy schema version 2", async () => {
     const snapshot = await loadSnapshot();
     const events = await loadEvents();
 
@@ -48,7 +48,7 @@ test("parsed fixture values are cloned and deeply immutable", async () => {
 test("snapshot validation rejects schema drift and incomplete lane sets", async () => {
     const snapshot = await loadSnapshot();
     const badVersion = clone(snapshot);
-    badVersion.schema_version = 2;
+    badVersion.schema_version = 3;
     assert.throws(() => validateSnapshot(badVersion), (error) => {
         assert.ok(error instanceof SchemaError);
         assert.match(error.message, /schema_version/);
@@ -70,6 +70,28 @@ test("snapshot validation rejects schema drift and incomplete lane sets", async 
     const malformedRegistry = clone(snapshot);
     malformedRegistry.registry.claimed_permits.pop();
     assert.throws(() => validateSnapshot(malformedRegistry), /one count per lane/);
+});
+
+test("fast-refill schema rejects contradictory disabled, quota, and expiry states", async () => {
+    const snapshot = await loadSnapshot();
+
+    const disabledWithLimits = clone(snapshot);
+    disabledWithLimits.fast_refill.configuration.enabled = false;
+    assert.throws(() => validateSnapshot(disabledWithLimits), /disabled state must use zero limits/);
+
+    const exhaustedButOpen = clone(snapshot);
+    exhaustedButOpen.fast_refill.refill.fast_members_used = 4;
+    exhaustedButOpen.fast_refill.refill.fast_members_remaining = 0;
+    assert.throws(() => validateSnapshot(exhaustedButOpen), /window_open requires a live bounded fast epoch/);
+
+    const openAtExpiry = clone(snapshot);
+    openAtExpiry.fast_refill.refill.remaining_ms = 0;
+    assert.throws(() => validateSnapshot(openAtExpiry), /window_open requires a live bounded fast epoch/);
+
+    const deadlineFreeOpen = clone(snapshot);
+    deadlineFreeOpen.fast_refill.refill.deadline_at = null;
+    deadlineFreeOpen.fast_refill.refill.remaining_ms = 0;
+    assert.throws(() => validateSnapshot(deadlineFreeOpen), /without a deadline must be unexpired, closed, and ineligible/);
 });
 
 test("event validation rejects mismatched SSE IDs and malformed typed payloads", async () => {

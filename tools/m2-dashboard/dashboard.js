@@ -1,6 +1,7 @@
 import { AdminStateClient } from "./lib/client.mjs";
 import { ControlIntentBuffer, createControlIntent } from "./lib/controls.mjs";
 import { createLiveDashboardTransport } from "./lib/live.mjs";
+import { renderFastRefill } from "./lib/refill.mjs";
 import {
     contentForDisplay,
     formatBytes,
@@ -16,6 +17,13 @@ let selectedRequestId = null;
 let liveMode = false;
 let activeClient = null;
 let activeLiveTransport = null;
+let refillSample = null;
+let refillSampleStartedMs = 0;
+let refillExpiryTimer = null;
+
+function monotonicNowMs() {
+    return globalThis.performance?.now?.() ?? Date.now();
+}
 
 function available(snapshot, field) {
     return snapshot.availability?.[field] !== false;
@@ -87,6 +95,33 @@ function renderHealth(snapshot, state) {
         ? ""
         : ` · ${state.recovery.reason}: ${state.recovery.lastError}`;
     setSafeText(connection, `${state.connection} · event ${state.lastEventId}${recovery}`);
+}
+
+function renderRefill(snapshot) {
+    clearTimeout(refillExpiryTimer);
+    refillExpiryTimer = null;
+    if (!available(snapshot, "fast_refill")) {
+        unavailable(document.querySelector("#refill-status"), "Fast-refill state");
+        return;
+    }
+    if (snapshot.fast_refill !== refillSample) {
+        refillSample = snapshot.fast_refill;
+        refillSampleStartedMs = monotonicNowMs();
+    }
+
+    const elapsedMs = Math.max(0, monotonicNowMs() - refillSampleStartedMs);
+    const view = renderFastRefill(
+        document.querySelector("#refill-status"),
+        snapshot.fast_refill,
+        elapsedMs,
+    );
+    if (view.windowOpen && view.remainingMs > 0) {
+        refillExpiryTimer = setTimeout(() => {
+            if (currentState?.snapshot.fast_refill === refillSample) {
+                renderRefill(currentState.snapshot);
+            }
+        }, Math.ceil(view.remainingMs) + 1);
+    }
 }
 
 function requestCard(request) {
@@ -378,6 +413,7 @@ function renderCurrentState() {
         selectedRequestId = snapshot.requests[0]?.id ?? null;
     }
     renderHealth(snapshot, currentState);
+    renderRefill(snapshot);
     renderLanes(snapshot);
     renderRequestDetail(snapshot);
     renderAllocator(snapshot);
@@ -420,6 +456,9 @@ async function loadFixtures() {
 }
 
 function stopActiveConnection() {
+    clearTimeout(refillExpiryTimer);
+    refillExpiryTimer = null;
+    refillSample = null;
     activeClient?.stop();
     activeClient = null;
     activeLiveTransport?.clear();

@@ -67,6 +67,16 @@ const char * lane_name(trusted_lane lane) {
     return "normal";
 }
 
+const char * lane_name(server_scheduler::lane lane) {
+    switch (lane) {
+        case server_scheduler::lane::low:    return "low";
+        case server_scheduler::lane::normal: return "normal";
+        case server_scheduler::lane::fast:   return "fast";
+        case server_scheduler::lane::count:  break;
+    }
+    return "normal";
+}
+
 const char * lifecycle_name(lifecycle value) {
     switch (value) {
         case lifecycle::absent:     return "absent";
@@ -238,6 +248,7 @@ json availability_json() {
         { "disks", false },
         { "dspark", false },
         { "capture", false },
+        { "fast_refill", true },
     };
 }
 
@@ -260,6 +271,33 @@ json registry_json(const server_queue_request_state & source) {
         { "claimed_permits", source.permits.claimed },
         { "bound_permits", source.permits.bound },
         { "total_permits", source.permits.total },
+    };
+}
+
+json fast_refill_json(const server_queue_request_state & source, uint64_t now_us) {
+    const auto & refill = source.fast_refill;
+    const auto status = refill.status_at(now_us, source.permits.total);
+    return {
+        { "configuration", {
+            { "enabled", refill.enabled },
+            { "max_members", refill.max_members_per_cohort },
+            { "window_ms", refill.window_us / 1000.0 },
+        } },
+        { "cohort", {
+            { "active", refill.cohort_active },
+            { "selection_open", refill.selection_open },
+            { "dominant_lane", refill.cohort_active ? json(lane_name(refill.dominant)) : json(nullptr) },
+            { "limit", refill.cohort_limit },
+        } },
+        { "refill", {
+            { "fast_members_used", refill.fast_members_used },
+            { "fast_members_remaining", status.fast_members_remaining },
+            { "deadline_at", refill.deadline_us == 0 ? json(nullptr) : json(monotonic_label(refill.deadline_us)) },
+            { "remaining_ms", status.remaining_us / 1000.0 },
+            { "deadline_expired", refill.deadline_us != 0 && now_us >= refill.deadline_us },
+            { "window_open", status.window_open },
+            { "one_member_eligible_now", status.one_member_eligible_now },
+        } },
     };
 }
 
@@ -376,6 +414,7 @@ json make_snapshot(const server_queue_request_state & source, uint64_t now_us) {
         { "generated_at", monotonic_label(now_us) },
         { "availability", availability_json() },
         { "registry", registry_json(source) },
+        { "fast_refill", fast_refill_json(source, now_us) },
         { "server", {
             { "health", "unavailable" },
             { "build", "unavailable" },
@@ -443,6 +482,7 @@ resume_batch make_resume_batch(
 
     const json lanes = lanes_json(source, now_us);
     const json registry = registry_json(source);
+    const json fast_refill = fast_refill_json(source, now_us);
 
     size_t bytes = 0;
     for (; event_it != source.events.events.end() && result.frames.size() < maximum_events_per_chunk; ++event_it) {
@@ -454,12 +494,14 @@ resume_batch make_resume_batch(
                     { "request", request_json(*request, now_us) },
                     { "lanes", lanes },
                     { "registry", registry },
+                    { "fast_refill", fast_refill },
                 };
             }
         }
         if (event["type"] == "request.remove") {
             event["payload"]["lanes"] = lanes;
             event["payload"]["registry"] = registry;
+            event["payload"]["fast_refill"] = fast_refill;
         }
         std::string frame = sse_frame(event);
         if (frame.size() > maximum_sse_event_bytes || bytes + frame.size() > maximum_sse_chunk_bytes) {

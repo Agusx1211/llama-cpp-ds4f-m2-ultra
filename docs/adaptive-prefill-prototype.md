@@ -77,6 +77,29 @@ malformed, partial, or out-of-range settings leave refill disabled. Confirm the
 startup log reports `trusted fast refill enabled: at most 4 fast members within
 30000 ms per cohort` before running the client.
 
+To watch this prototype while playing with the sequential bursts, serve the
+dependency-free read-only dashboard from a third shell:
+
+```sh
+cd tools/m2-dashboard
+python3 -m http.server 8081 --bind 127.0.0.1
+```
+
+Open `http://127.0.0.1:8081/`, enter the server URL plus the API and operator
+credentials above, and choose **Connect live**. The schema-v2 **Bounded fast
+refill** card comes from the queue-locked request runtime snapshot. It shows the
+configured maximum/window, whether a cohort is active, its dominant lane and
+width limit, cumulative fast members used/remaining, and the monotonic refill
+deadline. `Initial selection` reports the cohort's initial selection phase; it
+does not report whether later refill is open. `One member: eligible at sample`
+means at least one new independent fast member fit the latest sampled
+fast-dominant cohort and bounded window. It neither limits a same-fast family to
+one member nor promises admission. At the exact deadline the server sample
+reports the window closed. The browser also counts a sampled open window down
+from receipt and will not reopen it without a newer server sample; this bounds
+staleness but cannot remove transport latency. With either refill variable
+absent or invalid, the card explicitly reports the default disabled state.
+
 Then run the client from the credentialed shell:
 
 ```sh

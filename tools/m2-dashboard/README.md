@@ -16,9 +16,11 @@ Implemented here:
 - bounded event and timeline history;
 - fixture views for lanes, requests, allocator pools, cache objects, disks,
   DSpark, capture, and operational history;
+- schema-v2 bounded fast-refill configuration, cohort, cumulative member,
+  deadline, and sampled one-member eligibility status;
 - plain-text rendering and default prompt/output redaction;
-- local control-intent drafting without any network mutation; and
-- zero-dependency Node tests.
+- local control-intent drafting without any network mutation;
+- zero-dependency Node tests;
 - an opt-in live adapter using an API bearer and the loopback operator token;
 - bounded authenticated snapshot and resumable SSE request-registry views; and
 - explicit unavailable markers for metrics not supplied by this vertical.
@@ -66,6 +68,8 @@ clients:
 ```sh
 export LLAMA_API_KEY='replace-with-api-key'
 export LLAMA_SERVER_TRUSTED_SCHEDULING_TOKEN='replace-with-32-or-more-random-bytes'
+export LLAMA_SERVER_TRUSTED_FAST_REFILL_MAX_MEMBERS=4
+export LLAMA_SERVER_TRUSTED_FAST_REFILL_WINDOW_MS=30000
 
 llama-server ... \
   --api-key "$LLAMA_API_KEY" \
@@ -91,6 +95,20 @@ headers with browser credentials omitted, stay only in JavaScript memory, are
 cleared from the form immediately, and are cleared from the adapter on
 disconnect/page exit. They are never placed in a URL or browser storage.
 
+The two refill variables are optional and the policy is disabled by default.
+When both are valid, the compact **Bounded fast refill** card shows the runtime
+configuration, current cohort, cumulative used/remaining fast members, and the
+sampled monotonic deadline. `Initial selection` is the cohort's initial
+selection phase; it is not the refill window. `One member: eligible at sample`
+means at least one new independent fast member fit the fast-dominant cohort's
+width and bounded window at the latest server sample. A same-fast request family
+may use more width when demand, quota, and cohort capacity all permit it, so the
+field is neither a family-size limit nor an admission promise. The browser
+counts the sampled remaining time down from receipt and never reopens it without
+a newer server sample. This removes indefinitely stale open status but cannot
+remove snapshot or SSE transport latency; the label therefore remains explicitly
+sampled rather than claiming current eligibility.
+
 The two live endpoints are:
 
 ```text
@@ -102,7 +120,8 @@ Both require normal API-key middleware plus the operator header, reject
 non-loopback and cross-site browser ingress, reject lane/tag headers and query
 parameters, and are disabled when the operator token is absent. Router mode
 does not proxy them. Snapshot/event payloads contain numeric registry facts,
-permit counts, lifecycle reasons, and redacted request identities only.
+permit counts, refill state, lifecycle reasons, and redacted request identities
+only. The strict client contract is schema version 2.
 
 ## Client recovery contract
 

@@ -329,6 +329,63 @@ void test_fast_refill_window_and_terminal_boundaries() {
             "timeout and cancellation boundaries leave no refill permits or requests");
 }
 
+void test_fast_refill_telemetry_is_authoritative_at_sample_time() {
+    request_runtime disabled;
+    const auto disabled_state  = disabled.fast_refill();
+    const auto disabled_status = disabled_state.status_at(100, 0);
+    require(!disabled_state.enabled && disabled_state.max_members_per_cohort == 0 &&
+                disabled_state.window_us == 0 && !disabled_state.cohort_active &&
+                disabled_state.dominant == lane::count && disabled_state.fast_members_used == 0 &&
+                disabled_state.deadline_us == 0 && disabled_status.fast_members_remaining == 0 &&
+                disabled_status.remaining_us == 0 && !disabled_status.window_open &&
+                !disabled_status.one_member_eligible_now,
+            "default-off refill telemetry is explicit and empty");
+
+    runtime_config config;
+    config.fast_refill_max_members_per_epoch = 4;
+    config.fast_refill_window_us              = 1000;
+    request_runtime active(config);
+    require(active.admit(make_request(1, lane::low, 1)) && active.take_next(10, 2).request_id == 1 &&
+                active.bind_slot(1, 0, 11) && active.admit(make_request(2, lane::fast, 12)) &&
+                active.take_next(20, 2).request_id == 2 && active.bind_slot(2, 1, 21) &&
+                active.release_slot(2, 1, 22),
+            "build one reusable fast refill slot");
+    const auto open        = active.fast_refill();
+    const auto open_status = open.status_at(100, active.permits().total);
+    require(open.enabled && open.max_members_per_cohort == 4 && open.window_us == 1000 &&
+                open.cohort_active && !open.selection_open && open.dominant == lane::fast &&
+                open.cohort_limit == 2 && open.fast_members_used == 1 && open.deadline_us == 1020 &&
+                open_status.fast_members_remaining == 3 && open_status.remaining_us == 920 &&
+                open_status.window_open && open_status.one_member_eligible_now,
+            "sampled telemetry distinguishes a closed initial selection from an eligible refill window");
+    const auto expired = open.status_at(1020, active.permits().total);
+    require(open.deadline_us == 1020 && expired.remaining_us == 0 && !expired.window_open &&
+                !expired.one_member_eligible_now,
+            "exact refill deadline cannot report an open or eligible window");
+    require(active.release_slot(1, 0, 1021), "drain active telemetry fixture");
+
+    runtime_config quota_config;
+    quota_config.scheduler.lanes[static_cast<size_t>(lane::fast)].decode_cap = 8;
+    quota_config.fast_refill_max_members_per_epoch                           = 3;
+    quota_config.fast_refill_window_us                                      = 1000;
+    request_runtime quota(quota_config);
+    for (uint64_t id = 11; id <= 14; ++id) {
+        require(quota.admit(make_request(id, lane::fast, id)), "admit quota telemetry member");
+    }
+    require(quota.take_next(30, 8).request_id == 11 && quota.take_next(31, 8).request_id == 12 &&
+                quota.take_next(32, 8).request_id == 13,
+            "consume complete telemetry member quota");
+    const auto exhausted        = quota.fast_refill();
+    const auto exhausted_status = exhausted.status_at(33, quota.permits().total);
+    require(exhausted.selection_open && exhausted.fast_members_used == 3 &&
+                exhausted_status.fast_members_remaining == 0 && exhausted_status.remaining_us == 997 &&
+                !exhausted_status.window_open && !exhausted_status.one_member_eligible_now,
+            "raw initial selection state cannot overstate an exhausted refill member budget");
+    for (uint64_t id = 11; id <= 14; ++id) {
+        require(quota.cancel(id, 34), "clean quota telemetry member");
+    }
+}
+
 void test_fast_member_budget_covers_initial_fill_and_upgrade() {
     runtime_config config;
     config.scheduler.lanes[static_cast<size_t>(lane::fast)].decode_cap = 8;
@@ -723,6 +780,7 @@ int main() {
         { "dispatch permit lifecycle",  test_dispatch_permits_cover_selection_defer_and_caps },
         { "bounded fast refill",        test_bounded_same_fast_cohort_refill                  },
         { "fast refill boundaries",     test_fast_refill_window_and_terminal_boundaries       },
+        { "fast refill telemetry",      test_fast_refill_telemetry_is_authoritative_at_sample_time },
         { "fast refill total budget",   test_fast_member_budget_covers_initial_fill_and_upgrade },
         { "fast refill reentry",        test_fast_refill_reentry_and_unbound_terminal_budget    },
         { "profiled low widths",        test_profiled_exclusive_low_widths                   },

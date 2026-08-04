@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export const MAX_SCHEMA_ARRAY_LENGTH = 4096;
 export const MAX_SCHEMA_STRING_LENGTH = 1024 * 1024;
 export const MAX_SCHEMA_TOTAL_BYTES = 4 * 1024 * 1024;
@@ -302,6 +302,7 @@ const AVAILABILITY_FIELDS = Object.freeze([
     "disks",
     "dspark",
     "capture",
+    "fast_refill",
 ]);
 
 function validateAvailability(value, path, issues) {
@@ -336,6 +337,84 @@ function validateRegistry(value, path, issues) {
     }
     validateLanePermitCounts(registry.claimed_permits, `${path}.claimed_permits`, issues);
     validateLanePermitCounts(registry.bound_permits, `${path}.bound_permits`, issues);
+}
+
+function validateFastRefill(value, path, issues) {
+    const valueRecord = record(value, path, issues);
+    knownFields(valueRecord, ["configuration", "cohort", "refill"], path, issues);
+
+    const configuration = record(valueRecord.configuration, `${path}.configuration`, issues);
+    knownFields(configuration, ["enabled", "max_members", "window_ms"], `${path}.configuration`, issues);
+    boolean(configuration.enabled, `${path}.configuration.enabled`, issues);
+    integer(configuration.max_members, `${path}.configuration.max_members`, issues, { min: 0 });
+    finiteNumber(configuration.window_ms, `${path}.configuration.window_ms`, issues, { min: 0 });
+    if (configuration.enabled === false && (configuration.max_members !== 0 || configuration.window_ms !== 0)) {
+        issues.push(`${path}.configuration disabled state must use zero limits`);
+    }
+    if (configuration.enabled === true && (configuration.max_members < 1 || configuration.window_ms <= 0)) {
+        issues.push(`${path}.configuration enabled state requires positive limits`);
+    }
+
+    const cohort = record(valueRecord.cohort, `${path}.cohort`, issues);
+    knownFields(cohort, ["active", "selection_open", "dominant_lane", "limit"], `${path}.cohort`, issues);
+    boolean(cohort.active, `${path}.cohort.active`, issues);
+    boolean(cohort.selection_open, `${path}.cohort.selection_open`, issues);
+    if (cohort.dominant_lane !== null) {
+        enumeration(cohort.dominant_lane, LANES, `${path}.cohort.dominant_lane`, issues);
+    }
+    integer(cohort.limit, `${path}.cohort.limit`, issues, { min: 0 });
+    if (cohort.active === false && (cohort.selection_open !== false || cohort.dominant_lane !== null || cohort.limit !== 0)) {
+        issues.push(`${path}.cohort inactive state must be closed, lane-less, and zero-width`);
+    }
+    if (cohort.active === true && (cohort.dominant_lane === null || cohort.limit < 1)) {
+        issues.push(`${path}.cohort active state requires a dominant lane and positive limit`);
+    }
+
+    const refill = record(valueRecord.refill, `${path}.refill`, issues);
+    knownFields(refill, [
+        "fast_members_used", "fast_members_remaining", "deadline_at", "remaining_ms",
+        "deadline_expired", "window_open", "one_member_eligible_now",
+    ], `${path}.refill`, issues);
+    integer(refill.fast_members_used, `${path}.refill.fast_members_used`, issues, { min: 0 });
+    integer(refill.fast_members_remaining, `${path}.refill.fast_members_remaining`, issues, { min: 0 });
+    if (refill.deadline_at !== null) {
+        string(refill.deadline_at, `${path}.refill.deadline_at`, issues);
+    }
+    finiteNumber(refill.remaining_ms, `${path}.refill.remaining_ms`, issues, { min: 0 });
+    boolean(refill.deadline_expired, `${path}.refill.deadline_expired`, issues);
+    boolean(refill.window_open, `${path}.refill.window_open`, issues);
+    boolean(refill.one_member_eligible_now, `${path}.refill.one_member_eligible_now`, issues);
+
+    if (Number.isSafeInteger(configuration.max_members) && Number.isSafeInteger(refill.fast_members_used) &&
+        Number.isSafeInteger(refill.fast_members_remaining) &&
+        refill.fast_members_used + refill.fast_members_remaining !== configuration.max_members) {
+        issues.push(`${path}.refill member counts must equal configured max_members`);
+    }
+    if (cohort.active === false && (refill.fast_members_used !== 0 || refill.deadline_at !== null)) {
+        issues.push(`${path}.refill inactive cohort cannot retain members or a deadline`);
+    }
+    if (refill.deadline_at === null) {
+        if (refill.remaining_ms !== 0) {
+            issues.push(`${path}.refill without a deadline must have zero remaining_ms`);
+        }
+        if (refill.deadline_expired !== false || refill.window_open !== false ||
+            refill.one_member_eligible_now !== false) {
+            issues.push(`${path}.refill without a deadline must be unexpired, closed, and ineligible`);
+        }
+    }
+    if (refill.deadline_expired === true &&
+        (refill.remaining_ms !== 0 || refill.window_open !== false || refill.one_member_eligible_now !== false)) {
+        issues.push(`${path}.refill expired deadline must be closed with zero remaining_ms`);
+    }
+    if (refill.window_open === true &&
+        (configuration.enabled !== true || cohort.active !== true || cohort.dominant_lane !== "fast" ||
+         refill.fast_members_used < 1 || refill.fast_members_remaining < 1 || refill.deadline_at === null ||
+         refill.remaining_ms <= 0 || refill.deadline_expired !== false)) {
+        issues.push(`${path}.refill window_open requires a live bounded fast epoch`);
+    }
+    if (refill.one_member_eligible_now === true && refill.window_open !== true) {
+        issues.push(`${path}.refill one_member_eligible_now requires window_open`);
+    }
 }
 
 function validateRequest(value, path, issues) {
@@ -496,7 +575,7 @@ function validateSnapshotInto(snapshotValue, path, issues) {
     const snapshot = record(snapshotValue, path, issues);
     knownFields(snapshot, [
         "schema_version", "sequence", "generated_at", "availability", "registry", "server", "lanes",
-        "requests", "allocator", "cache", "disks", "dspark", "capture", "timeline",
+        "requests", "fast_refill", "allocator", "cache", "disks", "dspark", "capture", "timeline",
     ], path, issues);
     integer(snapshot.schema_version, `${path}.schema_version`, issues, { min: 1 });
     if (snapshot.schema_version !== SCHEMA_VERSION) {
@@ -506,6 +585,7 @@ function validateSnapshotInto(snapshotValue, path, issues) {
     string(snapshot.generated_at, `${path}.generated_at`, issues);
     validateAvailability(snapshot.availability, `${path}.availability`, issues);
     validateRegistry(snapshot.registry, `${path}.registry`, issues);
+    validateFastRefill(snapshot.fast_refill, `${path}.fast_refill`, issues);
     validateServer(snapshot.server, `${path}.server`, issues);
 
     const lanes = validateLanes(snapshot.lanes, `${path}.lanes`, issues);
@@ -569,13 +649,16 @@ function validateEventPayload(event, issues) {
     const payload = record(event.payload, "event.payload", issues);
     switch (event.type) {
         case "request.upsert":
-            knownFields(payload, ["request", "lanes", "registry"], "event.payload", issues);
+            knownFields(payload, ["request", "lanes", "registry", "fast_refill"], "event.payload", issues);
             validateRequest(payload.request, "event.payload.request", issues);
             if (Object.hasOwn(payload, "lanes")) {
                 validateLanes(payload.lanes, "event.payload.lanes", issues);
             }
             if (Object.hasOwn(payload, "registry")) {
                 validateRegistry(payload.registry, "event.payload.registry", issues);
+            }
+            if (Object.hasOwn(payload, "fast_refill")) {
+                validateFastRefill(payload.fast_refill, "event.payload.fast_refill", issues);
             }
             if (isRecord(payload.request)) {
                 if (event.request_id !== payload.request.id) {
@@ -587,13 +670,16 @@ function validateEventPayload(event, issues) {
             }
             break;
         case "request.remove":
-            knownFields(payload, ["request_id", "lanes", "registry"], "event.payload", issues);
+            knownFields(payload, ["request_id", "lanes", "registry", "fast_refill"], "event.payload", issues);
             string(payload.request_id, "event.payload.request_id", issues);
             if (Object.hasOwn(payload, "lanes")) {
                 validateLanes(payload.lanes, "event.payload.lanes", issues);
             }
             if (Object.hasOwn(payload, "registry")) {
                 validateRegistry(payload.registry, "event.payload.registry", issues);
+            }
+            if (Object.hasOwn(payload, "fast_refill")) {
+                validateFastRefill(payload.fast_refill, "event.payload.fast_refill", issues);
             }
             if (event.request_id !== payload.request_id) {
                 issues.push("event.request_id must equal event.payload.request_id");
