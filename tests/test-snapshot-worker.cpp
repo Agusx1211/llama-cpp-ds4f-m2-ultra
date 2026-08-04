@@ -7,11 +7,13 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -70,6 +72,37 @@ class temporary_directory {
 
   private:
     fs::path directory;
+};
+
+class race_gate {
+  public:
+    void arrive_and_wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        reached = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return released; });
+    }
+
+    void wait_until_reached(const std::string & message) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!cv.wait_for(lock, std::chrono::seconds(3), [&] { return reached; })) {
+            released = true;
+            cv.notify_all();
+            fail(message);
+        }
+    }
+
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+        cv.notify_all();
+    }
+
+  private:
+    std::mutex              mutex;
+    std::condition_variable cv;
+    bool                    reached  = false;
+    bool                    released = false;
 };
 
 llama_snapshot_digest digest_text(const std::string & value) {
@@ -379,6 +412,53 @@ void test_failures_cancellation_and_publication() {
     expect_current(store, identity, 1, baseline);
 }
 
+void test_cancellation_publication_fence() {
+    temporary_directory temp;
+    const auto          identity = make_identity();
+    const auto          config   = make_config(temp.path());
+    const auto          baseline = make_payload(129, 71);
+    llama_snapshot_store store(config.store);
+    expect_status(store.write_generation(make_metadata(1, identity), baseline).status, llama_snapshot_status::ok,
+                  "write publication-fence baseline");
+    llama_snapshot_worker worker(config);
+
+    race_gate             before_fence;
+    llama_snapshot_faults cancellable_faults;
+    cancellable_faults.before_manifest_commit_fence = [&] { before_fence.arrive_and_wait(); };
+    const auto cancelled_payload = make_payload(64, 83);
+    const auto cancellable =
+        worker.begin_write(make_metadata(2, identity), cancelled_payload.size(), cancellable_faults);
+    expect_worker_status(cancellable.status, llama_snapshot_worker_status::ok, "begin pre-fence cancellation");
+    stage_payload(worker, cancellable.job_id, cancelled_payload);
+    before_fence.wait_until_reached("write did not reach pre-publication fence");
+    const auto cancel_status = worker.cancel(cancellable.job_id);
+    before_fence.release();
+    expect_worker_status(cancel_status, llama_snapshot_worker_status::ok, "cancel before publication fence");
+    const auto cancelled = wait_complete(worker, cancellable.job_id);
+    expect_status(cancelled.operation_status, llama_snapshot_status::cancelled, "pre-fence cancellation result");
+    expect(!cancelled.committed && count_temporary_paths(temp.path()) == 0, "pre-fence cancellation cleanup");
+    expect(!fs::exists(temp.path() / "generation-0000000000000002"), "cancelled generation survived fence");
+    expect_current(store, identity, 1, baseline);
+
+    race_gate             after_fence;
+    llama_snapshot_faults committed_faults;
+    committed_faults.after_manifest_commit_fence = [&] { after_fence.arrive_and_wait(); };
+    const auto committed_payload = make_payload(64, 97);
+    const auto committing = worker.begin_write(make_metadata(3, identity), committed_payload.size(), committed_faults);
+    expect_worker_status(committing.status, llama_snapshot_worker_status::ok, "begin post-fence cancellation");
+    stage_payload(worker, committing.job_id, committed_payload);
+    after_fence.wait_until_reached("write did not cross publication fence");
+    const auto too_late_status = worker.cancel(committing.job_id);
+    after_fence.release();
+    expect_worker_status(too_late_status, llama_snapshot_worker_status::job_complete,
+                         "cancel after publication fence");
+    const auto committed = wait_complete(worker, committing.job_id);
+    expect_status(committed.operation_status, llama_snapshot_status::ok, "post-fence write result");
+    expect(committed.committed && count_temporary_paths(temp.path()) == 0, "post-fence publication cleanup");
+    expect_current(store, identity, 3, committed_payload);
+    expect(!fs::exists(temp.path() / "generation-0000000000000001"), "previous generation survived publication");
+}
+
 void test_invalid_config_destruction_and_fork_child() {
     const auto identity = make_identity();
     {
@@ -443,6 +523,7 @@ int main() {
     try {
         test_bounded_async_round_trip_and_backpressure();
         test_failures_cancellation_and_publication();
+        test_cancellation_publication_fence();
         test_invalid_config_destruction_and_fork_child();
     } catch (const std::exception & error) {
         std::fprintf(stderr, "test-snapshot-worker: %s\n", error.what());

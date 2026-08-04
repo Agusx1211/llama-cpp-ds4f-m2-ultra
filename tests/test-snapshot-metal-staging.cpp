@@ -97,17 +97,6 @@ void test_logical_layout_mapping() {
     expect(empty.total_bytes() == 0 && empty.region_count() == 0, "empty layout shape");
 }
 
-#if defined(GGML_TEST_METAL_SNAPSHOT_STAGING)
-
-void expect_metal_status(enum ggml_metal_snapshot_status actual,
-                         enum ggml_metal_snapshot_status expected,
-                         const std::string &             message) {
-    if (actual != expected) {
-        fail(message + ": expected " + ggml_metal_snapshot_status_name(expected) + ", got " +
-             ggml_metal_snapshot_status_name(actual));
-    }
-}
-
 struct options {
     uint64_t bytes            = 5 * 64 * 1024 + 37;
     uint64_t chunk_bytes      = 64 * 1024;
@@ -158,6 +147,17 @@ options parse_options(int argc, char ** argv) {
     return result;
 }
 
+#if defined(GGML_TEST_METAL_SNAPSHOT_STAGING)
+
+void expect_metal_status(enum ggml_metal_snapshot_status actual,
+                         enum ggml_metal_snapshot_status expected,
+                         const std::string &             message) {
+    if (actual != expected) {
+        fail(message + ": expected " + ggml_metal_snapshot_status_name(expected) + ", got " +
+             ggml_metal_snapshot_status_name(actual));
+    }
+}
+
 struct metal_resource {
     ggml_metal_buffer_t buffer = nullptr;
     ggml_tensor *       tensor = nullptr;
@@ -179,6 +179,17 @@ struct mapped_copies {
 
     size_t size() const { return count; }
 };
+
+void expect_resource_bytes(const std::array<metal_resource, 3> &       resources,
+                           const std::array<std::vector<uint8_t>, 3> & expected,
+                           const std::string &                         message) {
+    for (size_t index = 0; index < resources.size(); ++index) {
+        std::vector<uint8_t> actual(expected[index].size());
+        ggml_metal_buffer_get_tensor(resources[index].buffer, resources[index].tensor, actual.data(), 0,
+                                     actual.size());
+        expect(actual == expected[index], message + " for resource " + std::to_string(index));
+    }
+}
 
 mapped_copies map_copies(const llama_snapshot_metal_layout &   layout,
                          const std::array<metal_resource, 3> & resources,
@@ -344,6 +355,7 @@ void run_metal_gate(const options & run_options) {
     const uint64_t                           region2          = run_options.bytes - region0 - region1;
     const std::array<uint64_t, 3>            region_bytes     = { region0, region1, region2 };
     const std::array<uint64_t, 3>            resource_offsets = { 17, 31, 47 };
+    const std::array<uint64_t, 3>            resource_suffixes = { 23, 29, 43 };
     std::vector<llama_snapshot_metal_region> regions;
     uint64_t                                 logical_offset = 0;
     for (uint32_t index = 0; index < region_bytes.size(); ++index) {
@@ -364,12 +376,15 @@ void run_metal_gate(const options & run_options) {
     std::array<metal_resource, 3>       resources{};
     std::array<std::vector<uint8_t>, 3> initial;
     for (uint32_t index = 0; index < resources.size(); ++index) {
-        const size_t tensor_bytes = static_cast<size_t>(resource_offsets[index] + region_bytes[index]);
+        const size_t tensor_bytes =
+            static_cast<size_t>(resource_offsets[index] + region_bytes[index] + resource_suffixes[index]);
         resources[index].buffer   = ggml_metal_buffer_init(device, tensor_bytes, false);
         expect(resources[index].buffer != nullptr, "allocate private Metal resource");
         resources[index].tensor       = ggml_new_tensor_1d(context, GGML_TYPE_I8, tensor_bytes);
         resources[index].tensor->data = ggml_metal_buffer_get_base(resources[index].buffer);
         initial[index].assign(tensor_bytes, static_cast<uint8_t>(0xa0 + index));
+        std::fill(initial[index].begin() + static_cast<size_t>(resource_offsets[index] + region_bytes[index]),
+                  initial[index].end(), static_cast<uint8_t>(0xd0 + index));
         for (size_t byte = 0; byte < region_bytes[index]; ++byte) {
             initial[index][static_cast<size_t>(resource_offsets[index]) + byte] =
                 static_cast<uint8_t>(11 + index * 29 + byte * 37 + byte / 7);
@@ -407,10 +422,18 @@ void run_metal_gate(const options & run_options) {
     std::vector<uint8_t> snapshot;
     run_readback_pipeline(staging, layout, resources, static_cast<size_t>(run_options.chunk_bytes), snapshot);
     expect(snapshot == expected, "private-to-shared snapshot bytes");
-    for (const metal_resource & resource : resources) {
-        ggml_metal_buffer_clear(resource.buffer, 0);
+    expect_resource_bytes(resources, initial, "private resource guards changed during snapshot readback");
+
+    std::array<std::vector<uint8_t>, 3> cleared = initial;
+    for (size_t index = 0; index < resources.size(); ++index) {
+        std::vector<uint8_t> zeros(static_cast<size_t>(region_bytes[index]), 0);
+        std::fill_n(cleared[index].begin() + static_cast<size_t>(resource_offsets[index]), zeros.size(), uint8_t{ 0 });
+        ggml_metal_buffer_set_tensor(resources[index].buffer, resources[index].tensor, zeros.data(),
+                                     static_cast<size_t>(resource_offsets[index]), zeros.size());
     }
+    expect_resource_bytes(resources, cleared, "logical clear overwrote private resource guards");
     run_restore_pipeline(staging, layout, resources, static_cast<size_t>(run_options.chunk_bytes), snapshot);
+    expect_resource_bytes(resources, initial, "snapshot restore overwrote private resource guards");
     std::vector<uint8_t> restored;
     run_readback_pipeline(staging, layout, resources, static_cast<size_t>(run_options.chunk_bytes), restored);
     expect(restored == expected, "shared-to-private restored bytes");
@@ -463,12 +486,17 @@ void run_metal_gate(const options & run_options) {
 
 int main(int argc, char ** argv) {
     try {
+        const options run_options = parse_options(argc, argv);
         test_logical_layout_mapping();
 #if defined(GGML_TEST_METAL_SNAPSHOT_STAGING)
-        run_metal_gate(parse_options(argc, argv));
+        run_metal_gate(run_options);
 #else
-        (void) argc;
-        (void) argv;
+        if (run_options.require_m2_ultra) {
+            fail("required M2 Ultra check unavailable: Metal staging gate is not compiled and directly linked");
+        }
+        if (run_options.benchmark) {
+            fail("Metal staging benchmark unavailable: Metal staging gate is not compiled and directly linked");
+        }
         std::puts("snapshot Metal staging test skipped: Metal backend not built");
 #endif
     } catch (const std::exception & error) {

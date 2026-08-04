@@ -370,7 +370,7 @@ struct llama_snapshot_worker::impl {
         if (status != llama_snapshot_worker_status::ok) {
             return status;
         }
-        if (terminal_locked()) {
+        if (terminal_locked() || commit_started) {
             return llama_snapshot_worker_status::job_complete;
         }
         cancel_requested = true;
@@ -496,8 +496,19 @@ struct llama_snapshot_worker::impl {
             std::lock_guard<std::mutex> lock(mutex);
             return stopping || !active || active_job_id != job_id || cancel_requested;
         };
+        const llama_snapshot_commit_fence commit_fence = [this, job_id] {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stopping || !active || active_job_id != job_id || cancel_requested) {
+                return false;
+            }
+            // This is the cancellation/publication linearization point:
+            // cancel() observes commit_started under this same mutex.
+            commit_started = true;
+            return true;
+        };
         const llama_snapshot_write_result result =
-            store.write_generation_streamed(job.metadata, job.payload_bytes, source, cancelled, job.faults);
+            store.write_generation_streamed(job.metadata, job.payload_bytes, source, cancelled, job.faults,
+                                            commit_fence);
         finish_worker(job_id, result.status, result.generation, result.os_error, result.committed);
     }
 
@@ -634,6 +645,7 @@ struct llama_snapshot_worker::impl {
         worker_started     = false;
         worker_done        = false;
         cancel_requested   = false;
+        commit_started     = false;
         producer_active    = false;
         consumer_active    = false;
         source_failure     = llama_snapshot_status::ok;
@@ -735,6 +747,7 @@ struct llama_snapshot_worker::impl {
     bool                               worker_started         = false;
     bool                               worker_done            = false;
     bool                               cancel_requested       = false;
+    bool                               commit_started         = false;
     bool                               producer_active        = false;
     bool                               consumer_active        = false;
     uint64_t                           next_job_id             = 1;

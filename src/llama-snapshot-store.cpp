@@ -791,7 +791,8 @@ llama_snapshot_write_result llama_snapshot_store::write_generation_streamed(
         uint64_t                            total_payload_bytes,
         llama_snapshot_chunk_source_i &     source,
         const llama_snapshot_cancel_check & cancelled,
-        const llama_snapshot_faults &       faults) {
+        const llama_snapshot_faults &       faults,
+        const llama_snapshot_commit_fence & commit_fence) {
     llama_snapshot_write_result result;
     result.generation = metadata.snapshot_generation;
     try {
@@ -971,6 +972,15 @@ llama_snapshot_write_result llama_snapshot_store::write_generation_streamed(
         }
         if (cancelled && cancelled(static_cast<uint32_t>(manifest.chunks.size()))) {
             return fail({ llama_snapshot_status::cancelled, 0 });
+        }
+        if (faults.before_manifest_commit_fence) {
+            faults.before_manifest_commit_fence();
+        }
+        if (commit_fence && !commit_fence()) {
+            return fail({ llama_snapshot_status::cancelled, 0 });
+        }
+        if (faults.after_manifest_commit_fence) {
+            faults.after_manifest_commit_fence();
         }
         if (::rename(current_tmp.c_str(), (root / "current.manifest").c_str()) != 0) {
             return fail({ llama_snapshot_status::io_error, errno });

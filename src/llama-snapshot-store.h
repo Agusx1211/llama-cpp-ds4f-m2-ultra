@@ -103,11 +103,18 @@ struct llama_snapshot_faults {
     uint64_t                   fail_after_bytes            = std::numeric_limits<uint64_t>::max();
     llama_snapshot_write_fault write_fault                 = llama_snapshot_write_fault::none;
     bool                       fail_before_manifest_commit = false;
+    // Test-only deterministic race seams around the publication fence. The
+    // store calls these after its final ordinary cancellation check.
+    std::function<void()>      before_manifest_commit_fence;
+    std::function<void()>      after_manifest_commit_fence;
     // Test-only crash seam. Ordinary errors and cancellation always clean up.
     bool                       preserve_failed_generation  = false;
 };
 
 using llama_snapshot_cancel_check = std::function<bool(uint32_t durable_chunks)>;
+// Called exactly once immediately before current.manifest publication. A true
+// result establishes that cancellation is too late; false aborts publication.
+using llama_snapshot_commit_fence = std::function<bool()>;
 
 struct llama_snapshot_chunk_info {
     uint32_t              index          = 0;
@@ -200,7 +207,8 @@ class llama_snapshot_store {
             uint64_t                            total_payload_bytes,
             llama_snapshot_chunk_source_i &     source,
             const llama_snapshot_cancel_check & cancelled = {},
-            const llama_snapshot_faults &       faults    = {});
+            const llama_snapshot_faults &       faults       = {},
+            const llama_snapshot_commit_fence & commit_fence = {});
 
     llama_snapshot_open_result    open_current(const llama_snapshot_identity & expected_identity) const;
     llama_snapshot_status         validate(const llama_snapshot_manifest & manifest, int * os_error = nullptr) const;
