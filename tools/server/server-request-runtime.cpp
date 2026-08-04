@@ -656,7 +656,7 @@ bool request_runtime::release_bound_slot(std::map<uint64_t, record>::iterator it
                                        [slot](const binding_lease & value) { return value.slot == slot; });
     const auto unbind_reason =
         request.terminal == lifecycle::timed_out ? server_request_registry::reason_code::run_timeout :
-        request.terminal == lifecycle::cancelled ? server_request_registry::reason_code::client_cancel :
+        request.terminal == lifecycle::cancelled ? request.cancel_reason :
                                                    server_request_registry::reason_code::yielded;
     if (lease == bindings.end() || !registry.unbind(*lease, unbind_reason, at_us)) {
         return false;
@@ -669,7 +669,7 @@ bool request_runtime::release_bound_slot(std::map<uint64_t, record>::iterator it
     release_permit(request);
 
     const auto terminal_reason =
-        request.terminal == lifecycle::cancelled ? server_request_registry::reason_code::client_cancel :
+        request.terminal == lifecycle::cancelled ? request.cancel_reason :
         request.terminal == lifecycle::timed_out ? unbind_reason :
         request.terminal == lifecycle::failed    ? server_request_registry::reason_code::request_failed :
                                                    server_request_registry::reason_code::completed;
@@ -677,18 +677,32 @@ bool request_runtime::release_bound_slot(std::map<uint64_t, record>::iterator it
 }
 
 bool request_runtime::cancel(uint64_t request_id, uint64_t at_us) {
+    return cancel(request_id, server_request_registry::reason_code::client_cancel, at_us);
+}
+
+bool request_runtime::cancel(
+        uint64_t request_id,
+        server_request_registry::reason_code reason,
+        uint64_t at_us) {
+    if (reason != server_request_registry::reason_code::client_cancel &&
+        reason != server_request_registry::reason_code::server_cancel) {
+        return false;
+    }
     const std::vector<uint64_t> targets = terminal_targets(request_id);
     if (targets.empty()) {
         return false;
     }
     bool cancelled = true;
     for (uint64_t target : targets) {
-        cancelled = cancel_one(target, at_us) && cancelled;
+        cancelled = cancel_one(target, reason, at_us) && cancelled;
     }
     return cancelled;
 }
 
-bool request_runtime::cancel_one(uint64_t request_id, uint64_t at_us) {
+bool request_runtime::cancel_one(
+        uint64_t request_id,
+        server_request_registry::reason_code reason,
+        uint64_t at_us) {
     auto it = records.find(request_id);
     if (it == records.end()) {
         return false;
@@ -696,11 +710,11 @@ bool request_runtime::cancel_one(uint64_t request_id, uint64_t at_us) {
     if (it->second.terminal != lifecycle::completed) {
         return true;
     }
-    if (!registry.mark_cancel_requested(it->second.handle, server_request_registry::reason_code::client_cancel,
-                                        at_us)) {
+    if (!registry.mark_cancel_requested(it->second.handle, reason, at_us)) {
         return false;
     }
     it->second.terminal = lifecycle::cancelled;
+    it->second.cancel_reason = reason;
     if (it->second.scheduler_queued) {
         if (!scheduler.cancel(request_id).completed) {
             return false;
@@ -708,7 +722,7 @@ bool request_runtime::cancel_one(uint64_t request_id, uint64_t at_us) {
         it->second.scheduler_queued = false;
     }
     if (it->second.bindings.empty()) {
-        return finish(it, lifecycle::cancelled, server_request_registry::reason_code::client_cancel, at_us);
+        return finish(it, lifecycle::cancelled, reason, at_us);
     }
     return true;
 }

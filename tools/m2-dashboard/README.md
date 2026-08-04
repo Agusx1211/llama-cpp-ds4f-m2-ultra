@@ -139,7 +139,10 @@ Control accepts exactly `{"action":"cancel","request_id":"id:epoch"}`. The
 queue validates that full handle under its mutation lock before reusing the
 existing durable cancellation path. A second cancel while the same bound
 request is already cancelling is idempotent; stale, unknown, or terminal
-handles cannot mutate state.
+handles cannot mutate state. An accepted operator cancellation also publishes
+one `503 unavailable_error` with the fixed message `request cancelled by
+dashboard operator` to the original completion waiter, so a non-streaming
+client terminates instead of hanging after its slot is released.
 
 The dependency-free target probe starts its own long completion against an
 already-running direct server, discovers the new bound `id:epoch`, validates
@@ -150,11 +153,16 @@ a fresh completion afterward:
 ```sh
 export M2_DASHBOARD_BASE_URL=http://127.0.0.1:18130
 export M2_DASHBOARD_ORIGIN=http://127.0.0.1:8081
+export LLAMA_SERVER_BENCH_TRACE_CAPACITY=4096
 python3 tools/m2-dashboard/target/admin_cancel_probe.py
 ```
 
 It uses the same `LLAMA_API_KEY` and
 `LLAMA_SERVER_TRUSTED_SCHEDULING_TOKEN` environment credentials as the server.
+The trace-capacity variable must be present when the server starts: the probe
+uses a unique authenticated benchmark tag to bind its client request to the
+registry's exact runtime ID and refuses to select an unrelated concurrent
+request.
 Run it only against a disposable validation server: the discovered request is
 cancelled intentionally.
 

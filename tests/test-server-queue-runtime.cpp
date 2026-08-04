@@ -299,34 +299,47 @@ void test_cancel_before_dispatch() {
 void test_admin_cancel_requires_current_handle_and_is_idempotent_while_live() {
     {
         server_queue queue;
+        server_response responses;
         server_task task = make_user(queue, server_task::trusted_lane::normal, 21);
         const int id = task.id;
         require_posted(queue.post(std::move(task)), id, "post queued admin-cancel task");
         const auto handle = queue.request_snapshot().front().handle;
+        responses.add_waiting_task_id(id);
 
-        require(queue.admin_cancel({ handle.id + 1, handle.epoch }) ==
+        require(queue.admin_cancel(responses, { handle.id + 1, handle.epoch }) ==
                         server_queue_admin_cancel_code::unknown_request,
                 "unknown handle fails closed");
-        require(queue.admin_cancel({ handle.id, handle.epoch + 1 }) ==
+        require(queue.admin_cancel(responses, { handle.id, handle.epoch + 1 }) ==
                         server_queue_admin_cancel_code::stale_handle,
                 "stale generation fails closed");
         require(queue.request_summary().active_requests == 1,
                 "failed handle checks do not mutate the queued request");
-        require(queue.admin_cancel(handle) == server_queue_admin_cancel_code::accepted,
+        require(responses.recv_with_timeout({ id }, 0) == nullptr,
+                "failed handle checks publish no terminal result");
+        require(queue.admin_cancel(responses, handle) == server_queue_admin_cancel_code::accepted,
                 "exact queued handle is cancelled");
         require(queue.request_summary().active_requests == 0,
                 "queued admin cancellation retires durable state immediately");
-        require(queue.admin_cancel(handle) == server_queue_admin_cancel_code::unknown_request,
+        auto terminal = responses.recv_with_timeout({ id }, 0);
+        const auto * error = dynamic_cast<const server_task_result_error *>(terminal.get());
+        require(error != nullptr && error->err_type == ERROR_TYPE_UNAVAILABLE &&
+                        error->err_msg == "request cancelled by dashboard operator",
+                "queued admin cancellation publishes one operator terminal to its waiter");
+        require(queue.admin_cancel(responses, handle) == server_queue_admin_cancel_code::unknown_request,
                 "retired queued request fails closed on replay");
+        require(responses.recv_with_timeout({ id }, 0) == nullptr,
+                "retired replay publishes no duplicate terminal result");
     }
 
     {
         server_queue queue;
+        server_response responses;
         server_task task = make_user(queue, server_task::trusted_lane::fast, 22);
         const int id = task.id;
         require_posted(queue.post(std::move(task)), id, "post bound admin-cancel task");
         const auto handle = queue.request_snapshot().front().handle;
         bind_only(queue, id, 0);
+        responses.add_waiting_task_id(id);
 
         queue.set_prepare_terminal_control_hook_for_tests([](size_t attempt) {
             if (attempt == 1) {
@@ -335,32 +348,74 @@ void test_admin_cancel_requires_current_handle_and_is_idempotent_while_live() {
         });
         bool preparation_failed = false;
         try {
-            (void) queue.admin_cancel(handle);
+            (void) queue.admin_cancel(responses, handle);
         } catch (const std::runtime_error &) {
             preparation_failed = true;
         }
         require(preparation_failed && !queue.request_snapshot().front().cancel_requested,
                 "admin cancel preparation failure leaves durable state untouched");
         queue.set_prepare_terminal_control_hook_for_tests({});
-        require(queue.admin_cancel(handle) == server_queue_admin_cancel_code::accepted,
+
+        responses.set_prepare_send_hook_for_tests([](size_t attempt) {
+            if (attempt == 1) {
+                throw std::runtime_error("injected admin cancel result preparation failure");
+            }
+        });
+        preparation_failed = false;
+        try {
+            (void) queue.admin_cancel(responses, handle);
+        } catch (const std::runtime_error &) {
+            preparation_failed = true;
+        }
+        require(preparation_failed && !queue.request_snapshot().front().cancel_requested &&
+                        responses.recv_with_timeout({ id }, 0) == nullptr,
+                "admin result preparation failure leaves durable state and waiter untouched");
+        responses.set_prepare_send_hook_for_tests({});
+
+        require(queue.admin_cancel(responses, handle) == server_queue_admin_cancel_code::accepted,
                 "exact bound handle requests cancellation");
         const auto cancelled = queue.request_snapshot();
-        require(cancelled.size() == 1 && cancelled.front().cancel_requested,
-                "bound cancellation is durable before control dispatch");
-        require(queue.admin_cancel(handle) == server_queue_admin_cancel_code::already_requested,
+        require(cancelled.size() == 1 && cancelled.front().cancel_requested &&
+                        cancelled.front().last_reason == server_request_registry::reason_code::server_cancel,
+                "bound operator cancellation is durable and attributed before control dispatch");
+        auto terminal = responses.recv_with_timeout({ id }, 0);
+        const auto * error = dynamic_cast<const server_task_result_error *>(terminal.get());
+        require(error != nullptr && error->err_msg == "request cancelled by dashboard operator",
+                "bound admin cancellation releases the original waiter");
+        require(queue.admin_cancel(responses, handle) == server_queue_admin_cancel_code::already_requested,
                 "duplicate bound cancellation is idempotent");
+        require(responses.recv_with_timeout({ id }, 0) == nullptr,
+                "duplicate bound cancellation publishes no second terminal");
         require(queue.release_slot(id, 0), "release admin-cancelled bound task");
+        bool saw_operator_terminal = false;
+        bool saw_operator_removal  = false;
+        for (const auto & event : queue.request_events().events) {
+            if (!(event.request == handle)) {
+                continue;
+            }
+            saw_operator_terminal |=
+                    event.kind == server_request_registry::event_kind::terminal &&
+                    event.lifecycle_after == server_request_registry::lifecycle::cancelled &&
+                    event.reason == server_request_registry::reason_code::server_cancel;
+            saw_operator_removal |=
+                    event.kind == server_request_registry::event_kind::removed &&
+                    event.lifecycle_after == server_request_registry::lifecycle::absent &&
+                    event.reason == server_request_registry::reason_code::server_cancel;
+        }
+        require(saw_operator_terminal && saw_operator_removal,
+                "operator provenance labels the terminal and removal events themselves");
     }
 
     {
         server_queue queue;
+        server_response responses;
         server_task task = make_user(queue, server_task::trusted_lane::low, 23);
         const int id = task.id;
         require_posted(queue.post(std::move(task)), id, "post terminal admin-cancel task");
         const auto handle = queue.request_snapshot().front().handle;
         bind_only(queue, id, 0);
         require(queue.fail_task(id), "terminalize bound request before admin cancellation");
-        require(queue.admin_cancel(handle) == server_queue_admin_cancel_code::terminal_request,
+        require(queue.admin_cancel(responses, handle) == server_queue_admin_cancel_code::terminal_request,
                 "terminal request fails closed without another mutation");
         require(queue.release_slot(id, 0), "release terminal admin-cancel fixture");
     }
@@ -1451,6 +1506,13 @@ void test_family_failure_prepares_all_results_before_live_cancel() {
     std::vector<server_task> tasks;
     tasks.push_back(std::move(parent));
     require(queue.post(std::move(tasks)), "post family for atomic failure preparation");
+    server_request_registry::request_handle protected_handle;
+    for (const auto & request : queue.request_snapshot()) {
+        if (request.handle.id == static_cast<uint64_t>(family_ids[1]) + 1) {
+            protected_handle = request.handle;
+        }
+    }
+    require(protected_handle.id != 0, "capture protected child generation for admin cancellation");
 
     std::vector<bound_family_slot> bound;
     int update_turns   = 0;
@@ -1527,6 +1589,17 @@ void test_family_failure_prepares_all_results_before_live_cancel() {
             duplicate_parent_cancel.id_target = parent_id;
             require(queue.post(std::move(duplicate_parent_cancel), true),
                     "protected parent CANCEL deduplicates against the canonical child control");
+            const auto admin_cancel = queue.admin_cancel(responses, protected_handle);
+            const auto after_admin_cancel = queue.request_snapshot();
+            const auto protected_request = std::find_if(
+                    after_admin_cancel.begin(), after_admin_cancel.end(), [&](const auto & request) {
+                        return request.handle == protected_handle;
+                    });
+            require(admin_cancel == server_queue_admin_cancel_code::terminal_request &&
+                        protected_request != after_admin_cancel.end() &&
+                        !protected_request->cancel_requested &&
+                        responses.recv_with_timeout({ family_ids[1] }, 0) == nullptr,
+                    "admin cancel fails closed while a protected family terminal owns publication");
             responses.set_prepare_send_hook_for_tests({});
             queue.request_update();
             return;

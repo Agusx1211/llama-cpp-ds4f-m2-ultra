@@ -168,6 +168,9 @@ class request_runtime {
                                                uint64_t                         at_us);
     release_result release_slot(uint64_t request_id, server_request_registry::slot_id slot, uint64_t at_us);
     bool cancel(uint64_t request_id, uint64_t at_us);
+    bool cancel(uint64_t request_id,
+                server_request_registry::reason_code reason,
+                uint64_t at_us);
     bool fail(uint64_t request_id, uint64_t at_us);
     failure_publication_result failure_publication_status(uint64_t request_id) const;
     failure_publication_result fail_for_publication(uint64_t request_id, uint64_t at_us);
@@ -197,6 +200,8 @@ class request_runtime {
         std::vector<server_request_registry::binding_lease> bindings;
         bool                                                scheduler_queued = false;
         server_request_registry::lifecycle                  terminal = server_request_registry::lifecycle::completed;
+        server_request_registry::reason_code                cancel_reason =
+                server_request_registry::reason_code::none;
         uint64_t                                            queue_deadline_us = 0;
         uint64_t                                            run_timeout_us    = 0;
         uint64_t                                            run_deadline_us   = 0;
@@ -227,7 +232,9 @@ class request_runtime {
                             server_request_registry::lifecycle   terminal,
                             server_request_registry::reason_code reason,
                             uint64_t                             at_us);
-    bool                  cancel_one(uint64_t request_id, uint64_t at_us);
+    bool                  cancel_one(uint64_t request_id,
+                                     server_request_registry::reason_code reason,
+                                     uint64_t at_us);
     bool                  fail_one(uint64_t request_id, uint64_t at_us);
     std::vector<uint64_t> terminal_targets(uint64_t request_id) const;
     void                  release_permit(record & request);

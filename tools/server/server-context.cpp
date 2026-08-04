@@ -5916,7 +5916,7 @@ void server_routes::init_routes() {
             res->error(format_error_response(command.message, ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        const auto outcome = queue_tasks.admin_cancel(command.request);
+        const auto outcome = queue_tasks.admin_cancel(queue_results, command.request);
         const std::string canonical_id = std::to_string(command.request.id) + ":" +
                                          std::to_string(command.request.epoch);
         switch (outcome) {

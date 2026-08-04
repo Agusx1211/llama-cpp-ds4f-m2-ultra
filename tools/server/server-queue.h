@@ -190,7 +190,9 @@ public:
     // Low-rate admin seam. Exact handle validation and the existing durable
     // cancellation preparation/commit run under the queue mutex, so an epoch
     // cannot be checked and then silently discarded before mutation.
-    server_queue_admin_cancel_code admin_cancel(server_request_registry::request_handle handle);
+    server_queue_admin_cancel_code admin_cancel(
+            server_response &                        response,
+            server_request_registry::request_handle handle);
 
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called

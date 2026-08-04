@@ -1078,6 +1078,7 @@ server_queue_request_state server_queue::request_state() {
 }
 
 server_queue_admin_cancel_code server_queue::admin_cancel(
+        server_response &                        response,
         server_request_registry::request_handle handle) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     const uint64_t               at_us   = now_us();
@@ -1102,17 +1103,33 @@ server_queue_admin_cancel_code server_queue::admin_cancel(
     } else {
         GGML_ASSERT(handle.id > 0 &&
                     handle.id <= static_cast<uint64_t>(std::numeric_limits<int>::max()) + 1);
-        server_task cancel(SERVER_TASK_TYPE_CANCEL);
-        cancel.id        = id++;
-        cancel.id_target = static_cast<int>(handle.id - 1);
-        auto prepared_cancel = prepare_posted_cancel(std::move(cancel));
-        const int id_target = canonical_cancel_target(prepared_cancel.front().id_target);
-        prepared_cancel.front().id_target = id_target;
-        if (protected_terminal_family != id_target || !has_terminal_control(id_target)) {
-            cleanup_pending_task(id_target, at_us);
+        const int id_target = static_cast<int>(handle.id - 1);
+        const int canonical_target = canonical_cancel_target(id_target);
+        if (protected_terminal_family == canonical_target && has_terminal_control(canonical_target)) {
+            // A family-wide terminal transaction already owns publication and
+            // release. Do not acknowledge or publish a second terminal unless
+            // this cancellation becomes durable.
+            result = server_queue_admin_cancel_code::terminal_request;
+        } else {
+            server_task cancel(SERVER_TASK_TYPE_CANCEL);
+            cancel.id        = id++;
+            cancel.id_target = canonical_target;
+            auto prepared_cancel = prepare_posted_cancel(std::move(cancel));
+
+            auto cancellation_result      = std::make_unique<server_task_result_error>();
+            cancellation_result->id       = id_target;
+            cancellation_result->err_type = ERROR_TYPE_UNAVAILABLE;
+            cancellation_result->err_msg  = "request cancelled by dashboard operator";
+            auto prepared_result = response.prepare_send(id_target);
+
+            const bool cancelled = request_runtime.cancel(
+                    handle.id, server_request_registry::reason_code::server_cancel, at_us);
+            GGML_ASSERT(cancelled);
+            erase_pending_payload(id_target);
             commit_terminal_controls(prepared_cancel);
+            prepared_result.commit(std::move(cancellation_result));
+            result = server_queue_admin_cancel_code::accepted;
         }
-        result = server_queue_admin_cancel_code::accepted;
     }
 
     lock.unlock();
