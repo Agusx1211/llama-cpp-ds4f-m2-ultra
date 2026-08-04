@@ -448,7 +448,7 @@ class Smoke:
                 "ordinary_json_forgery_normal": True,
                 "fast_output_before_low_completion": True,
                 "exact_tokens_predicted_and_id_cardinality": True,
-                "exact_reference_fast_and_burst_outputs": True,
+                "exact_reference_fast_and_configured_burst_outputs": True,
                 "exact_stage_commit_pairs": True,
                 "maximum_one_owner": True,
                 "low_commit_during_fast_decode": True,
@@ -482,7 +482,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-prompt-tokens", type=int, default=128)
     parser.add_argument("--fast-n-predict", type=int, default=512)
     parser.add_argument("--reference-n-predict", type=int, default=32)
-    parser.add_argument("--burst-count", type=int, default=4)
+    parser.add_argument("--burst-count", type=int, default=0)
     parser.add_argument("--burst-interval-seconds", type=int, default=2)
     parser.add_argument("--burst-n-predict", type=int, default=16)
     parser.add_argument("--alignment-tokens", type=int, default=128)
@@ -548,9 +548,11 @@ def main() -> int:
     if args.low_prompt_tokens <= 0 or args.fast_prompt_tokens <= 0:
         raise ValueError("prompt lengths must be positive")
     if min(args.low_n_predict, args.fast_n_predict, args.reference_n_predict,
-           args.burst_n_predict, args.burst_count, args.alignment_tokens,
+           args.burst_n_predict, args.alignment_tokens,
            args.active_fast_chunk_limit_tokens) <= 0:
-        raise ValueError("prediction, burst, and alignment values must be positive")
+        raise ValueError("prediction and alignment values must be positive")
+    if args.burst_count < 0:
+        raise ValueError("burst count must be nonnegative")
 
     config = config_from_args(args)
     args.artifact.mkdir(parents=True, exist_ok=False)

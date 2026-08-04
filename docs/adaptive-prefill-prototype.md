@@ -42,13 +42,15 @@ python3 tools/server/tests/adaptive-prefill-smoke.py \
   --artifact "/tmp/adaptive-prefill-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
-The runner sends an 8K trusted-low prompt, an isolated and sustained
-trusted-fast 512-token decode, and four short fast bursts. It also checks an
-ordinary JSON lane-forgery request, rejects API-only trusted headers, and reads
-the scheduler trace only with both credentials.
+The default runner sends an 8K trusted-low prompt plus isolated and sustained
+trusted-fast 512-token decodes. It also checks an ordinary JSON lane-forgery
+request, rejects API-only trusted headers, and reads the scheduler trace only
+with both credentials. Additional fast bursts are a horizontal load test;
+enable them explicitly with `--burst-count 4` after adding enough slot capacity
+or extending the 30-second queue deadline.
 
 `PASS` requires exact `tokens_predicted` and token-ID cardinality for every
-request, identical token IDs and content for deterministic reference/fast/burst
+request, identical token IDs and content for deterministic reference/fast
 pairs, fast output before low completion, a low commit while fast decode is
 active, an aligned yielded low-owner release, exact stage-to-commit lease
 pairing, one prefill owner at most, and a lossless authenticated trace.
