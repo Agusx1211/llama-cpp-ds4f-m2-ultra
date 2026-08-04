@@ -37,6 +37,7 @@ enum class llama_dsv4_comp_status : uint8_t {
     slot_occupied,
     handle_bound,
     handle_resident,
+    resource_exhausted,
 };
 
 const char * llama_dsv4_comp_status_name(llama_dsv4_comp_status status);
@@ -129,6 +130,7 @@ struct llama_dsv4_comp_resident_handle {
 };
 
 struct llama_dsv4_comp_detach_plan;
+struct llama_dsv4_comp_attach_plan;
 
 struct llama_dsv4_comp_detach_quote {
     llama_dsv4_comp_status          status       = llama_dsv4_comp_status::invalid_argument;
@@ -144,6 +146,17 @@ struct llama_dsv4_comp_detach_quote {
 struct llama_dsv4_comp_resident_result {
     llama_dsv4_comp_status          status = llama_dsv4_comp_status::invalid_argument;
     llama_dsv4_comp_resident_handle resident;
+};
+
+struct llama_dsv4_comp_attach_quote {
+    llama_dsv4_comp_status          status       = llama_dsv4_comp_status::invalid_argument;
+    uint32_t                        execution_id = UINT32_MAX;
+    uint64_t                        pool_epoch   = 0;
+    llama_dsv4_comp_resident_handle resident;
+
+  private:
+    std::shared_ptr<llama_dsv4_comp_attach_plan> plan;
+    friend class llama_dsv4_comp_pool;
 };
 
 struct llama_dsv4_comp_change {
@@ -239,10 +252,19 @@ class llama_dsv4_comp_pool {
 
     // quote_detach is a fail-before-mutation preflight. detach consumes the
     // exact quote and transfers one uniquely bound compressed root into a
-    // generation-checked resident lease. attach consumes that lease into any
-    // free execution ID; release is the only operation that destroys it.
+    // generation-checked resident lease. Prepared attach preallocates its map
+    // node and can be committed and rolled back without allocation. A rollback
+    // after commit restores the exact resident lease if no intervening pool
+    // mutation occurred. release is the only operation that destroys it.
     llama_dsv4_comp_detach_quote    quote_detach(uint32_t execution_id) const;
     llama_dsv4_comp_resident_result detach(const llama_dsv4_comp_detach_quote & quote);
+    llama_dsv4_comp_attach_quote    quote_attach(llama_dsv4_comp_resident_handle resident,
+                                                 uint32_t execution_id) const;
+    llama_dsv4_comp_status          commit_attach(const llama_dsv4_comp_attach_quote & quote);
+    llama_dsv4_comp_status          rollback_attach(const llama_dsv4_comp_attach_quote & quote);
+
+    // One-shot compatibility helper. Coordinated transactions should retain
+    // the prepared quote until all components have committed.
     llama_dsv4_comp_status          attach(llama_dsv4_comp_resident_handle resident, uint32_t execution_id);
     llama_dsv4_comp_status          release(llama_dsv4_comp_resident_handle resident);
 

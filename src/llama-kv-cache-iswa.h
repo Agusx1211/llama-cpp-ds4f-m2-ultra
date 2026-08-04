@@ -54,6 +54,7 @@ struct llama_kv_iswa_resident_handle {
 };
 
 struct llama_kv_iswa_resident_detach_plan;
+struct llama_kv_iswa_resident_attach_plan;
 
 struct llama_kv_iswa_resident_detach_quote {
     llama_kv_iswa_resident_status status = llama_kv_iswa_resident_status::unsupported_layout;
@@ -69,6 +70,24 @@ struct llama_kv_iswa_resident_detach_quote {
 struct llama_kv_iswa_resident_result {
     llama_kv_iswa_resident_status status = llama_kv_iswa_resident_status::unsupported_layout;
     llama_kv_iswa_resident_handle resident;
+};
+
+struct llama_kv_iswa_resident_attach_quote {
+    llama_kv_iswa_resident_status status = llama_kv_iswa_resident_status::unsupported_layout;
+    llama_seq_id execution_id = -1;
+    llama_kv_iswa_resident_handle resident;
+
+  private:
+    std::shared_ptr<llama_kv_iswa_resident_attach_plan> plan;
+    friend class llama_kv_cache_iswa;
+};
+
+// The sparse backend exposes one-way, generation-bound move tickets. Callers
+// coordinating raw/SWA with reversible metadata must therefore attest that
+// this commit is the transaction's final atomic step. The scoped enum prevents
+// an unannotated prepared commit from compiling.
+enum class llama_kv_iswa_resident_final_step : uint8_t {
+    confirmed,
 };
 
 class llama_kv_cache_iswa : public llama_memory_i {
@@ -156,10 +175,24 @@ public:
 
     // Dormant DSV4 ownership primitive. A detach quote validates raw and SWA
     // metadata plus one free resident aperture before any mapping changes.
-    // Detach transfers both planes atomically; attach consumes the lease into
-    // any empty execution sequence, and release drops its page references.
+    // Detach transfers both planes atomically. Prepared attach allocates and
+    // validates everything while the lease remains resident. Rollback is an
+    // allocation-free, idempotent cancellation before commit. The backend has
+    // no reverse-ticket primitive, so commit_resident_attach_final() is an
+    // irreversible atomic success and must follow all reversible component
+    // commits. release drops the resident page references.
     llama_kv_iswa_resident_detach_quote quote_resident_detach(llama_seq_id execution_id) const;
     llama_kv_iswa_resident_result detach_resident(const llama_kv_iswa_resident_detach_quote & quote);
+    llama_kv_iswa_resident_attach_quote quote_resident_attach(llama_kv_iswa_resident_handle resident,
+                                                              llama_seq_id execution_id) const;
+    llama_kv_iswa_resident_status commit_resident_attach_final(
+            const llama_kv_iswa_resident_attach_quote & quote,
+            llama_kv_iswa_resident_final_step final_step);
+    llama_kv_iswa_resident_status rollback_resident_attach(
+            const llama_kv_iswa_resident_attach_quote & quote);
+
+    // One-shot compatibility helper. Multi-component transactions must use
+    // the explicit prepared/final-step API above.
     llama_kv_iswa_resident_status attach_resident(llama_kv_iswa_resident_handle resident,
                                                   llama_seq_id execution_id);
     llama_kv_iswa_resident_status release_resident(llama_kv_iswa_resident_handle resident);

@@ -96,6 +96,12 @@ enum class ticket_state : uint8_t {
     cancelled,
 };
 
+enum class resident_attach_state : uint8_t {
+    prepared,
+    committed,
+    rolled_back,
+};
+
 uint32_t populated_rows_in_segment(uint64_t visible_rows, uint32_t logical_segment) {
     const uint64_t start = static_cast<uint64_t>(logical_segment) * LLAMA_DSV4_COMP_SEGMENT_ROWS;
     if (visible_rows <= start) {
@@ -165,6 +171,16 @@ struct llama_dsv4_comp_detach_plan {
     llama_dsv4_comp_handle_id            handle                       = 0;
     uint64_t                             expected_handle_generation   = 0;
     uint64_t                             expected_resident_generation = 0;
+};
+
+struct llama_dsv4_comp_attach_plan {
+    std::shared_ptr<const pool_identity>                    owner;
+    uint64_t                                                pool_epoch = 0;
+    uint64_t                                                commit_epoch = 0;
+    uint32_t                                                execution_id = UINT32_MAX;
+    llama_dsv4_comp_resident_handle                         resident;
+    std::map<uint32_t, llama_dsv4_comp_handle_id>           prepared_binding;
+    resident_attach_state                                   state = resident_attach_state::prepared;
 };
 
 struct llama_dsv4_comp_pool::impl {
@@ -348,6 +364,8 @@ const char * llama_dsv4_comp_status_name(llama_dsv4_comp_status status) {
             return "handle_bound";
         case llama_dsv4_comp_status::handle_resident:
             return "handle_resident";
+        case llama_dsv4_comp_status::resource_exhausted:
+            return "resource_exhausted";
     }
     return "unknown";
 }
@@ -714,33 +732,142 @@ llama_dsv4_comp_resident_result llama_dsv4_comp_pool::detach(const llama_dsv4_co
     return result;
 }
 
-llama_dsv4_comp_status llama_dsv4_comp_pool::attach(llama_dsv4_comp_resident_handle resident, uint32_t execution_id) {
+llama_dsv4_comp_attach_quote llama_dsv4_comp_pool::quote_attach(
+        llama_dsv4_comp_resident_handle resident,
+        uint32_t                        execution_id) const {
+    llama_dsv4_comp_attach_quote result;
+    result.execution_id = execution_id;
+    result.pool_epoch   = pimpl->epoch;
+    result.resident     = resident;
+
     if (pimpl->busy()) {
-        return llama_dsv4_comp_status::busy;
+        result.status = llama_dsv4_comp_status::busy;
+        return result;
     }
     if (execution_id >= LLAMA_DSV4_COMP_GRAPH_STREAMS || resident.pool_id == 0 || resident.id == 0) {
-        return llama_dsv4_comp_status::invalid_argument;
+        result.status = llama_dsv4_comp_status::invalid_argument;
+        return result;
     }
     if (resident.pool_id != pimpl->identity->id) {
-        return llama_dsv4_comp_status::stale_handle;
+        result.status = llama_dsv4_comp_status::stale_handle;
+        return result;
     }
     const auto handle_it = pimpl->handles.find(resident.id);
     if (handle_it == pimpl->handles.end() || !handle_it->second.resident_owned ||
         handle_it->second.generation != resident.handle_generation ||
         handle_it->second.resident_generation != resident.lease_generation) {
-        return llama_dsv4_comp_status::stale_handle;
+        result.status = llama_dsv4_comp_status::stale_handle;
+        return result;
     }
     if (pimpl->bindings.count(execution_id) != 0) {
-        return llama_dsv4_comp_status::slot_occupied;
+        result.status = llama_dsv4_comp_status::slot_occupied;
+        return result;
     }
     if (pimpl->is_bound(resident.id)) {
-        return llama_dsv4_comp_status::handle_bound;
+        result.status = llama_dsv4_comp_status::handle_bound;
+        return result;
     }
 
-    pimpl->bindings.emplace(execution_id, resident.id);
+    try {
+        auto plan          = std::make_shared<llama_dsv4_comp_attach_plan>();
+        plan->owner        = pimpl->identity;
+        plan->pool_epoch   = pimpl->epoch;
+        plan->execution_id = execution_id;
+        plan->resident     = resident;
+        plan->prepared_binding.emplace(execution_id, resident.id);
+        result.status = llama_dsv4_comp_status::ok;
+        result.plan   = std::move(plan);
+        return result;
+    } catch (const std::bad_alloc &) {
+        result.status = llama_dsv4_comp_status::resource_exhausted;
+        return result;
+    }
+}
+
+llama_dsv4_comp_status llama_dsv4_comp_pool::commit_attach(const llama_dsv4_comp_attach_quote & quote) {
+    if (!quote.plan || quote.plan->owner != pimpl->identity ||
+        quote.plan->state != resident_attach_state::prepared) {
+        return llama_dsv4_comp_status::stale_quote;
+    }
+    if (pimpl->busy()) {
+        return llama_dsv4_comp_status::busy;
+    }
+    if (quote.plan->pool_epoch != pimpl->epoch) {
+        return llama_dsv4_comp_status::stale_quote;
+    }
+    const auto handle_it = pimpl->handles.find(quote.plan->resident.id);
+    if (handle_it == pimpl->handles.end() || !handle_it->second.resident_owned ||
+        handle_it->second.generation != quote.plan->resident.handle_generation ||
+        handle_it->second.resident_generation != quote.plan->resident.lease_generation ||
+        pimpl->bindings.count(quote.plan->execution_id) != 0 || pimpl->is_bound(quote.plan->resident.id)) {
+        return llama_dsv4_comp_status::stale_quote;
+    }
+
+    auto node = quote.plan->prepared_binding.extract(quote.plan->execution_id);
+    if (node.empty()) {
+        return llama_dsv4_comp_status::stale_quote;
+    }
+    auto inserted = pimpl->bindings.insert(std::move(node));
+    if (!inserted.inserted) {
+        const auto restored = quote.plan->prepared_binding.insert(std::move(inserted.node));
+        (void) restored;
+        return llama_dsv4_comp_status::stale_quote;
+    }
     handle_it->second.resident_owned = false;
     ++pimpl->epoch;
+    quote.plan->commit_epoch = pimpl->epoch;
+    quote.plan->state        = resident_attach_state::committed;
     return llama_dsv4_comp_status::ok;
+}
+
+llama_dsv4_comp_status llama_dsv4_comp_pool::rollback_attach(const llama_dsv4_comp_attach_quote & quote) {
+    if (!quote.plan || quote.plan->owner != pimpl->identity) {
+        return llama_dsv4_comp_status::stale_quote;
+    }
+    if (quote.plan->state == resident_attach_state::rolled_back) {
+        return llama_dsv4_comp_status::ok;
+    }
+    if (quote.plan->state == resident_attach_state::prepared) {
+        quote.plan->state = resident_attach_state::rolled_back;
+        return llama_dsv4_comp_status::ok;
+    }
+    if (pimpl->busy()) {
+        return llama_dsv4_comp_status::busy;
+    }
+    if (quote.plan->commit_epoch != pimpl->epoch) {
+        return llama_dsv4_comp_status::stale_quote;
+    }
+
+    const auto binding_it = pimpl->bindings.find(quote.plan->execution_id);
+    const auto handle_it  = pimpl->handles.find(quote.plan->resident.id);
+    if (binding_it == pimpl->bindings.end() || binding_it->second != quote.plan->resident.id ||
+        handle_it == pimpl->handles.end() || handle_it->second.resident_owned ||
+        handle_it->second.generation != quote.plan->resident.handle_generation ||
+        handle_it->second.resident_generation != quote.plan->resident.lease_generation) {
+        return llama_dsv4_comp_status::stale_quote;
+    }
+
+    auto node = pimpl->bindings.extract(binding_it);
+    auto restored = quote.plan->prepared_binding.insert(std::move(node));
+    if (!restored.inserted) {
+        const auto reinserted = pimpl->bindings.insert(std::move(restored.node));
+        (void) reinserted;
+        return llama_dsv4_comp_status::stale_quote;
+    }
+    handle_it->second.resident_owned = true;
+    ++pimpl->epoch;
+    quote.plan->state = resident_attach_state::rolled_back;
+    return llama_dsv4_comp_status::ok;
+}
+
+llama_dsv4_comp_status llama_dsv4_comp_pool::attach(
+        llama_dsv4_comp_resident_handle resident,
+        uint32_t                        execution_id) {
+    const auto quote = quote_attach(resident, execution_id);
+    if (quote.status != llama_dsv4_comp_status::ok) {
+        return quote.status;
+    }
+    return commit_attach(quote);
 }
 
 llama_dsv4_comp_status llama_dsv4_comp_pool::release(llama_dsv4_comp_resident_handle resident) {

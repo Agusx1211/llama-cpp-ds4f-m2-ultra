@@ -18,6 +18,45 @@
 #include <utility>
 #include <vector>
 
+namespace allocation_probe {
+thread_local bool   enabled = false;
+thread_local bool   reject  = false;
+thread_local size_t calls   = 0;
+}
+
+[[gnu::noinline]] void * operator new(std::size_t size) {
+    if (allocation_probe::enabled) {
+        ++allocation_probe::calls;
+        if (allocation_probe::reject) {
+            throw std::bad_alloc();
+        }
+    }
+    if (void * value = std::malloc(size == 0 ? 1 : size)) {
+        return value;
+    }
+    throw std::bad_alloc();
+}
+
+[[gnu::noinline]] void * operator new[](std::size_t size) {
+    return ::operator new(size);
+}
+
+[[gnu::noinline]] void operator delete(void * value) noexcept {
+    std::free(value);
+}
+
+[[gnu::noinline]] void operator delete[](void * value) noexcept {
+    ::operator delete(value);
+}
+
+[[gnu::noinline]] void operator delete(void * value, std::size_t) noexcept {
+    std::free(value);
+}
+
+[[gnu::noinline]] void operator delete[](void * value, std::size_t) noexcept {
+    ::operator delete(value);
+}
+
 #undef assert
 #define assert(expr) do {                                                        \
     if (!(expr)) {                                                               \
@@ -28,6 +67,41 @@
 } while (false)
 
 namespace {
+
+struct allocation_scope {
+    explicit allocation_scope(bool reject = false) {
+        if (allocation_probe::enabled) {
+            std::abort();
+        }
+        allocation_probe::calls   = 0;
+        allocation_probe::reject  = reject;
+        allocation_probe::enabled = true;
+    }
+
+    ~allocation_scope() {
+        allocation_probe::enabled = false;
+        allocation_probe::reject  = false;
+    }
+
+    size_t finish() {
+        const size_t result        = allocation_probe::calls;
+        allocation_probe::enabled = false;
+        allocation_probe::reject  = false;
+        return result;
+    }
+};
+
+using iswa_final_commit_fn = decltype(&llama_kv_cache_iswa::commit_resident_attach_final);
+static_assert(!std::is_invocable_v<
+              iswa_final_commit_fn,
+              llama_kv_cache_iswa *,
+              const llama_kv_iswa_resident_attach_quote &>);
+static_assert(std::is_invocable_r_v<
+              llama_kv_iswa_resident_status,
+              iswa_final_commit_fn,
+              llama_kv_cache_iswa *,
+              const llama_kv_iswa_resident_attach_quote &,
+              llama_kv_iswa_resident_final_step>);
 
 static_assert(GGML_DSV4_SPARSE_OK == 0);
 static_assert(GGML_DSV4_SPARSE_PRESSURE == 1);
@@ -575,6 +649,125 @@ void test_backend_failures_are_atomic_and_retryable() {
     assert(f.cache.release_resident(detached.resident) == llama_kv_iswa_resident_status::ok);
 }
 
+void test_prepared_attach_final_step_contract() {
+    backend_scope backend;
+    cache_fixture f;
+    f.put_metadata(0, 7, 7, 42);
+    f.fill_stream(f.base_k(), 0, 0x29);
+    f.fill_stream(f.swa_k(), 0, 0x6a);
+    const auto base_before = f.stream_bytes(f.base_k(), 0);
+    const auto swa_before  = f.stream_bytes(f.swa_k(), 0);
+    const auto handle      = park_sequence(f);
+    assert(f.cache.has_resident_handles());
+
+    auto cancelled = f.cache.quote_resident_attach(handle, 1);
+    assert(cancelled.status == llama_kv_iswa_resident_status::ok);
+    const int commits_before_cancel = commit_calls;
+    llama_kv_iswa_resident_status cancel_status;
+    size_t                        cancel_allocations = 0;
+    {
+        allocation_scope allocations;
+        cancel_status      = f.cache.rollback_resident_attach(cancelled);
+        cancel_allocations = allocations.finish();
+    }
+    assert(cancel_status == llama_kv_iswa_resident_status::ok);
+    assert(cancel_allocations == 0);
+    assert(f.cache.rollback_resident_attach(cancelled) == llama_kv_iswa_resident_status::ok);
+    assert(f.cache.commit_resident_attach_final(
+                   cancelled, llama_kv_iswa_resident_final_step::confirmed) ==
+           llama_kv_iswa_resident_status::stale_quote);
+    assert(commit_calls == commits_before_cancel);
+    assert(f.cache.has_resident_handles());
+
+    llama_kv_iswa_resident_attach_quote allocation_failure;
+    size_t                              failed_quote_allocations = 0;
+    {
+        allocation_scope allocations(true);
+        allocation_failure       = f.cache.quote_resident_attach(handle, 1);
+        failed_quote_allocations = allocations.finish();
+    }
+    assert(failed_quote_allocations == 1);
+    assert(allocation_failure.status == llama_kv_iswa_resident_status::resource_exhausted);
+    assert(f.cache.has_resident_handles());
+    assert(f.cache.get_base()->get_cells(1).get_used() == 0);
+    assert(f.cache.get_swa()->get_cells(1).get_used() == 0);
+
+    llama_kv_iswa_fail_next_resident_allocation_for_test();
+    const auto post_backend_allocation_failure = f.cache.quote_resident_attach(handle, 1);
+    assert(post_backend_allocation_failure.status == llama_kv_iswa_resident_status::resource_exhausted);
+    assert(f.cache.has_resident_handles());
+
+    auto stale = f.cache.quote_resident_attach(handle, 1);
+    assert(stale.status == llama_kv_iswa_resident_status::ok);
+    const int commits_before_stale = commit_calls;
+    assert(f.cache.seq_rm(1, 999, 1000));
+    assert(f.cache.commit_resident_attach_final(
+                   stale, llama_kv_iswa_resident_final_step::confirmed) ==
+           llama_kv_iswa_resident_status::stale_quote);
+    assert(commit_calls == commits_before_stale);
+    assert(f.cache.rollback_resident_attach(stale) == llama_kv_iswa_resident_status::ok);
+
+    f.put_metadata(1, 0, 0, 8);
+    assert(f.cache.quote_resident_attach(handle, 1).status == llama_kv_iswa_resident_status::slot_occupied);
+    f.cache.clear(false);
+
+    cache_fixture foreign;
+    auto          prepared = f.cache.quote_resident_attach(handle, 1);
+    assert(prepared.status == llama_kv_iswa_resident_status::ok);
+    assert(foreign.cache.commit_resident_attach_final(
+                   prepared, llama_kv_iswa_resident_final_step::confirmed) ==
+           llama_kv_iswa_resident_status::stale_quote);
+    assert(foreign.cache.rollback_resident_attach(prepared) == llama_kv_iswa_resident_status::stale_quote);
+
+    commit_status = GGML_DSV4_SPARSE_OOM;
+    const int commits_before_failure = commit_calls;
+    assert(f.cache.commit_resident_attach_final(
+                   prepared, llama_kv_iswa_resident_final_step::confirmed) ==
+           llama_kv_iswa_resident_status::resource_exhausted);
+    assert(commit_calls == commits_before_failure + 1);
+    assert(f.cache.has_resident_handles());
+    assert(f.cache.get_base()->get_cells(1).get_used() == 0);
+    assert(f.cache.get_swa()->get_cells(1).get_used() == 0);
+    assert(f.cache.rollback_resident_attach(prepared) == llama_kv_iswa_resident_status::ok);
+    assert(f.cache.rollback_resident_attach(prepared) == llama_kv_iswa_resident_status::ok);
+    commit_status = GGML_DSV4_SPARSE_OK;
+    assert(f.cache.commit_resident_attach_final(
+                   prepared, llama_kv_iswa_resident_final_step::confirmed) ==
+           llama_kv_iswa_resident_status::stale_quote);
+
+    auto retry = f.cache.quote_resident_attach(handle, 1);
+    assert(retry.status == llama_kv_iswa_resident_status::ok);
+    retry.execution_id       = 0;
+    retry.resident.pool_id   = UINT64_MAX;
+    retry.resident.id        = UINT64_MAX;
+    retry.resident.generation = UINT64_MAX;
+    llama_kv_iswa_resident_status final_status;
+    size_t                        final_allocations = 0;
+    {
+        allocation_scope allocations;
+        final_status = f.cache.commit_resident_attach_final(
+                retry, llama_kv_iswa_resident_final_step::confirmed);
+        final_allocations = allocations.finish();
+    }
+    assert(final_status == llama_kv_iswa_resident_status::ok);
+    assert(final_allocations == 0);
+    assert(!f.cache.has_resident_handles());
+    assert(f.cache.get_base()->get_cells(1).seq_has(7, 1));
+    assert(f.cache.get_swa()->get_cells(1).seq_has(7, 1));
+    assert(f.stream_bytes(f.base_k(), 1) == base_before);
+    assert(f.stream_bytes(f.swa_k(), 1) == swa_before);
+
+    const int commits_after_success = commit_calls;
+    assert(f.cache.rollback_resident_attach(retry) == llama_kv_iswa_resident_status::stale_quote);
+    assert(f.stream_bytes(f.base_k(), 1) == base_before);
+    assert(f.stream_bytes(f.swa_k(), 1) == swa_before);
+    assert(f.cache.commit_resident_attach_final(
+                   retry, llama_kv_iswa_resident_final_step::confirmed) ==
+           llama_kv_iswa_resident_status::stale_quote);
+    assert(commit_calls == commits_after_success);
+    assert(f.cache.quote_resident_attach(handle, 0).status == llama_kv_iswa_resident_status::stale_handle);
+}
+
 struct backend_status_case {
     int backend;
     llama_kv_iswa_resident_status detach_quote;
@@ -730,6 +923,7 @@ int main() {
     test_quote_staleness_and_no_backend_mutation();
     test_pending_copy_fail_closed();
     test_backend_failures_are_atomic_and_retryable();
+    test_prepared_attach_final_step_contract();
     test_backend_status_mapping_by_transaction_phase();
     test_cross_pool_handle_rejected();
     test_disabled_path_does_not_offer_residency();

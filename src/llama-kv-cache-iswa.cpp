@@ -190,6 +190,28 @@ struct llama_kv_iswa_resident_detach_plan {
     std::map<uint64_t, llama_kv_iswa_resident_record>      prepared;
 };
 
+enum class llama_kv_iswa_resident_attach_state : uint8_t {
+    prepared,
+    committed,
+    cancelled,
+};
+
+struct llama_kv_iswa_resident_attach_plan {
+    std::shared_ptr<const llama_kv_iswa_resident_identity> owner;
+    uint64_t                                               epoch      = 0;
+    uint64_t                                               version[2] = { 0, 0 };
+    llama_seq_id                                           execution_id = -1;
+    llama_kv_iswa_resident_handle                          resident;
+    uint32_t                                               resident_slot = UINT32_MAX;
+    uint32_t                                               base_head = 0;
+    uint32_t                                               swa_head  = 0;
+    llama_kv_cells                                         base_cells;
+    llama_kv_cells                                         swa_cells;
+    backend_move_quote                                     backend;
+    llama_kv_iswa_resident_attach_state                    state =
+            llama_kv_iswa_resident_attach_state::prepared;
+};
+
 const char * llama_kv_iswa_resident_status_name(llama_kv_iswa_resident_status status) {
     switch (status) {
         case llama_kv_iswa_resident_status::ok:
@@ -663,35 +685,46 @@ llama_kv_iswa_resident_result llama_kv_cache_iswa::detach_resident(const llama_k
     }
 }
 
-llama_kv_iswa_resident_status llama_kv_cache_iswa::attach_resident(llama_kv_iswa_resident_handle handle,
-                                                                   llama_seq_id                  execution_id) {
+llama_kv_iswa_resident_attach_quote llama_kv_cache_iswa::quote_resident_attach(
+        llama_kv_iswa_resident_handle handle,
+        llama_seq_id                  execution_id) const {
+    llama_kv_iswa_resident_attach_quote result;
+    result.execution_id = execution_id;
+    result.resident     = handle;
     try {
         [[maybe_unused]] auto resident_scope = lock_resident();
         if (!resident || handle.pool_id != resident->identity->id || handle.id == 0) {
-            return llama_kv_iswa_resident_status::stale_handle;
+            result.status = llama_kv_iswa_resident_status::stale_handle;
+            return result;
         }
         auto it = resident->handles.find(handle.id);
         if (it == resident->handles.end() || it->second.generation != handle.generation) {
-            return llama_kv_iswa_resident_status::stale_handle;
+            result.status = llama_kv_iswa_resident_status::stale_handle;
+            return result;
         }
         if (execution_id < 0 || (uint32_t) execution_id >= kv_base->get_n_stream()) {
-            return llama_kv_iswa_resident_status::invalid_sequence;
+            result.status = llama_kv_iswa_resident_status::invalid_sequence;
+            return result;
         }
         if (!resident_is_quiescent()) {
-            return llama_kv_iswa_resident_status::not_quiescent;
+            result.status = llama_kv_iswa_resident_status::not_quiescent;
+            return result;
         }
         if (!kv_base->resident_execution_layout(execution_id) || !kv_swa->resident_execution_layout(execution_id)) {
-            return llama_kv_iswa_resident_status::unsupported_layout;
+            result.status = llama_kv_iswa_resident_status::unsupported_layout;
+            return result;
         }
         if (!kv_base->resident_execution_empty(execution_id) || !kv_swa->resident_execution_empty(execution_id)) {
-            return llama_kv_iswa_resident_status::slot_occupied;
+            result.status = llama_kv_iswa_resident_status::slot_occupied;
+            return result;
         }
 
         llama_kv_cells base_cells = it->second.base_cells;
         llama_kv_cells swa_cells  = it->second.swa_cells;
         if (!base_cells.seq_replace(it->second.source_execution, execution_id) ||
             !swa_cells.seq_replace(it->second.source_execution, execution_id)) {
-            return llama_kv_iswa_resident_status::backend_error;
+            result.status = llama_kv_iswa_resident_status::backend_error;
+            return result;
         }
 
         std::vector<ggml_tensor *> sources;
@@ -702,25 +735,106 @@ llama_kv_iswa_resident_status llama_kv_cache_iswa::attach_resident(llama_kv_iswa
         kv_swa->resident_append_views((uint32_t) execution_id, false, destinations);
         auto backend = llama_kv_iswa_quote_move(sources, &destinations);
         if (!backend.value) {
-            return llama_kv_iswa_backend_status(backend.status, sparse_move_phase::attach_quote);
+            result.status = llama_kv_iswa_backend_status(backend.status, sparse_move_phase::attach_quote);
+            return result;
         }
-        const int backend_status = backend.commit(backend.value.get());
-        if (backend_status != GGML_DSV4_SPARSE_OK) {
-            return llama_kv_iswa_backend_status(backend_status, sparse_move_phase::attach_commit);
+        if (sparse_move_test_fail_next_allocation) {
+            sparse_move_test_fail_next_allocation = false;
+            throw std::bad_alloc();
         }
 
-        const uint32_t slot = it->second.slot;
-        kv_base->resident_restore_execution(execution_id, std::move(base_cells), it->second.base_head);
-        kv_swa->resident_restore_execution(execution_id, std::move(swa_cells), it->second.swa_head);
-        resident->slots[slot] = false;
-        resident->handles.erase(it);
-        GGML_ASSERT(resident->guard->parked_handles > 0);
-        --resident->guard->parked_handles;
-        ++resident->epoch;
-        return llama_kv_iswa_resident_status::ok;
+        auto plan            = std::make_shared<llama_kv_iswa_resident_attach_plan>();
+        plan->owner          = resident->identity;
+        plan->epoch          = resident->epoch;
+        plan->version[0]     = resident->guard->version[0];
+        plan->version[1]     = resident->guard->version[1];
+        plan->execution_id   = execution_id;
+        plan->resident       = handle;
+        plan->resident_slot  = it->second.slot;
+        plan->base_head      = it->second.base_head;
+        plan->swa_head       = it->second.swa_head;
+        plan->base_cells     = std::move(base_cells);
+        plan->swa_cells      = std::move(swa_cells);
+        plan->backend        = std::move(backend);
+
+        result.status = llama_kv_iswa_resident_status::ok;
+        result.plan   = std::move(plan);
+        return result;
     } catch (const std::bad_alloc &) {
-        return llama_kv_iswa_resident_status::resource_exhausted;
+        result.status = llama_kv_iswa_resident_status::resource_exhausted;
+        result.plan.reset();
+        return result;
     }
+}
+
+llama_kv_iswa_resident_status llama_kv_cache_iswa::commit_resident_attach_final(
+        const llama_kv_iswa_resident_attach_quote & quote,
+        llama_kv_iswa_resident_final_step final_step) {
+    [[maybe_unused]] auto resident_scope = lock_resident();
+    if (final_step != llama_kv_iswa_resident_final_step::confirmed || !resident || !quote.plan ||
+        quote.plan->owner != resident->identity ||
+        quote.plan->state != llama_kv_iswa_resident_attach_state::prepared ||
+        quote.plan->epoch != resident->epoch ||
+        quote.plan->version[0] != resident->guard->version[0] ||
+        quote.plan->version[1] != resident->guard->version[1] || !resident_is_quiescent() ||
+        quote.plan->execution_id < 0 ||
+        (uint32_t) quote.plan->execution_id >= kv_base->get_n_stream() ||
+        !kv_base->resident_execution_empty(quote.plan->execution_id) ||
+        !kv_swa->resident_execution_empty(quote.plan->execution_id)) {
+        return llama_kv_iswa_resident_status::stale_quote;
+    }
+
+    auto it = resident->handles.find(quote.plan->resident.id);
+    if (it == resident->handles.end() || it->second.generation != quote.plan->resident.generation ||
+        it->second.slot != quote.plan->resident_slot || quote.plan->resident_slot >= resident->slots.size() ||
+        !resident->slots[quote.plan->resident_slot]) {
+        return llama_kv_iswa_resident_status::stale_quote;
+    }
+
+    const int backend_status = quote.plan->backend.commit(quote.plan->backend.value.get());
+    if (backend_status != GGML_DSV4_SPARSE_OK) {
+        return llama_kv_iswa_backend_status(backend_status, sparse_move_phase::attach_commit);
+    }
+
+    kv_base->resident_restore_execution(
+            quote.plan->execution_id, std::move(quote.plan->base_cells), quote.plan->base_head);
+    kv_swa->resident_restore_execution(
+            quote.plan->execution_id, std::move(quote.plan->swa_cells), quote.plan->swa_head);
+    resident->slots[quote.plan->resident_slot] = false;
+    resident->handles.erase(it);
+    GGML_ASSERT(resident->guard->parked_handles > 0);
+    --resident->guard->parked_handles;
+    ++resident->epoch;
+    quote.plan->state = llama_kv_iswa_resident_attach_state::committed;
+    return llama_kv_iswa_resident_status::ok;
+}
+
+llama_kv_iswa_resident_status llama_kv_cache_iswa::rollback_resident_attach(
+        const llama_kv_iswa_resident_attach_quote & quote) {
+    [[maybe_unused]] auto resident_scope = lock_resident();
+    if (!resident || !quote.plan || quote.plan->owner != resident->identity) {
+        return llama_kv_iswa_resident_status::stale_quote;
+    }
+    if (quote.plan->state == llama_kv_iswa_resident_attach_state::cancelled) {
+        return llama_kv_iswa_resident_status::ok;
+    }
+    if (quote.plan->state == llama_kv_iswa_resident_attach_state::committed) {
+        // The backend has no reverse move ticket. Never pretend that a
+        // successful final-step commit was rolled back.
+        return llama_kv_iswa_resident_status::stale_quote;
+    }
+    quote.plan->state = llama_kv_iswa_resident_attach_state::cancelled;
+    return llama_kv_iswa_resident_status::ok;
+}
+
+llama_kv_iswa_resident_status llama_kv_cache_iswa::attach_resident(
+        llama_kv_iswa_resident_handle handle,
+        llama_seq_id                  execution_id) {
+    const auto quote = quote_resident_attach(handle, execution_id);
+    if (quote.status != llama_kv_iswa_resident_status::ok) {
+        return quote.status;
+    }
+    return commit_resident_attach_final(quote, llama_kv_iswa_resident_final_step::confirmed);
 }
 
 llama_kv_iswa_resident_status llama_kv_cache_iswa::release_resident(llama_kv_iswa_resident_handle handle) {

@@ -1,13 +1,82 @@
 #include "llama-dsv4-comp-pool.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <iostream>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+namespace allocation_probe {
+thread_local bool   enabled = false;
+thread_local bool   reject  = false;
+thread_local size_t calls   = 0;
+}
+
+[[gnu::noinline]] void * operator new(std::size_t size) {
+    if (allocation_probe::enabled) {
+        ++allocation_probe::calls;
+        if (allocation_probe::reject) {
+            throw std::bad_alloc();
+        }
+    }
+    if (void * value = std::malloc(size == 0 ? 1 : size)) {
+        return value;
+    }
+    throw std::bad_alloc();
+}
+
+[[gnu::noinline]] void * operator new[](std::size_t size) {
+    return ::operator new(size);
+}
+
+[[gnu::noinline]] void operator delete(void * value) noexcept {
+    std::free(value);
+}
+
+[[gnu::noinline]] void operator delete[](void * value) noexcept {
+    ::operator delete(value);
+}
+
+[[gnu::noinline]] void operator delete(void * value, std::size_t) noexcept {
+    std::free(value);
+}
+
+[[gnu::noinline]] void operator delete[](void * value, std::size_t) noexcept {
+    ::operator delete(value);
+}
+
 namespace {
+
+struct allocation_scope {
+    explicit allocation_scope(bool reject = false) {
+        expect_disabled();
+        allocation_probe::calls   = 0;
+        allocation_probe::reject  = reject;
+        allocation_probe::enabled = true;
+    }
+
+    ~allocation_scope() {
+        allocation_probe::enabled = false;
+        allocation_probe::reject  = false;
+    }
+
+    size_t finish() {
+        const size_t result        = allocation_probe::calls;
+        allocation_probe::enabled = false;
+        allocation_probe::reject  = false;
+        return result;
+    }
+
+  private:
+    static void expect_disabled() {
+        if (allocation_probe::enabled) {
+            std::abort();
+        }
+    }
+};
 
 [[noreturn]] void fail(const std::string & message) {
     throw std::runtime_error(message);
@@ -622,6 +691,133 @@ void test_resident_detach_attach_release_contract() {
     expect_status(pool.remove_handle(occupant), llama_dsv4_comp_status::ok, "remove attach occupant");
 }
 
+void test_prepared_resident_attach_transaction() {
+    llama_dsv4_comp_pool pool({ 8, 4 });
+    const auto           source = create_handle(pool);
+    commit_change(pool, source, llama_dsv4_comp_family::c4, 65);
+    commit_change(pool, source, llama_dsv4_comp_family::hca, 1);
+    expect_status(pool.bind(3, source), llama_dsv4_comp_status::ok, "bind prepared source");
+    const auto detached = pool.detach(pool.quote_detach(3));
+    expect_status(detached.status, llama_dsv4_comp_status::ok, "detach prepared source");
+    const auto resident_baseline = pool.memory_usage_snapshot();
+
+    auto cancelled = pool.quote_attach(detached.resident, 7);
+    expect_status(cancelled.status, llama_dsv4_comp_status::ok, "quote cancellable attach");
+    expect(pool.memory_usage_snapshot().epoch == resident_baseline.epoch, "attach quote mutated epoch");
+    expect_status(pool.rollback_attach(cancelled), llama_dsv4_comp_status::ok, "cancel prepared attach");
+    expect_status(pool.rollback_attach(cancelled), llama_dsv4_comp_status::ok, "idempotent prepared cancel");
+    expect_status(pool.commit_attach(cancelled), llama_dsv4_comp_status::stale_quote,
+                  "commit replayed cancelled attach");
+
+    llama_dsv4_comp_attach_quote allocation_failure;
+    size_t                       failed_quote_allocations = 0;
+    {
+        allocation_scope allocations(true);
+        allocation_failure       = pool.quote_attach(detached.resident, 7);
+        failed_quote_allocations = allocations.finish();
+    }
+    expect(failed_quote_allocations == 1, "prepared attach allocation failure was not deterministic");
+    expect_status(allocation_failure.status, llama_dsv4_comp_status::resource_exhausted,
+                  "prepared attach allocation failure status");
+    const auto after_allocation_failure = pool.memory_usage_snapshot();
+    expect(after_allocation_failure.epoch == resident_baseline.epoch &&
+               after_allocation_failure.bindings == resident_baseline.bindings &&
+               after_allocation_failure.resident_handles == resident_baseline.resident_handles,
+           "failed prepared allocation changed ownership");
+    expect_family_equal(after_allocation_failure.c4, resident_baseline.c4,
+                        "failed prepared allocation changed C4 accounting");
+    expect_family_equal(after_allocation_failure.hca, resident_baseline.hca,
+                        "failed prepared allocation changed HCA accounting");
+
+    auto stale = pool.quote_attach(detached.resident, 7);
+    expect_status(stale.status, llama_dsv4_comp_status::ok, "quote stale attach");
+    const auto unrelated = create_handle(pool);
+    expect_status(pool.commit_attach(stale), llama_dsv4_comp_status::stale_quote,
+                  "prepared attach ignored intervening mutation");
+    expect_status(pool.rollback_attach(stale), llama_dsv4_comp_status::ok,
+                  "stale prepared attach did not cancel");
+    expect_status(pool.remove_handle(unrelated), llama_dsv4_comp_status::ok, "remove stale mutation handle");
+
+    const auto occupant = create_handle(pool);
+    expect_status(pool.bind(7, occupant), llama_dsv4_comp_status::ok, "bind prepared occupant");
+    expect_status(pool.quote_attach(detached.resident, 7).status, llama_dsv4_comp_status::slot_occupied,
+                  "prepared quote accepted occupied target");
+    expect_status(pool.unbind(7), llama_dsv4_comp_status::ok, "unbind prepared occupant");
+    expect_status(pool.remove_handle(occupant), llama_dsv4_comp_status::ok, "remove prepared occupant");
+
+    const auto ticket = pool.try_reserve(pool.quote_batch({}));
+    expect_status(ticket.status, llama_dsv4_comp_status::ok, "reserve prepared busy ticket");
+    expect_status(pool.quote_attach(detached.resident, 7).status, llama_dsv4_comp_status::busy,
+                  "prepared quote ignored active ticket");
+    expect_status(pool.cancel(ticket.ticket), llama_dsv4_comp_status::ok, "cancel prepared busy ticket");
+
+    llama_dsv4_comp_pool foreign({ 1, 1 });
+    auto                  prepared = pool.quote_attach(detached.resident, 7);
+    expect_status(prepared.status, llama_dsv4_comp_status::ok, "quote prepared attach");
+    expect_status(foreign.commit_attach(prepared), llama_dsv4_comp_status::stale_quote,
+                  "foreign pool committed prepared attach");
+    expect_status(foreign.rollback_attach(prepared), llama_dsv4_comp_status::stale_quote,
+                  "foreign pool cancelled prepared attach");
+
+    prepared.execution_id             = 0;
+    prepared.pool_epoch               = UINT64_MAX;
+    prepared.resident.pool_id         = UINT64_MAX;
+    prepared.resident.lease_generation = UINT64_MAX;
+    llama_dsv4_comp_status commit_status;
+    size_t                 commit_allocations = 0;
+    {
+        allocation_scope allocations;
+        commit_status      = pool.commit_attach(prepared);
+        commit_allocations = allocations.finish();
+    }
+    expect_status(commit_status, llama_dsv4_comp_status::ok, "commit prepared attach");
+    expect(commit_allocations == 0, "prepared attach commit allocated");
+    llama_dsv4_comp_handle_id rebound = 0;
+    expect_status(pool.get_binding(7, rebound), llama_dsv4_comp_status::ok, "prepared binding missing");
+    expect(rebound == source, "prepared attach trusted mutable quote fields");
+    expect_status(pool.commit_attach(prepared), llama_dsv4_comp_status::stale_quote,
+                  "prepared attach commit replay succeeded");
+
+    llama_dsv4_comp_status rollback_status;
+    size_t                 rollback_allocations = 0;
+    {
+        allocation_scope allocations;
+        rollback_status      = pool.rollback_attach(prepared);
+        rollback_allocations = allocations.finish();
+    }
+    expect_status(rollback_status, llama_dsv4_comp_status::ok, "rollback committed attach");
+    expect(rollback_allocations == 0, "committed attach rollback allocated");
+    expect_status(pool.get_binding(7, rebound), llama_dsv4_comp_status::binding_not_found,
+                  "attach rollback retained binding");
+    auto usage = pool.memory_usage_snapshot();
+    expect(usage.bindings == resident_baseline.bindings &&
+               usage.resident_handles == resident_baseline.resident_handles,
+           "attach rollback did not restore resident ownership");
+    expect_family_equal(usage.c4, resident_baseline.c4, "attach rollback changed C4 accounting");
+    expect_family_equal(usage.hca, resident_baseline.hca, "attach rollback changed HCA accounting");
+    expect_status(pool.rollback_attach(prepared), llama_dsv4_comp_status::ok,
+                  "committed attach rollback was not idempotent");
+    expect_status(pool.commit_attach(prepared), llama_dsv4_comp_status::stale_quote,
+                  "rolled-back attach recommitted");
+
+    auto retry = pool.quote_attach(detached.resident, 5);
+    expect_status(retry.status, llama_dsv4_comp_status::ok, "quote exact attach retry");
+    expect_status(pool.commit_attach(retry), llama_dsv4_comp_status::ok, "commit exact attach retry");
+    const auto intervening = create_handle(pool);
+    expect_status(pool.rollback_attach(retry), llama_dsv4_comp_status::stale_quote,
+                  "post-commit rollback ignored intervening mutation");
+    expect_status(pool.remove_handle(intervening), llama_dsv4_comp_status::ok, "remove rollback mutation handle");
+
+    const auto detached_again = pool.detach(pool.quote_detach(5));
+    expect_status(detached_again.status, llama_dsv4_comp_status::ok, "detach prepared retry");
+    expect(detached_again.resident.lease_generation > detached.resident.lease_generation,
+           "prepared retry did not advance lease generation");
+    expect_status(pool.quote_attach(detached.resident, 5).status, llama_dsv4_comp_status::stale_handle,
+                  "stale lease generation prepared attach");
+    expect_status(pool.release(detached_again.resident), llama_dsv4_comp_status::ok,
+                  "release prepared retry lease");
+}
+
 void test_bounded_ticket_history_and_pool_identity() {
     {
         llama_dsv4_comp_pool   pool({ 0, 0 });
@@ -850,6 +1046,7 @@ int main() {
         test_exhaustion_immutability_and_ticket_idempotence();
         test_copy_remove_cycles_return_accounting_baseline();
         test_resident_detach_attach_release_contract();
+        test_prepared_resident_attach_transaction();
         test_bounded_ticket_history_and_pool_identity();
         test_sixty_four_handle_rounded_capacity_contract();
         test_deterministic_quotes_and_full_context_boundary();
