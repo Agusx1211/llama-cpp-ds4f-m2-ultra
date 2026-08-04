@@ -1,0 +1,141 @@
+{
+  "schema": 1,
+  "require_clean_source": true,
+  "phase_order": [
+    "disconnected",
+    "connected",
+    "connected",
+    "disconnected"
+  ],
+  "repetitions_per_block": 2,
+  "minimum_samples_per_phase": 4,
+  "warmups_per_block": 1,
+  "no_meaningful_impact_percent": 5.0,
+  "maximum_cv_percent": 20.0,
+  "maximum_swap_delta_bytes": 0,
+  "request_timeout_seconds": 900,
+  "server": {
+    "base_url": "http://127.0.0.1:18130",
+    "command": [
+      "build-phase8-dashboard-gate/bin/llama-server",
+      "-m",
+      "{model}",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "18130",
+      "-c",
+      "32768",
+      "-np",
+      "2",
+      "--no-kv-unified",
+      "-b",
+      "2048",
+      "-ub",
+      "2048",
+      "-t",
+      "16",
+      "-tb",
+      "16",
+      "-ctk",
+      "f16",
+      "-ctv",
+      "f16",
+      "-ngl",
+      "999",
+      "-fa",
+      "on",
+      "-fit",
+      "off",
+      "--cache-ram",
+      "0",
+      "--no-cache-idle-slots",
+      "--no-context-shift",
+      "--no-cache-prompt",
+      "--metrics",
+      "--slots"
+    ],
+    "ready_timeout_seconds": 900,
+    "teardown_timeout_seconds": 30
+  },
+  "dashboard_probe": {
+    "script": "tools/m2-dashboard/target/live-probe.mjs",
+    "node": "/opt/homebrew/bin/node",
+    "timeout_ms": 900000,
+    "establish_timeout_ms": 30000,
+    "ready_timeout_seconds": 30,
+    "teardown_timeout_seconds": 30,
+    "minimum_events": 1,
+    "require_refill_states": true,
+    "refill_states": [
+      "window_open"
+    ]
+  },
+  "workload": {
+    "requests": [
+      {
+        "tag": "dashboard-gate-low",
+        "lane": "low",
+        "prompt_tokens": 8192,
+        "n_predict": 8,
+        "salt": 1001,
+        "seed": 42,
+        "offset_ms": 0
+      },
+      {
+        "tag": "dashboard-gate-fast-0",
+        "lane": "fast",
+        "prompt_tokens": 128,
+        "n_predict": 4,
+        "salt": 5001,
+        "seed": 42,
+        "offset_ms": 1000
+      },
+      {
+        "tag": "dashboard-gate-fast-1",
+        "lane": "fast",
+        "prompt_tokens": 128,
+        "n_predict": 4,
+        "salt": 5002,
+        "seed": 42,
+        "offset_ms": 11000
+      },
+      {
+        "tag": "dashboard-gate-fast-2",
+        "lane": "fast",
+        "prompt_tokens": 128,
+        "n_predict": 4,
+        "salt": 5003,
+        "seed": 42,
+        "offset_ms": 21000
+      },
+      {
+        "tag": "dashboard-gate-fast-3",
+        "lane": "fast",
+        "prompt_tokens": 128,
+        "n_predict": 4,
+        "salt": 5004,
+        "seed": 42,
+        "offset_ms": 28000
+      }
+    ]
+  },
+  "system_samples": [
+    {
+      "name": "swap",
+      "command": [
+        "/usr/sbin/sysctl",
+        "vm.swapusage"
+      ],
+      "required": true
+    },
+    {
+      "name": "pressure",
+      "command": [
+        "/usr/bin/memory_pressure",
+        "-Q"
+      ],
+      "required": true
+    }
+  ]
+}
