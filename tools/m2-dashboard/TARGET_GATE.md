@@ -14,13 +14,18 @@ Do not call a run an exit-gate pass if the sample count or variance gate fails.
 
 ## Contract and security
 
-The probe uses `lib/live.mjs` and the strict shared snapshot/event parsers. It
-reports both the snapshot's schema version and the parser's exported
-`SCHEMA_VERSION`; it does not carry a private copy of dashboard schema v1 or v2.
-When shared schema v2 is integrated, the example also requires authoritative
-`fast_refill` objects in a parsed snapshot and parsed request events, including
-an observed `window_open` state. State labels are derived only from the parsed
-configuration, cohort, and refill fields.
+The checked-in target configuration uses the dependency-free Python probe in
+`target/live_probe.py`, because a stock macOS target is not required to have a
+JavaScript runtime. It strictly checks the schema-v2 wire envelope, redaction,
+and the authoritative `fast_refill` configuration/cohort/refill invariants.
+The host checks still run the browser's `lib/live.mjs` transport and full shared
+snapshot/event parsers, so the target fallback does not replace browser/parser
+coverage. An explicit `dashboard_probe.command` selects the probe executable;
+the harness never downloads or installs target dependencies.
+
+The example requires authoritative `fast_refill` objects in a snapshot and
+request events, including an observed `window_open` state. State labels are
+derived only from the validated configuration, cohort, and refill fields.
 
 Both credentials are accepted only through the process environment. They are
 never accepted in a URL, command argument, config file, report, or artifact.

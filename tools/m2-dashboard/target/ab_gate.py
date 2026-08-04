@@ -38,6 +38,8 @@ MAX_WORKLOAD_REQUESTS = 64
 MAX_TOTAL_PROMPT_TOKENS = 1024 * 1024
 MAX_TOTAL_PREDICT_TOKENS = 64 * 1024
 MAX_PREDICT_TOKENS = 4096
+MAX_PROBE_COMMAND_ARGUMENTS = 16
+MAX_PROBE_COMMAND_ARGUMENT_BYTES = 4096
 MAX_RESPONSE_LINE_BYTES = 1024 * 1024
 DEFAULT_ERROR_PATTERNS = (
     "ggml_metal_graph_compute: command buffer",
@@ -216,6 +218,20 @@ def expand_command(command: Any, model: str) -> list[str]:
     if not isinstance(command, list) or not command or not all(isinstance(value, str) for value in command):
         raise GateError("server.command must be a non-empty string array")
     return [value.replace("{model}", model) for value in command]
+
+
+def validate_probe_command(command: Any) -> list[str]:
+    if (not isinstance(command, list) or not command or
+            len(command) > MAX_PROBE_COMMAND_ARGUMENTS or
+            not all(isinstance(value, str) and value for value in command)):
+        raise GateError(
+            f"dashboard_probe.command must contain 1..{MAX_PROBE_COMMAND_ARGUMENTS} non-empty strings")
+    for value in command:
+        if (len(value.encode()) > MAX_PROBE_COMMAND_ARGUMENT_BYTES or
+                any(character in value for character in ("\0", "\n", "\r"))):
+            raise GateError(
+                "dashboard_probe.command arguments must be bounded strings without control characters")
+    return list(command)
 
 
 def validate_secret_boundary(config: dict[str, Any], command: list[str], redactor: Redactor) -> None:
@@ -630,7 +646,6 @@ def run_gate(config: dict[str, Any], artifact: pathlib.Path, repo: pathlib.Path)
     if not model:
         raise GateError("M2_DASHBOARD_MODEL is required in the environment")
     command = expand_command(server.get("command"), model)
-    validate_secret_boundary(config, command, redactor)
     workload = validate_workload(config.get("workload", {}).get("requests"))
 
     phase_order, repetitions, minimum_samples, available_per_phase = validate_phase_plan(config)
@@ -669,6 +684,8 @@ def run_gate(config: dict[str, Any], artifact: pathlib.Path, repo: pathlib.Path)
     unknown_refill_states = set(refill_states) - supported_refill_states
     if unknown_refill_states:
         raise GateError(f"dashboard_probe.refill_states contains unknown values: {sorted(unknown_refill_states)}")
+    probe_command = validate_probe_command(probe.get("command"))
+    validate_secret_boundary(config, command + probe_command, redactor)
 
     artifact.mkdir(parents=True, exist_ok=False)
     identity = command_identity(command, repo)
@@ -701,10 +718,6 @@ def run_gate(config: dict[str, Any], artifact: pathlib.Path, repo: pathlib.Path)
         phase_sample_counts = {"disconnected": 0, "connected": 0}
         for block, phase in enumerate(phase_order):
             if phase == "connected":
-                probe_script = pathlib.Path(str(probe.get(
-                    "script", "tools/m2-dashboard/target/live-probe.mjs")))
-                if not probe_script.is_absolute():
-                    probe_script = repo / probe_script
                 probe_environment = dict(environment)
                 probe_environment.update({
                     "M2_DASHBOARD_BASE_URL": base_url,
@@ -717,7 +730,7 @@ def run_gate(config: dict[str, Any], artifact: pathlib.Path, repo: pathlib.Path)
                 if refill_states:
                     probe_environment["M2_DASHBOARD_REFILL_STATES"] = ",".join(refill_states)
                 probe_process = subprocess.Popen(
-                    [str(probe.get("node", "node")), str(probe_script)],
+                    probe_command,
                     cwd=repo,
                     env=probe_environment,
                     stdin=subprocess.PIPE,

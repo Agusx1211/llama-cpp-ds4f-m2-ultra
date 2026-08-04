@@ -38,6 +38,15 @@ class TargetGateTests(unittest.TestCase):
             ab_gate.validate_secret_boundary(
                 {}, ["server", "--api-key", "not-a-real-key"], redactor)
 
+    def test_probe_command_is_explicit_and_bounded(self):
+        self.assertEqual(
+            ab_gate.validate_probe_command(["/usr/bin/python3", "target/live_probe.py"]),
+            ["/usr/bin/python3", "target/live_probe.py"],
+        )
+        for command in (None, [], [""], ["python3", "bad\nargument"], ["x"] * 17):
+            with self.assertRaises(ab_gate.GateError):
+                ab_gate.validate_probe_command(command)
+
     def test_loopback_url_boundary(self):
         self.assertEqual(ab_gate.require_loopback_url("http://127.0.0.1:18130/"),
                          "http://127.0.0.1:18130")

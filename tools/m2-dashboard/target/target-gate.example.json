@@ -59,8 +59,10 @@
     "teardown_timeout_seconds": 30
   },
   "dashboard_probe": {
-    "script": "tools/m2-dashboard/target/live-probe.mjs",
-    "node": "/opt/homebrew/bin/node",
+    "command": [
+      "/usr/bin/python3",
+      "tools/m2-dashboard/target/live_probe.py"
+    ],
     "timeout_ms": 900000,
     "establish_timeout_ms": 30000,
     "ready_timeout_seconds": 30,
