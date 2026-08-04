@@ -1225,6 +1225,7 @@ static bool test_dsv4_admission_lifecycle(size_t seed, ggml_backend_dev_t dev) {
     llama_memory_clear(llama_get_memory(test.lctx.get()), true);
     GGML_ASSERT(dsv4_usage_footprint_equal(baseline, memory->memory_usage_snapshot()) &&
             "mixed continuation admission did not return to baseline after logical clear");
+    test.clear_batch();
 
     const std::array<llama_kv_admission_span, 2> family = {{
         { 0, 0, 8 },
