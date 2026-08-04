@@ -638,7 +638,7 @@ async function main() {
             showConnectionError(error);
         }
     });
-    globalThis.addEventListener("pagehide", stopActiveConnection, { once: true });
+    globalThis.addEventListener("pagehide", stopActiveConnection);
     await connectFixture();
 }
 

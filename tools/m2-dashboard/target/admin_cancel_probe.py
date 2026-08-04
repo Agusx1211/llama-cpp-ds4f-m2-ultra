@@ -36,9 +36,10 @@ def distinct_credential(value: str) -> str:
 
 
 class HttpResult:
-    def __init__(self, status: int, body: Any):
+    def __init__(self, status: int, body: Any, headers: list[tuple[str, str]] | None = None):
         self.status = status
         self.body = body
+        self.headers = [] if headers is None else headers
 
 
 def request_json(
@@ -59,7 +60,7 @@ def request_json(
         if len(data) > maximum_bytes:
             raise live.ProbeError(f"{url} response exceeds {maximum_bytes} bytes")
         parsed = live.parse_json_bytes(data, url) if data else None
-        return HttpResult(response.status, parsed)
+        return HttpResult(response.status, parsed, list(response.headers.items()))
     finally:
         response.close()
 
@@ -91,7 +92,7 @@ def request_json_header_pairs(
         if len(data) > maximum_bytes:
             raise live.ProbeError(f"{url} response exceeds {maximum_bytes} bytes")
         parsed_body = live.parse_json_bytes(data, url) if data else None
-        return HttpResult(response.status, parsed_body)
+        return HttpResult(response.status, parsed_body, response.getheaders())
     finally:
         connection.close()
 
@@ -127,7 +128,7 @@ def require_error(
         label: str,
         secrets_to_hide: list[str] | None = None) -> int:
     if secrets_to_hide is not None:
-        assert_no_secrets(result.body, secrets_to_hide, label)
+        assert_response_no_secrets(result, secrets_to_hide, label)
     if result.status != status:
         raise live.ProbeError(f"{label} returned HTTP {result.status}, expected {status}: {result.body!r}")
     body = result.body
@@ -156,9 +157,83 @@ def assert_no_secrets(value: Any, secrets_to_hide: list[str], label: str) -> Non
         raise live.ProbeError(f"{label} reflected a credential value")
 
 
+def assert_response_no_secrets(result: HttpResult, secrets_to_hide: list[str], label: str) -> None:
+    assert_no_secrets({"body": result.body, "headers": result.headers}, secrets_to_hide, label)
+
+
+def response_header_values(result: HttpResult, name: str) -> list[str]:
+    expected = name.lower()
+    return [value for key, value in result.headers if key.lower() == expected]
+
+
+def require_single_header(result: HttpResult, name: str, expected: str, label: str) -> None:
+    values = response_header_values(result, name)
+    if values != [expected]:
+        raise live.ProbeError(f"{label} returned invalid {name}: {values!r}")
+
+
+def validate_response_protection_headers(result: HttpResult, label: str) -> None:
+    require_single_header(result, "Cache-Control", "no-store, no-cache, must-revalidate", label)
+    require_single_header(result, "Pragma", "no-cache", label)
+    require_single_header(result, "X-Content-Type-Options", "nosniff", label)
+    require_single_header(result, "Referrer-Policy", "no-referrer", label)
+    if response_header_values(result, "Set-Cookie"):
+        raise live.ProbeError(f"{label} attempted to persist a browser cookie")
+
+
+def validate_dashboard_response_headers(result: HttpResult, origin: str, label: str) -> None:
+    require_single_header(result, "Access-Control-Allow-Origin", origin, label)
+    validate_response_protection_headers(result, label)
+
+
+def require_protected_error(
+        result: HttpResult,
+        status: int,
+        error_type: str,
+        label: str,
+        secrets_to_hide: list[str] | None = None) -> int:
+    actual = require_error(result, status, error_type, label, secrets_to_hide)
+    validate_response_protection_headers(result, label)
+    return actual
+
+
+PREFLIGHT_HEADERS = {
+    "authorization",
+    "content-type",
+    "last-event-id",
+    "x-llama-dashboard-csrf",
+    "x-llama-trusted-scheduling-token",
+}
+
+
+def comma_separated_header(result: HttpResult, name: str, label: str) -> set[str]:
+    values = response_header_values(result, name)
+    if len(values) != 1:
+        raise live.ProbeError(f"{label} returned invalid {name}: {values!r}")
+    return {item.strip().lower() for item in values[0].split(",") if item.strip()}
+
+
+def validate_preflight(result: HttpResult, origin: str, label: str) -> None:
+    require_status(result, 200, label)
+    if result.body is not None:
+        raise live.ProbeError(f"{label} returned a non-empty response body")
+    require_single_header(result, "Access-Control-Allow-Origin", origin, label)
+    require_single_header(result, "Access-Control-Allow-Credentials", "false", label)
+    allowed_methods = comma_separated_header(result, "Access-Control-Allow-Methods", label)
+    if allowed_methods != {"get", "post"}:
+        raise live.ProbeError(f"{label} methods differ from exact GET, POST: {sorted(allowed_methods)}")
+    allowed_headers = comma_separated_header(result, "Access-Control-Allow-Headers", label)
+    if allowed_headers != PREFLIGHT_HEADERS:
+        raise live.ProbeError(
+            f"{label} headers differ: missing={sorted(PREFLIGHT_HEADERS - allowed_headers)}, "
+            f"unexpected={sorted(allowed_headers - PREFLIGHT_HEADERS)}")
+    if response_header_values(result, "Set-Cookie"):
+        raise live.ProbeError(f"{label} attempted to persist a browser cookie")
+
+
 def validated_trace_events(result: HttpResult, secrets_to_hide: list[str], label: str) -> list[dict[str, Any]]:
     require_status(result, 200, label)
-    assert_no_secrets(result.body, secrets_to_hide, label)
+    assert_response_no_secrets(result, secrets_to_hide, label)
     trace = live.require_record(result.body, label)
     live.require_exact_keys(trace, {"schema", "capacity", "total_events", "overflow_events", "events"}, label)
     if live.require_integer(trace["schema"], f"{label}.schema", 1) != 1:
@@ -397,6 +472,7 @@ def wait_for_bound_request(
             )
             if outcome.status != 200 or not isinstance(outcome.body, dict):
                 continue
+            assert_response_no_secrets(outcome, secrets, "bound request detail")
             validated = validate_detail(outcome.body, handle)
             registry = validated["registry"]
             if (request.get("state") in {"prefill", "decode"} and isinstance(registry, dict) and
@@ -444,32 +520,95 @@ def main() -> int:
     snapshot_url = base_url + live.SNAPSHOT_PATH
     events_url = base_url + live.EVENTS_PATH
     trace_url = base_url + TRACE_PATH
-    get_headers = live.credential_headers(api_key, operator_token)
+    get_headers = live.credential_headers(api_key, operator_token, Origin=origin)
     posts = post_headers(api_key, operator_token, origin)
     unknown_handle = "9007199254740991:9007199254740991"
     negative: dict[str, int] = {}
+    preflight_headers = [
+        ("Origin", origin),
+        ("Access-Control-Request-Method", "POST"),
+        ("Access-Control-Request-Headers", ", ".join(sorted(PREFLIGHT_HEADERS))),
+    ]
+    preflight = request_json_header_pairs(
+        "OPTIONS",
+        base_url + CONTROL_PATH,
+        preflight_headers,
+        None,
+        establish_seconds,
+        MAX_ADMIN_RESPONSE_BYTES,
+    )
+    validate_preflight(preflight, origin, "loopback dashboard preflight")
+
+    remote_preflight = request_json_header_pairs(
+        "OPTIONS",
+        base_url + CONTROL_PATH,
+        [
+            ("Origin", "https://example.invalid"),
+            ("Access-Control-Request-Method", "POST"),
+            ("Access-Control-Request-Headers", ", ".join(sorted(PREFLIGHT_HEADERS))),
+        ],
+        None,
+        establish_seconds,
+        MAX_ADMIN_RESPONSE_BYTES,
+    )
+    require_status(remote_preflight, 200, "remote dashboard preflight")
+    if response_header_values(remote_preflight, "Access-Control-Allow-Origin"):
+        raise live.ProbeError("remote dashboard preflight received an allow-origin header")
+    if remote_preflight.body is not None or response_header_values(remote_preflight, "Set-Cookie"):
+        raise live.ProbeError("remote dashboard preflight returned body or persistence state")
+
+    authenticated_detail = detail(base_url, posts, unknown_handle, establish_seconds)
+    negative["detail_authenticated_unknown"] = require_protected_error(
+        authenticated_detail,
+        404,
+        "not_found_error",
+        "authenticated unknown detail",
+        secrets,
+    )
+    validate_dashboard_response_headers(
+        authenticated_detail, origin, "authenticated unknown detail")
+    authenticated_control = request_json(
+        "POST",
+        base_url + CONTROL_PATH,
+        posts,
+        {"action": "cancel", "request_id": unknown_handle},
+        establish_seconds,
+        MAX_ADMIN_RESPONSE_BYTES,
+    )
+    negative["control_authenticated_unknown"] = require_protected_error(
+        authenticated_control,
+        404,
+        "not_found_error",
+        "authenticated unknown control",
+        secrets,
+    )
+    validate_dashboard_response_headers(
+        authenticated_control, origin, "authenticated unknown control")
+
     security_cases = {
         "missing_csrf": post_headers(api_key, operator_token, origin, csrf=None),
         "cross_origin": post_headers(api_key, operator_token, "https://example.invalid"),
         "wrong_content_type": post_headers(api_key, operator_token, origin, content_type="text/plain"),
     }
     for case, headers in security_cases.items():
-        negative[f"detail_{case}"] = require_error(
-            detail(base_url, headers, unknown_handle, establish_seconds),
+        detail_denial = detail(base_url, headers, unknown_handle, establish_seconds)
+        negative[f"detail_{case}"] = require_protected_error(
+            detail_denial,
             403,
             "permission_error",
             f"detail {case}",
             secrets,
         )
-        negative[f"control_{case}"] = require_error(
-            request_json(
-                "POST",
-                base_url + CONTROL_PATH,
-                headers,
-                {"action": "cancel", "request_id": unknown_handle},
-                establish_seconds,
-                MAX_ADMIN_RESPONSE_BYTES,
-            ),
+        control_denial = request_json(
+            "POST",
+            base_url + CONTROL_PATH,
+            headers,
+            {"action": "cancel", "request_id": unknown_handle},
+            establish_seconds,
+            MAX_ADMIN_RESPONSE_BYTES,
+        )
+        negative[f"control_{case}"] = require_protected_error(
+            control_denial,
             403,
             "permission_error",
             f"control {case}",
@@ -504,22 +643,24 @@ def main() -> int:
         "ambiguous_api_credentials": (ambiguous_api_headers, 403, "permission_error", secrets),
     }
     for case, (headers, status, error_type, case_secrets) in authorization_cases.items():
-        negative[f"detail_{case}"] = require_error(
-            detail(base_url, headers, unknown_handle, establish_seconds),
+        detail_denial = detail(base_url, headers, unknown_handle, establish_seconds)
+        negative[f"detail_{case}"] = require_protected_error(
+            detail_denial,
             status,
             error_type,
             f"detail {case}",
             case_secrets,
         )
-        negative[f"control_{case}"] = require_error(
-            request_json(
-                "POST",
-                base_url + CONTROL_PATH,
-                headers,
-                {"action": "cancel", "request_id": unknown_handle},
-                establish_seconds,
-                MAX_ADMIN_RESPONSE_BYTES,
-            ),
+        control_denial = request_json(
+            "POST",
+            base_url + CONTROL_PATH,
+            headers,
+            {"action": "cancel", "request_id": unknown_handle},
+            establish_seconds,
+            MAX_ADMIN_RESPONSE_BYTES,
+        )
+        negative[f"control_{case}"] = require_protected_error(
+            control_denial,
             status,
             error_type,
             f"control {case}",
@@ -527,7 +668,7 @@ def main() -> int:
         )
 
     query_suffix = "?unexpected=1"
-    negative["detail_query"] = require_error(
+    negative["detail_query"] = require_protected_error(
         request_json(
             "POST",
             base_url + DETAIL_PATH + query_suffix,
@@ -541,7 +682,7 @@ def main() -> int:
         "detail query",
         secrets,
     )
-    negative["control_query"] = require_error(
+    negative["control_query"] = require_protected_error(
         request_json(
             "POST",
             base_url + CONTROL_PATH + query_suffix,
@@ -560,7 +701,7 @@ def main() -> int:
         ("X-Llama-Trusted-Lane", "normal"),
         ("X-Llama-Trusted-Lane", "fast"),
     ]
-    negative["detail_ambiguous_classification"] = require_error(
+    negative["detail_ambiguous_classification"] = require_protected_error(
         request_json_header_pairs(
             "POST",
             base_url + DETAIL_PATH,
@@ -574,7 +715,7 @@ def main() -> int:
         "detail ambiguous classification headers",
         secrets,
     )
-    negative["control_ambiguous_classification"] = require_error(
+    negative["control_ambiguous_classification"] = require_protected_error(
         request_json_header_pairs(
             "POST",
             base_url + CONTROL_PATH,
@@ -589,7 +730,15 @@ def main() -> int:
         secrets,
     )
 
-    live.validate_snapshot(live.fetch_snapshot(snapshot_url, get_headers, establish_seconds), secrets)
+    authenticated_snapshot = require_status(
+        request_json("GET", snapshot_url, get_headers, None, establish_seconds),
+        200,
+        "authenticated dashboard snapshot",
+    )
+    live.validate_snapshot(authenticated_snapshot.body, secrets)
+    assert_response_no_secrets(authenticated_snapshot, secrets, "authenticated dashboard snapshot")
+    validate_dashboard_response_headers(
+        authenticated_snapshot, origin, "authenticated dashboard snapshot")
     benchmark_tag = new_benchmark_tag()
     initial_trace = request_json("GET", trace_url, get_headers, None, establish_seconds)
     initial_trace_events = validated_trace_events(initial_trace, secrets, "initial scheduler trace")
@@ -644,18 +793,21 @@ def main() -> int:
             raise live.ProbeError("new bound request was already cancelling")
 
         response = live.open_event_stream(events_url, get_headers, snapshot["sequence"], establish_seconds)
+        event_stream_headers = HttpResult(response.status, None, list(response.headers.items()))
+        assert_response_no_secrets(event_stream_headers, secrets, "dashboard event stream")
+        validate_dashboard_response_headers(event_stream_headers, origin, "dashboard event stream")
         capture = live.SseCapture(response)
         capture.start()
 
         stale = stale_handle(handle)
-        negative["stale_detail"] = require_error(
+        negative["stale_detail"] = require_protected_error(
             detail(base_url, posts, stale, establish_seconds),
             409,
             "stale_request_handle",
             "stale-handle detail",
             secrets,
         )
-        negative["stale_cancel"] = require_error(
+        negative["stale_cancel"] = require_protected_error(
             request_json(
                 "POST",
                 base_url + CONTROL_PATH,
@@ -672,7 +824,8 @@ def main() -> int:
 
         unchanged = require_status(detail(base_url, posts, handle, establish_seconds), 200, "post-denial detail")
         unchanged_detail = validate_detail(unchanged.body, handle)
-        assert_no_secrets(unchanged.body, secrets, "post-denial detail")
+        assert_response_no_secrets(unchanged, secrets, "post-denial detail")
+        validate_dashboard_response_headers(unchanged, origin, "post-denial detail")
         if unchanged_detail["registry"]["cancel_requested"] is not False:
             raise live.ProbeError("a rejected dashboard mutation changed cancellation state")
 
@@ -689,7 +842,8 @@ def main() -> int:
             "valid cancel",
         )
         validate_control(accepted.body, handle, "accepted")
-        assert_no_secrets(accepted.body, secrets, "accepted cancel")
+        assert_response_no_secrets(accepted, secrets, "accepted cancel")
+        validate_dashboard_response_headers(accepted, origin, "accepted cancel")
         accepted_cancel = True
 
         replay = request_json(
@@ -704,11 +858,12 @@ def main() -> int:
             validate_control(replay.body, handle, "already_requested")
             replay_state = "already_requested"
         elif replay.status == 404:
-            require_error(replay, 404, "not_found_error", "retired cancel replay", secrets)
+            require_protected_error(replay, 404, "not_found_error", "retired cancel replay", secrets)
             replay_state = "retired"
         else:
             raise live.ProbeError(f"cancel replay returned unexpected HTTP {replay.status}: {replay.body!r}")
-        assert_no_secrets(replay.body, secrets, "cancel replay")
+        assert_response_no_secrets(replay, secrets, "cancel replay")
+        validate_dashboard_response_headers(replay, origin, "cancel replay")
 
         cancelled_completion = completion.wait(request_seconds)
         require_error(
@@ -720,7 +875,6 @@ def main() -> int:
         )
         if cancelled_completion.body["error"]["message"] != "request cancelled by dashboard operator":
             raise live.ProbeError("cancelled completion did not receive the operator terminal reason")
-        assert_no_secrets(cancelled_completion.body, secrets, "cancelled completion")
         final_snapshot = wait_for_removed(
             snapshot_url, get_headers, handle, establish_seconds, secrets)
 
@@ -756,8 +910,8 @@ def main() -> int:
             sequence = event["sequence"]
 
         terminal_detail = detail(base_url, posts, handle, establish_seconds)
-        require_error(terminal_detail, 404, "not_found_error", "removed request detail", secrets)
-        assert_no_secrets(terminal_detail.body, secrets, "terminal detail")
+        require_protected_error(terminal_detail, 404, "not_found_error", "removed request detail", secrets)
+        validate_dashboard_response_headers(terminal_detail, origin, "terminal detail")
 
         fresh = require_status(
             request_json(
@@ -778,7 +932,7 @@ def main() -> int:
         )
         if not isinstance(fresh.body, dict) or "content" not in fresh.body:
             raise live.ProbeError("fresh completion lacked a normal completion response")
-        assert_no_secrets(fresh.body, secrets, "fresh completion")
+        assert_response_no_secrets(fresh, secrets, "fresh completion")
 
         result = {
             "report_schema_version": 1,
@@ -795,6 +949,13 @@ def main() -> int:
                 "state": current_detail["request"]["state"],
             },
             "negative_statuses": negative,
+            "cors": {
+                "loopback_preflight": preflight.status,
+                "remote_origin_allowed": False,
+                "required_headers": sorted(PREFLIGHT_HEADERS),
+                "audited_routes": ["snapshot", "events", "detail", "control"],
+                "admin_response_headers": "no-store-nosniff-no-referrer-no-cookie",
+            },
             "cancel": {
                 "http_status": accepted.status,
                 "completion_http_status": cancelled_completion.status,
