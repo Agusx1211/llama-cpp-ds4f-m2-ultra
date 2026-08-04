@@ -1,15 +1,27 @@
 #include "ggml-backend.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-model.h"
+#include "llama-ext.h"
 #include "llama.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+#include "sha256/sha256.h"
+#ifdef __cplusplus
+}
+#endif
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -18,8 +30,11 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 namespace {
 
@@ -72,6 +87,26 @@ struct model_manifest {
     std::map<std::string, std::string> fields;
     std::array<model_shard_manifest, MODEL_SHARD_COUNT> shards;
 };
+
+struct file_identity {
+    uint64_t device      = 0;
+    uint64_t inode       = 0;
+    uint64_t size        = 0;
+    int64_t  mtime_sec   = 0;
+    int64_t  mtime_nsec  = 0;
+
+    bool operator==(const file_identity & other) const {
+        return device == other.device && inode == other.inode && size == other.size && mtime_sec == other.mtime_sec &&
+               mtime_nsec == other.mtime_nsec;
+    }
+};
+
+struct model_file_snapshot {
+    file_identity identity;
+    std::string   sha256;
+};
+
+using model_file_snapshots = std::array<model_file_snapshot, MODEL_SHARD_COUNT>;
 
 using model_ptr   = std::unique_ptr<llama_model, decltype(&llama_model_free)>;
 using context_ptr = std::unique_ptr<llama_context, decltype(&llama_free)>;
@@ -214,64 +249,170 @@ model_manifest read_model_manifest(const std::string & manifest_path) {
     return result;
 }
 
-std::string shell_quote(const std::string & value) {
-    std::string result = "'";
-    for (const char character : value) {
-        if (character == '\'') {
-            result += "'\\''";
-        } else {
-            result += character;
-        }
-    }
-    result += "'";
+file_identity file_identity_from_stat(const struct stat & info, const std::string & path) {
+    expect(S_ISREG(info.st_mode), "pinned model shard is not a regular file: " + path);
+    expect(info.st_size >= 0, "pinned model shard has a negative size: " + path);
+    file_identity result;
+    result.device = (uint64_t) info.st_dev;
+    result.inode  = (uint64_t) info.st_ino;
+    result.size   = (uint64_t) info.st_size;
+#if defined(__APPLE__)
+    result.mtime_sec  = (int64_t) info.st_mtimespec.tv_sec;
+    result.mtime_nsec = (int64_t) info.st_mtimespec.tv_nsec;
+#else
+    result.mtime_sec  = (int64_t) info.st_mtim.tv_sec;
+    result.mtime_nsec = (int64_t) info.st_mtim.tv_nsec;
+#endif
     return result;
 }
 
-std::string sha256_file(const std::filesystem::path & path) {
-    const std::string command = "shasum -a 256 -- " + shell_quote(path.string()) + " 2>/dev/null";
-    FILE *            pipe    = ::popen(command.c_str(), "r");
-    expect(pipe != nullptr, "pinned model digest helper could not be started");
-    char output[256] = {};
-    const bool read_ok = std::fgets(output, sizeof(output), pipe) != nullptr;
-    const int  status  = ::pclose(pipe);
-    expect(read_ok && status == 0, "pinned model digest helper failed");
-    const std::string line = trim(output);
-    const auto        separator = line.find_first_of(" \t");
-    expect(separator != std::string::npos, "pinned model digest helper output is malformed");
-    const std::string digest = line.substr(0, separator);
-    expect(digest.size() == 64, "pinned model digest helper returned an invalid digest");
-    return digest;
+file_identity path_identity(const std::filesystem::path & path) {
+    struct stat info = {};
+    const int   status = ::lstat(path.c_str(), &info);
+    if (status != 0) {
+        const int error = errno;
+        fail("pinned model shard could not be lstat'ed: " + path.string() + ": " + std::strerror(error));
+    }
+    expect(!S_ISLNK(info.st_mode), "pinned model shard is a symlink: " + path.string());
+    return file_identity_from_stat(info, path.string());
 }
 
-void verify_model_files(const std::string & model_path, const model_manifest & manifest) {
+struct descriptor_guard {
+    int fd = -1;
+
+    descriptor_guard() = default;
+    descriptor_guard(const descriptor_guard &) = delete;
+    descriptor_guard & operator=(const descriptor_guard &) = delete;
+    descriptor_guard(descriptor_guard && other) noexcept : fd(std::exchange(other.fd, -1)) {}
+    descriptor_guard & operator=(descriptor_guard && other) noexcept {
+        if (this != &other) {
+            if (fd >= 0) {
+                (void) ::close(fd);
+            }
+            fd = std::exchange(other.fd, -1);
+        }
+        return *this;
+    }
+
+    ~descriptor_guard() {
+        if (fd >= 0) {
+            (void) ::close(fd);
+        }
+    }
+};
+
+descriptor_guard open_model_shard(const std::filesystem::path & path) {
+    int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    descriptor_guard result;
+    result.fd = ::open(path.c_str(), flags);
+    if (result.fd < 0) {
+        const int error = errno;
+        fail("pinned model shard could not be opened: " + path.string() + ": " + std::strerror(error));
+    }
+    return result;
+}
+
+file_identity descriptor_identity(int fd, const std::filesystem::path & path) {
+    struct stat info = {};
+    if (::fstat(fd, &info) != 0) {
+        const int error = errno;
+        fail("pinned model shard descriptor could not be stat'ed: " + path.string() + ": " + std::strerror(error));
+    }
+    return file_identity_from_stat(info, path.string());
+}
+
+std::string sha256_hex(const unsigned char * digest, size_t size) {
+    static constexpr char HEX[] = "0123456789abcdef";
+    std::string           result;
+    result.reserve(size * 2);
+    for (size_t index = 0; index < size; ++index) {
+        result.push_back(HEX[digest[index] >> 4]);
+        result.push_back(HEX[digest[index] & 0x0f]);
+    }
+    return result;
+}
+
+std::string sha256_descriptor(int fd, uint64_t expected_bytes, const std::filesystem::path & path) {
+    sha256_t hash;
+    sha256_init(&hash);
+    std::array<unsigned char, 1 << 20> buffer = {};
+    uint64_t                           total  = 0;
+    for (;;) {
+        const ssize_t read_bytes = ::read(fd, buffer.data(), buffer.size());
+        if (read_bytes < 0 && errno == EINTR) {
+            continue;
+        }
+        if (read_bytes < 0) {
+            const int error = errno;
+            fail("pinned model shard read failed: " + path.string() + ": " + std::strerror(error));
+        }
+        if (read_bytes == 0) {
+            break;
+        }
+        expect(total + (uint64_t) read_bytes <= expected_bytes,
+               "pinned model shard grew while hashing: " + path.string());
+        sha256_update(&hash, buffer.data(), (size_t) read_bytes);
+        total += (uint64_t) read_bytes;
+    }
+    expect(total == expected_bytes, "pinned model shard size changed while hashing: " + path.string());
+    unsigned char digest[SHA256_DIGEST_SIZE] = {};
+    sha256_final(&hash, digest);
+    return sha256_hex(digest, sizeof(digest));
+}
+
+model_file_snapshots verify_model_files(const std::string &                 model_path,
+                                        const model_manifest &               manifest,
+                                        const model_file_snapshots *          expected_snapshots = nullptr,
+                                        const char *                          stage = "pre-load") {
     const std::filesystem::path first = std::filesystem::path(model_path);
     expect(first.filename() == manifest.shards[0].filename,
            "exact-model gate requires the pinned canonical first shard filename");
-    expect(std::filesystem::exists(first) && std::filesystem::is_regular_file(first) &&
-               !std::filesystem::is_symlink(first),
-           "pinned model first shard is missing, non-regular, or a symlink");
 
+    model_file_snapshots snapshots;
     uint64_t total_bytes = 0;
-    for (const auto & shard : manifest.shards) {
+    for (size_t index = 0; index < manifest.shards.size(); ++index) {
+        const auto & shard = manifest.shards[index];
         const std::filesystem::path path = first.parent_path() / shard.filename;
-        expect(std::filesystem::exists(path) && std::filesystem::is_regular_file(path) &&
-                   !std::filesystem::is_symlink(path),
-               "pinned model shard is missing, non-regular, or a symlink: " + path.string());
-        const uint64_t bytes = std::filesystem::file_size(path);
-        expect(bytes == shard.bytes, "pinned model shard byte size mismatch: " + path.string());
-        const std::string digest = sha256_file(path);
+        const file_identity path_before = path_identity(path);
+        descriptor_guard guard           = open_model_shard(path);
+        const file_identity descriptor_before = descriptor_identity(guard.fd, path);
+        expect(path_before == descriptor_before,
+               std::string(stage) + " model shard path changed before hashing: " + path.string());
+        expect(descriptor_before.size == shard.bytes, "pinned model shard byte size mismatch: " + path.string());
+        const std::string digest = sha256_descriptor(guard.fd, shard.bytes, path);
+        const file_identity descriptor_after = descriptor_identity(guard.fd, path);
+        const file_identity path_after       = path_identity(path);
+        expect(descriptor_after == descriptor_before && path_after == descriptor_before,
+               std::string(stage) + " model shard changed while hashing: " + path.string());
         expect(digest == shard.sha256, "pinned model shard SHA-256 mismatch: " + path.string());
-        std::fprintf(stderr, "resident-model identity shard=%u name=%s bytes=%llu sha256=%s\n", shard.index,
-                     shard.filename.c_str(), (unsigned long long) bytes, digest.c_str());
-        total_bytes += bytes;
+        if (expected_snapshots != nullptr) {
+            expect(descriptor_after == (*expected_snapshots)[index].identity &&
+                       digest == (*expected_snapshots)[index].sha256,
+                   std::string(stage) + " model shard identity changed after load: " + path.string());
+        }
+        snapshots[index] = { descriptor_after, digest };
+        std::fprintf(stderr,
+                     "resident-model identity stage=%s shard=%u name=%s device=%llu inode=%llu bytes=%llu "
+                     "mtime=%lld.%09lld sha256=%s\n",
+                     stage, shard.index, shard.filename.c_str(), (unsigned long long) descriptor_after.device,
+                     (unsigned long long) descriptor_after.inode, (unsigned long long) descriptor_after.size,
+                     (long long) descriptor_after.mtime_sec, (long long) descriptor_after.mtime_nsec, digest.c_str());
+        total_bytes += descriptor_after.size;
     }
     expect(total_bytes == MODEL_TOTAL_FILE_BYTES, "pinned model total file size mismatch");
+    return snapshots;
 }
 
-void verify_target_metal_device() {
+ggml_backend_dev_t verify_target_metal_device() {
     ggml_backend_reg_t metal = ggml_backend_reg_by_name("Metal");
     expect(metal != nullptr, "exact-model gate requires the Metal backend registry");
-    bool found_target = false;
+    ggml_backend_dev_t target = nullptr;
     for (size_t index = 0; index < ggml_backend_reg_dev_count(metal); ++index) {
         ggml_backend_dev_t device = ggml_backend_reg_dev_get(metal, index);
         const char *        name = ggml_backend_dev_name(device);
@@ -281,10 +422,50 @@ void verify_target_metal_device() {
         if (desc != nullptr && std::strcmp(desc, "Apple M2 Ultra") == 0) {
             expect(ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU,
                    "exact-model M2 Ultra device is not reported as a GPU");
-            found_target = true;
+            expect(target == nullptr, "exact-model gate found multiple Apple M2 Ultra Metal devices");
+            target = device;
         }
     }
-    expect(found_target, "exact-model gate requires an Apple M2 Ultra Metal device");
+    expect(target != nullptr, "exact-model gate requires an Apple M2 Ultra Metal device");
+    return target;
+}
+
+void verify_model_placement(const llama_model * model, ggml_backend_dev_t target) {
+    expect(llama_model_n_devices(model) == 1, "exact-model loaded model selected an unexpected device count");
+    expect(llama_model_get_device(model, 0) == target,
+           "exact-model loaded model did not select the verified Apple M2 Ultra Metal device");
+
+    const auto & tensors = llama_internal_get_tensor_map(model);
+    expect(!tensors.empty(), "exact-model loaded model has no tensors to verify for device placement");
+    size_t target_tensors = 0;
+    size_t cpu_tensors    = 0;
+    uint64_t target_bytes = 0;
+    uint64_t cpu_bytes    = 0;
+    for (const auto & item : tensors) {
+        const ggml_tensor * tensor = item.second;
+        expect(tensor != nullptr && tensor->buffer != nullptr,
+               "exact-model loaded tensor has no backend buffer: " + item.first);
+        const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+        const ggml_backend_dev_t         device = buft != nullptr ? ggml_backend_buft_get_device(buft) : nullptr;
+        expect(device != nullptr, "exact-model loaded tensor has no backend device: " + item.first);
+        const uint64_t bytes = ggml_nbytes(tensor);
+        if (device == target) {
+            ++target_tensors;
+            target_bytes += bytes;
+        } else {
+            expect(ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU,
+                   "exact-model loaded tensor is placed on an unexpected non-Metal device: " + item.first);
+            ++cpu_tensors;
+            cpu_bytes += bytes;
+        }
+    }
+    expect(target_tensors > 0 && target_bytes > 0,
+           "exact-model loaded tensors did not allocate any bytes on the Apple M2 Ultra Metal device");
+    std::fprintf(stderr,
+                 "resident-model placement device=%s description=%s metal_tensors=%zu metal_bytes=%llu "
+                 "cpu_tensors=%zu cpu_bytes=%llu\n",
+                 ggml_backend_dev_name(target), ggml_backend_dev_description(target), target_tensors,
+                 (unsigned long long) target_bytes, cpu_tensors, (unsigned long long) cpu_bytes);
 }
 
 std::string model_meta(const llama_model * model, const char * key) {
@@ -295,6 +476,9 @@ std::string model_meta(const llama_model * model, const char * key) {
 }
 
 void verify_model_metadata(const llama_model * model, const model_manifest & manifest) {
+    // The manifest quantization_label is the official artifact label. GGUF's
+    // authoritative quantization checks are quantization_version, file_type,
+    // and the runtime llama_model_ftype value below.
     expect(model_meta(model, "general.architecture") == MODEL_ARCH, "exact-model architecture metadata mismatch");
     expect(model_meta(model, "general.name") == MODEL_NAME, "exact-model name metadata mismatch");
     expect(model_meta(model, "general.size_label") == MODEL_SIZE_LABEL,
@@ -951,6 +1135,55 @@ void expect_comp_handle_info_equal(const llama_dsv4_comp_handle_info & expected,
            std::string(phase) + " compressed survivor handle metadata changed");
 }
 
+void expect_boundary_segment_transition(const llama_dsv4_comp_handle_info & info,
+                                        uint32_t                            boundary,
+                                        const char *                        phase) {
+    if (boundary < 255) {
+        return;
+    }
+    const uint64_t tokens     = (uint64_t) boundary + 1;
+    const uint64_t c4_rows    = llama_dsv4_comp_rows_for_tokens(llama_dsv4_comp_family::c4, tokens);
+    const uint64_t hca_rows   = llama_dsv4_comp_rows_for_tokens(llama_dsv4_comp_family::hca, tokens);
+    const uint64_t c4_segments  = llama_dsv4_comp_segments_for_rows(c4_rows);
+    const uint64_t hca_segments = llama_dsv4_comp_segments_for_rows(hca_rows);
+    expect(info.visible_c4_rows == c4_rows && info.visible_hca_rows == hca_rows,
+           std::string(phase) + " compressed visible rows did not cross the expected physical boundary");
+    expect(info.c4_segment_ids.size() == c4_segments && info.hca_segment_ids.size() == hca_segments,
+           std::string(phase) + " compressed physical segment count did not cross the expected boundary");
+    expect(c4_rows > 0 && llama_dsv4_comp_logical_segment(c4_rows - 1) == c4_segments - 1 &&
+               llama_dsv4_comp_segment_row(c4_rows - 1) == (c4_rows - 1) % LLAMA_DSV4_COMP_SEGMENT_ROWS,
+           std::string(phase) + " C4 logical-to-physical segment row mapping is incorrect");
+    expect(hca_rows > 0 && llama_dsv4_comp_logical_segment(hca_rows - 1) == hca_segments - 1 &&
+               llama_dsv4_comp_segment_row(hca_rows - 1) == (hca_rows - 1) % LLAMA_DSV4_COMP_SEGMENT_ROWS,
+           std::string(phase) + " HCA logical-to-physical segment row mapping is incorrect");
+    for (size_t index = 0; index < info.c4_segment_ids.size(); ++index) {
+        expect(info.c4_segment_ids[index] >= 2, std::string(phase) + " C4 binding referenced a permanent segment");
+        for (size_t previous = 0; previous < index; ++previous) {
+            expect(info.c4_segment_ids[previous] != info.c4_segment_ids[index],
+                   std::string(phase) + " C4 binding reused a physical segment ID");
+        }
+    }
+    for (size_t index = 0; index < info.hca_segment_ids.size(); ++index) {
+        expect(info.hca_segment_ids[index] >= 2, std::string(phase) + " HCA binding referenced a permanent segment");
+        for (size_t previous = 0; previous < index; ++previous) {
+            expect(info.hca_segment_ids[previous] != info.hca_segment_ids[index],
+                   std::string(phase) + " HCA binding reused a physical segment ID");
+        }
+    }
+    if (boundary == 255 || boundary == 256) {
+        expect(c4_rows == 64 && c4_segments == 1 && info.c4_segment_ids.size() == 1,
+               std::string(phase) + " expected one full C4 segment at boundary 255/256");
+    } else if (boundary == 260) {
+        expect(c4_rows == 65 && c4_segments == 2 && info.c4_segment_ids.size() == 2,
+               std::string(phase) + " expected a second C4 segment at boundary 260");
+    }
+    std::fprintf(stderr,
+                 "resident-model boundary=%u phase=%s physical-segments c4_rows=%llu c4_segments=%llu "
+                 "hca_rows=%llu hca_segments=%llu\n",
+                 boundary, phase, (unsigned long long) c4_rows, (unsigned long long) c4_segments,
+                 (unsigned long long) hca_rows, (unsigned long long) hca_segments);
+}
+
 void expect_comp_release_delta(const llama_dsv4_comp_memory_usage &               before,
                                const llama_dsv4_comp_memory_usage &               after,
                                const llama_dsv4_comp_handle_info &                released,
@@ -1242,6 +1475,7 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary) {
     expect(survivor_binding_before_detach == initial_binding1, "survivor compressed binding changed during prompt");
     const auto source_info_before_detach   = comp_handle_info(comp_pool, initial_binding0, "prompt");
     const auto survivor_info_before_detach = comp_handle_info(comp_pool, survivor_binding_before_detach, "prompt");
+    expect_boundary_segment_transition(source_info_before_detach, boundary, "prompt source");
     validate_memory_snapshot(memory_before_detach, "prompt", boundary);
 
     const uint64_t callback_before_detach = counter.evaluations;
@@ -1589,15 +1823,19 @@ int main(int argc, char ** argv) {
         // Validate the supplied path before the platform gate so wrong-model
         // failure paths are deterministic even on a non-Metal host. Hashing
         // only proceeds after the canonical five-shard layout is present.
-        verify_model_files(model_path, manifest);
+        const model_file_snapshots model_snapshots = verify_model_files(model_path, manifest);
         backend_scope backend;
-        verify_target_metal_device();
+        const ggml_backend_dev_t target_device = verify_target_metal_device();
+        std::array<ggml_backend_dev_t, 2> model_devices = { target_device, nullptr };
         llama_model_params model_params = llama_model_default_params();
         model_params.n_gpu_layers       = 999;
         model_params.split_mode         = LLAMA_SPLIT_MODE_LAYER;
+        model_params.devices             = model_devices.data();
         model_params.progress_callback  = silent_progress;
         model_ptr model(llama_model_load_from_file(model_path.c_str(), model_params), llama_model_free);
         expect(model != nullptr, "failed to load exact DeepSeek V4 Flash model");
+        (void) verify_model_files(model_path, manifest, &model_snapshots, "post-load");
+        verify_model_placement(model.get(), target_device);
         verify_model_metadata(model.get(), manifest);
         const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         expect(n_vocab > 1, "exact model vocabulary is empty");

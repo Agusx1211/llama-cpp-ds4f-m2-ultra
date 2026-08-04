@@ -3,8 +3,9 @@
 
 The queue invokes this wrapper as one bounded job.  It keeps the model process
 attached to the caller, captures stdout/stderr in a retained artifact directory,
-and terminates the whole process group on timeout.  The C++ gate remains the
-authority for model identity, Metal device, correctness, and accounting.
+forwards SIGINT/SIGTERM to the child process group, and terminates the whole
+process group on timeout.  The C++ gate remains the authority for model
+identity, Metal device, correctness, and accounting.
 """
 
 from __future__ import annotations
@@ -22,6 +23,9 @@ from pathlib import Path
 
 DEFAULT_TIMEOUT_SECONDS = 7200
 
+_ACTIVE_PROCESS: subprocess.Popen[bytes] | None = None
+_FORWARDED_SIGNAL: int | None = None
+
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -36,11 +40,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
-def terminate_group(process: subprocess.Popen[bytes], grace_seconds: float = 10.0) -> None:
+def terminate_group(
+    process: subprocess.Popen[bytes], signal_number: int = signal.SIGTERM, grace_seconds: float = 10.0
+) -> None:
+    """Signal the child session, then reap the leader after bounded cleanup."""
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process.pid, signal_number)
     except ProcessLookupError:
-        return
+        pass
     try:
         process.wait(timeout=grace_seconds)
         return
@@ -53,7 +60,21 @@ def terminate_group(process: subprocess.Popen[bytes], grace_seconds: float = 10.
     process.wait()
 
 
+def forward_signal(signum: int, _frame: object) -> None:
+    """Forward parent SIGINT/SIGTERM to the child process group and reap it."""
+    global _FORWARDED_SIGNAL
+    if _FORWARDED_SIGNAL is not None:
+        return
+    _FORWARDED_SIGNAL = signum
+    process = _ACTIVE_PROCESS
+    if process is not None and process.poll() is None:
+        terminate_group(process, signal_number=signum)
+
+
 def main(argv: list[str]) -> int:
+    global _ACTIVE_PROCESS, _FORWARDED_SIGNAL
+    _ACTIVE_PROCESS = None
+    _FORWARDED_SIGNAL = None
     args = parse_args(argv)
     artifacts = Path(args.artifacts_dir).expanduser()
     artifacts.mkdir(parents=True, exist_ok=False)
@@ -79,6 +100,7 @@ def main(argv: list[str]) -> int:
 
     timed_out = False
     return_code: int
+    previous_handlers: dict[int, signal.Handlers] = {}
     try:
         with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
             process = subprocess.Popen(
@@ -88,12 +110,24 @@ def main(argv: list[str]) -> int:
                 stderr=stderr,
                 start_new_session=True,
             )
+            _ACTIVE_PROCESS = process
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, forward_signal)
             try:
                 return_code = process.wait(timeout=args.timeout_seconds)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 terminate_group(process)
                 return_code = 124
+            finally:
+                if _FORWARDED_SIGNAL is not None:
+                    if process.poll() is None:
+                        terminate_group(process, signal_number=_FORWARDED_SIGNAL)
+                    return_code = 128 + _FORWARDED_SIGNAL
+                _ACTIVE_PROCESS = None
+                for signum, handler in previous_handlers.items():
+                    signal.signal(signum, handler)
     except OSError as error:
         stderr_path.write_text(f"runner failed to start child: {error}\n", encoding="utf-8")
         return_code = 127
@@ -107,6 +141,8 @@ def main(argv: list[str]) -> int:
             "finished_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
     )
+    if _FORWARDED_SIGNAL is not None:
+        record["forwarded_signal"] = _FORWARDED_SIGNAL
     status_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(
         f"dsv4-resident-model-gate status={record['status']} return_code={return_code} "
