@@ -27,6 +27,8 @@ add_library(${TARGET} STATIC
     server-scheduler.h
     server-request-registry.cpp
     server-request-registry.h
+    server-resident-request.cpp
+    server-resident-request.h
     server-request-runtime.cpp
     server-request-runtime.h
     server-prefix-cache.cpp
