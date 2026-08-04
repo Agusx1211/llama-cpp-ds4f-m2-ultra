@@ -84,12 +84,14 @@ void test_live_ingress_and_dispatch() {
 void test_queue_cap_and_queued_cancellation() {
     runtime_config config;
     config.scheduler.lanes[static_cast<size_t>(lane::fast)].queue_cap = 1;
+    config.overload_retry_after_seconds                               = 77;
     request_runtime runtime(config);
 
     require(runtime.admit(make_request(1, lane::fast, 10)), "fill fast queue");
     const server_request_runtime::admission_result rejected = runtime.admit(make_request(2, lane::fast, 11));
     require(!rejected && rejected.code == server_request_runtime::result_code::queue_full &&
-                rejected.reason == server_scheduler::reason_code::reject_queue_full,
+                rejected.reason == server_scheduler::reason_code::reject_queue_full &&
+                rejected.retry_after_seconds == 60,
             "lane queue cap rejects deterministically");
     require(runtime.cancel(1, 12), "cancel queued request");
     require(runtime.queued_total() == 0 && runtime.summary().active_requests == 0,
@@ -139,6 +141,119 @@ void test_passive_child_binding() {
     require(runtime.release_slot(31, 4, 52), "complete passive child");
 }
 
+bool has_terminal_event(const request_runtime &              runtime,
+                        uint64_t                             id,
+                        lifecycle                            terminal,
+                        server_request_registry::reason_code reason) {
+    for (const auto & event : runtime.events().events) {
+        if (event.request.id == id && event.kind == event_kind::terminal && event.lifecycle_after == terminal &&
+            event.reason == reason) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void test_queue_deadlines_and_exact_capacity_reuse() {
+    runtime_config config;
+    config.default_queue_timeout_us = 10;
+    config.default_run_timeout_us   = 20;
+    config.registry.max_requests    = 1;
+    request_runtime runtime(config);
+
+    const request_metadata ready = make_request(41, lane::normal, 100);
+    require(ready.queue_timeout_us == 0 && runtime.admit(ready),
+            "zero request timeout selects bounded server queue default");
+    require(runtime.expire_due(109).empty(), "ready request lives before exact deadline");
+    const auto ready_expired = runtime.expire_due(110);
+    require(ready_expired.size() == 1 && ready_expired[0].request_id == 41 &&
+                ready_expired[0].kind == deadline_kind::queue && !ready_expired[0].was_running,
+            "ready request expires at exact queue deadline");
+    require(!runtime.contains(41) && has_terminal_event(runtime, 41, lifecycle::timed_out,
+                                                        server_request_registry::reason_code::queue_timeout),
+            "ready timeout retires durable metadata with queue reason");
+
+    require(runtime.admit(make_request(42, lane::normal, 110)), "reuse capacity immediately after ready timeout");
+    require(runtime.take_next(111).request_id == 42, "dispatch request for blocked timeout");
+    require(runtime.mark_deferred(42, 112), "mark request blocked before timeout");
+    require(runtime.expire_due(119).empty(), "blocked request lives before deadline");
+    require(runtime.expire_due(120).size() == 1 && !runtime.contains(42),
+            "blocked request expires and releases capacity");
+
+    require(runtime.admit(make_request(43, lane::normal, 120), false), "register passive child deadline");
+    require(runtime.expire_due(130).size() == 1 && !runtime.contains(43),
+            "passive child expires from durable ready state");
+
+    require(runtime.admit(make_request(44, lane::normal, 130)), "admit setup-phase deadline request");
+    require(runtime.take_next(131).request_id == 44, "dispatch setup-phase deadline request");
+    require(runtime.expire_due(140).size() == 1 && !runtime.contains(44),
+            "dispatched unbound request remains governed by queue deadline");
+}
+
+void test_run_deadline_and_first_terminal_wins() {
+    runtime_config config;
+    config.default_queue_timeout_us = 100;
+    config.default_run_timeout_us   = 20;
+    request_runtime runtime(config);
+
+    const request_metadata running = make_request(51, lane::fast, 200);
+    require(running.run_timeout_us == 0 && runtime.admit(running),
+            "zero request timeout selects bounded server run default");
+    require(runtime.take_next(201).request_id == 51, "dispatch run deadline request");
+    require(runtime.bind_slot(51, 0, 205), "bind starts run deadline");
+    require(runtime.expire_due(224).empty(), "bound request lives before run deadline");
+    const auto expired = runtime.expire_due(225);
+    require(expired.size() == 1 && expired[0].request_id == 51 && expired[0].kind == deadline_kind::run &&
+                expired[0].was_running,
+            "bound request expires at exact run deadline");
+    const request_snapshot timed_out = find_request(runtime, 51);
+    require(timed_out.state == lifecycle::executing && timed_out.timeout_expired &&
+                timed_out.last_reason == server_request_registry::reason_code::run_timeout,
+            "run timeout remains durable until its lease is released");
+    require(runtime.cancel(51, 226), "late cancellation is an idempotent no-op");
+    require(runtime.release_slot(51, 0, 227), "release timed-out lease");
+    require(!runtime.contains(51) && has_terminal_event(runtime, 51, lifecycle::timed_out,
+                                                        server_request_registry::reason_code::run_timeout),
+            "timeout wins race against later cancellation");
+
+    require(runtime.admit(make_request(52, lane::low, 300)), "admit cancellation winner");
+    require(runtime.take_next(301).request_id == 52 && runtime.bind_slot(52, 1, 302), "bind cancellation winner");
+    require(runtime.cancel(52, 303), "cancel before run deadline");
+    require(runtime.expire_due(400).empty(), "cancelled request cannot be overwritten by timeout");
+    require(runtime.release_slot(52, 1, 401), "release cancelled lease");
+    require(has_terminal_event(runtime, 52, lifecycle::cancelled, server_request_registry::reason_code::client_cancel),
+            "cancellation remains terminal winner");
+
+    require(runtime.admit(make_request(53, lane::normal, 500)), "admit completed winner");
+    require(runtime.take_next(501).request_id == 53 && runtime.bind_slot(53, 2, 502), "bind completed winner");
+    require(runtime.release_slot(53, 2, 503), "complete before run deadline");
+    require(!runtime.cancel(53, 504) && runtime.expire_due(600).empty(),
+            "completed request cannot be cancelled or expired after retirement");
+}
+
+void test_zero_configuration_keeps_bounded_defaults() {
+    runtime_config config;
+    config.default_queue_timeout_us = 0;
+    config.default_run_timeout_us   = 0;
+    request_runtime runtime(config);
+
+    request_metadata queued = make_request(61, lane::normal, 100);
+    require(runtime.admit(queued), "admit zero-config queue default request");
+    require(runtime.expire_due(100 + runtime_config::queue_timeout_default_us - 1).empty(),
+            "zero configuration keeps request before bounded queue default");
+    require(runtime.expire_due(100 + runtime_config::queue_timeout_default_us).size() == 1,
+            "zero configuration cannot disable bounded queue default");
+
+    request_metadata running = make_request(62, lane::normal, 1000);
+    require(runtime.admit(running) && runtime.take_next(1001).request_id == 62 && runtime.bind_slot(62, 0, 1002),
+            "bind zero-config run default request");
+    require(runtime.expire_due(1002 + runtime_config::run_timeout_default_us - 1).empty(),
+            "zero configuration keeps request before bounded run default");
+    require(runtime.expire_due(1002 + runtime_config::run_timeout_default_us).size() == 1 &&
+                runtime.release_slot(62, 0, 1002 + runtime_config::run_timeout_default_us),
+            "zero configuration cannot disable bounded run default");
+}
+
 event_log_snapshot replay() {
     request_runtime runtime;
     runtime.admit(make_request(1, lane::low, 1));
@@ -165,6 +280,9 @@ int main() {
         { "defer, resume, and cancel",  test_defer_resume_and_cancel           },
         { "cancel while bound",         test_cancel_while_bound                },
         { "passive child binding",      test_passive_child_binding             },
+        { "queue deadlines",            test_queue_deadlines_and_exact_capacity_reuse  },
+        { "run deadline races",         test_run_deadline_and_first_terminal_wins      },
+        { "zero timeout defaults",      test_zero_configuration_keeps_bounded_defaults },
         { "deterministic replay",       test_deterministic_replay              },
     };
 

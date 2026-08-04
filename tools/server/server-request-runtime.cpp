@@ -57,11 +57,28 @@ uint64_t saturating_add(uint64_t lhs, uint64_t rhs) {
     return rhs > std::numeric_limits<uint64_t>::max() - lhs ? std::numeric_limits<uint64_t>::max() : lhs + rhs;
 }
 
+uint64_t deadline_from(uint64_t start_us, uint64_t timeout_us) {
+    return timeout_us == 0 ? std::numeric_limits<uint64_t>::max() : saturating_add(start_us, timeout_us);
+}
+
+uint32_t bounded_retry_after(uint32_t seconds) {
+    return std::min<uint32_t>(60, std::max<uint32_t>(1, seconds));
+}
+
 }  // namespace
+
+bool is_overload(result_code code) {
+    return code == result_code::queue_full || code == result_code::registry_capacity;
+}
 
 request_runtime::request_runtime(runtime_config config) :
     scheduler(std::move(config.scheduler)),
-    registry(std::move(config.registry)) {}
+    registry(std::move(config.registry)),
+    default_queue_timeout_us(config.default_queue_timeout_us == 0 ? runtime_config::queue_timeout_default_us :
+                                                                    config.default_queue_timeout_us),
+    default_run_timeout_us(config.default_run_timeout_us == 0 ? runtime_config::run_timeout_default_us :
+                                                                config.default_run_timeout_us),
+    overload_retry_after_seconds(bounded_retry_after(config.overload_retry_after_seconds)) {}
 
 admission_result request_runtime::admit(const request_metadata & request, bool scheduled) {
     const bool duplicate = records.count(request.id) != 0;
@@ -73,6 +90,9 @@ admission_result request_runtime::admit(const request_metadata & request, bool s
 
     record next;
     next.metadata = request;
+    next.queue_deadline_us = deadline_from(
+        request.arrival_us, request.queue_timeout_us == 0 ? default_queue_timeout_us : request.queue_timeout_us);
+    next.run_timeout_us = request.run_timeout_us == 0 ? default_run_timeout_us : request.run_timeout_us;
 
     request_registration registration;
     registration.id                 = request.id;
@@ -85,7 +105,9 @@ admission_result request_runtime::admit(const request_metadata & request, bool s
 
     const auto registered = registry.register_request(registration);
     if (!registered) {
-        return { registry_rejection(registered.code), server_scheduler::reason_code::reject_invalid_request };
+        const result_code code = registry_rejection(registered.code);
+        return { code, server_scheduler::reason_code::reject_invalid_request,
+                 is_overload(code) ? overload_retry_after_seconds : 0 };
     }
     next.handle = registered.handle;
 
@@ -121,7 +143,8 @@ admission_result request_runtime::enqueue(record & request, uint64_t at_us) {
     feasibility_quote quote;
     const auto        admitted = scheduler.admit(scheduling, quote);
     if (!admitted.accepted) {
-        return { scheduler_rejection(admitted.reason), admitted.reason };
+        const result_code code = scheduler_rejection(admitted.reason);
+        return { code, admitted.reason, is_overload(code) ? overload_retry_after_seconds : 0 };
     }
 
     const queue_state queue  = admitted.ready ? queue_state::ready : queue_state::admission;
@@ -183,9 +206,74 @@ dispatch_result request_runtime::take_next(uint64_t now_us) {
     return { true, decision.request_id, decision.selected_lane, decision.reason, decision.lane_reason };
 }
 
+expiration request_runtime::expire(std::map<uint64_t, record>::iterator it, deadline_kind kind, uint64_t at_us) {
+    record &   request = it->second;
+    expiration result  = { request.metadata.id, kind, !request.bindings.empty() };
+    const auto reason  = kind == deadline_kind::queue ? server_request_registry::reason_code::queue_timeout :
+                                                        server_request_registry::reason_code::run_timeout;
+    if (!registry.mark_timeout_expired(request.handle, reason, at_us)) {
+        return {};
+    }
+    request.terminal = lifecycle::timed_out;
+    if (request.scheduler_queued) {
+        if (!scheduler.cancel(request.metadata.id).completed) {
+            return {};
+        }
+        request.scheduler_queued = false;
+    }
+    if (!request.bindings.empty()) {
+        return result;
+    }
+
+    if (!finish(it, lifecycle::timed_out, reason, at_us)) {
+        return {};
+    }
+    return result;
+}
+
+std::vector<expiration> request_runtime::expire_due(uint64_t now_us) {
+    std::vector<expiration> result;
+    auto                    it = records.begin();
+    while (it != records.end()) {
+        const record & request = it->second;
+        if (request.terminal != lifecycle::completed) {
+            ++it;
+            continue;
+        }
+
+        const bool     run_started = request.run_deadline_us != 0;
+        const uint64_t deadline    = run_started ? request.run_deadline_us : request.queue_deadline_us;
+        if (now_us < deadline) {
+            ++it;
+            continue;
+        }
+
+        const auto current = it++;
+        expiration expired = expire(current, run_started ? deadline_kind::run : deadline_kind::queue, now_us);
+        if (expired.request_id != 0) {
+            result.push_back(expired);
+        }
+    }
+    return result;
+}
+
+expiration request_runtime::expire_if_due(std::map<uint64_t, record>::iterator it, uint64_t at_us) {
+    const record & request = it->second;
+    if (request.terminal != lifecycle::completed) {
+        return {};
+    }
+    const bool     run_started = request.run_deadline_us != 0;
+    const uint64_t deadline    = run_started ? request.run_deadline_us : request.queue_deadline_us;
+    if (at_us < deadline) {
+        return {};
+    }
+    return expire(it, run_started ? deadline_kind::run : deadline_kind::queue, at_us);
+}
+
 bool request_runtime::mark_deferred(uint64_t request_id, uint64_t at_us) {
     const auto it = records.find(request_id);
-    return it != records.end() && !it->second.scheduler_queued && it->second.bindings.empty() &&
+    return it != records.end() && it->second.terminal == lifecycle::completed && at_us < it->second.queue_deadline_us &&
+           !it->second.scheduler_queued && it->second.bindings.empty() &&
            registry.set_queue_state(it->second.handle, queue_state::blocked,
                                     server_request_registry::reason_code::capacity_blocked, at_us);
 }
@@ -195,6 +283,9 @@ admission_result request_runtime::resume(uint64_t request_id, uint64_t at_us) {
     if (it == records.end()) {
         return { result_code::unknown_request, server_scheduler::reason_code::reject_invalid_request };
     }
+    if (it->second.terminal != lifecycle::completed || at_us >= it->second.queue_deadline_us) {
+        return { result_code::deadline_expired, server_scheduler::reason_code::reject_invalid_request };
+    }
     if (it->second.scheduler_queued || !it->second.bindings.empty()) {
         return { result_code::invalid_transition, server_scheduler::reason_code::reject_invalid_request };
     }
@@ -203,7 +294,8 @@ admission_result request_runtime::resume(uint64_t request_id, uint64_t at_us) {
 
 bool request_runtime::bind_slot(uint64_t request_id, slot_id slot, uint64_t at_us) {
     const auto it = records.find(request_id);
-    if (it == records.end() || it->second.scheduler_queued) {
+    if (it == records.end() || it->second.terminal != lifecycle::completed || it->second.scheduler_queued ||
+        (it->second.run_deadline_us == 0 && at_us >= it->second.queue_deadline_us)) {
         return false;
     }
     const binding_result result =
@@ -212,18 +304,54 @@ bool request_runtime::bind_slot(uint64_t request_id, slot_id slot, uint64_t at_u
         return false;
     }
     it->second.bindings.push_back(result.lease);
+    if (it->second.run_deadline_us == 0) {
+        it->second.run_deadline_us = deadline_from(at_us, it->second.run_timeout_us);
+    }
     return true;
 }
 
-bool request_runtime::release_slot(uint64_t request_id, slot_id slot, uint64_t at_us) {
+publication_result request_runtime::gate_result_publication(uint64_t request_id,
+                                                            slot_id  slot,
+                                                            bool     final,
+                                                            uint64_t at_us) {
+    auto it = records.find(request_id);
+    if (it == records.end() || it->second.terminal != lifecycle::completed) {
+        return {};
+    }
+
+    const expiration expired = expire_if_due(it, at_us);
+    if (expired.request_id != 0) {
+        return { false, expired };
+    }
+
+    const record & request = it->second;
+    if (!std::any_of(request.bindings.begin(), request.bindings.end(),
+                     [slot](const binding_lease & value) { return value.slot == slot; })) {
+        return {};
+    }
+    return { !final || release_bound_slot(it, slot, at_us), {} };
+}
+
+release_result request_runtime::release_slot(uint64_t request_id, slot_id slot, uint64_t at_us) {
     auto it = records.find(request_id);
     if (it == records.end()) {
-        return false;
+        return {};
     }
-    auto &     bindings = it->second.bindings;
+    const expiration expired = expire_if_due(it, at_us);
+    it = records.find(request_id);
+    return { it != records.end() && release_bound_slot(it, slot, at_us), expired };
+}
+
+bool request_runtime::release_bound_slot(std::map<uint64_t, record>::iterator it, slot_id slot, uint64_t at_us) {
+    auto &     request  = it->second;
+    auto &     bindings = request.bindings;
     const auto lease    = std::find_if(bindings.begin(), bindings.end(),
                                        [slot](const binding_lease & value) { return value.slot == slot; });
-    if (lease == bindings.end() || !registry.unbind(*lease, server_request_registry::reason_code::yielded, at_us)) {
+    const auto unbind_reason =
+        request.terminal == lifecycle::timed_out ? server_request_registry::reason_code::run_timeout :
+        request.terminal == lifecycle::cancelled ? server_request_registry::reason_code::client_cancel :
+                                                   server_request_registry::reason_code::yielded;
+    if (lease == bindings.end() || !registry.unbind(*lease, unbind_reason, at_us)) {
         return false;
     }
     bindings.erase(lease);
@@ -231,17 +359,12 @@ bool request_runtime::release_slot(uint64_t request_id, slot_id slot, uint64_t a
         return true;
     }
 
-    const auto snapshot = registry.get(it->second.handle);
-    if (!snapshot) {
-        return false;
-    }
-    if (snapshot->cancel_requested) {
-        return finish(it, lifecycle::cancelled, server_request_registry::reason_code::client_cancel, at_us);
-    }
-    return finish(it, it->second.terminal,
-                  it->second.terminal == lifecycle::failed ? server_request_registry::reason_code::request_failed :
-                                                             server_request_registry::reason_code::completed,
-                  at_us);
+    const auto terminal_reason =
+        request.terminal == lifecycle::cancelled ? server_request_registry::reason_code::client_cancel :
+        request.terminal == lifecycle::timed_out ? unbind_reason :
+        request.terminal == lifecycle::failed    ? server_request_registry::reason_code::request_failed :
+                                                   server_request_registry::reason_code::completed;
+    return finish(it, request.terminal, terminal_reason, at_us);
 }
 
 bool request_runtime::cancel(uint64_t request_id, uint64_t at_us) {
@@ -249,10 +372,14 @@ bool request_runtime::cancel(uint64_t request_id, uint64_t at_us) {
     if (it == records.end()) {
         return false;
     }
+    if (it->second.terminal != lifecycle::completed) {
+        return true;
+    }
     if (!registry.mark_cancel_requested(it->second.handle, server_request_registry::reason_code::client_cancel,
                                         at_us)) {
         return false;
     }
+    it->second.terminal = lifecycle::cancelled;
     if (it->second.scheduler_queued) {
         if (!scheduler.cancel(request_id).completed) {
             return false;
@@ -269,6 +396,9 @@ bool request_runtime::fail(uint64_t request_id, uint64_t at_us) {
     auto it = records.find(request_id);
     if (it == records.end()) {
         return false;
+    }
+    if (it->second.terminal != lifecycle::completed) {
+        return true;
     }
     it->second.terminal = lifecycle::failed;
     if (it->second.scheduler_queued) {

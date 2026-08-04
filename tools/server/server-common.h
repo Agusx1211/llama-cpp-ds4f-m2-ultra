@@ -59,6 +59,8 @@ enum error_type {
     ERROR_TYPE_SERVER,
     ERROR_TYPE_NOT_FOUND,
     ERROR_TYPE_PERMISSION,
+    ERROR_TYPE_OVERLOADED, // custom 429 queue-cap response
+    ERROR_TYPE_TIMEOUT, // custom queue/run deadline response
     ERROR_TYPE_UNAVAILABLE, // custom error
     ERROR_TYPE_NOT_SUPPORTED, // custom error
     ERROR_TYPE_EXCEED_CONTEXT_SIZE, // custom error
@@ -91,6 +93,9 @@ struct server_grammar_trigger {
 };
 
 json format_error_response(const std::string & message, const enum error_type type);
+
+uint32_t bounded_retry_after_seconds(uint64_t seconds);
+std::string retry_after_header_value(const json & error_data);
 
 //
 // random string / id

@@ -1528,6 +1528,9 @@ json server_task_result_rerank::to_json() {
 //
 json server_task_result_error::to_json() {
     json res = format_error_response(err_msg, err_type);
+    if (err_type == ERROR_TYPE_OVERLOADED) {
+        res["retry_after"] = bounded_retry_after_seconds(retry_after_seconds);
+    }
     if (err_type == ERROR_TYPE_EXCEED_CONTEXT_SIZE) {
         res["n_prompt_tokens"] = n_prompt_tokens;
         res["n_ctx"]           = n_ctx;

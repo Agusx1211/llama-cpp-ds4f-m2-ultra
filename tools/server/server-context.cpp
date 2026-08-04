@@ -1507,6 +1507,14 @@ private:
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
+        queue_tasks.on_request_expired([this](server_queue_expiration expiration) {
+            auto result = std::make_unique<server_task_result_error>();
+            result->id       = expiration.task_id;
+            result->err_type = ERROR_TYPE_TIMEOUT;
+            result->err_msg  = expiration.kind == server_request_runtime::deadline_kind::queue ?
+                                   "request queue deadline expired" : "request run deadline expired";
+            queue_results.send(std::move(result));
+        });
 
         metrics.init();
 
@@ -1901,8 +1909,11 @@ private:
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
 
-        if (!queue_tasks.bind_slot(slot.task->id, slot.id)) {
-            send_error(slot, "failed to bind durable request state", ERROR_TYPE_SERVER);
+        const auto binding = queue_tasks.bind_slot(slot.task->id, slot.id);
+        if (!binding) {
+            if (binding.code != server_queue_bind_code::expired) {
+                send_error(slot, "failed to bind durable request state", ERROR_TYPE_SERVER);
+            }
             slot.release();
             return false;
         }
@@ -2141,7 +2152,7 @@ private:
         return true;
     }
 
-    void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
+    bool send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
         res->id    = slot.task->id;
@@ -2181,10 +2192,11 @@ private:
             res->timings = slot.get_timings();
         }
 
-        queue_results.send(std::move(res));
+        return queue_tasks.publish_slot_result(queue_results, slot.task->id, slot.id,
+                                               server_queue_result_kind::partial, std::move(res));
     }
 
-    void send_final_response(server_slot & slot) {
+    bool send_final_response(server_slot & slot) {
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -2244,10 +2256,11 @@ private:
 
         res->generation_params = slot.task->params; // copy the parameters
 
-        queue_results.send(std::move(res));
+        return queue_tasks.publish_slot_result(queue_results, slot.task->id, slot.id,
+                                               server_queue_result_kind::final, std::move(res));
     }
 
-    void send_embedding(const server_slot & slot, const llama_batch & batch) {
+    bool send_embedding(const server_slot & slot, const llama_batch & batch) {
         auto res = std::make_unique<server_task_result_embd>();
         res->id        = slot.task->id;
         res->index     = slot.task->index;
@@ -2289,10 +2302,11 @@ private:
 
         SLT_DBG(slot, "%s", "sending embeddings\n");
 
-        queue_results.send(std::move(res));
+        return queue_tasks.publish_slot_result(queue_results, slot.task->id, slot.id,
+                                               server_queue_result_kind::final, std::move(res));
     }
 
-    void send_rerank(const server_slot & slot, const llama_batch & batch) {
+    bool send_rerank(const server_slot & slot, const llama_batch & batch) {
         auto res = std::make_unique<server_task_result_rerank>();
         res->id       = slot.task->id;
         res->index    = slot.task->index;
@@ -2320,7 +2334,8 @@ private:
 
         SLT_DBG(slot, "sending rerank result, res.score = %f\n", res->score);
 
-        queue_results.send(std::move(res));
+        return queue_tasks.publish_slot_result(queue_results, slot.task->id, slot.id,
+                                               server_queue_result_kind::final, std::move(res));
     }
 
     //
@@ -4076,8 +4091,9 @@ private:
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
                 slot.print_timings();
-                send_final_response(slot);
-                metrics.on_prediction(slot);
+                if (send_final_response(slot)) {
+                    metrics.on_prediction(slot);
+                }
                 slot.release();
 
                 return;
@@ -4206,8 +4222,9 @@ private:
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();
-                    send_final_response(slot);
-                    metrics.on_prediction(slot);
+                    if (send_final_response(slot)) {
+                        metrics.on_prediction(slot);
+                    }
                     slot.release();
 
                     return;
@@ -4321,6 +4338,10 @@ struct server_res_generator : server_res_spipe {
     }
     void error(const json & error_data) {
         status = json_value(error_data, "code", 500);
+        const std::string retry_after = retry_after_header_value(error_data);
+        if (!retry_after.empty()) {
+            headers["Retry-After"] = retry_after;
+        }
         data = safe_json_to_str({{ "error", error_data }});
     }
 };

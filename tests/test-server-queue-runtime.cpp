@@ -4,7 +4,10 @@
 
 #include "server-queue.h"
 
+#include <condition_variable>
 #include <cstdio>
+#include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -18,13 +21,87 @@ void require(bool condition, const char * message) {
     }
 }
 
-server_task make_user(server_queue & queue, server_task::trusted_lane lane, uint64_t arrival_us) {
-    server_task task(SERVER_TASK_TYPE_COMPLETION);
+void require_posted(const server_queue_post_result & result, int task_id, const char * message) {
+    require(result && result.task_id == task_id, message);
+}
+
+server_request_runtime::runtime_config test_runtime_config() {
+    server_request_runtime::runtime_config config;
+    config.scheduler.context_tokens = std::numeric_limits<uint64_t>::max();
+    return config;
+}
+
+struct test_partial_result : server_task_result {
+    bool is_stop() override { return false; }
+
+    json to_json() override {
+        return {
+            { "partial", true }
+        };
+    }
+};
+
+server_task make_user(server_queue &              queue,
+                      server_task::trusted_lane lane,
+                      uint64_t                   arrival_us,
+                      server_task_type           type = SERVER_TASK_TYPE_COMPLETION) {
+    server_task task(type);
     task.id                          = queue.get_new_id();
     task.scheduling.lane             = lane;
     task.scheduling.arrival_us       = arrival_us;
     task.scheduling.predicted_gpu_us = 1;
+    // Most legacy scheduling tests use tiny synthetic arrival timestamps. Keep
+    // them independent of wall-clock deadlines; deadline tests override these.
+    task.scheduling.queue_timeout_us = std::numeric_limits<uint64_t>::max();
+    task.scheduling.run_timeout_us   = std::numeric_limits<uint64_t>::max();
     return task;
+}
+
+void bind_only(server_queue & queue, int task_id, int slot_id) {
+    queue.on_new_task([&](server_task && selected) {
+        require(selected.id == task_id, "dispatch expected publication task");
+        require(queue.bind_slot(selected.id, slot_id), "bind publication task");
+        queue.terminate();
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+}
+
+server_task_result_ptr make_final_result(server_task_type type, int task_id) {
+    server_task_result_ptr result;
+    switch (type) {
+        case SERVER_TASK_TYPE_COMPLETION:
+            result = std::make_unique<server_task_result_cmpl_final>();
+            break;
+        case SERVER_TASK_TYPE_EMBEDDING:
+            result = std::make_unique<server_task_result_embd>();
+            break;
+        case SERVER_TASK_TYPE_RERANK:
+            result = std::make_unique<server_task_result_rerank>();
+            break;
+        default:
+            throw std::runtime_error("unsupported publication fixture type");
+    }
+    result->id = task_id;
+    return result;
+}
+
+void send_timeout_result(server_response & responses, server_queue_expiration event) {
+    auto error      = std::make_unique<server_task_result_error>();
+    error->id       = event.task_id;
+    error->err_type = ERROR_TYPE_TIMEOUT;
+    error->err_msg  = event.kind == server_request_runtime::deadline_kind::run ? "request run deadline exceeded" :
+                                                                                 "request queue deadline exceeded";
+    responses.send(std::move(error));
+}
+
+void require_timeout_only(server_response & responses, int task_id, const char * message) {
+    auto result = responses.recv_with_timeout({ task_id }, 0);
+    auto error  = dynamic_cast<server_task_result_error *>(result.get());
+    require(error != nullptr && error->err_type == ERROR_TYPE_TIMEOUT, message);
+    require(responses.recv_with_timeout({ task_id }, 0) == nullptr,
+            "terminal timeout leaves no queued success result");
 }
 
 void test_internal_and_three_lane_dispatch() {
@@ -42,10 +119,10 @@ void test_internal_and_three_lane_dispatch() {
     control.id           = queue.get_new_id();
     const int control_id = control.id;
 
-    require(queue.post(std::move(low)) == low_id, "post low");
-    require(queue.post(std::move(normal)) == normal_id, "post normal");
-    require(queue.post(std::move(fast)) == fast_id, "post fast");
-    require(queue.post(std::move(control)) == control_id, "post internal control");
+    require_posted(queue.post(std::move(low)), low_id, "post low");
+    require_posted(queue.post(std::move(normal)), normal_id, "post normal");
+    require_posted(queue.post(std::move(fast)), fast_id, "post fast");
+    require_posted(queue.post(std::move(control)), control_id, "post internal control");
 
     queue.on_new_task([&](server_task && task) {
         order.push_back(task.id);
@@ -73,7 +150,7 @@ void test_deferred_request_reenters_policy() {
     server_queue queue;
     server_task  task = make_user(queue, server_task::trusted_lane::normal, 10);
     const int    id   = task.id;
-    require(queue.post(std::move(task)) == id, "post deferrable task");
+    require_posted(queue.post(std::move(task)), id, "post deferrable task");
 
     int dispatches = 0;
     queue.on_new_task([&](server_task && selected) {
@@ -107,13 +184,13 @@ void test_cancel_before_dispatch() {
     server_queue queue;
     server_task  task = make_user(queue, server_task::trusted_lane::low, 20);
     const int    id   = task.id;
-    require(queue.post(std::move(task)) == id, "post cancellable task");
+    require_posted(queue.post(std::move(task)), id, "post cancellable task");
 
     std::vector<server_task> cancellations;
     server_task              cancel(SERVER_TASK_TYPE_CANCEL);
     cancel.id_target = id;
     cancellations.push_back(std::move(cancel));
-    require(queue.post(std::move(cancellations), true) == 0, "post cancellation");
+    require(queue.post(std::move(cancellations), true), "post cancellation");
 
     int user_dispatches = 0;
     queue.on_new_task([&](server_task && selected) {
@@ -128,13 +205,54 @@ void test_cancel_before_dispatch() {
     require(queue.request_summary().active_requests == 0, "queued cancellation retires durable state");
 }
 
-void test_live_fast_queue_cap() {
+void test_cancel_deferred_payload() {
     server_queue     queue;
+    server_task  task = make_user(queue, server_task::trusted_lane::normal, 30);
+    const int    id   = task.id;
+    require_posted(queue.post(std::move(task)), id, "post deferred cancellation request");
+
+    bool deferred                = false;
+    bool cancel_posted           = false;
+    int  cancellation_dispatches = 0;
+    queue.on_new_task([&](server_task && selected) {
+        if (selected.type == SERVER_TASK_TYPE_COMPLETION) {
+            deferred = true;
+            queue.defer(std::move(selected));
+            return;
+        }
+        if (selected.type == SERVER_TASK_TYPE_CANCEL) {
+            ++cancellation_dispatches;
+            queue.terminate();
+        }
+    });
+    queue.on_update_slots([&] {
+        if (deferred && !cancel_posted) {
+            cancel_posted = true;
+            std::vector<server_task> cancellations;
+            server_task              cancel(SERVER_TASK_TYPE_CANCEL);
+            cancel.id_target = id;
+            cancellations.push_back(std::move(cancel));
+            require(queue.post(std::move(cancellations), true), "cancel blocked deferred request");
+        }
+    });
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+
+    require(cancellation_dispatches == 1 && queue.queue_tasks_deferred_size() == 0 &&
+                queue.request_summary().active_requests == 0,
+            "deferred cancellation removes payload and durable state exactly once");
+}
+
+void test_live_fast_queue_cap() {
+    auto config                         = test_runtime_config();
+    config.overload_retry_after_seconds = 999;
+    uint64_t         now_us             = 100;
+    server_queue     queue(config, [&] { return now_us; });
     std::vector<int> accepted;
     for (int i = 0; i < 16; ++i) {
         server_task task = make_user(queue, server_task::trusted_lane::fast, static_cast<uint64_t>(100 + i));
         const int   id   = task.id;
-        require(queue.post(std::move(task)) == id, "fill configured fast queue");
+        require_posted(queue.post(std::move(task)), id, "fill configured fast queue");
         accepted.push_back(id);
     }
 
@@ -143,9 +261,15 @@ void test_live_fast_queue_cap() {
     server_task            rejected = make_user(queue, server_task::trusted_lane::fast, 200);
     reader.post_task(std::move(rejected));
     auto         backpressure = reader.next([] { return false; });
-    const auto * error        = dynamic_cast<server_task_result_error *>(backpressure.get());
-    require(error != nullptr && error->err_type == ERROR_TYPE_UNAVAILABLE && error->err_msg == "request queue is full",
-            "seventeenth fast request receives explicit backpressure");
+    auto * error        = dynamic_cast<server_task_result_error *>(backpressure.get());
+    require(error != nullptr && error->err_type == ERROR_TYPE_OVERLOADED && error->err_msg == "request queue is full",
+            "seventeenth fast request receives overload backpressure");
+    const json overload = error->to_json();
+    require(json_value(overload, "code", 0) == 429 && json_value(overload, "retry_after", 0) == 60 &&
+                retry_after_header_value(overload) == "60",
+            "overload response carries HTTP 429 and bounded Retry-After");
+    require(bounded_retry_after_seconds(0) == 1 && bounded_retry_after_seconds(999) == 60,
+            "Retry-After public bounds are deterministic");
     require(queue.request_summary().active_requests == accepted.size(), "rejected request leaves no live metadata");
 
     std::vector<server_task> cancellations;
@@ -154,7 +278,7 @@ void test_live_fast_queue_cap() {
         cancel.id_target = id;
         cancellations.push_back(std::move(cancel));
     }
-    require(queue.post(std::move(cancellations), true) == 0, "cancel capped queue");
+    require(queue.post(std::move(cancellations), true), "cancel capped queue");
     require(queue.request_summary().active_requests == 0, "capacity is reusable after queued cancellation");
 }
 
@@ -186,7 +310,7 @@ void test_parallel_children_share_parent_admission() {
 
     std::vector<server_task> tasks;
     tasks.push_back(std::move(parent));
-    require(queue.post(std::move(tasks)) == 0, "post parent and passive child");
+    require(queue.post(std::move(tasks)), "post parent and passive child");
     require(queue.request_summary().active_requests == 2, "parent and child have separate durable identities");
 
     queue.on_new_task([&](server_task && selected) {
@@ -203,6 +327,550 @@ void test_parallel_children_share_parent_admission() {
     require(queue.request_summary().active_requests == 0, "parent group retires independently of slots");
 }
 
+void test_non_overload_rejection_stays_unavailable() {
+    auto config                     = test_runtime_config();
+    config.scheduler.context_tokens = 1;
+    uint64_t               now_us   = 100;
+    server_queue           queue(config, [&] { return now_us; });
+    server_response        responses;
+    server_response_reader reader(queue, responses, 1);
+
+    server_task rejected      = make_user(queue, server_task::trusted_lane::normal, 0);
+    rejected.params.n_predict = 2;
+    reader.post_task(std::move(rejected));
+    auto   result = reader.next([] { return false; });
+    auto * error  = dynamic_cast<server_task_result_error *>(result.get());
+    require(error != nullptr && error->err_type == ERROR_TYPE_UNAVAILABLE,
+            "non-overload admission rejection remains unavailable");
+    const json unavailable = error->to_json();
+    require(json_value(unavailable, "code", 0) == 503 && retry_after_header_value(unavailable).empty(),
+            "HTTP 503 does not acquire an overload Retry-After header");
+}
+
+void test_transactional_multi_post_rollback() {
+    auto config                                                                         = test_runtime_config();
+    config.scheduler.lanes[static_cast<size_t>(server_scheduler::lane::fast)].queue_cap = 1;
+    uint64_t     now_us                                                                 = 200;
+    server_queue queue(config, [&] { return now_us; });
+
+    server_task              first  = make_user(queue, server_task::trusted_lane::fast, 0);
+    server_task              second = make_user(queue, server_task::trusted_lane::fast, 0);
+    std::vector<server_task> batch;
+    batch.push_back(std::move(first));
+    batch.push_back(std::move(second));
+    const auto rejected = queue.post(std::move(batch));
+    require(!rejected && rejected.code == server_queue_post_code::overloaded && rejected.retry_after_seconds == 1,
+            "multi-post reports the admission failure as overload");
+    require(queue.request_summary().active_requests == 0, "failed multi-post rolls back every durable registration");
+
+    server_task replacement    = make_user(queue, server_task::trusted_lane::fast, 0);
+    const int   replacement_id = replacement.id;
+    require_posted(queue.post(std::move(replacement)), replacement_id,
+                   "rolled-back lane capacity is immediately reusable");
+    server_task cancel(SERVER_TASK_TYPE_CANCEL);
+    cancel.id        = queue.get_new_id();
+    cancel.id_target = replacement_id;
+    require(queue.post(std::move(cancel), true), "clean replacement after rollback test");
+}
+
+void test_queue_and_deferred_deadlines() {
+    auto config                                 = test_runtime_config();
+    config.default_queue_timeout_us             = 10;
+    config.registry.max_requests                = 1;
+    uint64_t                             now_us = 300;
+    server_queue                         queue(config, [&] { return now_us; });
+    std::vector<server_queue_expiration> expirations;
+    queue.on_request_expired([&](server_queue_expiration event) { expirations.push_back(event); });
+
+    server_task first                 = make_user(queue, server_task::trusted_lane::normal, 0);
+    first.scheduling.queue_timeout_us = 0;
+    const int first_id                = first.id;
+    require_posted(queue.post(std::move(first)), first_id, "post exact-deadline request");
+    now_us                                  = 310;
+    server_task replacement                 = make_user(queue, server_task::trusted_lane::normal, 0);
+    replacement.scheduling.queue_timeout_us = 0;
+    const int replacement_id                = replacement.id;
+    require_posted(queue.post(std::move(replacement)), replacement_id,
+                   "post boundary sweep reuses exact registry and lane capacity");
+    require(expirations.size() == 1 && expirations[0].task_id == first_id &&
+                expirations[0].kind == server_request_runtime::deadline_kind::queue,
+            "queued request expires at exact injected-clock boundary");
+
+    queue.on_new_task([&](server_task && selected) { queue.defer(std::move(selected)); });
+    queue.on_update_slots([&] { now_us = 320; });
+    queue.on_sleeping_state([](bool) {});
+    queue.on_request_expired([&](server_queue_expiration event) {
+        expirations.push_back(event);
+        require(queue.request_summary().active_requests == 0, "expiry callback can reenter queue after mutex release");
+        queue.terminate();
+    });
+    queue.start_loop();
+    require(expirations.size() == 2 && expirations.back().task_id == replacement_id &&
+                queue.queue_tasks_deferred_size() == 0 && queue.request_summary().active_requests == 0,
+            "blocked deferred request expires, removes payload, and retires metadata");
+}
+
+void test_selected_request_expires_before_bind() {
+    auto config                     = test_runtime_config();
+    config.default_queue_timeout_us = 10;
+    uint64_t               now_us   = 350;
+    server_queue           queue(config, [&] { return now_us; });
+    int                    expiration_callbacks = 0;
+    server_queue_bind_code bind_code            = server_queue_bind_code::rejected;
+
+    queue.on_request_expired([&](server_queue_expiration event) {
+        ++expiration_callbacks;
+        require(event.kind == server_request_runtime::deadline_kind::queue,
+                "selected unbound request keeps queue deadline");
+        require(queue.request_summary().active_requests == 0, "pre-bind expiry callback runs outside queue mutex");
+    });
+    queue.on_new_task([&](server_task && selected) {
+        now_us    = 360;
+        bind_code = queue.bind_slot(selected.id, 0).code;
+        queue.terminate();
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+
+    server_task task                 = make_user(queue, server_task::trusted_lane::normal, 0);
+    task.scheduling.queue_timeout_us = 0;
+    require(queue.post(std::move(task)), "post pre-bind deadline request");
+    queue.start_loop();
+    require(bind_code == server_queue_bind_code::expired && expiration_callbacks == 1 &&
+                queue.request_summary().active_requests == 0,
+            "selected payload crossing its deadline cannot bind or remain durable");
+}
+
+void test_passive_child_deadline_order() {
+    auto config                     = test_runtime_config();
+    config.default_queue_timeout_us = 10;
+    uint64_t         now_us         = 400;
+    server_queue     queue(config, [&] { return now_us; });
+    std::vector<int> expired_ids;
+    queue.on_request_expired([&](server_queue_expiration event) { expired_ids.push_back(event.task_id); });
+
+    server_task parent                 = make_user(queue, server_task::trusted_lane::normal, 0);
+    parent.scheduling.queue_timeout_us = 0;
+    const int parent_id                = parent.id;
+    const int child_id                 = queue.get_new_id();
+    parent.add_child(parent_id, child_id);
+    std::vector<server_task> tasks;
+    tasks.push_back(std::move(parent));
+    require(queue.post(std::move(tasks)), "post parent and passive deadline child");
+    now_us = 410;
+    require(queue.expire_requests() == 2 && expired_ids == std::vector<int>({ parent_id, child_id }),
+            "parent and passive child expire in deterministic durable-ID order");
+    require(queue.request_summary().active_requests == 0, "passive child deadline releases all capacity");
+}
+
+void test_passive_child_cancellation() {
+    server_queue queue;
+    server_task  parent    = make_user(queue, server_task::trusted_lane::normal, 450);
+    const int    parent_id = parent.id;
+    const int    child_id  = queue.get_new_id();
+    parent.add_child(parent_id, child_id);
+    std::vector<server_task> tasks;
+    tasks.push_back(std::move(parent));
+    require(queue.post(std::move(tasks)), "post cancellable passive child");
+
+    std::vector<server_task> cancellations;
+    server_task              cancel(SERVER_TASK_TYPE_CANCEL);
+    cancel.id_target = child_id;
+    cancellations.push_back(std::move(cancel));
+    require(queue.post(std::move(cancellations), true), "cancel passive child before parent dispatch");
+    require(queue.request_summary().active_requests == 1,
+            "passive-child cancellation preserves parent durable request");
+
+    int cancellation_dispatches = 0;
+    queue.on_new_task([&](server_task && selected) {
+        if (selected.type == SERVER_TASK_TYPE_CANCEL) {
+            ++cancellation_dispatches;
+            return;
+        }
+        require(selected.id == parent_id && selected.child_tasks.empty(),
+                "cancelled passive child payload cannot reach slot setup");
+        require(queue.bind_slot(parent_id, 0) && queue.release_slot(parent_id, 0), "unaffected parent still completes");
+        queue.terminate();
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+    require(cancellation_dispatches == 1 && queue.request_summary().active_requests == 0,
+            "passive-child cancellation retires independently");
+}
+
+void test_final_result_publication_deadline_gate() {
+    const std::vector<server_task_type> result_types = {
+        SERVER_TASK_TYPE_COMPLETION,
+        SERVER_TASK_TYPE_EMBEDDING,
+        SERVER_TASK_TYPE_RERANK,
+    };
+
+    auto run_case = [](server_task_type type, uint64_t epoch_us, bool deadline_wins) {
+        auto config                     = test_runtime_config();
+        config.default_queue_timeout_us = 100;
+        config.default_run_timeout_us   = 10;
+        uint64_t        now_us = epoch_us;
+        server_queue    queue(config, [&] { return now_us; });
+        server_response responses;
+        int expiration_callbacks = 0;
+        queue.on_request_expired([&](server_queue_expiration event) {
+            ++expiration_callbacks;
+            send_timeout_result(responses, event);
+        });
+
+        server_task task                 = make_user(queue, server_task::trusted_lane::normal, 0, type);
+        task.scheduling.queue_timeout_us = 0;
+        task.scheduling.run_timeout_us   = 0;
+        const int task_id                = task.id;
+        responses.add_waiting_task_id(task_id);
+        require_posted(queue.post(std::move(task)), task_id, "post gated final publication");
+        bind_only(queue, task_id, 0);
+
+        now_us = epoch_us + (deadline_wins ? 10 : 9);
+        const bool published = queue.publish_slot_result(responses, task_id, 0,
+                                                         server_queue_result_kind::final,
+                                                         make_final_result(type, task_id));
+        require(published != deadline_wins,
+                "completion, embedding, or rerank publication obeys the exact run boundary");
+        if (deadline_wins) {
+            require_timeout_only(responses, task_id, "exact-boundary final publication returns timeout");
+            require(expiration_callbacks == 1 && queue.release_slot(task_id, 0) &&
+                        queue.request_summary().active_requests == 0,
+                    "exact-boundary final timeout retires its slot exactly once");
+        } else {
+            auto success = responses.recv_with_timeout({ task_id }, 0);
+            require(success != nullptr && !success->is_error() && success->is_stop(),
+                    "pre-boundary final publication emits exactly one success");
+            now_us = epoch_us + 10;
+            require(queue.expire_requests() == 0 && expiration_callbacks == 0 &&
+                        queue.request_summary().active_requests == 0 &&
+                        responses.recv_with_timeout({ task_id }, 0) == nullptr,
+                    "committed final success cannot be overwritten by a later timeout");
+        }
+    };
+
+    uint64_t epoch_us = 1000;
+    for (server_task_type type : result_types) {
+        run_case(type, epoch_us, true);
+        epoch_us += 100;
+    }
+    for (server_task_type type : result_types) {
+        run_case(type, epoch_us, false);
+        epoch_us += 100;
+    }
+}
+
+void test_stream_result_publication_deadline_gate() {
+    auto config                     = test_runtime_config();
+    config.default_queue_timeout_us = 100;
+    config.default_run_timeout_us   = 10;
+    uint64_t        now_us          = 3000;
+    server_queue    queue(config, [&] { return now_us; });
+    server_response responses;
+    int             expiration_callbacks = 0;
+    queue.on_request_expired([&](server_queue_expiration event) {
+        ++expiration_callbacks;
+        send_timeout_result(responses, event);
+    });
+
+    server_task streaming                 = make_user(queue, server_task::trusted_lane::fast, 0);
+    streaming.scheduling.queue_timeout_us = 0;
+    streaming.scheduling.run_timeout_us   = 0;
+    streaming.params.stream               = true;
+    const int streaming_id                = streaming.id;
+    responses.add_waiting_task_id(streaming_id);
+    require_posted(queue.post(std::move(streaming)), streaming_id, "post streaming publication task");
+    bind_only(queue, streaming_id, 0);
+
+    now_us = 3009;
+    auto partial = std::make_unique<test_partial_result>();
+    partial->id  = streaming_id;
+    require(queue.publish_slot_result(responses, streaming_id, 0, server_queue_result_kind::partial,
+                                      std::move(partial)),
+            "streaming partial publishes before run deadline");
+    auto published_partial = responses.recv_with_timeout({ streaming_id }, 0);
+    require(published_partial != nullptr && !published_partial->is_error() && !published_partial->is_stop(),
+            "pre-boundary streaming partial is observable");
+
+    now_us = 3010;
+    require(!queue.publish_slot_result(responses, streaming_id, 0, server_queue_result_kind::final,
+                                       make_final_result(SERVER_TASK_TYPE_COMPLETION, streaming_id)),
+            "streaming final is denied at exact run deadline");
+    require_timeout_only(responses, streaming_id, "streaming final exact boundary returns timeout");
+    require(expiration_callbacks == 1 && queue.release_slot(streaming_id, 0),
+            "streaming final timeout retires once after an earlier partial");
+    queue.on_new_task([&](server_task && selected) {
+        require(selected.type == SERVER_TASK_TYPE_CANCEL && selected.id_target == streaming_id,
+                "streaming expiry queues its internal cancellation control");
+        queue.terminate();
+    });
+    queue.start_loop();
+
+    now_us = 3100;
+    server_task exact_partial                 = make_user(queue, server_task::trusted_lane::fast, 0);
+    exact_partial.scheduling.queue_timeout_us = 0;
+    exact_partial.scheduling.run_timeout_us   = 0;
+    exact_partial.params.stream               = true;
+    const int exact_partial_id                = exact_partial.id;
+    responses.add_waiting_task_id(exact_partial_id);
+    require_posted(queue.post(std::move(exact_partial)), exact_partial_id,
+                   "post exact-boundary streaming partial task");
+    bind_only(queue, exact_partial_id, 1);
+
+    now_us = 3110;
+    auto denied_partial = std::make_unique<test_partial_result>();
+    denied_partial->id  = exact_partial_id;
+    require(!queue.publish_slot_result(responses, exact_partial_id, 1, server_queue_result_kind::partial,
+                                       std::move(denied_partial)),
+            "streaming partial is denied at exact run deadline");
+    require_timeout_only(responses, exact_partial_id, "streaming partial exact boundary returns timeout");
+    require(expiration_callbacks == 2 && queue.release_slot(exact_partial_id, 1) &&
+                queue.request_summary().active_requests == 0,
+            "partial timeout emits once and leaks no success after terminal expiry");
+}
+
+void test_concurrent_update_publication_after_expiry() {
+    auto config                     = test_runtime_config();
+    config.default_queue_timeout_us = 100;
+    config.default_run_timeout_us   = 10;
+    uint64_t        now_us          = 4000;
+    server_queue    queue(config, [&] { return now_us; });
+    server_response responses;
+    std::mutex              rendezvous_mutex;
+    std::condition_variable rendezvous;
+    bool                    update_entered = false;
+    bool                    expiry_done    = false;
+    bool                    published      = true;
+    int                     task_id        = -1;
+    int                     expiration_callbacks = 0;
+    int                     cancellation_dispatches = 0;
+    int                     released_leases = 0;
+
+    queue.on_request_expired([&](server_queue_expiration event) {
+        ++expiration_callbacks;
+        send_timeout_result(responses, event);
+    });
+    queue.on_new_task([&](server_task && selected) {
+        if (selected.type == SERVER_TASK_TYPE_COMPLETION) {
+            require(queue.bind_slot(selected.id, 0), "bind concurrent update publication task");
+            return;
+        }
+        require(selected.type == SERVER_TASK_TYPE_CANCEL && selected.id_target == task_id,
+                "run expiry queues cancellation for concurrent update task");
+        ++cancellation_dispatches;
+        released_leases += queue.release_slot(selected.id_target, 0);
+        queue.terminate();
+    });
+    queue.on_update_slots([&] {
+        {
+            std::lock_guard<std::mutex> lock(rendezvous_mutex);
+            update_entered = true;
+        }
+        rendezvous.notify_one();
+        {
+            std::unique_lock<std::mutex> lock(rendezvous_mutex);
+            rendezvous.wait(lock, [&] { return expiry_done; });
+        }
+        auto partial = std::make_unique<test_partial_result>();
+        partial->id  = task_id;
+        published = queue.publish_slot_result(responses, task_id, 0, server_queue_result_kind::partial,
+                                              std::move(partial));
+    });
+    queue.on_sleeping_state([](bool) {});
+
+    server_task task                 = make_user(queue, server_task::trusted_lane::normal, 0);
+    task.scheduling.queue_timeout_us = 0;
+    task.scheduling.run_timeout_us   = 0;
+    task.params.stream               = true;
+    task_id                          = task.id;
+    responses.add_waiting_task_id(task_id);
+    require_posted(queue.post(std::move(task)), task_id, "post concurrent update publication task");
+
+    std::thread expirer([&] {
+        {
+            std::unique_lock<std::mutex> lock(rendezvous_mutex);
+            rendezvous.wait(lock, [&] { return update_entered; });
+        }
+        now_us = 4010;
+        require(queue.expire_requests() == 1, "concurrent sweep expires task at exact run deadline");
+        {
+            std::lock_guard<std::mutex> lock(rendezvous_mutex);
+            expiry_done = true;
+        }
+        rendezvous.notify_one();
+    });
+
+    queue.start_loop();
+    expirer.join();
+    require(!published, "callback_update_slots cannot publish after concurrent terminal expiry");
+    require_timeout_only(responses, task_id, "concurrent update race returns only timeout");
+    require(expiration_callbacks == 1 && cancellation_dispatches == 1 && released_leases == 1 &&
+                queue.request_summary().active_requests == 0,
+            "concurrent expiry performs exactly one timeout and one slot cleanup");
+}
+
+void test_publication_gate_scales_without_global_sweep() {
+    auto config = test_runtime_config();
+    config.scheduler.lanes[static_cast<size_t>(server_scheduler::lane::normal)].queue_cap = 128;
+    config.registry.max_requests                                                        = 128;
+    config.default_queue_timeout_us                                                     = 1000;
+    config.default_run_timeout_us                                                       = 1000;
+    uint64_t        now_us = 5000;
+    server_queue    queue(config, [&] { return now_us; });
+    server_response responses;
+    std::vector<int> bound_ids;
+    std::vector<int> queued_ids;
+    std::vector<int> expired_ids;
+
+    int target_id        = -1;
+    int unrelated_due_id = -1;
+    int release_probe_id = -1;
+    for (int i = 0; i < 64; ++i) {
+        server_task task = make_user(queue, server_task::trusted_lane::normal, 0);
+        if (i == 0) {
+            target_id                      = task.id;
+            task.scheduling.run_timeout_us = 100;
+        } else if (i == 1) {
+            unrelated_due_id               = task.id;
+            task.scheduling.run_timeout_us = 10;
+        } else if (i == 2) {
+            release_probe_id = task.id;
+        }
+        const int task_id = task.id;
+        require_posted(queue.post(std::move(task)), task_id, "post scaled bound publication task");
+    }
+
+    queue.on_request_expired([&](server_queue_expiration event) { expired_ids.push_back(event.task_id); });
+    queue.on_new_task([&](server_task && selected) {
+        require(selected.type == SERVER_TASK_TYPE_COMPLETION, "scaled setup dispatches only user tasks");
+        require(queue.bind_slot(selected.id, selected.id), "bind scaled publication task");
+        bound_ids.push_back(selected.id);
+        if (bound_ids.size() == 64) {
+            queue.terminate();
+        }
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+
+    for (int i = 0; i < 32; ++i) {
+        server_task task  = make_user(queue, server_task::trusted_lane::normal, 0);
+        const int task_id = task.id;
+        require_posted(queue.post(std::move(task)), task_id, "post scaled queued publication task");
+        queued_ids.push_back(task_id);
+    }
+    require(queue.request_summary().active_requests == 96, "scale fixture holds 64 bound and 32 queued requests");
+
+    responses.add_waiting_task_id(target_id);
+    now_us = 5010;
+    auto partial = std::make_unique<test_partial_result>();
+    partial->id  = target_id;
+    require(queue.publish_slot_result(responses, target_id, target_id, server_queue_result_kind::partial,
+                                      std::move(partial)),
+            "target partial publishes while an unrelated request is due");
+    auto published = responses.recv_with_timeout({ target_id }, 0);
+    require(published != nullptr && !published->is_stop() && expired_ids.empty(),
+            "current-request gate does not sweep unrelated deadlines");
+    require(queue.release_slot(release_probe_id, release_probe_id) && expired_ids.empty(),
+            "current-request slot release does not sweep unrelated deadlines");
+
+    require(queue.expire_requests() == 1 && expired_ids == std::vector<int>({ unrelated_due_id }),
+            "normal queue boundary later sweeps the unrelated due request");
+    require(queue.release_slot(unrelated_due_id, unrelated_due_id), "release unrelated timed-out scale lease");
+
+    require(queue.publish_slot_result(responses, target_id, target_id, server_queue_result_kind::final,
+                                      make_final_result(SERVER_TASK_TYPE_COMPLETION, target_id)),
+            "scaled target final commits before its own deadline");
+    require(responses.recv_with_timeout({ target_id }, 0) != nullptr, "scaled target final is observable");
+    for (int id : bound_ids) {
+        if (id != target_id && id != unrelated_due_id && id != release_probe_id) {
+            require(queue.release_slot(id, id), "release remaining scaled bound lease");
+        }
+    }
+
+    std::vector<server_task> cancellations;
+    cancellations.reserve(queued_ids.size());
+    for (int id : queued_ids) {
+        server_task cancel(SERVER_TASK_TYPE_CANCEL);
+        cancel.id_target = id;
+        cancellations.push_back(std::move(cancel));
+    }
+    require(queue.post(std::move(cancellations), true) && queue.request_summary().active_requests == 0,
+            "scale fixture cleanup retires all remaining durable requests");
+}
+
+void test_bound_stream_timeout_and_cancel_race() {
+    auto config                     = test_runtime_config();
+    config.default_queue_timeout_us = 100;
+    config.default_run_timeout_us   = 20;
+    uint64_t               now_us   = 500;
+    server_queue           queue(config, [&] { return now_us; });
+    server_response        responses;
+    server_response_reader reader(queue, responses, 1);
+    int                    cancellation_dispatches = 0;
+    int                    released_leases         = 0;
+    int                    expiration_callbacks    = 0;
+
+    queue.on_request_expired([&](server_queue_expiration event) {
+        ++expiration_callbacks;
+        auto error      = std::make_unique<server_task_result_error>();
+        error->id       = event.task_id;
+        error->err_type = ERROR_TYPE_TIMEOUT;
+        error->err_msg  = event.kind == server_request_runtime::deadline_kind::run ? "request run deadline exceeded" :
+                                                                                     "request queue deadline exceeded";
+        responses.send(std::move(error));
+    });
+    queue.on_new_task([&](server_task && selected) {
+        if (selected.type == SERVER_TASK_TYPE_COMPLETION) {
+            require(queue.bind_slot(selected.id, 0), "bind streaming request");
+            auto partial = std::make_unique<test_partial_result>();
+            partial->id  = selected.id;
+            require(queue.publish_slot_result(responses, selected.id, 0, server_queue_result_kind::partial,
+                                              std::move(partial)),
+                    "publish streaming response through durable terminal gate");
+            queue.terminate();
+            return;
+        }
+        if (selected.type == SERVER_TASK_TYPE_CANCEL) {
+            ++cancellation_dispatches;
+            released_leases += queue.release_slot(selected.id_target, 0);
+            if (cancellation_dispatches == 2) {
+                queue.terminate();
+            }
+        }
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+
+    server_task streaming                 = make_user(queue, server_task::trusted_lane::fast, 0);
+    streaming.scheduling.queue_timeout_us = 0;
+    streaming.scheduling.run_timeout_us   = 0;
+    streaming.params.stream               = true;
+    const int streaming_id                = streaming.id;
+    reader.post_task(std::move(streaming));
+    queue.start_loop();
+    auto partial = reader.next([] { return false; });
+    require(partial != nullptr && !partial->is_error() && !partial->is_stop(),
+            "stream produces a partial response before its run deadline");
+
+    now_us = 520;
+    require(queue.release_slot(streaming_id, 0),
+            "release crossing exact run deadline expires and retires the bound lease");
+    auto   timeout = reader.next([] { return false; });
+    auto * error   = dynamic_cast<server_task_result_error *>(timeout.get());
+    require(error != nullptr && error->err_type == ERROR_TYPE_TIMEOUT && json_value(error->to_json(), "code", 0) == 408,
+            "stream receives deterministic timeout envelope after headers are already sent");
+    // next() stops an errored reader and explicitly posts a client CANCEL in
+    // addition to the run-expiry CANCEL already queued by release_slot().
+    require(reader.cancelled, "timeout reader posts duplicate client cancellation control");
+
+    queue.start_loop();
+    require(expiration_callbacks == 1 && cancellation_dispatches == 2 && released_leases == 0 &&
+                queue.request_summary().active_requests == 0,
+            "deadline emits once and duplicate cancellation controls cannot retire the lease a second time");
+}
+
 }  // namespace
 
 int main() {
@@ -210,9 +878,21 @@ int main() {
         { "internal and lane dispatch",   test_internal_and_three_lane_dispatch         },
         { "deferred policy reentry",      test_deferred_request_reenters_policy         },
         { "cancel before dispatch",       test_cancel_before_dispatch                   },
+        { "cancel deferred payload",      test_cancel_deferred_payload                  },
         { "live fast queue cap",          test_live_fast_queue_cap                      },
         { "internal defer compatibility", test_internal_defer_path_is_preserved         },
         { "parallel child registration",  test_parallel_children_share_parent_admission },
+        { "non-overload unavailable",     test_non_overload_rejection_stays_unavailable },
+        { "transactional rollback",       test_transactional_multi_post_rollback        },
+        { "queue and deferred deadlines", test_queue_and_deferred_deadlines             },
+        { "selected pre-bind deadline",   test_selected_request_expires_before_bind     },
+        { "passive child deadlines",      test_passive_child_deadline_order             },
+        { "passive child cancellation",   test_passive_child_cancellation               },
+        { "final publication gate",       test_final_result_publication_deadline_gate   },
+        { "stream publication gate",      test_stream_result_publication_deadline_gate  },
+        { "concurrent publication expiry", test_concurrent_update_publication_after_expiry },
+        { "publication scale isolation",  test_publication_gate_scales_without_global_sweep },
+        { "bound stream timeout",         test_bound_stream_timeout_and_cancel_race     },
     };
 
     for (const auto & test : tests) {
