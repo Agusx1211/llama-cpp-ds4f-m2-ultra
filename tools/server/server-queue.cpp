@@ -202,38 +202,48 @@ server_queue_post_result server_queue::post(std::vector<server_task> && tasks, b
     return { server_queue_post_code::accepted, 0, 0 };
 }
 
+server_queue_expiration server_queue::record_expiration_locked(const server_request_runtime::expiration & event) {
+    const int task_id = static_cast<int>(event.request_id - 1);
+    erase_pending_payload(task_id);
+    return { task_id, event.kind };
+}
+
+void server_queue::enqueue_expiration_cancel_locked(const server_request_runtime::expiration & event) {
+    if (event.was_running) {
+        server_task cancel(SERVER_TASK_TYPE_CANCEL);
+        cancel.id        = id++;
+        cancel.id_target = static_cast<int>(event.request_id - 1);
+        queue_tasks.emplace_front(std::move(cancel));
+    }
+}
+
 std::vector<server_queue_expiration> server_queue::expire_requests_locked(uint64_t at_us) {
     const auto                           runtime_expired = request_runtime.expire_due(at_us);
     std::vector<server_queue_expiration> expired;
     expired.reserve(runtime_expired.size());
 
     for (const auto & event : runtime_expired) {
-        const int task_id = static_cast<int>(event.request_id - 1);
-        erase_pending_payload(task_id);
-        expired.push_back({ task_id, event.kind });
+        expired.push_back(record_expiration_locked(event));
     }
 
     // Running requests need their temporary slots released. Insert the
     // cancellation controls in reverse so ascending durable request order is
     // preserved at the front of the internal queue.
     for (auto it = runtime_expired.rbegin(); it != runtime_expired.rend(); ++it) {
-        if (!it->was_running) {
-            continue;
-        }
-        server_task cancel(SERVER_TASK_TYPE_CANCEL);
-        cancel.id        = id++;
-        cancel.id_target = static_cast<int>(it->request_id - 1);
-        queue_tasks.emplace_front(std::move(cancel));
+        enqueue_expiration_cancel_locked(*it);
     }
     return expired;
 }
 
-void server_queue::notify_expired(const std::vector<server_queue_expiration> & expired) {
-    if (!callback_request_expired) {
-        return;
+void server_queue::notify_expired(const server_queue_expiration & expired) {
+    if (callback_request_expired) {
+        callback_request_expired(expired);
     }
+}
+
+void server_queue::notify_expired(const std::vector<server_queue_expiration> & expired) {
     for (const auto & event : expired) {
-        callback_request_expired(event);
+        notify_expired(event);
     }
 }
 
@@ -517,38 +527,49 @@ bool server_queue::publish_slot_result(server_response &         response,
                                        server_queue_result_kind  kind,
                                        server_task_result_ptr && result) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    const uint64_t               at_us   = now_us();
-    auto                         expired = expire_requests_locked(at_us);
-    const bool active = id_task >= 0 && id_slot >= 0 &&
-                        request_runtime.can_publish(runtime_id(id_task),
-                                                    static_cast<server_request_registry::slot_id>(id_slot));
-    const bool final = kind == server_queue_result_kind::final;
-    const bool publish = active &&
-                         (!final || request_runtime.release_slot(
-                                        runtime_id(id_task),
-                                        static_cast<server_request_registry::slot_id>(id_slot), at_us));
-    if (publish) {
-        GGML_ASSERT(result && result->id == id_task);
+    GGML_ASSERT(result && result->id == id_task);
+    server_request_runtime::publication_result publication;
+    if (id_task >= 0 && id_slot >= 0) {
+        publication = request_runtime.gate_result_publication(
+            runtime_id(id_task), static_cast<server_request_registry::slot_id>(id_slot),
+            kind == server_queue_result_kind::final, now_us());
+    }
+
+    server_queue_expiration expired;
+    if (publication.expired.request_id != 0) {
+        expired = record_expiration_locked(publication.expired);
+        enqueue_expiration_cancel_locked(publication.expired);
+    }
+    if (publication.publish) {
         // Keep the durable deadline/terminal decision and response insertion in
         // one serialized transaction. A concurrent cancel or expiry therefore
         // orders wholly before or wholly after this publication.
         response.send(std::move(result));
     }
     lock.unlock();
-    notify_expired(expired);
-    return publish;
+    if (expired.task_id >= 0) {
+        notify_expired(expired);
+    }
+    return publication.publish;
 }
 
 bool server_queue::release_slot(int id_task, int id_slot) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    const uint64_t               at_us    = now_us();
-    auto                         expired  = expire_requests_locked(at_us);
-    const bool                   released = id_task >= 0 && id_slot >= 0 &&
-                          request_runtime.release_slot(runtime_id(id_task),
-                                                       static_cast<server_request_registry::slot_id>(id_slot), at_us);
+    server_request_runtime::release_result release;
+    if (id_task >= 0 && id_slot >= 0) {
+        release = request_runtime.release_slot(runtime_id(id_task),
+                                               static_cast<server_request_registry::slot_id>(id_slot), now_us());
+    }
+    server_queue_expiration expired;
+    if (release.expired.request_id != 0) {
+        expired = record_expiration_locked(release.expired);
+        enqueue_expiration_cancel_locked(release.expired);
+    }
     lock.unlock();
-    notify_expired(expired);
-    return released;
+    if (expired.task_id >= 0) {
+        notify_expired(expired);
+    }
+    return release.released;
 }
 
 bool server_queue::fail_task(int id_task) {

@@ -257,6 +257,19 @@ std::vector<expiration> request_runtime::expire_due(uint64_t now_us) {
     return result;
 }
 
+expiration request_runtime::expire_if_due(std::map<uint64_t, record>::iterator it, uint64_t at_us) {
+    const record & request = it->second;
+    if (request.terminal != lifecycle::completed) {
+        return {};
+    }
+    const bool     run_started = request.run_deadline_us != 0;
+    const uint64_t deadline    = run_started ? request.run_deadline_us : request.queue_deadline_us;
+    if (at_us < deadline) {
+        return {};
+    }
+    return expire(it, run_started ? deadline_kind::run : deadline_kind::queue, at_us);
+}
+
 bool request_runtime::mark_deferred(uint64_t request_id, uint64_t at_us) {
     const auto it = records.find(request_id);
     return it != records.end() && it->second.terminal == lifecycle::completed && at_us < it->second.queue_deadline_us &&
@@ -297,22 +310,39 @@ bool request_runtime::bind_slot(uint64_t request_id, slot_id slot, uint64_t at_u
     return true;
 }
 
-bool request_runtime::can_publish(uint64_t request_id, slot_id slot) const {
-    const auto it = records.find(request_id);
+publication_result request_runtime::gate_result_publication(uint64_t request_id,
+                                                            slot_id  slot,
+                                                            bool     final,
+                                                            uint64_t at_us) {
+    auto it = records.find(request_id);
     if (it == records.end() || it->second.terminal != lifecycle::completed) {
-        return false;
+        return {};
     }
-    const auto & bindings = it->second.bindings;
-    return std::any_of(bindings.begin(), bindings.end(),
-                       [slot](const binding_lease & value) { return value.slot == slot; });
+
+    const expiration expired = expire_if_due(it, at_us);
+    if (expired.request_id != 0) {
+        return { false, expired };
+    }
+
+    const record & request = it->second;
+    if (!std::any_of(request.bindings.begin(), request.bindings.end(),
+                     [slot](const binding_lease & value) { return value.slot == slot; })) {
+        return {};
+    }
+    return { !final || release_bound_slot(it, slot, at_us), {} };
 }
 
-bool request_runtime::release_slot(uint64_t request_id, slot_id slot, uint64_t at_us) {
-    expire_due(at_us);
+release_result request_runtime::release_slot(uint64_t request_id, slot_id slot, uint64_t at_us) {
     auto it = records.find(request_id);
     if (it == records.end()) {
-        return false;
+        return {};
     }
+    const expiration expired = expire_if_due(it, at_us);
+    it = records.find(request_id);
+    return { it != records.end() && release_bound_slot(it, slot, at_us), expired };
+}
+
+bool request_runtime::release_bound_slot(std::map<uint64_t, record>::iterator it, slot_id slot, uint64_t at_us) {
     auto &     request  = it->second;
     auto &     bindings = request.bindings;
     const auto lease    = std::find_if(bindings.begin(), bindings.end(),

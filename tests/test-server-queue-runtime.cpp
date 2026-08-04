@@ -710,6 +710,96 @@ void test_concurrent_update_publication_after_expiry() {
             "concurrent expiry performs exactly one timeout and one slot cleanup");
 }
 
+void test_publication_gate_scales_without_global_sweep() {
+    auto config = test_runtime_config();
+    config.scheduler.lanes[static_cast<size_t>(server_scheduler::lane::normal)].queue_cap = 128;
+    config.registry.max_requests                                                        = 128;
+    config.default_queue_timeout_us                                                     = 1000;
+    config.default_run_timeout_us                                                       = 1000;
+    uint64_t        now_us = 5000;
+    server_queue    queue(config, [&] { return now_us; });
+    server_response responses;
+    std::vector<int> bound_ids;
+    std::vector<int> queued_ids;
+    std::vector<int> expired_ids;
+
+    int target_id        = -1;
+    int unrelated_due_id = -1;
+    int release_probe_id = -1;
+    for (int i = 0; i < 64; ++i) {
+        server_task task = make_user(queue, server_task::trusted_lane::normal, 0);
+        if (i == 0) {
+            target_id                      = task.id;
+            task.scheduling.run_timeout_us = 100;
+        } else if (i == 1) {
+            unrelated_due_id               = task.id;
+            task.scheduling.run_timeout_us = 10;
+        } else if (i == 2) {
+            release_probe_id = task.id;
+        }
+        const int task_id = task.id;
+        require_posted(queue.post(std::move(task)), task_id, "post scaled bound publication task");
+    }
+
+    queue.on_request_expired([&](server_queue_expiration event) { expired_ids.push_back(event.task_id); });
+    queue.on_new_task([&](server_task && selected) {
+        require(selected.type == SERVER_TASK_TYPE_COMPLETION, "scaled setup dispatches only user tasks");
+        require(queue.bind_slot(selected.id, selected.id), "bind scaled publication task");
+        bound_ids.push_back(selected.id);
+        if (bound_ids.size() == 64) {
+            queue.terminate();
+        }
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+
+    for (int i = 0; i < 32; ++i) {
+        server_task task  = make_user(queue, server_task::trusted_lane::normal, 0);
+        const int task_id = task.id;
+        require_posted(queue.post(std::move(task)), task_id, "post scaled queued publication task");
+        queued_ids.push_back(task_id);
+    }
+    require(queue.request_summary().active_requests == 96, "scale fixture holds 64 bound and 32 queued requests");
+
+    responses.add_waiting_task_id(target_id);
+    now_us = 5010;
+    auto partial = std::make_unique<test_partial_result>();
+    partial->id  = target_id;
+    require(queue.publish_slot_result(responses, target_id, target_id, server_queue_result_kind::partial,
+                                      std::move(partial)),
+            "target partial publishes while an unrelated request is due");
+    auto published = responses.recv_with_timeout({ target_id }, 0);
+    require(published != nullptr && !published->is_stop() && expired_ids.empty(),
+            "current-request gate does not sweep unrelated deadlines");
+    require(queue.release_slot(release_probe_id, release_probe_id) && expired_ids.empty(),
+            "current-request slot release does not sweep unrelated deadlines");
+
+    require(queue.expire_requests() == 1 && expired_ids == std::vector<int>({ unrelated_due_id }),
+            "normal queue boundary later sweeps the unrelated due request");
+    require(queue.release_slot(unrelated_due_id, unrelated_due_id), "release unrelated timed-out scale lease");
+
+    require(queue.publish_slot_result(responses, target_id, target_id, server_queue_result_kind::final,
+                                      make_final_result(SERVER_TASK_TYPE_COMPLETION, target_id)),
+            "scaled target final commits before its own deadline");
+    require(responses.recv_with_timeout({ target_id }, 0) != nullptr, "scaled target final is observable");
+    for (int id : bound_ids) {
+        if (id != target_id && id != unrelated_due_id && id != release_probe_id) {
+            require(queue.release_slot(id, id), "release remaining scaled bound lease");
+        }
+    }
+
+    std::vector<server_task> cancellations;
+    cancellations.reserve(queued_ids.size());
+    for (int id : queued_ids) {
+        server_task cancel(SERVER_TASK_TYPE_CANCEL);
+        cancel.id_target = id;
+        cancellations.push_back(std::move(cancel));
+    }
+    require(queue.post(std::move(cancellations), true) && queue.request_summary().active_requests == 0,
+            "scale fixture cleanup retires all remaining durable requests");
+}
+
 void test_bound_stream_timeout_and_cancel_race() {
     auto config                     = test_runtime_config();
     config.default_queue_timeout_us = 100;
@@ -801,6 +891,7 @@ int main() {
         { "final publication gate",       test_final_result_publication_deadline_gate   },
         { "stream publication gate",      test_stream_result_publication_deadline_gate  },
         { "concurrent publication expiry", test_concurrent_update_publication_after_expiry },
+        { "publication scale isolation",  test_publication_gate_scales_without_global_sweep },
         { "bound stream timeout",         test_bound_stream_timeout_and_cancel_race     },
     };
 

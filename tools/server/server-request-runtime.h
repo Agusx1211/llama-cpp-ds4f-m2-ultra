@@ -33,6 +33,18 @@ struct expiration {
     bool          was_running = false;
 };
 
+struct publication_result {
+    bool       publish = false;
+    expiration expired;
+};
+
+struct release_result {
+    bool       released = false;
+    expiration expired;
+
+    operator bool() const { return released; }
+};
+
 struct request_metadata {
     uint64_t                                   id                 = 0;
     server_scheduler::lane                     lane               = server_scheduler::lane::normal;
@@ -88,8 +100,11 @@ class request_runtime {
     std::vector<expiration> expire_due(uint64_t now_us);
 
     bool bind_slot(uint64_t request_id, server_request_registry::slot_id slot, uint64_t at_us);
-    bool can_publish(uint64_t request_id, server_request_registry::slot_id slot) const;
-    bool release_slot(uint64_t request_id, server_request_registry::slot_id slot, uint64_t at_us);
+    publication_result gate_result_publication(uint64_t request_id,
+                                               server_request_registry::slot_id slot,
+                                               bool                             final,
+                                               uint64_t                         at_us);
+    release_result release_slot(uint64_t request_id, server_request_registry::slot_id slot, uint64_t at_us);
     bool cancel(uint64_t request_id, uint64_t at_us);
     bool fail(uint64_t request_id, uint64_t at_us);
 
@@ -113,6 +128,10 @@ class request_runtime {
 
     admission_result enqueue(record & request, uint64_t at_us);
     expiration       expire(std::map<uint64_t, record>::iterator it, deadline_kind kind, uint64_t at_us);
+    expiration       expire_if_due(std::map<uint64_t, record>::iterator it, uint64_t at_us);
+    bool             release_bound_slot(std::map<uint64_t, record>::iterator it,
+                                        server_request_registry::slot_id     slot,
+                                        uint64_t                             at_us);
     bool             finish(std::map<uint64_t, record>::iterator it,
                             server_request_registry::lifecycle   terminal,
                             server_request_registry::reason_code reason,

@@ -183,7 +183,10 @@ private:
     uint64_t now_us() const;
     server_request_runtime::request_metadata make_request_metadata(server_task & task, uint64_t at_us);
     server_request_runtime::admission_result enqueue_user_task(server_task && task, uint64_t at_us);
+    server_queue_expiration record_expiration_locked(const server_request_runtime::expiration & event);
+    void enqueue_expiration_cancel_locked(const server_request_runtime::expiration & event);
     std::vector<server_queue_expiration> expire_requests_locked(uint64_t at_us);
+    void notify_expired(const server_queue_expiration & expired);
     void notify_expired(const std::vector<server_queue_expiration> & expired);
     void erase_pending_payload(int id_target);
     void cleanup_pending_task(int id_target, uint64_t at_us);
