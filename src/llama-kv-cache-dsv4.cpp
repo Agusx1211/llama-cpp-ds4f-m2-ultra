@@ -102,7 +102,7 @@ llama_dsv4_cow_preflight_test_stats llama_kv_cache_dsv4_test_get_cow_preflight_s
 }
 
 void llama_kv_cache_dsv4_test_enable_page_delta_audit(bool enabled) {
-    dsv4_test_page_delta_audit_enabled.store(enabled, std::memory_order_release);
+    dsv4_test_page_delta_audit_enabled.store(enabled, std::memory_order_relaxed);
 }
 
 void llama_kv_cache_dsv4_test_reset_page_delta_audit() {
@@ -386,7 +386,7 @@ public:
             const std::vector<dsv4_sparse_range> & ranges,
             llama_dsv4_batch_quote & result) {
         n_ranges = ranges.size();
-        if (dsv4_test_page_delta_audit_enabled.load(std::memory_order_acquire)) {
+        if (dsv4_test_page_delta_audit_enabled.load(std::memory_order_relaxed)) {
             audit_state = std::make_unique<dsv4_sparse_transaction_audit_state>();
         }
         for (size_t i = 0; i < result.families.size(); ++i) {
