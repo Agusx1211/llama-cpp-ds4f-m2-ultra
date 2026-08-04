@@ -7,6 +7,7 @@
 #include <cctype>
 #include <charconv>
 #include <optional>
+#include <string_view>
 
 namespace server_admin_dashboard {
 
@@ -39,6 +40,28 @@ bool has_header(const std::map<std::string, std::string> & headers, const char *
     return find_header(headers, name).has_value();
 }
 
+bool loopback_origin_host(const std::string & host) {
+    if (host == "localhost" || host == "::1") {
+        return true;
+    }
+    size_t begin = 0;
+    for (size_t octet = 0; octet < 4; ++octet) {
+        const size_t end = host.find('.', begin);
+        if ((octet < 3 && end == std::string::npos) || (octet == 3 && end != std::string::npos)) {
+            return false;
+        }
+        const size_t segment_end = end == std::string::npos ? host.size() : end;
+        unsigned int value = 0;
+        const auto parsed = std::from_chars(host.data() + begin, host.data() + segment_end, value, 10);
+        if (parsed.ec != std::errc() || parsed.ptr != host.data() + segment_end || value > 255 ||
+            (octet == 0 && value != 127)) {
+            return false;
+        }
+        begin = segment_end + 1;
+    }
+    return true;
+}
+
 bool unsafe_browser_origin(const std::map<std::string, std::string> & headers) {
     const auto origin = find_header(headers, "Origin");
     if (origin) {
@@ -46,7 +69,7 @@ bool unsafe_browser_origin(const std::map<std::string, std::string> & headers) {
             const common_http_url parsed = common_http_parse_url(*origin);
             const std::string host = ascii_lower(parsed.host);
             if (!parsed.user.empty() || !parsed.password.empty() || parsed.path != "/" ||
-                (host != "localhost" && !server_trusted_scheduling::is_loopback_address(host))) {
+                !loopback_origin_host(host)) {
                 return true;
             }
         } catch (const std::exception &) {
@@ -54,7 +77,11 @@ bool unsafe_browser_origin(const std::map<std::string, std::string> & headers) {
         }
     }
     const auto site = find_header(headers, "Sec-Fetch-Site");
-    return site && ascii_lower(*site) == "cross-site";
+    if (!site) {
+        return false;
+    }
+    const std::string normalized = ascii_lower(*site);
+    return normalized != "same-origin" && normalized != "same-site";
 }
 
 const char * lane_name(trusted_lane lane) {
@@ -151,6 +178,66 @@ const char * event_name(event_kind value) {
 
 std::string request_id(request_handle handle) {
     return std::to_string(handle.id) + ":" + std::to_string(handle.epoch);
+}
+
+bool parse_nonzero_decimal(std::string_view value, uint64_t & result) {
+    result = 0;
+    if (value.empty() || (value.size() > 1 && value.front() == '0')) {
+        return false;
+    }
+    const char * begin = value.data();
+    const char * end   = begin + value.size();
+    const auto parsed = std::from_chars(begin, end, result, 10);
+    return parsed.ec == std::errc() && parsed.ptr == end && result != 0;
+}
+
+bool parse_request_id(const json & value, request_handle & result) {
+    if (!value.is_string()) {
+        return false;
+    }
+    const std::string encoded = value.get<std::string>();
+    const size_t      split   = encoded.find(':');
+    if (encoded.size() > 41 || split == std::string::npos || split == 0 ||
+        split + 1 >= encoded.size() || encoded.find(':', split + 1) != std::string::npos) {
+        return false;
+    }
+    return parse_nonzero_decimal(std::string_view(encoded).substr(0, split), result.id) &&
+           parse_nonzero_decimal(std::string_view(encoded).substr(split + 1), result.epoch);
+}
+
+bool json_content_type(const std::string & value) {
+    const size_t separator = value.find(';');
+    std::string media = ascii_lower(value.substr(0, separator));
+    const auto first = media.find_first_not_of(" \t");
+    const auto last  = media.find_last_not_of(" \t");
+    if (first == std::string::npos) {
+        return false;
+    }
+    media = media.substr(first, last - first + 1);
+    return media == "application/json";
+}
+
+request_command parse_command(const std::string & body, bool control) {
+    if (body.size() > maximum_post_body_bytes) {
+        return { request_command_status::invalid_shape, {}, "dashboard request body exceeds its byte budget" };
+    }
+    const json value = json::parse(body, nullptr, false);
+    if (value.is_discarded()) {
+        return { request_command_status::malformed_json, {}, "dashboard request body is not valid JSON" };
+    }
+    const size_t expected_fields = control ? 2 : 1;
+    if (!value.is_object() || value.size() != expected_fields || !value.contains("request_id") ||
+        (control && !value.contains("action"))) {
+        return { request_command_status::invalid_shape, {}, "dashboard request body has unsupported fields" };
+    }
+    request_handle handle;
+    if (!parse_request_id(value.at("request_id"), handle)) {
+        return { request_command_status::invalid_request_handle, {}, "dashboard request_id must be canonical id:epoch" };
+    }
+    if (control && (!value.at("action").is_string() || value.at("action") != "cancel")) {
+        return { request_command_status::unsupported_action, {}, "dashboard control supports only cancel" };
+    }
+    return { request_command_status::ok, handle, "ok" };
 }
 
 std::string monotonic_label(uint64_t at_us) {
@@ -342,26 +429,26 @@ authorization_result authorize(
         bool                                       ambiguous_last_event_id,
         const std::string &                        query_string) {
     if (!operator_control.enabled()) {
-        return { authorization_status::disabled, "read-only dashboard is disabled" };
+        return { authorization_status::disabled, "dashboard admin routes are disabled" };
     }
     if (!api_authentication_enabled) {
         return { authorization_status::api_authentication_disabled,
-                 "read-only dashboard requires configured API-key authentication" };
+                 "dashboard admin routes require configured API-key authentication" };
     }
     if (!server_trusted_scheduling::is_loopback_address(remote_address)) {
-        return { authorization_status::non_loopback, "read-only dashboard requires loopback ingress" };
+        return { authorization_status::non_loopback, "dashboard admin routes require loopback ingress" };
     }
     if (ambiguous_operator_header || ambiguous_last_event_id) {
-        return { authorization_status::ambiguous_header, "ambiguous read-only dashboard header" };
+        return { authorization_status::ambiguous_header, "ambiguous dashboard security header" };
     }
     if (has_header(headers, server_trusted_scheduling::lane_header) ||
         has_header(headers, server_trusted_scheduling::tag_header)) {
         return { authorization_status::classification_header,
-                 "read-only dashboard requests cannot carry scheduling classification headers" };
+                 "dashboard admin requests cannot carry scheduling classification headers" };
     }
     if (!query_string.empty()) {
         return { authorization_status::query_not_allowed,
-                 "read-only dashboard credentials and cursors must use headers, not query parameters" };
+                 "dashboard admin requests do not accept query parameters" };
     }
     if (unsafe_browser_origin(headers)) {
         return { authorization_status::cross_site_browser,
@@ -369,9 +456,58 @@ authorization_result authorize(
     }
     if (!operator_control.authorize_operator(remote_address, headers)) {
         return { authorization_status::missing_or_invalid_credential,
-                 "read-only dashboard requires the loopback operator credential" };
+                 "dashboard admin routes require the loopback operator credential" };
     }
     return { authorization_status::allowed, "allowed" };
+}
+
+authorization_result authorize_post(
+        const server_trusted_scheduling::control & operator_control,
+        bool                                       api_authentication_enabled,
+        const std::string &                        remote_address,
+        const std::map<std::string, std::string> & headers,
+        bool                                       ambiguous_operator_header,
+        bool                                       ambiguous_last_event_id,
+        const std::string &                        query_string,
+        size_t                                     body_size) {
+    const authorization_result base = authorize(
+            operator_control,
+            api_authentication_enabled,
+            remote_address,
+            headers,
+            ambiguous_operator_header,
+            ambiguous_last_event_id,
+            query_string);
+    if (!base) {
+        return base;
+    }
+    if (!find_header(headers, "Origin")) {
+        return { authorization_status::missing_origin,
+                 "dashboard POST requires an explicit loopback Origin" };
+    }
+    const auto content_type = find_header(headers, "Content-Type");
+    if (!content_type || !json_content_type(*content_type)) {
+        return { authorization_status::invalid_content_type,
+                 "dashboard POST requires application/json" };
+    }
+    const auto csrf = find_header(headers, csrf_header);
+    if (!csrf || *csrf != csrf_value) {
+        return { authorization_status::invalid_csrf,
+                 "dashboard POST requires the CSRF proof header" };
+    }
+    if (body_size > maximum_post_body_bytes) {
+        return { authorization_status::body_too_large,
+                 "dashboard POST body exceeds its byte budget" };
+    }
+    return { authorization_status::allowed, "allowed" };
+}
+
+request_command parse_detail_command(const std::string & body) {
+    return parse_command(body, false);
+}
+
+request_command parse_control_command(const std::string & body) {
+    return parse_command(body, true);
 }
 
 bool parse_last_event_id(const std::map<std::string, std::string> & headers, uint64_t & result) {
@@ -449,6 +585,43 @@ json make_snapshot(const server_queue_request_state & source, uint64_t now_us) {
             { "last_error", nullptr },
         } },
         { "timeline", std::move(timeline) },
+    };
+}
+
+request_detail make_request_detail(
+        const server_queue_request_state & source,
+        request_handle                     handle,
+        uint64_t                           now_us) {
+    const auto same_id = std::find_if(source.requests.begin(), source.requests.end(),
+            [handle](const request_snapshot & request) { return request.handle.id == handle.id; });
+    if (same_id == source.requests.end()) {
+        return { request_lookup_status::unknown, {} };
+    }
+    if (!(same_id->handle == handle)) {
+        return { request_lookup_status::stale, {} };
+    }
+
+    json bindings = json::array();
+    for (const auto & binding : same_id->bindings) {
+        bindings.push_back({
+            { "slot_id", binding.slot },
+            { "slot_generation", binding.slot_generation },
+        });
+    }
+    return {
+        request_lookup_status::found,
+        {
+            { "schema_version", schema_version },
+            { "request", request_json(*same_id, now_us) },
+            { "registry", {
+                { "revision", same_id->revision },
+                { "cancel_requested", same_id->cancel_requested },
+                { "timeout_expired", same_id->timeout_expired },
+                { "binding_count", same_id->bindings.size() },
+                { "bindings", std::move(bindings) },
+            } },
+            { "content_reveal", false },
+        },
     };
 }
 

@@ -1,4 +1,5 @@
 import { AdminStateClient } from "./lib/client.mjs";
+import { confirmAndCancel } from "./lib/admin.mjs";
 import { ControlIntentBuffer, createControlIntent } from "./lib/controls.mjs";
 import { createLiveDashboardTransport } from "./lib/live.mjs";
 import { renderFastRefill } from "./lib/refill.mjs";
@@ -17,6 +18,11 @@ let selectedRequestId = null;
 let liveMode = false;
 let activeClient = null;
 let activeLiveTransport = null;
+let liveRequestDetail = null;
+let detailRequestedId = null;
+let detailGeneration = 0;
+let cancelPendingRequestId = null;
+let adminMessage = "";
 let refillSample = null;
 let refillSampleStartedMs = 0;
 let refillExpiryTimer = null;
@@ -144,7 +150,13 @@ function requestCard(request) {
     );
     card.append(title, metadata);
     card.addEventListener("click", () => {
+        if (selectedRequestId !== request.id) {
+            cancelPendingRequestId = null;
+        }
         selectedRequestId = request.id;
+        liveRequestDetail = null;
+        detailRequestedId = null;
+        adminMessage = "";
         renderCurrentState();
     });
     return card;
@@ -198,13 +210,68 @@ function contentBlock(label, content) {
     return block;
 }
 
+function liveCancelControls(request) {
+    const controls = element("div", "detail-block detail-block-wide");
+    controls.append(
+        element("span", "metric-label", "Authenticated live control"),
+        element("p", "notice", adminMessage || "Cancel is the only live mutation in this prototype."),
+    );
+    const button = element("button", "", "Cancel live request");
+    button.type = "button";
+    button.disabled = ["complete", "cancelled", "failed"].includes(request.state) ||
+        liveRequestDetail?.registry.cancel_requested === true || cancelPendingRequestId === request.id;
+    button.addEventListener("click", async () => {
+        if (button.disabled || activeLiveTransport === null) {
+            return;
+        }
+        const transport = activeLiveTransport;
+        const requestId = request.id;
+        button.disabled = true;
+        cancelPendingRequestId = requestId;
+        try {
+            const outcome = await confirmAndCancel({
+                requestId,
+                cancelRequest: transport.cancelRequest,
+            });
+            if (transport !== activeLiveTransport || requestId !== selectedRequestId) {
+                return;
+            }
+            if (!outcome.confirmed) {
+                cancelPendingRequestId = null;
+                adminMessage = "Cancel was not sent.";
+                button.disabled = false;
+            } else {
+                adminMessage = outcome.response.status === "already_requested"
+                    ? "Cancellation was already requested."
+                    : "Cancellation accepted; waiting for the registry update.";
+                void activeClient?.resnapshot("admin_cancel");
+            }
+        } catch (error) {
+            if (transport !== activeLiveTransport || requestId !== selectedRequestId) {
+                return;
+            }
+            cancelPendingRequestId = null;
+            adminMessage = `Cancel failed: ${error.message ?? error}`;
+            button.disabled = false;
+        }
+        renderCurrentState();
+    });
+    const controlRow = element("div", "control-row");
+    controlRow.append(button);
+    controls.append(controlRow);
+    return controls;
+}
+
 function renderRequestDetail(snapshot) {
     const detail = document.querySelector("#request-detail");
     const selected = snapshot.requests.find((request) => request.id === selectedRequestId);
     if (!selected) {
         selectedRequestId = snapshot.requests[0]?.id ?? null;
     }
-    const request = snapshot.requests.find((candidate) => candidate.id === selectedRequestId);
+    const snapshotRequest = snapshot.requests.find((candidate) => candidate.id === selectedRequestId);
+    const request = liveMode && liveRequestDetail?.request.id === selectedRequestId
+        ? liveRequestDetail.request
+        : snapshotRequest;
     if (!request) {
         detail.className = "detail-empty";
         detail.replaceChildren(element("p", "muted", "No requests in this snapshot."));
@@ -240,17 +307,25 @@ function renderRequestDetail(snapshot) {
     } else {
         blocks.push(valueBlock("Content", "not collected by this route", true));
     }
-    if (!liveMode) {
+    if (liveMode) {
+        if (liveRequestDetail?.request.id === request.id) {
+            blocks.push(
+                valueBlock("Registry revision", String(liveRequestDetail.registry.revision)),
+                valueBlock("Bindings", String(liveRequestDetail.registry.binding_count)),
+            );
+        }
+        blocks.push(liveCancelControls(request));
+    } else {
         const controls = element("div", "detail-block detail-block-wide");
         controls.append(
             element("span", "metric-label", "Local control intent preview"),
-            element("p", "notice", "No authenticated mutation adapter is attached."),
+            element("p", "notice", "Fixture controls are local drafts; no request is sent."),
         );
         const controlRow = element("div", "control-row");
         controlRow.append(
-            controlButton("Cancel", "request.cancel", request.id),
-            controlButton(request.state === "parked" ? "Resume" : "Pause", request.state === "parked" ? "request.resume" : "request.pause", request.id),
-            controlButton("Move to fast", "request.reprioritize", request.id, { lane: "fast" }),
+            controlButton("Draft cancel", "request.cancel", request.id),
+            controlButton(request.state === "parked" ? "Draft resume" : "Draft pause", request.state === "parked" ? "request.resume" : "request.pause", request.id),
+            controlButton("Draft move to fast", "request.reprioritize", request.id, { lane: "fast" }),
         );
         controls.append(controlRow);
         blocks.push(controls);
@@ -404,13 +479,47 @@ function renderIntents() {
 
 let currentState = null;
 
+function ensureLiveRequestDetail() {
+    if (!liveMode || activeLiveTransport === null || selectedRequestId === null ||
+        detailRequestedId === selectedRequestId) {
+        return;
+    }
+    const transport = activeLiveTransport;
+    const requestId = selectedRequestId;
+    const generation = ++detailGeneration;
+    detailRequestedId = requestId;
+    adminMessage = "Loading live request detail…";
+    void transport.getRequestDetail(requestId).then((detail) => {
+        if (transport !== activeLiveTransport || generation !== detailGeneration || requestId !== selectedRequestId) {
+            return;
+        }
+        liveRequestDetail = detail;
+        adminMessage = "Live detail loaded; content remains unavailable.";
+        renderCurrentState();
+    }).catch((error) => {
+        if (transport !== activeLiveTransport || generation !== detailGeneration || requestId !== selectedRequestId) {
+            return;
+        }
+        liveRequestDetail = null;
+        adminMessage = `Detail failed: ${error.message ?? error}`;
+        renderCurrentState();
+    });
+}
+
 function renderCurrentState() {
     if (currentState === null) {
         return;
     }
     const snapshot = currentState.snapshot;
     if (!snapshot.requests.some((request) => request.id === selectedRequestId)) {
-        selectedRequestId = snapshot.requests[0]?.id ?? null;
+        const nextRequestId = snapshot.requests[0]?.id ?? null;
+        if (selectedRequestId !== nextRequestId) {
+            liveRequestDetail = null;
+            detailRequestedId = null;
+            cancelPendingRequestId = null;
+            adminMessage = "";
+        }
+        selectedRequestId = nextRequestId;
     }
     renderHealth(snapshot, currentState);
     renderRefill(snapshot);
@@ -423,6 +532,7 @@ function renderCurrentState() {
     renderTimeline(snapshot);
     renderHistory(currentState);
     renderIntents();
+    ensureLiveRequestDetail();
 }
 
 async function loadJson(url) {
@@ -463,6 +573,11 @@ function stopActiveConnection() {
     activeClient = null;
     activeLiveTransport?.clear();
     activeLiveTransport = null;
+    liveRequestDetail = null;
+    detailRequestedId = null;
+    detailGeneration += 1;
+    cancelPendingRequestId = null;
+    adminMessage = "";
 }
 
 async function startClient(transport, mode) {
@@ -473,7 +588,7 @@ async function startClient(transport, mode) {
     }
     const badgeNode = document.querySelector("#mode-badge");
     badgeNode.className = `badge badge-${liveMode ? "live" : "fixture"}`;
-    setSafeText(badgeNode, liveMode ? "live read-only" : "fixture data");
+    setSafeText(badgeNode, liveMode ? "live admin" : "fixture data");
 
     activeClient = new AdminStateClient({
         getSnapshot: transport.getSnapshot,

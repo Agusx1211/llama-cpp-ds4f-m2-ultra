@@ -58,6 +58,14 @@ struct server_queue_bind_result {
     operator bool() const { return code == server_queue_bind_code::bound; }
 };
 
+enum class server_queue_admin_cancel_code : uint8_t {
+    accepted = 0,
+    already_requested,
+    unknown_request,
+    stale_handle,
+    terminal_request,
+};
+
 enum class server_queue_result_kind : uint8_t {
     partial = 0,
     final,
@@ -179,6 +187,10 @@ public:
     server_request_registry::registry_summary request_summary();
     server_request_runtime::dispatch_permit_snapshot dispatch_permits();
     server_queue_request_state request_state();
+    // Low-rate admin seam. Exact handle validation and the existing durable
+    // cancellation preparation/commit run under the queue mutex, so an epoch
+    // cannot be checked and then silently discarded before mutation.
+    server_queue_admin_cancel_code admin_cancel(server_request_registry::request_handle handle);
 
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called

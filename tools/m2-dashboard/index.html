@@ -23,8 +23,8 @@
     <section class="panel connection-panel" aria-labelledby="connection-title">
       <div class="panel-heading">
         <div>
-          <p class="eyebrow">Read-only loopback connection</p>
-          <h2 id="connection-title">Live registry</h2>
+          <p class="eyebrow">Authenticated loopback connection</p>
+          <h2 id="connection-title">Live registry and cancel</h2>
         </div>
         <button id="fixture-button" type="button">Use fixture</button>
       </div>
@@ -43,7 +43,7 @@
         </label>
         <button type="submit">Connect live</button>
       </form>
-      <p class="notice">Credentials are sent only as headers, retained only in this page's memory, and cleared on disconnect. Serve this page and llama-server from the same loopback hostname.</p>
+      <p class="notice">Credentials are sent only as headers, retained only in this page's memory, and cleared on disconnect. Live cancel also requires an explicit confirmation, loopback Origin, JSON content type, and CSRF proof header.</p>
     </section>
 
     <section aria-label="system summary">
@@ -153,17 +153,17 @@
       <section class="panel" aria-labelledby="intent-title">
         <div class="panel-heading">
           <div>
-            <p class="eyebrow">No transport attached</p>
+            <p class="eyebrow">Local drafts only</p>
             <h2 id="intent-title">Control intents</h2>
           </div>
         </div>
-        <p class="notice">Buttons draft local intents only. No control request is sent.</p>
+        <p class="notice">Pause, resume, reprioritize, and cache controls remain local drafts. Only the confirmed cancel button in live request detail sends a control request.</p>
         <ol id="intent-list" class="timeline"></ol>
       </section>
     </div>
   </main>
 
-  <footer>Read-only dashboard · content reveal disabled · no browser persistence</footer>
+  <footer>Loopback admin dashboard · cancel-only live mutation · content reveal disabled · no browser persistence</footer>
 
   <script type="module" src="dashboard.js"></script>
 </body>

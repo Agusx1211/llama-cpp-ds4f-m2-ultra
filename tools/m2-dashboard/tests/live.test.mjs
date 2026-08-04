@@ -3,11 +3,15 @@ import test from "node:test";
 
 import {
     createLiveDashboardTransport,
+    CONTROL_PATH,
+    CSRF_HEADER,
+    DETAIL_PATH,
     EVENTS_PATH,
     normalizeLoopbackBaseUrl,
     OPERATOR_TOKEN_HEADER,
     SNAPSHOT_PATH,
 } from "../lib/live.mjs";
+import { loadSnapshot } from "./helpers.mjs";
 
 const apiKey = "dashboard-api-key";
 const operatorToken = "0123456789abcdef0123456789abcdef";
@@ -67,6 +71,75 @@ test("live snapshot rejects a response above its transport byte budget", async (
     });
 
     await assert.rejects(() => transport.getSnapshot(), /exceeds 4194304 bytes/);
+    transport.clear();
+});
+
+test("live detail and cancel use bounded JSON POSTs with CSRF proof and exact identity", async () => {
+    const snapshot = structuredClone(await loadSnapshot());
+    const request = structuredClone(snapshot.requests[0]);
+    request.id = "7:19";
+    request.content = { prompt: "", output: "", retained: false };
+    const calls = [];
+    const fetchImpl = async (url, options) => {
+        calls.push({ url, options });
+        const payload = url.endsWith(DETAIL_PATH)
+            ? {
+                schema_version: 2,
+                request,
+                registry: {
+                    revision: 3,
+                    cancel_requested: false,
+                    timeout_expired: false,
+                    binding_count: 0,
+                    bindings: [],
+                },
+                content_reveal: false,
+            }
+            : { schema_version: 2, request_id: request.id, action: "cancel", status: "accepted" };
+        return new Response(JSON.stringify(payload), {
+            status: url.endsWith(CONTROL_PATH) ? 202 : 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    };
+    const transport = createLiveDashboardTransport({
+        baseUrl: "http://127.0.0.1:18130",
+        apiKey,
+        operatorToken,
+        fetchImpl,
+    });
+
+    const detail = await transport.getRequestDetail(request.id);
+    const control = await transport.cancelRequest(request.id);
+    assert.equal(detail.request.id, request.id);
+    assert.equal(detail.content_reveal, false);
+    assert.equal(control.status, "accepted");
+    assert.deepEqual(calls.map((call) => new URL(call.url).pathname), [DETAIL_PATH, CONTROL_PATH]);
+    for (const call of calls) {
+        assert.equal(call.options.method, "POST");
+        assert.equal(call.options.credentials, "omit");
+        assert.equal(call.options.headers.get("Content-Type"), "application/json");
+        assert.equal(call.options.headers.get(CSRF_HEADER), "1");
+        assert.equal(call.options.headers.get(OPERATOR_TOKEN_HEADER), operatorToken);
+        assert.equal(call.options.headers.has("X-Llama-Trusted-Lane"), false);
+    }
+    assert.deepEqual(JSON.parse(calls[0].options.body), { request_id: request.id });
+    assert.deepEqual(JSON.parse(calls[1].options.body), { action: "cancel", request_id: request.id });
+    transport.clear();
+});
+
+test("live control rejects non-canonical identity before fetch", async () => {
+    let fetches = 0;
+    const transport = createLiveDashboardTransport({
+        baseUrl: "http://127.0.0.1:18130",
+        apiKey,
+        operatorToken,
+        fetchImpl: async () => {
+            fetches += 1;
+        },
+    });
+    await assert.rejects(() => transport.cancelRequest("9"), /canonical id:epoch/);
+    await assert.rejects(() => transport.getRequestDetail("09:2"), /canonical id:epoch/);
+    assert.equal(fetches, 0);
     transport.clear();
 });
 

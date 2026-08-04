@@ -1077,6 +1077,49 @@ server_queue_request_state server_queue::request_state() {
     };
 }
 
+server_queue_admin_cancel_code server_queue::admin_cancel(
+        server_request_registry::request_handle handle) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    const uint64_t               at_us   = now_us();
+    auto                         expired = expire_requests_locked(at_us);
+
+    server_queue_admin_cancel_code result = server_queue_admin_cancel_code::unknown_request;
+    const auto requests = request_runtime.snapshot();
+    const auto current = std::find_if(requests.begin(), requests.end(), [handle](const auto & request) {
+        return request.handle.id == handle.id;
+    });
+    if (current == requests.end()) {
+        result = server_queue_admin_cancel_code::unknown_request;
+    } else if (current->handle.epoch != handle.epoch) {
+        result = server_queue_admin_cancel_code::stale_handle;
+    } else if (server_request_registry::is_terminal(current->state) || current->timeout_expired) {
+        result = server_queue_admin_cancel_code::terminal_request;
+    } else if (current->cancel_requested) {
+        result = server_queue_admin_cancel_code::already_requested;
+    } else if (request_runtime.failure_publication_status(handle.id).code ==
+               server_request_runtime::failure_publication_code::already_terminal) {
+        result = server_queue_admin_cancel_code::terminal_request;
+    } else {
+        GGML_ASSERT(handle.id > 0 &&
+                    handle.id <= static_cast<uint64_t>(std::numeric_limits<int>::max()) + 1);
+        server_task cancel(SERVER_TASK_TYPE_CANCEL);
+        cancel.id        = id++;
+        cancel.id_target = static_cast<int>(handle.id - 1);
+        auto prepared_cancel = prepare_posted_cancel(std::move(cancel));
+        const int id_target = canonical_cancel_target(prepared_cancel.front().id_target);
+        prepared_cancel.front().id_target = id_target;
+        if (protected_terminal_family != id_target || !has_terminal_control(id_target)) {
+            cleanup_pending_task(id_target, at_us);
+            commit_terminal_controls(prepared_cancel);
+        }
+        result = server_queue_admin_cancel_code::accepted;
+    }
+
+    lock.unlock();
+    notify_expired(expired);
+    return result;
+}
+
 //
 // server_response
 //

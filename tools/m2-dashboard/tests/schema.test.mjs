@@ -10,6 +10,8 @@ import {
     SCHEMA_VERSION,
     SchemaError,
     parseEvent,
+    parseControlResponse,
+    parseRequestDetail,
     parseSnapshot,
     validateEvent,
     validateSnapshot,
@@ -26,6 +28,45 @@ test("deterministic snapshot and event fixtures satisfy schema version 2", async
     }
     assert.equal(snapshot.schema_version, SCHEMA_VERSION);
     assert.equal(events[0].sequence, snapshot.sequence + 1);
+});
+
+test("detail and control responses are bounded redacted and immutable", async () => {
+    const snapshot = await loadSnapshot();
+    const request = clone(snapshot.requests[0]);
+    request.id = "7:19";
+    request.content = { prompt: "", output: "", retained: false };
+    const source = {
+        schema_version: SCHEMA_VERSION,
+        request,
+        registry: {
+            revision: 3,
+            cancel_requested: false,
+            timeout_expired: false,
+            binding_count: 1,
+            bindings: [{ slot_id: 2, slot_generation: 4 }],
+        },
+        content_reveal: false,
+    };
+    const detail = parseRequestDetail(source);
+    assert.equal(detail.request.id, "7:19");
+    assert.ok(Object.isFrozen(detail.registry.bindings[0]));
+
+    const retained = clone(source);
+    retained.request.content = { prompt: "secret", output: "", retained: true };
+    retained.content_reveal = true;
+    assert.throws(() => parseRequestDetail(retained), /must not retain or reveal/);
+    const wrongCount = clone(source);
+    wrongCount.registry.binding_count = 2;
+    assert.throws(() => parseRequestDetail(wrongCount), /must equal bindings length/);
+
+    const control = parseControlResponse({
+        schema_version: SCHEMA_VERSION,
+        request_id: "7:19",
+        action: "cancel",
+        status: "accepted",
+    });
+    assert.ok(Object.isFrozen(control));
+    assert.throws(() => parseControlResponse({ ...control, action: "pause" }), /must be one of cancel/);
 });
 
 test("parsed fixture values are cloned and deeply immutable", async () => {

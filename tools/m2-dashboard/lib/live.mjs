@@ -1,13 +1,18 @@
 import { createFetchSseTransport } from "./sse.mjs";
+import { parseControlResponse, parseRequestDetail } from "./schema.mjs";
 
 export const OPERATOR_TOKEN_HEADER = "X-Llama-Trusted-Scheduling-Token";
 export const SNAPSHOT_PATH = "/internal/admin/dashboard/snapshot";
 export const EVENTS_PATH = "/internal/admin/dashboard/events";
+export const DETAIL_PATH = "/internal/admin/dashboard/request-detail";
+export const CONTROL_PATH = "/internal/admin/dashboard/request-control";
+export const CSRF_HEADER = "X-Llama-Dashboard-CSRF";
 
 const MAX_API_KEY_BYTES = 1024;
 const MIN_OPERATOR_TOKEN_BYTES = 32;
 const MAX_OPERATOR_TOKEN_BYTES = 256;
 const MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024;
+const MAX_DETAIL_BYTES = 64 * 1024;
 const MAX_SSE_EVENT_BYTES = 64 * 1024;
 const textEncoder = new TextEncoder();
 
@@ -60,15 +65,15 @@ function endpointUrl(base, path) {
     return result.href;
 }
 
-async function boundedJson(response) {
+async function boundedJson(response, maximumBytes = MAX_SNAPSHOT_BYTES, label = "snapshot") {
     const contentLength = Number(response.headers.get("Content-Length"));
-    if (Number.isFinite(contentLength) && contentLength > MAX_SNAPSHOT_BYTES) {
-        throw new RangeError(`snapshot response exceeds ${MAX_SNAPSHOT_BYTES} bytes`);
+    if (Number.isFinite(contentLength) && contentLength > maximumBytes) {
+        throw new RangeError(`${label} response exceeds ${maximumBytes} bytes`);
     }
 
     const reader = response.body?.getReader();
     if (!reader) {
-        throw new Error("snapshot response body is not a readable stream");
+        throw new Error(`${label} response body is not a readable stream`);
     }
     const decoder = new TextDecoder();
     let total = 0;
@@ -80,9 +85,9 @@ async function boundedJson(response) {
                 break;
             }
             total += value.byteLength;
-            if (total > MAX_SNAPSHOT_BYTES) {
+            if (total > maximumBytes) {
                 await reader.cancel();
-                throw new RangeError(`snapshot response exceeds ${MAX_SNAPSHOT_BYTES} bytes`);
+                throw new RangeError(`${label} response exceeds ${maximumBytes} bytes`);
             }
             text += decoder.decode(value, { stream: true });
         }
@@ -91,6 +96,13 @@ async function boundedJson(response) {
         reader.releaseLock();
     }
     return JSON.parse(text);
+}
+
+function canonicalRequestId(value) {
+    if (typeof value !== "string" || value.length > 41 || !/^[1-9]\d*:[1-9]\d*$/u.test(value)) {
+        throw new TypeError("request ID must be canonical id:epoch");
+    }
+    return value;
 }
 
 export function createLiveDashboardTransport({
@@ -125,7 +137,7 @@ export function createLiveDashboardTransport({
         headers.delete("X-Llama-Benchmark-Tag");
         return fetchImpl(url, {
             ...options,
-            method: "GET",
+            method: options.method ?? "GET",
             headers,
             credentials: "omit",
             cache: "no-store",
@@ -136,6 +148,8 @@ export function createLiveDashboardTransport({
 
     const snapshotUrl = endpointUrl(base, SNAPSHOT_PATH);
     const eventsUrl = endpointUrl(base, EVENTS_PATH);
+    const detailUrl = endpointUrl(base, DETAIL_PATH);
+    const controlUrl = endpointUrl(base, CONTROL_PATH);
     const boundedParserOptions = {
         ...parserOptions,
         maxBufferBytes: Math.min(parserOptions.maxBufferBytes ?? MAX_SSE_EVENT_BYTES, MAX_SSE_EVENT_BYTES),
@@ -151,11 +165,51 @@ export function createLiveDashboardTransport({
             }
             return boundedJson(response);
         },
+        async getRequestDetail(requestId) {
+            const expected = canonicalRequestId(requestId);
+            const response = await credentialedFetch(detailUrl, {
+                method: "POST",
+                headers: {
+                    Accept: "application/json",
+                    "Content-Type": "application/json",
+                    [CSRF_HEADER]: "1",
+                },
+                body: JSON.stringify({ request_id: expected }),
+            });
+            if (!response.ok) {
+                throw new Error(`request detail failed: ${response.status} ${response.statusText}`);
+            }
+            const detail = parseRequestDetail(await boundedJson(response, MAX_DETAIL_BYTES, "request detail"));
+            if (detail.request.id !== expected) {
+                throw new Error("request detail identity mismatch");
+            }
+            return detail;
+        },
+        async cancelRequest(requestId) {
+            const expected = canonicalRequestId(requestId);
+            const response = await credentialedFetch(controlUrl, {
+                method: "POST",
+                headers: {
+                    Accept: "application/json",
+                    "Content-Type": "application/json",
+                    [CSRF_HEADER]: "1",
+                },
+                body: JSON.stringify({ action: "cancel", request_id: expected }),
+            });
+            if (!response.ok) {
+                throw new Error(`cancel request failed: ${response.status} ${response.statusText}`);
+            }
+            const result = parseControlResponse(await boundedJson(response, MAX_DETAIL_BYTES, "control"));
+            if (result.request_id !== expected || result.action !== "cancel") {
+                throw new Error("cancel response identity mismatch");
+            }
+            return result;
+        },
         openEvents: createFetchSseTransport(eventsUrl, credentialedFetch, boundedParserOptions),
         clear() {
             secrets.apiKey = "";
             secrets.operatorToken = "";
         },
-        endpoints: Object.freeze({ snapshotUrl, eventsUrl }),
+        endpoints: Object.freeze({ snapshotUrl, eventsUrl, detailUrl, controlUrl }),
     };
 }

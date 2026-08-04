@@ -296,6 +296,76 @@ void test_cancel_before_dispatch() {
     require(queue.request_summary().active_requests == 0, "queued cancellation retires durable state");
 }
 
+void test_admin_cancel_requires_current_handle_and_is_idempotent_while_live() {
+    {
+        server_queue queue;
+        server_task task = make_user(queue, server_task::trusted_lane::normal, 21);
+        const int id = task.id;
+        require_posted(queue.post(std::move(task)), id, "post queued admin-cancel task");
+        const auto handle = queue.request_snapshot().front().handle;
+
+        require(queue.admin_cancel({ handle.id + 1, handle.epoch }) ==
+                        server_queue_admin_cancel_code::unknown_request,
+                "unknown handle fails closed");
+        require(queue.admin_cancel({ handle.id, handle.epoch + 1 }) ==
+                        server_queue_admin_cancel_code::stale_handle,
+                "stale generation fails closed");
+        require(queue.request_summary().active_requests == 1,
+                "failed handle checks do not mutate the queued request");
+        require(queue.admin_cancel(handle) == server_queue_admin_cancel_code::accepted,
+                "exact queued handle is cancelled");
+        require(queue.request_summary().active_requests == 0,
+                "queued admin cancellation retires durable state immediately");
+        require(queue.admin_cancel(handle) == server_queue_admin_cancel_code::unknown_request,
+                "retired queued request fails closed on replay");
+    }
+
+    {
+        server_queue queue;
+        server_task task = make_user(queue, server_task::trusted_lane::fast, 22);
+        const int id = task.id;
+        require_posted(queue.post(std::move(task)), id, "post bound admin-cancel task");
+        const auto handle = queue.request_snapshot().front().handle;
+        bind_only(queue, id, 0);
+
+        queue.set_prepare_terminal_control_hook_for_tests([](size_t attempt) {
+            if (attempt == 1) {
+                throw std::runtime_error("injected admin cancel node preparation failure");
+            }
+        });
+        bool preparation_failed = false;
+        try {
+            (void) queue.admin_cancel(handle);
+        } catch (const std::runtime_error &) {
+            preparation_failed = true;
+        }
+        require(preparation_failed && !queue.request_snapshot().front().cancel_requested,
+                "admin cancel preparation failure leaves durable state untouched");
+        queue.set_prepare_terminal_control_hook_for_tests({});
+        require(queue.admin_cancel(handle) == server_queue_admin_cancel_code::accepted,
+                "exact bound handle requests cancellation");
+        const auto cancelled = queue.request_snapshot();
+        require(cancelled.size() == 1 && cancelled.front().cancel_requested,
+                "bound cancellation is durable before control dispatch");
+        require(queue.admin_cancel(handle) == server_queue_admin_cancel_code::already_requested,
+                "duplicate bound cancellation is idempotent");
+        require(queue.release_slot(id, 0), "release admin-cancelled bound task");
+    }
+
+    {
+        server_queue queue;
+        server_task task = make_user(queue, server_task::trusted_lane::low, 23);
+        const int id = task.id;
+        require_posted(queue.post(std::move(task)), id, "post terminal admin-cancel task");
+        const auto handle = queue.request_snapshot().front().handle;
+        bind_only(queue, id, 0);
+        require(queue.fail_task(id), "terminalize bound request before admin cancellation");
+        require(queue.admin_cancel(handle) == server_queue_admin_cancel_code::terminal_request,
+                "terminal request fails closed without another mutation");
+        require(queue.release_slot(id, 0), "release terminal admin-cancel fixture");
+    }
+}
+
 void test_cancel_deferred_payload() {
     server_queue     queue;
     server_task  task = make_user(queue, server_task::trusted_lane::normal, 30);
@@ -2524,6 +2594,7 @@ int main() {
         { "internal and lane dispatch",   test_internal_and_three_lane_dispatch         },
         { "deferred policy reentry",      test_deferred_request_reenters_policy         },
         { "cancel before dispatch",       test_cancel_before_dispatch                   },
+        { "generation-safe admin cancel", test_admin_cancel_requires_current_handle_and_is_idempotent_while_live },
         { "cancel deferred payload",      test_cancel_deferred_payload                  },
         { "cancel preparation atomicity", test_external_cancel_preparation_is_fault_atomic },
         { "live fast queue cap",          test_live_fast_queue_cap                      },

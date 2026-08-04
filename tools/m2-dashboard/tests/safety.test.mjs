@@ -60,8 +60,13 @@ test("dashboard sources avoid HTML injection and browser persistence primitives"
     }
 
     const networkMethods = [...combined.matchAll(/method:\s*"([A-Z]+)"/g)].map((match) => match[1]);
-    assert.ok(networkMethods.length > 0, "expected explicit read-only network methods");
-    assert.ok(networkMethods.every((method) => method === "GET"), `state-changing network method found: ${networkMethods}`);
+    assert.ok(networkMethods.length > 0, "expected explicit dashboard network methods");
+    assert.ok(networkMethods.every((method) => ["GET", "POST"].includes(method)),
+        `unsupported network method found: ${networkMethods}`);
+    assert.equal(networkMethods.filter((method) => method === "POST").length, 2,
+        "only request detail and cancel use POST");
+    assert.match(combined, /X-Llama-Dashboard-CSRF/u);
+    assert.match(combined, /"Content-Type": "application\/json"/u);
 });
 
 test("control intents are immutable, bounded, and explicitly transport-free", () => {

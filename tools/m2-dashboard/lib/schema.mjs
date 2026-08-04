@@ -457,6 +457,64 @@ function validateRequest(value, path, issues) {
     boolean(content.retained, `${path}.content.retained`, issues);
 }
 
+export function validateRequestDetail(value) {
+    validateJsonBudget(value, "request detail");
+    const issues = [];
+    const detail = record(value, "detail", issues);
+    knownFields(detail, ["schema_version", "request", "registry", "content_reveal"], "detail", issues);
+    integer(detail.schema_version, "detail.schema_version", issues, { min: 1 });
+    if (detail.schema_version !== SCHEMA_VERSION) {
+        issues.push(`detail.schema_version must equal ${SCHEMA_VERSION}`);
+    }
+    validateRequest(detail.request, "detail.request", issues);
+
+    const registry = record(detail.registry, "detail.registry", issues);
+    knownFields(registry, [
+        "revision", "cancel_requested", "timeout_expired", "binding_count", "bindings",
+    ], "detail.registry", issues);
+    integer(registry.revision, "detail.registry.revision", issues, { min: 1 });
+    boolean(registry.cancel_requested, "detail.registry.cancel_requested", issues);
+    boolean(registry.timeout_expired, "detail.registry.timeout_expired", issues);
+    integer(registry.binding_count, "detail.registry.binding_count", issues, { min: 0 });
+    const bindings = array(registry.bindings, "detail.registry.bindings", issues, { maxLength: 4096 });
+    if (Number.isSafeInteger(registry.binding_count) && registry.binding_count !== bindings.length) {
+        issues.push("detail.registry.binding_count must equal bindings length");
+    }
+    for (const [index, valueBinding] of bindings.entries()) {
+        const binding = record(valueBinding, `detail.registry.bindings[${index}]`, issues);
+        knownFields(binding, ["slot_id", "slot_generation"], `detail.registry.bindings[${index}]`, issues);
+        integer(binding.slot_id, `detail.registry.bindings[${index}].slot_id`, issues, { min: 0 });
+        integer(binding.slot_generation, `detail.registry.bindings[${index}].slot_generation`, issues, { min: 1 });
+    }
+    boolean(detail.content_reveal, "detail.content_reveal", issues);
+    if (detail.content_reveal !== false || detail.request?.content?.retained !== false ||
+        detail.request?.content?.prompt !== "" || detail.request?.content?.output !== "") {
+        issues.push("detail must not retain or reveal request content");
+    }
+    if (issues.length > 0) {
+        throw new SchemaError("request detail", issues);
+    }
+    return value;
+}
+
+export function validateControlResponse(value) {
+    validateJsonBudget(value, "control response");
+    const issues = [];
+    const response = record(value, "control", issues);
+    knownFields(response, ["schema_version", "request_id", "action", "status"], "control", issues);
+    integer(response.schema_version, "control.schema_version", issues, { min: 1 });
+    if (response.schema_version !== SCHEMA_VERSION) {
+        issues.push(`control.schema_version must equal ${SCHEMA_VERSION}`);
+    }
+    string(response.request_id, "control.request_id", issues, { maxLength: 41 });
+    enumeration(response.action, ["cancel"], "control.action", issues);
+    enumeration(response.status, ["accepted", "already_requested"], "control.status", issues);
+    if (issues.length > 0) {
+        throw new SchemaError("control response", issues);
+    }
+    return value;
+}
+
 function validatePool(value, path, issues) {
     const pool = record(value, path, issues);
     knownFields(pool, [
@@ -810,4 +868,14 @@ export function parseEvent(value) {
     validateEvent(value);
     const event = cloneJson(value);
     return deepFreeze(event);
+}
+
+export function parseRequestDetail(value) {
+    validateRequestDetail(value);
+    return deepFreeze(cloneJson(value));
+}
+
+export function parseControlResponse(value) {
+    validateControlResponse(value);
+    return deepFreeze(cloneJson(value));
 }

@@ -121,6 +121,9 @@ void test_operator_authorization_is_loopback_read_only_and_trace_independent() {
     remote_origin["Origin"] = "https://example.com";
     require(!authorize(enabled, true, "127.0.0.1", remote_origin, false, false, ""),
             "non-loopback browser origin rejected");
+    remote_origin["Origin"] = "http://127.example.com";
+    require(!authorize(enabled, true, "127.0.0.1", remote_origin, false, false, ""),
+            "hostname with a loopback-looking prefix is rejected");
     auto loopback_origin = headers;
     loopback_origin["Origin"] = "http://127.0.0.1:8081";
     loopback_origin["Sec-Fetch-Site"] = "same-site";
@@ -128,6 +131,93 @@ void test_operator_authorization_is_loopback_read_only_and_trace_independent() {
             "loopback same-site browser origin accepted");
     require(!authorize(enabled, true, "127.0.0.1", headers, false, false, "token=secret"),
             "query parameters rejected");
+}
+
+void test_post_authorization_requires_origin_json_csrf_and_unambiguous_headers() {
+    server_trusted_scheduling::control enabled({ secret, 0 });
+    std::map<std::string, std::string> headers = {
+        { server_trusted_scheduling::token_header, secret },
+        { "Origin", "http://127.0.0.1:8081" },
+        { "Sec-Fetch-Site", "same-site" },
+        { "Content-Type", "application/json; charset=utf-8" },
+        { csrf_header, csrf_value },
+    };
+    require(static_cast<bool>(authorize_post(enabled, true, "127.0.0.1", headers, false, false, "", 64)),
+            "loopback JSON POST with explicit CSRF proof is accepted");
+
+    auto changed = headers;
+    changed.erase("Origin");
+    require(!authorize_post(enabled, true, "127.0.0.1", changed, false, false, "", 64),
+            "POST without Origin is rejected");
+    changed = headers;
+    changed["Origin"] = "https://example.com";
+    require(!authorize_post(enabled, true, "127.0.0.1", changed, false, false, "", 64),
+            "remote browser Origin is rejected");
+    changed = headers;
+    changed["Sec-Fetch-Site"] = "none";
+    require(!authorize_post(enabled, true, "127.0.0.1", changed, false, false, "", 64),
+            "non-same-site browser POST is rejected");
+    changed = headers;
+    changed["Content-Type"] = "text/plain";
+    require(!authorize_post(enabled, true, "127.0.0.1", changed, false, false, "", 64),
+            "non-JSON POST is rejected");
+    changed = headers;
+    changed.erase(csrf_header);
+    require(!authorize_post(enabled, true, "127.0.0.1", changed, false, false, "", 64),
+            "POST without CSRF proof is rejected");
+    require(!authorize_post(enabled, true, "127.0.0.1", headers, false, false, "",
+                            maximum_post_body_bytes + 1),
+            "oversized POST is rejected before parsing");
+    require(!authorize_post(enabled, true, "127.0.0.1", headers, true, false, "", 64),
+            "ambiguous POST security headers are rejected before map collapse");
+}
+
+void test_post_commands_are_canonical_bounded_and_cancel_only() {
+    const auto detail = parse_detail_command(R"({"request_id":"17:29"})");
+    require(detail && detail.request == request_handle{ 17, 29 },
+            "detail accepts one canonical generation-safe request handle");
+    const auto control = parse_control_command(R"({"action":"cancel","request_id":"17:29"})");
+    require(control && control.request == request_handle{ 17, 29 },
+            "control accepts only exact cancel command shape");
+    require(!parse_detail_command("{"), "malformed JSON fails closed");
+    require(!parse_detail_command(R"({"request_id":"017:29"})"),
+            "leading-zero request ID is non-canonical");
+    require(!parse_detail_command(R"({"request_id":"17:29","extra":true})"),
+            "detail rejects extra fields");
+    require(parse_control_command(R"({"action":"pause","request_id":"17:29"})").status ==
+                    request_command_status::unsupported_action,
+            "pause remains outside the prototype mutation surface");
+    require(!parse_control_command(R"({"action":"cancel","request_id":"17"})"),
+            "generation-less cancel is rejected");
+    require(!parse_detail_command(std::string(maximum_post_body_bytes + 1, 'x')),
+            "parser independently enforces its body budget");
+}
+
+void test_request_detail_is_exact_and_remains_redacted() {
+    auto source = source_state();
+    source.requests[0].bindings.push_back({ source.requests[0].handle, 4, 9 });
+    source.requests[0].cancel_requested = true;
+    source.requests[0].revision = 7;
+
+    const auto detail = make_request_detail(source, source.requests[0].handle, 5000);
+    require(static_cast<bool>(detail), "current exact handle resolves detail");
+    require(detail.body.dump().size() < maximum_detail_bytes, "detail stays within response budget");
+    require(detail.body.at("request").at("content").at("prompt") == "" &&
+                detail.body.at("request").at("content").at("output") == "" &&
+                detail.body.at("content_reveal") == false,
+            "detail preserves hard content redaction");
+    require(detail.body.at("registry").at("revision") == 7 &&
+                detail.body.at("registry").at("cancel_requested") == true &&
+                detail.body.at("registry").at("binding_count") == 1 &&
+                detail.body.at("registry").at("bindings")[0].at("slot_id") == 4 &&
+                detail.body.at("registry").at("bindings")[0].at("slot_generation") == 9,
+            "detail exposes bounded authoritative registry metadata");
+    require(make_request_detail(source, { 99, 1 }, 5000).status == request_lookup_status::unknown,
+            "unknown request fails closed");
+    require(make_request_detail(source, { source.requests[0].handle.id,
+                                          source.requests[0].handle.epoch + 1 }, 5000).status ==
+                    request_lookup_status::stale,
+            "stale generation fails closed");
 }
 
 void test_resume_header_is_strict_and_bounded() {
@@ -292,6 +382,12 @@ int main() {
     } tests[] = {
         { "operator authorization is loopback read-only and trace independent",
           test_operator_authorization_is_loopback_read_only_and_trace_independent },
+        { "POST authorization requires origin JSON CSRF and unambiguous headers",
+          test_post_authorization_requires_origin_json_csrf_and_unambiguous_headers },
+        { "POST commands are canonical bounded and cancel-only",
+          test_post_commands_are_canonical_bounded_and_cancel_only },
+        { "request detail is exact and remains redacted",
+          test_request_detail_is_exact_and_remains_redacted },
         { "resume header is strict and bounded", test_resume_header_is_strict_and_bounded },
         { "snapshot is redacted bounded and marks unavailable sources",
           test_snapshot_is_redacted_bounded_and_marks_unavailable_sources },

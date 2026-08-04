@@ -569,6 +569,8 @@ static bool has_ambiguous_dashboard_security_headers(const httplib::Request & re
     size_t api_key_count       = 0;
     size_t origin_count        = 0;
     size_t fetch_site_count    = 0;
+    size_t csrf_count          = 0;
+    size_t content_type_count  = 0;
     for (const auto & header : req.headers) {
         if (header_name_equals(header.first, "Authorization")) {
             ++authorization_count;
@@ -578,11 +580,15 @@ static bool has_ambiguous_dashboard_security_headers(const httplib::Request & re
             ++origin_count;
         } else if (header_name_equals(header.first, "Sec-Fetch-Site")) {
             ++fetch_site_count;
+        } else if (header_name_equals(header.first, "X-Llama-Dashboard-CSRF")) {
+            ++csrf_count;
+        } else if (header_name_equals(header.first, "Content-Type")) {
+            ++content_type_count;
         }
     }
     return authorization_count > 1 || api_key_count > 1 ||
            (authorization_count != 0 && api_key_count != 0) ||
-           origin_count > 1 || fetch_site_count > 1;
+           origin_count > 1 || fetch_site_count > 1 || csrf_count > 1 || content_type_count > 1;
 }
 
 static std::string build_query_string(const httplib::Request & req) {

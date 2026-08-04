@@ -5745,8 +5745,33 @@ void server_routes::init_routes() {
         return false;
     };
 
-    this->get_admin_dashboard_snapshot = [this, authorize_dashboard](const server_http_req & req) {
+    const auto authorize_dashboard_post = [this](const server_http_req & req, server_res_generator & res) {
+        const auto authorization = server_admin_dashboard::authorize_post(
+                ctx_server.trusted_scheduling,
+                !params.api_keys.empty(),
+                req.remote_addr,
+                req.headers,
+                req.ambiguous_trusted_scheduling_headers || req.ambiguous_dashboard_security_headers,
+                req.ambiguous_last_event_id_header,
+                req.query_string,
+                req.body.size());
+        if (authorization) {
+            return true;
+        }
+        res.error(format_error_response(authorization.message, ERROR_TYPE_PERMISSION));
+        return false;
+    };
+
+    const auto secure_dashboard_response = [](server_res_generator & res) {
+        res.headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
+        res.headers["Pragma"] = "no-cache";
+        res.headers["X-Content-Type-Options"] = "nosniff";
+        res.headers["Referrer-Policy"] = "no-referrer";
+    };
+
+    this->get_admin_dashboard_snapshot = [this, authorize_dashboard, secure_dashboard_response](const server_http_req & req) {
         auto res = create_response(true);
+        secure_dashboard_response(*res);
         if (!authorize_dashboard(req, *res)) {
             return res;
         }
@@ -5758,15 +5783,12 @@ void server_routes::init_routes() {
                     ERROR_TYPE_OVERLOADED));
             return res;
         }
-        res->headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
-        res->headers["Pragma"] = "no-cache";
-        res->headers["X-Content-Type-Options"] = "nosniff";
-        res->headers["Referrer-Policy"] = "no-referrer";
         return res;
     };
 
-    this->get_admin_dashboard_events = [this, authorize_dashboard](const server_http_req & req) {
+    this->get_admin_dashboard_events = [this, authorize_dashboard, secure_dashboard_response](const server_http_req & req) {
         auto res = create_response(true);
+        secure_dashboard_response(*res);
         if (!authorize_dashboard(req, *res)) {
             return res;
         }
@@ -5804,10 +5826,6 @@ void server_routes::init_routes() {
         res->status = 200;
         res->data.clear();
         res->content_type = "text/event-stream; charset=utf-8";
-        res->headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
-        res->headers["Pragma"] = "no-cache";
-        res->headers["X-Content-Type-Options"] = "nosniff";
-        res->headers["Referrer-Policy"] = "no-referrer";
         const auto * should_stop = &req.should_stop;
         server_queue * queue = &queue_tasks;
         auto last_write = std::chrono::steady_clock::now();
@@ -5846,6 +5864,97 @@ void server_routes::init_routes() {
             return false;
         };
         return res;
+    };
+
+    this->post_admin_dashboard_detail =
+            [this, authorize_dashboard_post, secure_dashboard_response](const server_http_req & req) {
+        auto res = create_response(true);
+        secure_dashboard_response(*res);
+        if (!authorize_dashboard_post(req, *res)) {
+            return res;
+        }
+
+        const auto command = server_admin_dashboard::parse_detail_command(req.body);
+        if (!command) {
+            res->error(format_error_response(command.message, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const auto detail = server_admin_dashboard::make_request_detail(
+                queue_tasks.request_state(), command.request, ggml_time_us());
+        if (detail.status == server_admin_dashboard::request_lookup_status::unknown) {
+            res->error(format_error_response("dashboard request is unknown", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        if (detail.status == server_admin_dashboard::request_lookup_status::stale) {
+            res->status = 409;
+            res->data = safe_json_to_str({ { "error", {
+                { "code", 409 },
+                { "message", "dashboard request handle is stale" },
+                { "type", "stale_request_handle" },
+            } } });
+            return res;
+        }
+        res->ok(detail.body);
+        if (res->data.size() > server_admin_dashboard::maximum_detail_bytes) {
+            res->error(format_error_response(
+                    "dashboard request detail exceeds its bounded response budget",
+                    ERROR_TYPE_OVERLOADED));
+        }
+        return res;
+    };
+
+    this->post_admin_dashboard_control =
+            [this, authorize_dashboard_post, secure_dashboard_response](const server_http_req & req) {
+        auto res = create_response(true);
+        secure_dashboard_response(*res);
+        if (!authorize_dashboard_post(req, *res)) {
+            return res;
+        }
+
+        const auto command = server_admin_dashboard::parse_control_command(req.body);
+        if (!command) {
+            res->error(format_error_response(command.message, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const auto outcome = queue_tasks.admin_cancel(command.request);
+        const std::string canonical_id = std::to_string(command.request.id) + ":" +
+                                         std::to_string(command.request.epoch);
+        switch (outcome) {
+            case server_queue_admin_cancel_code::accepted:
+            case server_queue_admin_cancel_code::already_requested:
+                res->ok({
+                    { "schema_version", server_admin_dashboard::schema_version },
+                    { "request_id", canonical_id },
+                    { "action", "cancel" },
+                    { "status", outcome == server_queue_admin_cancel_code::accepted
+                            ? "accepted"
+                            : "already_requested" },
+                });
+                if (outcome == server_queue_admin_cancel_code::accepted) {
+                    res->status = 202;
+                }
+                return res;
+            case server_queue_admin_cancel_code::unknown_request:
+                res->error(format_error_response("dashboard request is unknown", ERROR_TYPE_NOT_FOUND));
+                return res;
+            case server_queue_admin_cancel_code::stale_handle:
+                res->status = 409;
+                res->data = safe_json_to_str({ { "error", {
+                    { "code", 409 },
+                    { "message", "dashboard request handle is stale" },
+                    { "type", "stale_request_handle" },
+                } } });
+                return res;
+            case server_queue_admin_cancel_code::terminal_request:
+                res->status = 409;
+                res->data = safe_json_to_str({ { "error", {
+                    { "code", 409 },
+                    { "message", "dashboard request is already terminal" },
+                    { "type", "terminal_request" },
+                } } });
+                return res;
+        }
+        GGML_ABORT("unreachable dashboard cancel result");
     };
 
     this->get_metrics = [this](const server_http_req & req) {

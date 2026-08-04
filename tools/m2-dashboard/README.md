@@ -1,8 +1,8 @@
-# M2 Ultra admin dashboard fixture foundation
+# M2 Ultra admin dashboard playable vertical
 
 This directory is a dependency-free, static dashboard for the adaptive
 server. It runs against deterministic fixtures by default and can connect to
-the direct single-model server's narrow read-only request-registry routes.
+the direct single-model server's narrow request-registry admin routes.
 
 Implemented here:
 
@@ -19,21 +19,27 @@ Implemented here:
 - schema-v2 bounded fast-refill configuration, cohort, cumulative member,
   deadline, and sampled one-member eligibility status;
 - plain-text rendering and default prompt/output redaction;
-- local control-intent drafting without any network mutation;
+- local pause/resume/reprioritize/cache control-intent drafting without any
+  network mutation;
 - zero-dependency Node tests;
 - an opt-in live adapter using an API bearer and the loopback operator token;
-- bounded authenticated snapshot and resumable SSE request-registry views; and
+- bounded authenticated snapshot, resumable SSE, exact-handle request detail,
+  and confirmed cancel-only control views;
+- queue-locked `id:epoch` cancellation with idempotent in-flight handling and
+  fail-closed stale, unknown, and terminal handles;
+- mandatory loopback Origin, JSON content type, custom CSRF proof, and
+  duplicate-security-header rejection for both POST routes; and
 - explicit unavailable markers for metrics not supplied by this vertical.
 
 Not implemented or claimed:
 
 - DNS, TLS, reverse-proxy configuration, or trusted lane headers;
-- POST/DELETE control transport;
-- request mutation/detail routes or content reveal;
+- pause/resume, reprioritization, cache mutation, or content reveal;
 - allocator, cache, disk, DSpark, capture, model, or process telemetry in the
   live registry-only view;
 - browser automation or browser-storage audits; or
-- dashboard/inference performance measurements.
+- a fresh dashboard/inference impact run for the cancel vertical (the existing
+  read-only target gate remains available under `target/`).
 
 ## Test
 
@@ -55,10 +61,11 @@ python3 -m http.server 8080
 ```
 
 The page initially fetches `fixtures/state.json` and `fixtures/events.json`.
-It performs no state-changing requests. Fixture control buttons only create a
-bounded local intent preview; the live view does not expose them.
+Fixture mode performs no state-changing requests: its control buttons only
+create a bounded local intent preview. In live mode, only request cancellation
+is wired; all other controls remain visibly local drafts.
 
-## Live read-only view
+## Live detail and cancel view
 
 Configure the direct server with an API key, an operator token of 32-256 bytes,
 and localhost CORS. The operator token also controls trusted benchmark lanes,
@@ -74,7 +81,7 @@ export LLAMA_SERVER_TRUSTED_FAST_REFILL_WINDOW_MS=30000
 llama-server ... \
   --api-key "$LLAMA_API_KEY" \
   --cors-origins localhost \
-  --cors-headers 'Authorization, X-Llama-Trusted-Scheduling-Token, Last-Event-ID'
+  --cors-headers 'Authorization, Content-Type, X-Llama-Dashboard-CSRF, X-Llama-Trusted-Scheduling-Token, Last-Event-ID'
 ```
 
 The explicit CORS header list is required for a dashboard served from a
@@ -109,23 +116,41 @@ a newer server sample. This removes indefinitely stale open status but cannot
 remove snapshot or SSE transport latency; the label therefore remains explicitly
 sampled rather than claiming current eligibility.
 
-The two live endpoints are:
+The four live endpoints are:
 
 ```text
 GET /internal/admin/dashboard/snapshot
 GET /internal/admin/dashboard/events  (Last-Event-ID header)
+POST /internal/admin/dashboard/request-detail
+POST /internal/admin/dashboard/request-control
 ```
 
-Both require normal API-key middleware plus the operator header, reject
+All four require normal API-key middleware plus the operator header, reject
 non-loopback and cross-site browser ingress, reject lane/tag headers and query
-parameters, and are disabled when the operator token is absent. Router mode
-does not proxy them. Snapshot/event payloads contain numeric registry facts,
-permit counts, refill state, lifecycle reasons, and redacted request identities
-only. The strict client contract is schema version 2.
+parameters, and are disabled when the operator token is absent. The POST routes
+additionally require an explicit loopback `Origin`, `Content-Type:
+application/json`, and `X-Llama-Dashboard-CSRF: 1`; each body is capped at 4
+KiB and duplicate security headers are rejected before header-map collapse.
+Router mode does not proxy these endpoints.
+
+Request identity is the canonical `id:epoch` string from the registry. Detail
+returns bounded registry metadata and explicitly empty, unretained content.
+Control accepts exactly `{"action":"cancel","request_id":"id:epoch"}`. The
+queue validates that full handle under its mutation lock before reusing the
+existing durable cancellation path. A second cancel while the same bound
+request is already cancelling is idempotent; stale, unknown, or terminal
+handles cannot mutate state.
+
+Selecting a live request fetches its detail. **Cancel live request** presents a
+request-specific browser confirmation before POSTing. Pause/resume,
+reprioritization, and cache actions remain local drafts. Snapshot/event payloads
+contain numeric registry facts, permit counts, refill state, lifecycle reasons,
+and redacted request identities only. The strict client contract is schema
+version 2.
 
 ## Client recovery contract
 
-`AdminStateClient` accepts two injected read-only functions:
+`AdminStateClient` still accepts two injected stream-state functions:
 
 ```text
 getSnapshot() -> immutable versioned snapshot
@@ -139,6 +164,6 @@ mismatch, or local slow-consumer overflow discards queued deltas and fetches a
 fresh snapshot before reopening the stream. Snapshot and stream-open failures
 use finite retry schedules and expose the latest failure in client state.
 
-Control intent objects are intentionally transport-free. A later authenticated
-adapter must validate authorization and CSRF policy before translating an
-intent into a network mutation.
+Control intent objects for unfinished actions remain intentionally
+transport-free. The live adapter separately exposes bounded `getRequestDetail`
+and `cancelRequest` calls; no generic mutation dispatcher exists.
