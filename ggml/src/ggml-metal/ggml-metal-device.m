@@ -3449,6 +3449,8 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         dispatch_semaphore_wait(completion_semaphore, DISPATCH_TIME_FOREVER);
         dispatch_release(completion_semaphore);
 
+        [buf_src release];
+
         //[cmd_buf waitUntilCompleted];
     }
 }
@@ -3459,14 +3461,39 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         return;
     }
 
+    if (size == 0) {
+        return;
+    }
+    GGML_ASSERT(data != NULL);
+
     @autoreleasepool {
         // src
         struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf, tensor);
         bid_src.offs += offset;
 
+        // Metal requires no-copy host buffers to cover whole pages. Keep the
+        // caller's requested bytes at their original offset within the mapped
+        // range so arbitrary host destinations remain valid.
+        const size_t size_page = sysconf(_SC_PAGESIZE);
+        GGML_ASSERT(size_page > 0);
+
+        const uintptr_t data_addr = (uintptr_t) data;
+        const size_t data_offset = data_addr % size_page;
+        void * data_page = (void *) (data_addr - data_offset);
+
+        GGML_ASSERT(size <= SIZE_MAX - data_offset);
+        size_t size_mapped = size + data_offset;
+        const size_t size_remainder = size_mapped % size_page;
+        if (size_remainder != 0) {
+            const size_t size_padding = size_page - size_remainder;
+            GGML_ASSERT(size_mapped <= SIZE_MAX - size_padding);
+            size_mapped += size_padding;
+        }
+        GGML_ASSERT(size_mapped <= (size_t) [buf->dev->mtl_device maxBufferLength]);
+
         // dst
-        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data
-                                                               length:size
+        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_page
+                                                               length:size_mapped
                                                               options:MTLResourceStorageModeShared
                                                           deallocator:nil];
 
@@ -3480,7 +3507,7 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
             [encoder copyFromBuffer:bid_src.metal
                        sourceOffset:bid_src.offs
                            toBuffer:buf_dst
-                  destinationOffset:0
+                  destinationOffset:data_offset
                                size:size];
 
             [encoder endEncoding];
@@ -3488,6 +3515,8 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+
+        [buf_dst release];
     }
 }
 

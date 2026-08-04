@@ -267,6 +267,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         target_compile_definitions(test-metal-sparse-reservation PRIVATE
             GGML_TEST_METAL_SPARSE_RESERVATION)
     endif()
+    llama_build_and_test(test-metal-private-readback.cpp)
+    if (TARGET ggml-metal AND NOT GGML_BACKEND_DL)
+        target_link_libraries(test-metal-private-readback PRIVATE ggml-metal)
+        target_include_directories(test-metal-private-readback PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+        target_compile_definitions(test-metal-private-readback PRIVATE
+            GGML_TEST_METAL_PRIVATE_READBACK)
+    endif()
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if (Python3_Interpreter_FOUND)
         llama_test_cmd(
