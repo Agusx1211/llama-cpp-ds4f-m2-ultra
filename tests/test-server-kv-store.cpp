@@ -166,11 +166,17 @@ void expect_pool_metadata_bounded(const temp_directory & temporary) {
     CHECK(!error);
 }
 
-void create_sparse_file(const fs::path & path, off_t size) {
+bool create_sparse_file(const fs::path & path, off_t size) {
     const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     CHECK(descriptor >= 0);
-    CHECK(::ftruncate(descriptor, size) == 0);
+    if (::ftruncate(descriptor, size) != 0) {
+        const int error = errno;
+        CHECK(::close(descriptor) == 0);
+        CHECK(error == EFBIG || error == ENOSPC || error == EINVAL || error == EOPNOTSUPP);
+        return false;
+    }
     CHECK(::close(descriptor) == 0);
+    return true;
 }
 
 void expect_child_lock_probe(const std::string & root) {
@@ -879,9 +885,17 @@ void test_sparse_stale_charge_overflow_fails_restart_closed() {
         fs::u8path(temporary.path()) / "live" / llama_snapshot_digest_hex(key) / "generation-0000000000000002";
     CHECK(fs::create_directory(stale));
     create_empty_file(stale / "generation.manifest");
+    const llama_snapshot_storage_estimate oversized =
+        llama_snapshot_estimate_storage(cfg.snapshot, make_metadata(1), std::numeric_limits<uint64_t>::max());
+    CHECK(oversized.status == llama_snapshot_status::invalid_argument);
     const off_t huge = std::numeric_limits<off_t>::max() - 4095;
-    create_sparse_file(stale / "chunk-00000000.pack", huge);
-    create_sparse_file(stale / "chunk-00000001.pack", huge);
+    if (!create_sparse_file(stale / "chunk-00000000.pack", huge) ||
+        !create_sparse_file(stale / "chunk-00000001.pack", huge)) {
+        std::fprintf(
+            stderr,
+            "SKIP: filesystem cannot construct near-off_t-maximum sparse files; logical overflow check passed\n");
+        return;
+    }
 
     store restarted(cfg);
     CHECK(restarted.initialization_status() == status::reconciliation_required);
