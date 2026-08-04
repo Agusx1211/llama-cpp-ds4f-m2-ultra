@@ -1447,6 +1447,7 @@ bool llama_context::set_adapter_cvec(
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
+        mctx->finish(false);
         if (mctx->get_status() == LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE) {
             LLAMA_LOG_WARN("%s: physical KV pressure before graph submission\n", __func__);
         } else {
@@ -1489,6 +1490,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
+            if (mctx) {
+                mctx->finish(false);
+            }
             return nullptr;
         }
 
@@ -1499,6 +1503,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
+            if (mctx) {
+                mctx->finish(false);
+            }
             return nullptr;
         }
     }
@@ -1517,10 +1524,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
+        if (mctx) {
+            mctx->finish(false);
+        }
         return nullptr;
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    if (mctx) {
+        mctx->finish(true);
+    }
 
     return res;
 }

@@ -797,17 +797,21 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     indexer_weights = ggml_scale(ctx0, indexer_weights, 1.0f/sqrtf(float(n_embd_indexer_head*n_indexer_head)));
     cb(indexer_weights, "lid_weights", il);
 
-    ggml_tensor * indexer_k = inp_dsv4->mctx->get_lid()->get_k(ctx0, il);
+    const bool indexed = inp_lid.segment_ids != nullptr;
+    ggml_tensor * indexer_k = indexed ? inp_dsv4->mctx->get_lid()->get_k_pool(ctx0, il) :
+            inp_dsv4->mctx->get_lid()->get_k(ctx0, il);
     const int64_t n_lid = inp_lid.kq_mask->ne[0];
     GGML_ASSERT(n_lid > 0);
-    GGML_ASSERT(n_lid <= indexer_k->ne[2]);
+    GGML_ASSERT(n_lid <= (indexed ? indexer_k->ne[1] : indexer_k->ne[2]));
 
-    indexer_k = ggml_view_4d(ctx0, indexer_k,
-            indexer_k->ne[0], indexer_k->ne[1], n_lid, indexer_k->ne[3],
-            indexer_k->nb[1], indexer_k->nb[2], indexer_k->nb[3], 0);
+    if (!indexed) {
+        indexer_k = ggml_view_4d(ctx0, indexer_k,
+                indexer_k->ne[0], indexer_k->ne[1], n_lid, indexer_k->ne[3],
+                indexer_k->nb[1], indexer_k->nb[2], indexer_k->nb[3], 0);
+    }
     cb(indexer_k, "lid_k", il);
 
-    const int64_t n_stream = indexer_k->ne[3];
+    const int64_t n_stream = indexed ? inp_lid.kq_mask->ne[3] : indexer_k->ne[3];
     indexer_q = ggml_view_4d(ctx0, indexer_q,
             indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream,
             indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3]/n_stream, 0);
@@ -816,8 +820,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
             indexer_weights->nb[1], indexer_weights->nb[2]/n_stream, indexer_weights->nb[3]/n_stream, 0);
 
     ggml_tensor * indexer_score = nullptr;
-    if (cparams.fused_lid) {
-        indexer_score = ggml_lightning_indexer(ctx0, indexer_q, indexer_k, indexer_weights, inp_lid.kq_mask);
+    if (cparams.fused_lid || indexed) {
+        indexer_score = indexed ? ggml_dsv4_indexed_lightning_indexer(
+                ctx0, indexer_q, indexer_k, indexer_weights, inp_lid.kq_mask, inp_lid.segment_ids) :
+                ggml_lightning_indexer(ctx0, indexer_q, indexer_k, indexer_weights, inp_lid.kq_mask);
         cb(indexer_score, "lid_score_masked", il);
         res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, indexer_score, il});
     } else {
@@ -909,14 +915,18 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
     cb(raw_k, "csa_raw_k", il);
 
-    ggml_tensor * csa_k = inp_dsv4->mctx->get_csa()->get_k(ctx0, il);
+    const bool indexed = inp_csa.segment_ids != nullptr;
+    ggml_tensor * csa_k = indexed ? inp_dsv4->mctx->get_csa()->get_k_pool(ctx0, il) :
+            inp_dsv4->mctx->get_csa()->get_k(ctx0, il);
     const int64_t n_csa = inp_csa.kq_mask->ne[0];
     GGML_ASSERT(n_csa > 0);
-    GGML_ASSERT(n_csa <= csa_k->ne[2]);
+    GGML_ASSERT(n_csa <= (indexed ? csa_k->ne[1] : csa_k->ne[2]));
 
-    csa_k = ggml_view_4d(ctx0, csa_k,
-            csa_k->ne[0], csa_k->ne[1], n_csa, csa_k->ne[3],
-            csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
+    if (!indexed) {
+        csa_k = ggml_view_4d(ctx0, csa_k,
+                csa_k->ne[0], csa_k->ne[1], n_csa, csa_k->ne[3],
+                csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
+    }
     cb(csa_k, "csa_comp_k", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
@@ -940,20 +950,22 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             std::getenv("GGML_DSV4_SPARSE_PARALLEL_DISABLE") == nullptr;
     static const bool sparse_gather_enabled =
             std::getenv("GGML_DSV4_SPARSE_GATHER_DISABLE") == nullptr;
+    const int64_t comp_n_stream = indexed ? inp_csa.kq_mask->ne[3] : csa_k->ne[3];
     const bool sparse_parallel_decode = sparse_parallel_enabled &&
-            csa_k->ne[3] > 1 && q->ne[2] == csa_k->ne[3];
+            comp_n_stream > 1 && q->ne[2] == comp_n_stream;
     const bool gather_decode = sparse_gather_enabled &&
             cparams.fused_dsv4_sparse && cparams.flash_attn &&
             sparse_k_type &&
             (q->ne[2] == 1 || sparse_parallel_decode) && top_k &&
-            top_k->ne[1] == 1 && top_k->ne[3] == csa_k->ne[3] &&
+            top_k->ne[1] == 1 && top_k->ne[3] == comp_n_stream &&
             n_csa >= 2*(int64_t) hparams.indexer_top_k;
     if (gather_decode) {
-        const int64_t n_stream = csa_k->ne[3];
+        const int64_t n_stream = comp_n_stream;
         const int64_t n_raw = raw_k->type == GGML_TYPE_Q8_0 ?
                 std::min<int64_t>(hparams.n_swa, raw_k->ne[2]) : 0;
-        ggml_tensor * packed = ggml_dsv4_sparse_pack(
-                ctx0, raw_k, csa_k, raw_mask, inp_csa.kq_mask, top_k, n_raw);
+        ggml_tensor * packed = indexed ? ggml_dsv4_indexed_sparse_pack(
+                ctx0, raw_k, csa_k, raw_mask, inp_csa.kq_mask, top_k, inp_csa.segment_ids, n_raw) :
+                ggml_dsv4_sparse_pack(ctx0, raw_k, csa_k, raw_mask, inp_csa.kq_mask, top_k, n_raw);
         cb(packed, "csa_gathered_pack", il);
         res->add_fused_node({LLM_FUSED_OP_DSV4_SPARSE_PACK, packed, il});
 
@@ -1027,20 +1039,22 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             sparse_k_type &&
             (sparse_probe || sparse_prefill)) {
         GGML_ASSERT(top_k);
-        const int64_t n_stream = csa_k->ne[3];
+        const int64_t n_stream = comp_n_stream;
         const int64_t nq       = q->ne[2]/n_stream;
         const int64_t nt       = q->ne[2];
         const int64_t n_head   = q->ne[1];
         const int64_t n_raw    = std::min<int64_t>(hparams.n_swa, raw_k->ne[2]);
 
         GGML_ASSERT(q->ne[0] == raw_k->ne[0]);
-        GGML_ASSERT(raw_k->ne[1] == 1 && csa_k->ne[1] == 1);
+        GGML_ASSERT(raw_k->ne[1] == 1);
+        GGML_ASSERT(indexed || csa_k->ne[1] == 1);
         GGML_ASSERT(raw_k->ne[3] == n_stream);
         GGML_ASSERT(raw_mask->ne[1] == nq && raw_mask->ne[3] == n_stream);
         GGML_ASSERT(inp_csa.kq_mask->ne[1] == nq && inp_csa.kq_mask->ne[3] == n_stream);
 
-        ggml_tensor * packed = ggml_dsv4_sparse_pack(ctx0, raw_k, csa_k, raw_mask,
-                inp_csa.kq_mask, top_k, n_raw);
+        ggml_tensor * packed = indexed ? ggml_dsv4_indexed_sparse_pack(ctx0, raw_k, csa_k, raw_mask,
+                inp_csa.kq_mask, top_k, inp_csa.segment_ids, n_raw) :
+                ggml_dsv4_sparse_pack(ctx0, raw_k, csa_k, raw_mask, inp_csa.kq_mask, top_k, n_raw);
         cb(packed, "csa_sparse_pack", il);
         res->add_fused_node({LLM_FUSED_OP_DSV4_SPARSE_PACK, packed, il});
 
@@ -1070,7 +1084,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         return out;
     }
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
+    ggml_tensor * k_all = indexed ? ggml_dsv4_indexed_concat(
+            ctx0, raw_k, csa_k, inp_csa.segment_ids, n_csa) :
+            ggml_concat(ctx0, raw_k, csa_k, 2);
     cb(k_all, "csa_k_all", il);
 
     ggml_tensor * csa_mask = inp_csa.kq_mask;
@@ -1127,17 +1143,23 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
     cb(raw_k, "hca_raw_k", il);
 
-    ggml_tensor * hca_k = inp_dsv4->mctx->get_hca()->get_k(ctx0, il);
+    const bool indexed = inp_hca.segment_ids != nullptr;
+    ggml_tensor * hca_k = indexed ? inp_dsv4->mctx->get_hca()->get_k_pool(ctx0, il) :
+            inp_dsv4->mctx->get_hca()->get_k(ctx0, il);
     const int64_t n_hca = inp_hca.kq_mask->ne[0];
     GGML_ASSERT(n_hca > 0);
-    GGML_ASSERT(n_hca <= hca_k->ne[2]);
+    GGML_ASSERT(n_hca <= (indexed ? hca_k->ne[1] : hca_k->ne[2]));
 
-    hca_k = ggml_view_4d(ctx0, hca_k,
-            hca_k->ne[0], hca_k->ne[1], n_hca, hca_k->ne[3],
-            hca_k->nb[1], hca_k->nb[2], hca_k->nb[3], 0);
+    if (!indexed) {
+        hca_k = ggml_view_4d(ctx0, hca_k,
+                hca_k->ne[0], hca_k->ne[1], n_hca, hca_k->ne[3],
+                hca_k->nb[1], hca_k->nb[2], hca_k->nb[3], 0);
+    }
     cb(hca_k, "hca_comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, hca_k, 2);
+    ggml_tensor * k_all = indexed ? ggml_dsv4_indexed_concat(
+            ctx0, raw_k, hca_k, inp_hca.segment_ids, n_hca) :
+            ggml_concat(ctx0, raw_k, hca_k, 2);
     cb(k_all, "hca_k_all", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();

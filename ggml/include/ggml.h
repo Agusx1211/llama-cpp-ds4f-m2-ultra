@@ -2611,6 +2611,17 @@ extern "C" {
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
 
+    // Segment-addressed form for the aggregate DeepSeek V4 compressed pool.
+    // k_pool:      [n_embd_idx, pool_rows]
+    // segment_ids: [ceil(n_kv/64), n_stream]
+    GGML_API struct ggml_tensor * ggml_dsv4_indexed_lightning_indexer(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_pool,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * segment_ids);
+
     // DeepSeek V4 compressor weighted reduction.
     //
     // kv_state, score_state: [overlap ? 2*n_embd : n_embd, n_rows]

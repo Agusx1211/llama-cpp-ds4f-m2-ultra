@@ -6330,29 +6330,40 @@ struct ggml_tensor * ggml_gated_delta_net(
 
 // ggml_lightning_indexer
 
-struct ggml_tensor * ggml_lightning_indexer(
+static struct ggml_tensor * ggml_lightning_indexer_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
-        struct ggml_tensor  * mask) {
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * segment_ids) {
 
     GGML_ASSERT(       q->type == GGML_TYPE_F32);
     GGML_ASSERT( weights->type == GGML_TYPE_F32);
     GGML_ASSERT(    mask->type == GGML_TYPE_F16);
     GGML_ASSERT(      q->ne[0] == k->ne[0]);
-    GGML_ASSERT(   mask->ne[0] == k->ne[2]);
+    const int64_t n_kv = mask->ne[0];
     GGML_ASSERT(      q->ne[1] == weights->ne[0]);
-    GGML_ASSERT(      k->ne[1] == 1);
+    if (segment_ids != NULL) {
+        GGML_ASSERT(k->ne[1] > 0 && k->ne[1] % 64 == 0);
+        GGML_ASSERT(k->ne[2] == 1 && k->ne[3] == 1);
+        GGML_ASSERT(segment_ids->type == GGML_TYPE_I32);
+        GGML_ASSERT(segment_ids->ne[0] == (n_kv + 63)/64);
+        GGML_ASSERT(segment_ids->ne[1] == q->ne[3]);
+        GGML_ASSERT(segment_ids->ne[2] == 1 && segment_ids->ne[3] == 1);
+    } else {
+        GGML_ASSERT(mask->ne[0] == k->ne[2]);
+        GGML_ASSERT(k->ne[1] == 1);
+        GGML_ASSERT(q->ne[3] == k->ne[3]);
+    }
     GGML_ASSERT(   mask->ne[1] == q->ne[2]);
     GGML_ASSERT(      q->ne[2] == weights->ne[1]);
     GGML_ASSERT(weights->ne[2] == 1);
     GGML_ASSERT(   mask->ne[2] == 1);
-    GGML_ASSERT(      q->ne[3] == k->ne[3]);
-    GGML_ASSERT(      k->ne[3] == weights->ne[3]);
+    GGML_ASSERT(      q->ne[3] == weights->ne[3]);
     GGML_ASSERT(weights->ne[3] % mask->ne[3] == 0);
 
-    int64_t ne[4] = { k->ne[2], q->ne[2], 1, q->ne[3] };
+    int64_t ne[4] = { n_kv, q->ne[2], 1, q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     result->op   = GGML_OP_LIGHTNING_INDEXER;
@@ -6360,8 +6371,29 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+    result->src[4] = segment_ids;
 
     return result;
+}
+
+struct ggml_tensor * ggml_lightning_indexer(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask) {
+    return ggml_lightning_indexer_impl(ctx, q, k, weights, mask, NULL);
+}
+
+struct ggml_tensor * ggml_dsv4_indexed_lightning_indexer(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_pool,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * segment_ids) {
+    GGML_ASSERT(segment_ids != NULL);
+    return ggml_lightning_indexer_impl(ctx, q, k_pool, weights, mask, segment_ids);
 }
 
 // ggml_dsv4_compress

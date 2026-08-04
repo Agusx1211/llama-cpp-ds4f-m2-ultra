@@ -491,7 +491,7 @@ struct ggml_backend_metal_sparse_buft_bundle {
 static ggml_backend_buffer_type_t ggml_backend_metal_dsv4_sparse_buffer_type(
         ggml_backend_dev_t dev,
         uint32_t n_stream) {
-    if (dev == NULL || n_stream <= 1) {
+    if (dev == NULL || n_stream == 0) {
         return NULL;
     }
 

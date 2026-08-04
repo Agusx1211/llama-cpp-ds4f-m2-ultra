@@ -212,6 +212,10 @@ class llama_dsv4_comp_pool {
     llama_dsv4_comp_directory ticket_directory(llama_dsv4_comp_ticket ticket,
                                                llama_dsv4_comp_family family,
                                                uint32_t               logical_segments) const;
+    llama_dsv4_comp_directory ticket_directory_for(llama_dsv4_comp_ticket           ticket,
+                                                   llama_dsv4_comp_family           family,
+                                                   const std::vector<uint32_t> &    execution_ids,
+                                                   uint32_t                         logical_segments) const;
 
     uint32_t zero_segment(llama_dsv4_comp_family family) const;
     uint32_t scratch_segment(llama_dsv4_comp_family family) const;

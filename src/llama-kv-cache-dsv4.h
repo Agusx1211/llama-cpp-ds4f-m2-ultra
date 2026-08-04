@@ -2,6 +2,7 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-dsv4-comp-pool.h"
 
 #include <map>
 #include <array>
@@ -18,6 +19,18 @@ bool llama_kv_cache_dsv4_supports_elastic_metal(
 // Test-only deterministic fault seam. Each injected failure is consumed by a
 // successful target Metal sparse reservation before it can be committed.
 void llama_kv_cache_dsv4_test_inject_physical_pressure(uint32_t count);
+
+struct llama_dsv4_cow_preflight_test_stats {
+    uint64_t source_ranges_submitted      = 0;
+    uint64_t destination_ranges_submitted = 0;
+    uint64_t copy_operations              = 0;
+};
+
+// Test-only observability for aggregate COW preflight ordering. Submitted
+// ranges have reached the atomic sparse reservation call; copy operations have
+// started moving a cache tensor segment.
+void                                llama_kv_cache_dsv4_test_reset_cow_preflight_stats();
+llama_dsv4_cow_preflight_test_stats llama_kv_cache_dsv4_test_get_cow_preflight_stats();
 
 enum llama_dsv4_memory_family {
     LLAMA_DSV4_MEMORY_RAW = 0,
@@ -225,6 +238,11 @@ public:
     llama_dsv4_comp_state * get_hca_state() const;
     llama_dsv4_comp_state * get_lid_state() const;
 
+    bool is_aggregate_compressed() const;
+    uint32_t get_c4_logical_rows() const;
+    uint32_t get_hca_logical_rows() const;
+    llama_dsv4_comp_pool * get_comp_pool() const;
+
     uint32_t get_n_rs_seq() const;
     const std::vector<uint32_t> & get_rs_idx() const;
     bool set_rs_depth(uint32_t depth);
@@ -251,6 +269,11 @@ private:
     std::unique_ptr<llama_dsv4_comp_state> csa_state;
     std::unique_ptr<llama_dsv4_comp_state> hca_state;
     std::unique_ptr<llama_dsv4_comp_state> lid_state;
+    std::unique_ptr<llama_dsv4_comp_pool> comp_pool;
+
+    bool aggregate_compressed = false;
+    uint32_t c4_logical_rows = 0;
+    uint32_t hca_logical_rows = 0;
 
     uint64_t state_identity_hash = 0;
 
@@ -329,18 +352,20 @@ class llama_kv_cache_dsv4_comp_context {
 public:
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
-    llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv);
+    llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv, uint32_t logical_n_kv = 0);
 
     llama_kv_cache_dsv4_comp_context(
             llama_kv_cache * kv,
             slot_info_vec_t sinfos,
-            std::vector<llama_ubatch> ubatches);
+            std::vector<llama_ubatch> ubatches,
+            uint32_t logical_n_kv = 0);
 
     bool next();
 
     uint32_t get_n_kv() const;
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_pool(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
@@ -395,6 +420,11 @@ public:
         // A non-boundary CSA/LID decode step can target a masked scratch row.
         std::vector<int64_t> state_write_idxs;
 
+        // Original affine logical destinations and dummy markers are retained
+        // until the aggregate-pool ticket resolves them to physical rows.
+        std::vector<int64_t> state_write_logical_idxs;
+        std::vector<uint8_t> state_write_dummy;
+
         // RoPE positions for state-backed commits.
         std::vector<int32_t> state_write_pos;
 
@@ -407,6 +437,10 @@ public:
         // Graph-width for compressed rows. This can be larger than n_visible
         // so masked padding rows do not force a new graph at every CSA block.
         int64_t n_kv = 0;
+
+        // Column-major [logical_segment, graph_stream]. Empty for the legacy
+        // affine compressed-cache layout.
+        std::vector<int32_t> segment_ids;
     };
 
     llama_kv_cache_dsv4_context(llama_memory_status status);
@@ -439,6 +473,7 @@ public:
     bool next()      override;
     bool apply()     override;
     bool preflight() override;
+    void finish(bool success) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -467,6 +502,8 @@ public:
 
 private:
     bool reserve_batch_ranges();
+    bool reserve_aggregate_pool(std::vector<llama_dsv4_comp_allocation> & cow_allocations);
+    void rollback_aggregate_pool();
 
     llama_kv_cache_dsv4 * kv = nullptr;
 
@@ -504,6 +541,9 @@ private:
 
     uint32_t last_pressure_family_mask = 0;
     bool batch_ranges_reserved = false;
+    llama_dsv4_comp_ticket comp_ticket;
+    bool comp_ticket_active = false;
+    size_t comp_finished_ubatches = 0;
 
     llama_memory_status status;
 };
