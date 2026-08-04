@@ -1159,7 +1159,8 @@ static dsv4_parallel_result run_dsv4_shared_prefix(
 
             llama_kv_pressure_info pressure = {};
             GGML_ASSERT(llama_get_last_kv_pressure(test.lctx.get(), &pressure));
-            GGML_ASSERT(pressure.required_pages > 0);
+            GGML_ASSERT(pressure.limiting_family_mask != 0);
+            GGML_ASSERT(pressure.limiting_pool_id != 0);
             GGML_ASSERT(dsv4_usage_snapshot_equal(aggregate_sparse_before, dsv4_memory->memory_usage_snapshot()));
 
             llama_dsv4_comp_handle_id   handle_a_after = 0;
