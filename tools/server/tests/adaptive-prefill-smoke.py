@@ -194,11 +194,16 @@ class Smoke:
                             timestamp = now_ns()
                             progress = item.get("prompt_progress")
                             if isinstance(progress, dict):
+                                if item.get("tokens") not in (None, []):
+                                    raise RuntimeError(f"{tag}: prompt-progress frame returned generated tokens")
+                                if item.get("content") not in (None, ""):
+                                    raise RuntimeError(f"{tag}: prompt-progress frame returned generated content")
                                 saved = {**progress, "client_monotonic_ns": timestamp}
                                 result.progress.append(saved)
                                 self.emit("prompt_progress", tag=tag, **progress)
                                 if tag == "low-8k":
                                     self.low_progress.set()
+                                continue
                             tokens = item.get("tokens") or []
                             if not isinstance(tokens, list) or not all(isinstance(token, int) for token in tokens):
                                 raise RuntimeError(f"{tag}: invalid token array")

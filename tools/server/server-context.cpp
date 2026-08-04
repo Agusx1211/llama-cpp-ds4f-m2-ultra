@@ -2303,7 +2303,7 @@ private:
         }
         if (is_begin) {
             res->is_begin = true;
-        } else {
+        } else if (!is_progress) {
             res->content = tkn.text_to_send;
             res->tokens  = { tkn.tok };
         }

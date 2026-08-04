@@ -75,6 +75,33 @@ def test_completion_stream(prompt: str, n_predict: int, re_content: str, n_promp
             content += data["content"]
 
 
+def test_completion_stream_progress_does_not_return_generated_tokens():
+    global server
+    server.n_batch = 64
+    server.n_ctx = 256
+    server.n_slots = 1
+    server.start()
+    response = server.make_stream_request("POST", "/completion", data={
+        "prompt": "This is a test" * 10,
+        "n_predict": 10,
+        "ignore_eos": True,
+        "stream": True,
+        "return_progress": True,
+        "return_tokens": True,
+    })
+    generated_tokens = []
+    progress_events = 0
+    for data in response:
+        if "prompt_progress" in data:
+            assert data["tokens"] == []
+            assert data["content"] == ""
+            progress_events += 1
+        elif not data["stop"]:
+            generated_tokens.extend(data["tokens"])
+    assert progress_events > 0
+    assert len(generated_tokens) == 10
+
+
 def test_completion_stream_vs_non_stream():
     global server
     server.start()
