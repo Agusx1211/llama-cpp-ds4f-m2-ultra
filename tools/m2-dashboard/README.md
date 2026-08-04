@@ -141,6 +141,23 @@ existing durable cancellation path. A second cancel while the same bound
 request is already cancelling is idempotent; stale, unknown, or terminal
 handles cannot mutate state.
 
+The dependency-free target probe starts its own long completion against an
+already-running direct server, discovers the new bound `id:epoch`, validates
+redacted detail and negative CSRF/origin/content-type/stale-handle cases,
+cancels that exact generation, checks contiguous lifecycle events, and submits
+a fresh completion afterward:
+
+```sh
+export M2_DASHBOARD_BASE_URL=http://127.0.0.1:18130
+export M2_DASHBOARD_ORIGIN=http://127.0.0.1:8081
+python3 tools/m2-dashboard/target/admin_cancel_probe.py
+```
+
+It uses the same `LLAMA_API_KEY` and
+`LLAMA_SERVER_TRUSTED_SCHEDULING_TOKEN` environment credentials as the server.
+Run it only against a disposable validation server: the discovered request is
+cancelled intentionally.
+
 Selecting a live request fetches its detail. **Cancel live request** presents a
 request-specific browser confirmation before POSTing. Pause/resume,
 reprioritization, and cache actions remain local drafts. Snapshot/event payloads
