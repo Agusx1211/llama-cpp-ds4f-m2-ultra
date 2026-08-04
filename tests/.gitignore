@@ -1,6 +1,8 @@
 *
 !*.*
 !snapshots/
+!fixtures/
+!fixtures/*.csv
 *.o
 ggml-common.h
 **/*.swp
