@@ -12,6 +12,12 @@ Ultra geometry:
 - an idle launch cohort. A one-slot request waits while the other slot is
   active; a parallel two-completion family is quoted and reserved atomically.
 
+That intentional one-slot wait remains visible through the normal request
+snapshot and admin-dashboard event stream as reason `admission_wait`. Generic
+slot exhaustion continues to report `capacity_blocked`, so an operator playing
+with this vertical can distinguish its physical-admission rule from ordinary
+server contention.
+
 Enable it in addition to the normal target launch command:
 
 ```sh

@@ -2859,7 +2859,8 @@ private:
                         if (!launch_slots_with_parent_task(*slot, child_slots, task, admission_deferred)) {
                             if (admission_deferred) {
                                 SRV_DBG("DSV4 physical capacity is temporarily busy, defer family, id_task = %d\n", id_task);
-                                queue_tasks.defer(std::move(task));
+                                queue_tasks.defer(
+                                        std::move(task), server_queue_defer_reason::physical_admission);
                                 break;
                             }
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
@@ -2870,7 +2871,8 @@ private:
                         if (!launch_single_slot_with_admission(*slot, task, admission_deferred)) {
                             if (admission_deferred) {
                                 SRV_DBG("DSV4 physical capacity is temporarily busy, defer task, id_task = %d\n", id_task);
-                                queue_tasks.defer(std::move(task));
+                                queue_tasks.defer(
+                                        std::move(task), server_queue_defer_reason::physical_admission);
                                 break;
                             }
                             SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);

@@ -568,13 +568,18 @@ expiration request_runtime::expire_if_due(std::map<uint64_t, record>::iterator i
     return expire(it, run_started ? deadline_kind::run : deadline_kind::queue, at_us);
 }
 
-bool request_runtime::mark_deferred(uint64_t request_id, uint64_t at_us) {
+bool request_runtime::mark_deferred(
+        uint64_t request_id,
+        uint64_t at_us,
+        server_request_registry::reason_code reason) {
     const auto it = records.find(request_id);
-    return it != records.end() && it->second.terminal == lifecycle::completed && at_us < it->second.queue_deadline_us &&
+    const bool valid_reason = reason == server_request_registry::reason_code::capacity_blocked ||
+                              reason == server_request_registry::reason_code::admission_wait;
+    return valid_reason && it != records.end() && it->second.terminal == lifecycle::completed &&
+           at_us < it->second.queue_deadline_us &&
            !it->second.scheduler_queued && it->second.bindings.empty() &&
            it->second.permit == record::permit_state::selected_unbound &&
-           registry.set_queue_state(it->second.handle, queue_state::blocked,
-                                    server_request_registry::reason_code::capacity_blocked, at_us);
+           registry.set_queue_state(it->second.handle, queue_state::blocked, reason, at_us);
 }
 
 admission_result request_runtime::resume(uint64_t request_id, uint64_t at_us) {

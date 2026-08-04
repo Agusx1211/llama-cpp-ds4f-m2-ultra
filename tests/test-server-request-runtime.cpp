@@ -117,6 +117,19 @@ void test_defer_resume_and_cancel() {
             "resume preserves original arrival and becomes ready");
     require(runtime.cancel(11, 31), "cancel resumed request");
     require(!runtime.contains(11), "cancelled ready request retired");
+
+    request_runtime physical;
+    require(physical.admit(make_request(12, lane::normal, 40)), "admit physical-wait request");
+    require(physical.take_next(41).request_id == 12, "dispatch physical-wait request");
+    require(physical.mark_deferred(
+                    12, 42, server_request_registry::reason_code::admission_wait),
+            "mark physical admission wait");
+    const request_snapshot admission_wait = find_request(physical, 12);
+    require(admission_wait.state == lifecycle::queued && admission_wait.queue == queue_state::blocked &&
+                admission_wait.last_reason == server_request_registry::reason_code::admission_wait,
+            "physical admission defer remains distinct from generic capacity");
+    require(physical.resume(12, 43) && physical.cancel(12, 44),
+            "physical admission wait resumes and retires normally");
 }
 
 void test_cancel_while_bound() {

@@ -18,6 +18,11 @@ enum class server_queue_post_code : uint8_t {
     unavailable,
 };
 
+enum class server_queue_defer_reason : uint8_t {
+    capacity = 0,
+    physical_admission,
+};
+
 struct server_queue_post_result {
     server_queue_post_code code                = server_queue_post_code::accepted;
     int                    task_id             = -1;
@@ -105,7 +110,9 @@ public:
     server_queue_post_result post(std::vector<server_task> && tasks, bool front = false);
 
     // Add a new task, but defer until one slot is available
-    void defer(server_task && task);
+    void defer(
+            server_task && task,
+            server_queue_defer_reason reason = server_queue_defer_reason::capacity);
 
     // Get the next id for creating a new task
     int get_new_id();

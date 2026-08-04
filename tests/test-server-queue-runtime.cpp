@@ -243,7 +243,7 @@ void test_deferred_request_reenters_policy() {
     queue.on_new_task([&](server_task && selected) {
         ++dispatches;
         if (dispatches == 1) {
-            queue.defer(std::move(selected));
+            queue.defer(std::move(selected), server_queue_defer_reason::physical_admission);
             return;
         }
         require(queue.bind_slot(selected.id, 0), "bind resumed task");
@@ -261,10 +261,14 @@ void test_deferred_request_reenters_policy() {
     require(dispatches == 2, "deferred request dispatched exactly twice");
     const auto events      = queue.request_events();
     bool       saw_blocked = false;
+    bool       saw_admission_wait = false;
     for (const auto & event : events.events) {
         saw_blocked |= event.queue_after == server_request_registry::queue_state::blocked;
+        saw_admission_wait |= event.queue_after == server_request_registry::queue_state::blocked &&
+                              event.reason == server_request_registry::reason_code::admission_wait;
     }
     require(saw_blocked, "defer records blocked durable state");
+    require(saw_admission_wait, "physical admission defer publishes its exact durable reason");
 }
 
 void test_cancel_before_dispatch() {

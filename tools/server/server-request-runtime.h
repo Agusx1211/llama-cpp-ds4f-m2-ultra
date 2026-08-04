@@ -150,7 +150,11 @@ class request_runtime {
             const std::array<size_t, server_scheduler::lane_count> & demand,
             size_t physical_slot_capacity) const;
     dispatch_result  take_next(uint64_t now_us, size_t physical_slot_capacity = 64);
-    bool             mark_deferred(uint64_t request_id, uint64_t at_us);
+    bool             mark_deferred(
+            uint64_t request_id,
+            uint64_t at_us,
+            server_request_registry::reason_code reason =
+                    server_request_registry::reason_code::capacity_blocked);
     admission_result resume(uint64_t request_id, uint64_t at_us);
     expiration        expiration_due(uint64_t request_id, uint64_t at_us) const;
     std::vector<expiration> expirations_due(uint64_t at_us) const;

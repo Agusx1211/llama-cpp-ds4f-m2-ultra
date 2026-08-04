@@ -518,12 +518,15 @@ size_t server_queue::expire_requests() {
     return expired.size();
 }
 
-void server_queue::defer(server_task && task) {
+void server_queue::defer(server_task && task, server_queue_defer_reason reason) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     const uint64_t               at_us   = now_us();
     auto                         expired = expire_requests_locked(at_us);
     QUE_DBG("defer task, id = %d\n", task.id);
-    if (is_user_task(task) && !request_runtime.mark_deferred(runtime_id(task.id), at_us)) {
+    const auto registry_reason = reason == server_queue_defer_reason::physical_admission ?
+            server_request_registry::reason_code::admission_wait :
+            server_request_registry::reason_code::capacity_blocked;
+    if (is_user_task(task) && !request_runtime.mark_deferred(runtime_id(task.id), at_us, registry_reason)) {
         const bool timed_out =
             std::any_of(expired.begin(), expired.end(),
                         [&task](const server_queue_expiration & event) { return event.task_id == task.id; });
