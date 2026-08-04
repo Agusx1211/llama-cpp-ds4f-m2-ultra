@@ -1,13 +1,18 @@
 #include "server-kv-store.h"
 
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -23,6 +28,8 @@ using namespace server_kv_store;
     } while (false)
 
 namespace {
+
+std::string executable_path;
 
 class temp_directory {
   public:
@@ -105,6 +112,32 @@ std::vector<uint8_t> payload(size_t size, uint8_t seed = 1) {
         bytes[index] = static_cast<uint8_t>(seed + index * 13);
     }
     return bytes;
+}
+
+void create_empty_file(const fs::path & path) {
+    const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    CHECK(descriptor >= 0);
+    CHECK(::close(descriptor) == 0);
+}
+
+void create_sparse_file(const fs::path & path, off_t size) {
+    const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    CHECK(descriptor >= 0);
+    CHECK(::ftruncate(descriptor, size) == 0);
+    CHECK(::close(descriptor) == 0);
+}
+
+void expect_child_lock_probe(const std::string & root) {
+    const pid_t child = ::fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        ::execl(executable_path.c_str(), executable_path.c_str(), "--probe-authority", root.c_str(), nullptr);
+        _exit(127);
+    }
+    int child_status = 0;
+    CHECK(::waitpid(child, &child_status, 0) == child);
+    CHECK(WIFEXITED(child_status));
+    CHECK(WEXITSTATUS(child_status) == 0);
 }
 
 void test_exact_charge_and_config_validation() {
@@ -277,6 +310,39 @@ void test_replacement_and_reservation_cleanup() {
     CHECK(tight_quota.acquire(key, object_class::live, make_identity()).lease->manifest().snapshot_generation == 1);
 }
 
+void test_preserved_failed_replacement_is_charged_until_reconciled() {
+    temp_directory temporary;
+    config         cfg    = make_config(temporary.path(), UINT64_MAX / 4, 0);
+    const uint64_t charge = estimate_bytes(cfg, 8);
+    cfg.live_quota_bytes  = 2 * charge;
+    store            quota(cfg);
+    const object_key key = make_key(1);
+    CHECK(quota.write_generation(key, object_class::live, make_metadata(1), payload(8, 1)).store_status == status::ok);
+
+    faults injected;
+    injected.snapshot.fail_before_manifest_commit = true;
+    injected.snapshot.preserve_failed_generation  = true;
+    const write_result failed =
+        quota.write_generation(key, object_class::live, make_metadata(2), payload(8, 2), {}, injected);
+    CHECK(failed.store_status == status::reconciliation_required);
+    CHECK(!failed.committed);
+    CHECK(quota.get_stats().live_committed_bytes == charge);
+    CHECK(quota.get_stats().live_reserved_bytes == charge);
+    CHECK(quota.get_stats().reconciliation_needed);
+    CHECK(quota.acquire(key, object_class::live, make_identity()).store_status == status::reconciliation_required);
+
+    const fs::path object_root = fs::u8path(temporary.path()) / "live" / llama_snapshot_digest_hex(key);
+    CHECK(fs::exists(object_root / "generation-0000000000000002"));
+    CHECK(quota.reconcile() == status::ok);
+    CHECK(!fs::exists(object_root / "generation-0000000000000002"));
+    CHECK(quota.get_stats().live_committed_bytes == charge);
+    CHECK(quota.get_stats().live_reserved_bytes == 0);
+    open_result current = quota.acquire(key, object_class::live, make_identity());
+    CHECK(current.store_status == status::ok);
+    CHECK(current.lease->manifest().snapshot_generation == 1);
+    CHECK(current.lease->read_all().payload == payload(8, 1));
+}
+
 void test_failed_deletion_retains_charge() {
     temp_directory temporary;
     config         cfg     = make_config(temporary.path(), UINT64_MAX / 4, UINT64_MAX / 4);
@@ -342,6 +408,180 @@ void test_exact_generation_delete_and_class_immutability() {
     CHECK(quota.acquire(key, object_class::live, make_identity()).store_status == status::not_found);
 }
 
+void test_erase_recreate_is_aba_proof_across_restart() {
+    temp_directory   temporary;
+    config           cfg = make_config(temporary.path(), UINT64_MAX / 4, UINT64_MAX / 8);
+    const object_key key = make_key(1);
+    {
+        store quota(cfg);
+        CHECK(quota.write_generation(key, object_class::live, make_metadata(2), payload(8, 2)).store_status ==
+              status::ok);
+        CHECK(quota.erase(key, object_class::live, 2).store_status == status::ok);
+        CHECK(quota.write_generation(key, object_class::prefix, make_metadata(3), payload(8)).store_status ==
+              status::class_conflict);
+    }
+    {
+        store restarted(cfg);
+        CHECK(restarted.initialization_status() == status::ok);
+        CHECK(restarted.write_generation(key, object_class::live, make_metadata(2), payload(8, 2)).store_status ==
+              status::stale_generation);
+        CHECK(restarted.write_generation(key, object_class::live, make_metadata(3), payload(8, 3)).store_status ==
+              status::ok);
+        CHECK(restarted.erase(key, object_class::live, 2).store_status == status::stale_generation);
+        open_result current = restarted.acquire(key, object_class::live, make_identity());
+        CHECK(current.store_status == status::ok);
+        CHECK(current.lease->manifest().snapshot_generation == 3);
+        CHECK(current.lease->read_all().payload == payload(8, 3));
+    }
+    {
+        store final_restart(cfg);
+        CHECK(final_restart.initialization_status() == status::ok);
+        CHECK(final_restart.acquire(key, object_class::live, make_identity()).lease->manifest().snapshot_generation ==
+              3);
+    }
+    const fs::path object_root = fs::u8path(temporary.path()) / "live" / llama_snapshot_digest_hex(key);
+    create_empty_file(object_root / ".deleted-generation-0000000000000003");
+    CHECK(fs::remove(object_root / "generation-0000000000000003" / "chunk-00000000.pack"));
+    store interrupted_erase(cfg);
+    CHECK(interrupted_erase.initialization_status() == status::ok);
+    CHECK(interrupted_erase.acquire(key, object_class::live, make_identity()).store_status == status::not_found);
+    CHECK(interrupted_erase.write_generation(key, object_class::live, make_metadata(3), payload(8)).store_status ==
+          status::stale_generation);
+    CHECK(interrupted_erase.write_generation(key, object_class::live, make_metadata(4), payload(8, 4)).store_status ==
+          status::ok);
+}
+
+void test_pool_authority_covers_processes_and_lease_lifetime() {
+    temp_directory              temporary;
+    config                      cfg = make_config(temporary.path(), UINT64_MAX / 4, UINT64_MAX / 8);
+    std::unique_ptr<read_lease> retained;
+    {
+        store owner(cfg);
+        CHECK(owner.initialization_status() == status::ok);
+        CHECK(owner.write_generation(make_key(1), object_class::prefix, make_metadata(1), payload(8)).store_status ==
+              status::ok);
+        open_result acquired = owner.acquire(make_key(1), object_class::prefix, make_identity());
+        CHECK(acquired.store_status == status::ok);
+        retained = std::move(acquired.lease);
+
+        store same_process(cfg);
+        CHECK(same_process.initialization_status() == status::authority_unavailable);
+        CHECK(same_process.erase(make_key(1), object_class::prefix, 1).store_status == status::authority_unavailable);
+        expect_child_lock_probe(temporary.path());
+    }
+    store lease_holds_authority(cfg);
+    CHECK(lease_holds_authority.initialization_status() == status::authority_unavailable);
+    retained.reset();
+    store successor(cfg);
+    CHECK(successor.initialization_status() == status::ok);
+    CHECK(successor.acquire(make_key(1), object_class::prefix, make_identity()).store_status == status::ok);
+}
+
+void test_directory_creation_parent_fsync_failures() {
+    temp_directory temporary;
+    {
+        config cfg                             = make_config(temporary.path() + "/pool", UINT64_MAX / 4, 0);
+        cfg.test_faults.fail_pool_parent_fsync = true;
+        store failed(cfg);
+        CHECK(failed.initialization_status() == status::commit_uncertain);
+    }
+    {
+        config recovered = make_config(temporary.path() + "/pool", UINT64_MAX / 4, 0);
+        store  quota(recovered);
+        CHECK(quota.initialization_status() == status::ok);
+    }
+
+    temp_directory class_root;
+    {
+        config cfg                              = make_config(class_root.path(), UINT64_MAX / 4, 0);
+        cfg.test_faults.fail_class_parent_fsync = true;
+        store failed(cfg);
+        CHECK(failed.initialization_status() == status::commit_uncertain);
+    }
+    config class_recovered = make_config(class_root.path(), UINT64_MAX / 4, 0);
+    {
+        store quota(class_recovered);
+        CHECK(quota.initialization_status() == status::ok);
+    }
+
+    temp_directory object_root;
+    config         object_cfg     = make_config(object_root.path(), UINT64_MAX / 4, UINT64_MAX / 8);
+    const uint64_t charge         = estimate_bytes(object_cfg, 8);
+    object_cfg.live_quota_bytes   = charge;
+    object_cfg.prefix_quota_bytes = charge;
+    {
+        store quota(object_cfg);
+        CHECK(quota.write_generation(make_key(1), object_class::prefix, make_metadata(1), payload(8)).store_status ==
+              status::ok);
+        faults injected;
+        injected.fail_object_parent_fsync = true;
+        const write_result failed =
+            quota.write_generation(make_key(2), object_class::live, make_metadata(1), payload(8), {}, injected);
+        CHECK(failed.store_status == status::commit_uncertain);
+        CHECK(failed.evicted_prefixes.empty());
+        CHECK(quota.get_stats().prefix_committed_bytes == charge);
+        CHECK(quota.get_stats().live_committed_bytes == 0);
+    }
+    store recovered(object_cfg);
+    CHECK(recovered.initialization_status() == status::ok);
+    CHECK(recovered.acquire(make_key(1), object_class::prefix, make_identity()).store_status == status::ok);
+}
+
+void test_sparse_stale_charge_overflow_fails_restart_closed() {
+    temp_directory   temporary;
+    config           cfg = make_config(temporary.path(), UINT64_MAX, 0);
+    const object_key key = make_key(1);
+    {
+        store quota(cfg);
+        CHECK(quota.write_generation(key, object_class::live, make_metadata(1), payload(8)).store_status == status::ok);
+    }
+    const fs::path stale =
+        fs::u8path(temporary.path()) / "live" / llama_snapshot_digest_hex(key) / "generation-0000000000000002";
+    CHECK(fs::create_directory(stale));
+    create_empty_file(stale / "generation.manifest");
+    const off_t huge = std::numeric_limits<off_t>::max() - 4095;
+    create_sparse_file(stale / "chunk-00000000.pack", huge);
+    create_sparse_file(stale / "chunk-00000001.pack", huge);
+
+    store restarted(cfg);
+    CHECK(restarted.initialization_status() == status::reconciliation_required);
+    CHECK(restarted.get_stats().reconciliation_needed);
+    CHECK(restarted.write_generation(make_key(2), object_class::live, make_metadata(1), payload(8)).store_status ==
+          status::reconciliation_required);
+}
+
+void test_prefix_object_count_uses_disposable_lru() {
+    temp_directory temporary;
+    config         cfg     = make_config(temporary.path(), UINT64_MAX / 4, UINT64_MAX / 8);
+    cfg.max_prefix_objects = 2;
+    store quota(cfg);
+    CHECK(quota.write_generation(make_key(1), object_class::prefix, make_metadata(1), payload(8)).store_status ==
+          status::ok);
+    CHECK(quota.write_generation(make_key(2), object_class::prefix, make_metadata(1), payload(8)).store_status ==
+          status::ok);
+    {
+        open_result touch = quota.acquire(make_key(1), object_class::prefix, make_identity());
+        CHECK(touch.store_status == status::ok);
+    }
+    const write_result third = quota.write_generation(make_key(3), object_class::prefix, make_metadata(1), payload(8));
+    CHECK(third.store_status == status::ok);
+    CHECK(third.evicted_prefixes == std::vector<object_key>{ make_key(2) });
+    CHECK(quota.acquire(make_key(1), object_class::prefix, make_identity()).store_status == status::ok);
+    CHECK(quota.acquire(make_key(2), object_class::prefix, make_identity()).store_status == status::not_found);
+    CHECK(quota.acquire(make_key(3), object_class::prefix, make_identity()).store_status == status::ok);
+
+    temp_directory leased_root;
+    config         leased_cfg     = make_config(leased_root.path(), UINT64_MAX / 4, UINT64_MAX / 8);
+    leased_cfg.max_prefix_objects = 1;
+    store leased(leased_cfg);
+    CHECK(leased.write_generation(make_key(1), object_class::prefix, make_metadata(1), payload(8)).store_status ==
+          status::ok);
+    open_result held = leased.acquire(make_key(1), object_class::prefix, make_identity());
+    CHECK(held.store_status == status::ok);
+    CHECK(leased.write_generation(make_key(2), object_class::prefix, make_metadata(1), payload(8)).store_status ==
+          status::blocked_by_prefix_lease);
+}
+
 void test_unknown_disk_state_fails_closed() {
     temp_directory temporary;
     config         cfg = make_config(temporary.path(), UINT64_MAX / 4, 0);
@@ -392,15 +632,27 @@ void test_bounded_prefix_stress() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--probe-authority") {
+        const config probe_cfg = make_config(argv[2], UINT64_MAX / 4, UINT64_MAX / 8);
+        return store(probe_cfg).initialization_status() == status::authority_unavailable ? 0 : 1;
+    }
+    CHECK(argc == 1);
+    executable_path = fs::canonical(argv[0]).string();
     test_exact_charge_and_config_validation();
     test_prefix_and_live_reclamation();
     test_intrinsic_live_rejection_does_not_evict_prefix();
     test_read_lease_blocks_mandatory_reclamation();
     test_replacement_and_reservation_cleanup();
+    test_preserved_failed_replacement_is_charged_until_reconciled();
     test_failed_deletion_retains_charge();
     test_commit_uncertainty_and_restart_reconciliation();
     test_exact_generation_delete_and_class_immutability();
+    test_erase_recreate_is_aba_proof_across_restart();
+    test_pool_authority_covers_processes_and_lease_lifetime();
+    test_directory_creation_parent_fsync_failures();
+    test_sparse_stale_charge_overflow_fails_restart_closed();
+    test_prefix_object_count_uses_disposable_lru();
     test_unknown_disk_state_fails_closed();
     test_bounded_prefix_stress();
     std::puts("server kv store quota tests passed");

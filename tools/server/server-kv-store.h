@@ -20,6 +20,7 @@ enum class status : uint8_t {
     ok,
     invalid_config,
     invalid_argument,
+    authority_unavailable,
     not_found,
     class_conflict,
     object_limit,
@@ -39,6 +40,8 @@ const char * status_name(status value);
 struct config {
     // snapshot.root_path names the one physical-device pool. Object stores are
     // placed below live/ and prefix/ and inherit the remaining format limits.
+    // One process-wide authority lock is held for this root until the store
+    // and every read lease issued by it have been destroyed.
     llama_snapshot_store_config snapshot;
     // live_quota_bytes is also the shared physical pool ceiling. Prefix data
     // may borrow its unused capacity but can never exceed its own subquota.
@@ -46,12 +49,21 @@ struct config {
     uint64_t                    prefix_quota_bytes = 0;
     size_t                      max_live_objects   = 64;
     size_t                      max_prefix_objects = 8192;
+
+    struct {
+        // Deterministic construction seams; not exposed through server JSON.
+        bool fail_pool_parent_fsync  = false;
+        bool fail_class_parent_fsync = false;
+    } test_faults;
 };
 
 struct faults {
     llama_snapshot_faults snapshot;
     // Deterministic failure before a selected disposable prefix is unlinked.
-    bool                  fail_prefix_delete = false;
+    bool                  fail_prefix_delete       = false;
+    // Deterministic failure after creating a new object directory but before
+    // its class-directory durability fence.
+    bool                  fail_object_parent_fsync = false;
 };
 
 struct stats {
@@ -100,10 +112,12 @@ class read_lease {
 
   private:
     friend class store;
-    read_lease(std::shared_ptr<lease_counter> counter,
+    read_lease(std::shared_ptr<shared_state>  authority,
+               std::shared_ptr<lease_counter> counter,
                llama_snapshot_store_config    snapshot,
                llama_snapshot_manifest        manifest);
 
+    std::shared_ptr<shared_state>  authority_;
     std::shared_ptr<lease_counter> counter_;
     llama_snapshot_store_config    snapshot_;
     llama_snapshot_manifest        manifest_;
@@ -120,7 +134,8 @@ class store {
   public:
     // Every method except read_lease destruction performs synchronous
     // filesystem work and belongs on the storage worker, never an inference
-    // thread. Dropping a lease is lock-free and does not wait for filesystem.
+    // thread. Dropping a lease is lock-free and does not wait for filesystem;
+    // the lease nevertheless retains the root authority lock.
     explicit store(config config);
     ~store();
 
@@ -151,8 +166,9 @@ class store {
                         object_class                    storage_class,
                         const llama_snapshot_identity & expected_identity);
 
-    // Generation equality is a compare-and-delete fence. In particular, a
-    // stale completion can never erase a newer mandatory live continuation.
+    // Generation equality is a compare-and-delete fence. A durable tombstone
+    // makes generations for a key permanently monotonic across deletion and
+    // restart, so a stale completion cannot erase a recreated continuation.
     erase_result erase(const object_key & key, object_class storage_class, uint64_t expected_generation);
 
   private:

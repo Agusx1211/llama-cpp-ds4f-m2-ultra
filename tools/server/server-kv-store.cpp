@@ -1,11 +1,14 @@
 #include "server-kv-store.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -33,6 +36,13 @@ struct object_record {
     llama_snapshot_identity        identity;
 };
 
+struct tombstone_record {
+    object_class storage_class = object_class::live;
+    uint64_t     generation    = 0;
+};
+
+constexpr const char * AUTHORITY_LOCK_NAME = ".server-kv.lock";
+
 bool key_is_zero(const object_key & key) {
     return std::all_of(key.begin(), key.end(), [](uint8_t byte) { return byte == 0; });
 }
@@ -50,6 +60,29 @@ bool is_generation_name(const std::string & value) {
 bool is_chunk_name(const std::string & value) {
     return value.size() == 19 && value.rfind("chunk-", 0) == 0 && value.compare(14, 5, ".pack") == 0 &&
            is_lower_hex(value.substr(6, 8), 8);
+}
+
+bool parse_generation_suffix(const std::string & value, const std::string & prefix, uint64_t & generation) {
+    if (value.size() != prefix.size() + 16 || value.rfind(prefix, 0) != 0 ||
+        !is_lower_hex(value.substr(prefix.size()), 16)) {
+        return false;
+    }
+    generation = 0;
+    for (size_t index = prefix.size(); index < value.size(); ++index) {
+        const char byte = value[index];
+        generation      = generation * 16 + static_cast<uint64_t>(byte <= '9' ? byte - '0' : byte - 'a' + 10);
+    }
+    return generation != 0;
+}
+
+bool tombstone_generation(const std::string & value, uint64_t & generation) {
+    return parse_generation_suffix(value, ".deleted-generation-", generation);
+}
+
+std::string tombstone_name(uint64_t generation) {
+    char buffer[64];
+    std::snprintf(buffer, sizeof(buffer), ".deleted-generation-%016llx", static_cast<unsigned long long>(generation));
+    return buffer;
 }
 
 object_key parse_key(const std::string & text) {
@@ -106,14 +139,38 @@ status fsync_directory(const fs::path & path, int * os_error = nullptr) {
     return error == 0 ? status::ok : status::io_error;
 }
 
-status ensure_directory(const fs::path & path) {
-    std::error_code error;
-    fs::create_directories(path, error);
-    if (error) {
+status ensure_directory(const fs::path & path, bool fail_parent_fsync) {
+    std::error_code       error;
+    const fs::file_status existing = fs::symlink_status(path, error);
+    if (!error && fs::exists(existing)) {
+        if (!fs::is_directory(existing) || fs::is_symlink(existing)) {
+            return status::io_error;
+        }
+        return fsync_directory(path);
+    }
+    if (error && error != std::errc::no_such_file_or_directory) {
         return status::io_error;
     }
-    const fs::file_status file_status = fs::symlink_status(path, error);
-    return !error && fs::is_directory(file_status) && !fs::is_symlink(file_status) ? status::ok : status::io_error;
+
+    const fs::path parent = path.parent_path();
+    if (parent.empty()) {
+        return status::io_error;
+    }
+    const status parent_ready = ensure_directory(parent, false);
+    if (parent_ready != status::ok) {
+        return parent_ready;
+    }
+    if (!fs::create_directory(path, error) || error) {
+        return status::io_error;
+    }
+    const status child_synced = fsync_directory(path);
+    if (child_synced != status::ok) {
+        return child_synced;
+    }
+    if (fail_parent_fsync) {
+        return status::commit_uncertain;
+    }
+    return fsync_directory(parent);
 }
 
 bool checked_add(uint64_t & target, uint64_t value) {
@@ -124,11 +181,17 @@ bool checked_add(uint64_t & target, uint64_t value) {
     return true;
 }
 
+uint64_t saturating_add(uint64_t lhs, uint64_t rhs) {
+    return rhs > std::numeric_limits<uint64_t>::max() - lhs ? std::numeric_limits<uint64_t>::max() : lhs + rhs;
+}
+
 struct scanned_object {
     status                  store_status    = status::reconciliation_required;
     llama_snapshot_status   snapshot_status = llama_snapshot_status::invalid_argument;
     int                     os_error        = 0;
     uint64_t                charged_bytes   = 0;
+    uint64_t                tombstone       = 0;
+    bool                    layout_valid    = false;
     llama_snapshot_manifest manifest;
 };
 
@@ -199,14 +262,22 @@ scanned_object scan_object(const config & cfg, object_class storage_class, const
                 return result;
             }
         } else {
-            return result;
+            uint64_t tombstone = 0;
+            if (!tombstone_generation(name, tombstone) || !fs::is_regular_file(file_status) ||
+                iterator->file_size(error) != 0 || error) {
+                result.os_error = error.value();
+                return result;
+            }
+            result.tombstone = std::max(result.tombstone, tombstone);
         }
     }
     if (error) {
         result.os_error = error.value();
         return result;
     }
+    result.layout_valid = true;
     if (!has_current) {
+        result.store_status    = status::not_found;
         result.snapshot_status = llama_snapshot_status::no_current_generation;
         return result;
     }
@@ -216,6 +287,7 @@ scanned_object scan_object(const config & cfg, object_class storage_class, const
         result.os_error        = opened.os_error;
         return result;
     }
+    result.manifest                            = opened.manifest;
     int                         validate_error = 0;
     const llama_snapshot_status validated      = snapshot.validate(opened.manifest, &validate_error);
     if (validated != llama_snapshot_status::ok) {
@@ -225,8 +297,79 @@ scanned_object scan_object(const config & cfg, object_class storage_class, const
     }
     result.store_status    = status::ok;
     result.snapshot_status = llama_snapshot_status::ok;
-    result.manifest        = opened.manifest;
     return result;
+}
+
+status prune_object(const fs::path & root,
+                    uint64_t         keep_generation,
+                    uint64_t         keep_tombstone,
+                    int *            os_error = nullptr) {
+    std::error_code error;
+    bool            changed = false;
+    for (fs::directory_iterator iterator(root, error), end; !error && iterator != end; iterator.increment(error)) {
+        const std::string name       = iterator->path().filename().string();
+        bool              remove     = name == "current.manifest" && keep_generation == 0;
+        uint64_t          generation = 0;
+        if (parse_generation_suffix(name, "generation-", generation)) {
+            remove = generation != keep_generation;
+        } else if (tombstone_generation(name, generation)) {
+            remove = generation != keep_tombstone;
+        }
+        if (!remove) {
+            continue;
+        }
+        fs::remove_all(iterator->path(), error);
+        if (error) {
+            break;
+        }
+        changed = true;
+    }
+    if (error) {
+        if (os_error != nullptr) {
+            *os_error = error.value();
+        }
+        return status::io_error;
+    }
+    if (!changed) {
+        return status::ok;
+    }
+    const status synced = fsync_directory(root, os_error);
+    return synced == status::ok ? status::ok : status::commit_uncertain;
+}
+
+status publish_tombstone(const fs::path & root, uint64_t generation, int * os_error) {
+    const fs::path path       = root / tombstone_name(generation);
+    const int      descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (descriptor < 0 && errno != EEXIST) {
+        if (os_error != nullptr) {
+            *os_error = errno;
+        }
+        return status::io_error;
+    }
+    int error = 0;
+    if (descriptor >= 0) {
+        if (::fsync(descriptor) != 0) {
+            error = errno;
+        }
+        if (::close(descriptor) != 0 && error == 0) {
+            error = errno;
+        }
+    } else {
+        struct stat file_status{};
+        if (::lstat(path.c_str(), &file_status) != 0) {
+            error = errno;
+        } else if (!S_ISREG(file_status.st_mode) || file_status.st_size != 0) {
+            error = EIO;
+        }
+    }
+    if (error != 0) {
+        if (os_error != nullptr) {
+            *os_error = error;
+        }
+        return status::io_error;
+    }
+    const status synced = fsync_directory(root, os_error);
+    return synced == status::ok ? status::ok : status::commit_uncertain;
 }
 
 class vector_source final : public llama_snapshot_chunk_source_i {
@@ -251,42 +394,66 @@ class vector_source final : public llama_snapshot_chunk_source_i {
 struct shared_state {
     explicit shared_state(config value) : cfg(std::move(value)) {}
 
-    config                               cfg;
-    mutable std::mutex                   mutex;
-    std::map<std::string, object_record> objects;
-    stats                                counters;
-    status                               ready        = status::reconciliation_required;
-    uint64_t                             access_clock = 0;
+    ~shared_state() {
+        if (authority_fd >= 0) {
+            ::close(authority_fd);
+        }
+    }
+
+    config                                  cfg;
+    mutable std::mutex                      mutex;
+    std::map<std::string, object_record>    objects;
+    std::map<std::string, tombstone_record> tombstones;
+    stats                                   counters;
+    status                                  ready        = status::reconciliation_required;
+    uint64_t                                access_clock = 0;
+    int                                     authority_fd = -1;
 };
 
 namespace {
 
 uint64_t committed_total(const stats & counters) {
-    return counters.live_committed_bytes + counters.prefix_committed_bytes;
+    return saturating_add(counters.live_committed_bytes, counters.prefix_committed_bytes);
 }
 
 uint64_t reserved_total(const stats & counters) {
-    return counters.live_reserved_bytes + counters.prefix_reserved_bytes;
+    return saturating_add(counters.live_reserved_bytes, counters.prefix_reserved_bytes);
 }
 
-void add_record(stats & counters, const object_record & record) {
+bool add_record(stats & counters, const object_record & record) {
     if (record.storage_class == object_class::live) {
-        counters.live_committed_bytes += record.charged_bytes;
+        if (!checked_add(counters.live_committed_bytes, record.charged_bytes) ||
+            counters.live_objects == std::numeric_limits<size_t>::max()) {
+            counters.live_committed_bytes = std::numeric_limits<uint64_t>::max();
+            return false;
+        }
         ++counters.live_objects;
     } else {
-        counters.prefix_committed_bytes += record.charged_bytes;
+        if (!checked_add(counters.prefix_committed_bytes, record.charged_bytes) ||
+            counters.prefix_objects == std::numeric_limits<size_t>::max()) {
+            counters.prefix_committed_bytes = std::numeric_limits<uint64_t>::max();
+            return false;
+        }
         ++counters.prefix_objects;
     }
+    return true;
 }
 
-void remove_record(stats & counters, const object_record & record) {
+bool remove_record(stats & counters, const object_record & record) {
     if (record.storage_class == object_class::live) {
+        if (record.charged_bytes > counters.live_committed_bytes || counters.live_objects == 0) {
+            return false;
+        }
         counters.live_committed_bytes -= record.charged_bytes;
         --counters.live_objects;
     } else {
+        if (record.charged_bytes > counters.prefix_committed_bytes || counters.prefix_objects == 0) {
+            return false;
+        }
         counters.prefix_committed_bytes -= record.charged_bytes;
         --counters.prefix_objects;
     }
+    return true;
 }
 
 status validate_config(const config & cfg) {
@@ -316,6 +483,27 @@ status validate_config(const config & cfg) {
                status::invalid_config;
 }
 
+status acquire_authority(shared_state & state) {
+    const fs::path lock_path  = pool_path(state.cfg) / AUTHORITY_LOCK_NAME;
+    const int      descriptor = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (descriptor < 0) {
+        return status::io_error;
+    }
+    if (::flock(descriptor, LOCK_EX | LOCK_NB) != 0) {
+        const int error = errno;
+        ::close(descriptor);
+        return error == EWOULDBLOCK || error == EAGAIN ? status::authority_unavailable : status::io_error;
+    }
+    struct stat file_status{};
+    if (::fstat(descriptor, &file_status) != 0 || !S_ISREG(file_status.st_mode) || file_status.st_size != 0 ||
+        ::fsync(descriptor) != 0 || fsync_directory(pool_path(state.cfg)) != status::ok) {
+        ::close(descriptor);
+        return status::io_error;
+    }
+    state.authority_fd = descriptor;
+    return status::ok;
+}
+
 status erase_prefix_locked(shared_state &                                 state,
                            std::map<std::string, object_record>::iterator victim,
                            bool                                           inject_failure,
@@ -326,29 +514,34 @@ status erase_prefix_locked(shared_state &                                 state,
         }
         return status::io_error;
     }
-    const object_key key  = parse_key(victim->first);
-    const fs::path   path = object_path(state.cfg, object_class::prefix, key);
-    std::error_code  error;
-    fs::remove_all(path, error);
-    if (error) {
-        if (os_error != nullptr) {
-            *os_error = error.value();
-        }
+    const object_key key        = parse_key(victim->first);
+    const fs::path   path       = object_path(state.cfg, object_class::prefix, key);
+    const uint64_t   generation = victim->second.generation;
+    const status     published  = publish_tombstone(path, generation, os_error);
+    if (published != status::ok) {
         state.ready                          = status::reconciliation_required;
         state.counters.reconciliation_needed = true;
-        return status::io_error;
+        return published;
     }
-    int          sync_error = 0;
-    const status synced     = fsync_directory(path.parent_path(), &sync_error);
-    if (synced != status::ok) {
-        if (os_error != nullptr) {
-            *os_error = sync_error;
-        }
+    state.tombstones[victim->first] = { object_class::prefix, generation };
+    const status pruned             = prune_object(path, 0, generation, os_error);
+    if (pruned != status::ok) {
         state.ready                          = status::reconciliation_required;
         state.counters.reconciliation_needed = true;
-        return status::commit_uncertain;
+        return pruned;
     }
-    remove_record(state.counters, victim->second);
+    const scanned_object tombstone = scan_object(state.cfg, object_class::prefix, key);
+    if (!tombstone.layout_valid || tombstone.store_status != status::not_found || tombstone.charged_bytes != 0 ||
+        tombstone.tombstone != generation) {
+        state.ready                          = status::reconciliation_required;
+        state.counters.reconciliation_needed = true;
+        return status::reconciliation_required;
+    }
+    if (!remove_record(state.counters, victim->second)) {
+        state.ready                          = status::reconciliation_required;
+        state.counters.reconciliation_needed = true;
+        return status::reconciliation_required;
+    }
     state.objects.erase(victim);
     ++state.counters.prefix_evictions;
     return status::ok;
@@ -381,12 +574,20 @@ bool has_leased_prefix(const shared_state & state, const std::string & excluded_
     return false;
 }
 
-void reserve(stats & counters, object_class storage_class, uint64_t bytes) {
-    (storage_class == object_class::live ? counters.live_reserved_bytes : counters.prefix_reserved_bytes) += bytes;
+bool reserve(stats & counters, object_class storage_class, uint64_t bytes) {
+    uint64_t & reserved =
+        storage_class == object_class::live ? counters.live_reserved_bytes : counters.prefix_reserved_bytes;
+    return checked_add(reserved, bytes);
 }
 
-void release(stats & counters, object_class storage_class, uint64_t bytes) {
-    (storage_class == object_class::live ? counters.live_reserved_bytes : counters.prefix_reserved_bytes) -= bytes;
+bool release(stats & counters, object_class storage_class, uint64_t bytes) {
+    uint64_t & reserved =
+        storage_class == object_class::live ? counters.live_reserved_bytes : counters.prefix_reserved_bytes;
+    if (bytes > reserved) {
+        return false;
+    }
+    reserved -= bytes;
+    return true;
 }
 
 }  // namespace
@@ -399,6 +600,8 @@ const char * status_name(status value) {
             return "invalid_config";
         case status::invalid_argument:
             return "invalid_argument";
+        case status::authority_unavailable:
+            return "authority_unavailable";
         case status::not_found:
             return "not_found";
         case status::class_conflict:
@@ -427,9 +630,11 @@ const char * status_name(status value) {
     return "unknown";
 }
 
-read_lease::read_lease(std::shared_ptr<lease_counter> counter,
+read_lease::read_lease(std::shared_ptr<shared_state>  authority,
+                       std::shared_ptr<lease_counter> counter,
                        llama_snapshot_store_config    snapshot,
                        llama_snapshot_manifest        manifest) :
+    authority_(std::move(authority)),
     counter_(std::move(counter)),
     snapshot_(std::move(snapshot)),
     manifest_(std::move(manifest)) {}
@@ -455,6 +660,16 @@ store::store(config cfg) : state_(std::make_shared<shared_state>(std::move(cfg))
         state_->ready = status::invalid_config;
         return;
     }
+    const status root_ready = ensure_directory(pool_path(state_->cfg), state_->cfg.test_faults.fail_pool_parent_fsync);
+    if (root_ready != status::ok) {
+        state_->ready = root_ready;
+        return;
+    }
+    const status authority = acquire_authority(*state_);
+    if (authority != status::ok) {
+        state_->ready = authority;
+        return;
+    }
     state_->ready = reconcile();
 }
 
@@ -471,25 +686,33 @@ status store::reconcile() {
         state_->ready = status::invalid_config;
         return state_->ready;
     }
+    if (state_->authority_fd < 0) {
+        state_->ready = status::authority_unavailable;
+        return state_->ready;
+    }
     for (const auto & item : state_->objects) {
         if (item.second.leases->value.load(std::memory_order_acquire) != 0) {
             return status::object_in_use;
         }
     }
-    if (ensure_directory(pool_path(state_->cfg)) != status::ok ||
-        ensure_directory(class_path(state_->cfg, object_class::live)) != status::ok ||
-        ensure_directory(class_path(state_->cfg, object_class::prefix)) != status::ok) {
-        state_->ready = status::io_error;
+    const status live_ready =
+        ensure_directory(class_path(state_->cfg, object_class::live), state_->cfg.test_faults.fail_class_parent_fsync);
+    const status prefix_ready = ensure_directory(class_path(state_->cfg, object_class::prefix),
+                                                 state_->cfg.test_faults.fail_class_parent_fsync);
+    if (live_ready != status::ok || prefix_ready != status::ok) {
+        state_->ready = live_ready != status::ok ? live_ready : prefix_ready;
         return state_->ready;
     }
 
     std::error_code error;
     for (fs::directory_iterator iterator(pool_path(state_->cfg), error), end; !error && iterator != end;
          iterator.increment(error)) {
-        const std::string     name        = iterator->path().filename().string();
-        const fs::file_status file_status = iterator->symlink_status(error);
-        if (error || fs::is_symlink(file_status) || !fs::is_directory(file_status) ||
-            (name != "live" && name != "prefix")) {
+        const std::string     name           = iterator->path().filename().string();
+        const fs::file_status file_status    = iterator->symlink_status(error);
+        const bool            authority_lock = name == AUTHORITY_LOCK_NAME && fs::is_regular_file(file_status) &&
+                                    iterator->file_size(error) == 0 && !error;
+        if (error || fs::is_symlink(file_status) ||
+            (!authority_lock && (!fs::is_directory(file_status) || (name != "live" && name != "prefix")))) {
             state_->ready                          = status::reconciliation_required;
             state_->counters.reconciliation_needed = true;
             return state_->ready;
@@ -500,8 +723,9 @@ status store::reconcile() {
         return state_->ready;
     }
 
-    std::map<std::string, object_record> scanned;
-    stats                                counters;
+    std::map<std::string, object_record>    scanned;
+    std::map<std::string, tombstone_record> tombstones;
+    stats                                   counters;
     counters.prefix_evictions = state_->counters.prefix_evictions;
     uint64_t clock            = 0;
     for (object_class storage_class : { object_class::live, object_class::prefix }) {
@@ -515,24 +739,64 @@ status store::reconcile() {
                 return state_->ready;
             }
             const object_key key = parse_key(name);
-            if (scanned.find(name) != scanned.end()) {
+            if (scanned.find(name) != scanned.end() || tombstones.find(name) != tombstones.end()) {
                 state_->ready                          = status::class_conflict;
                 state_->counters.reconciliation_needed = true;
                 return state_->ready;
             }
-            const scanned_object object = scan_object(state_->cfg, storage_class, key);
-            if (object.store_status != status::ok) {
-                if (object.snapshot_status == llama_snapshot_status::no_current_generation &&
-                    object.charged_bytes == 0) {
-                    std::error_code remove_error;
-                    fs::remove(iterator->path(), remove_error);
-                    if (!remove_error && fsync_directory(root) == status::ok) {
-                        continue;
-                    }
-                }
+            scanned_object object = scan_object(state_->cfg, storage_class, key);
+            if (!object.layout_valid) {
                 state_->ready                          = status::reconciliation_required;
                 state_->counters.reconciliation_needed = true;
                 return state_->ready;
+            }
+            uint64_t keep_generation = 0;
+            if (object.store_status == status::ok) {
+                keep_generation = object.manifest.snapshot_generation;
+                if (object.tombstone > keep_generation) {
+                    state_->ready                          = status::reconciliation_required;
+                    state_->counters.reconciliation_needed = true;
+                    return state_->ready;
+                }
+                if (object.tombstone == keep_generation) {
+                    keep_generation = 0;
+                }
+            } else if (object.tombstone != 0 && object.manifest.snapshot_generation == object.tombstone) {
+                keep_generation = 0;
+            } else if (object.store_status != status::not_found) {
+                state_->ready                          = status::reconciliation_required;
+                state_->counters.reconciliation_needed = true;
+                return state_->ready;
+            }
+            const status pruned = prune_object(iterator->path(), keep_generation, object.tombstone);
+            if (pruned != status::ok) {
+                state_->ready                          = status::reconciliation_required;
+                state_->counters.reconciliation_needed = true;
+                return state_->ready;
+            }
+            if (keep_generation == 0) {
+                if (object.tombstone == 0) {
+                    std::error_code remove_error;
+                    fs::remove(iterator->path(), remove_error);
+                    if (remove_error || fsync_directory(root) != status::ok) {
+                        state_->ready                          = status::reconciliation_required;
+                        state_->counters.reconciliation_needed = true;
+                        return state_->ready;
+                    }
+                } else {
+                    tombstones.emplace(name, tombstone_record{ storage_class, object.tombstone });
+                }
+                continue;
+            }
+            object = scan_object(state_->cfg, storage_class, key);
+            if (object.store_status != status::ok || object.manifest.snapshot_generation != keep_generation ||
+                object.tombstone >= keep_generation) {
+                state_->ready                          = status::reconciliation_required;
+                state_->counters.reconciliation_needed = true;
+                return state_->ready;
+            }
+            if (object.tombstone != 0) {
+                tombstones.emplace(name, tombstone_record{ storage_class, object.tombstone });
             }
             object_record record;
             record.storage_class = storage_class;
@@ -540,7 +804,12 @@ status store::reconcile() {
             record.generation    = object.manifest.snapshot_generation;
             record.identity      = object.manifest.identity;
             record.last_access   = ++clock;
-            add_record(counters, record);
+            if (!add_record(counters, record)) {
+                state_->counters                       = counters;
+                state_->counters.reconciliation_needed = true;
+                state_->ready                          = status::reconciliation_required;
+                return state_->ready;
+            }
             scanned.emplace(name, std::move(record));
         }
         if (error) {
@@ -549,6 +818,7 @@ status store::reconcile() {
         }
     }
     state_->objects      = std::move(scanned);
+    state_->tombstones   = std::move(tombstones);
     state_->counters     = counters;
     state_->access_clock = clock;
 
@@ -601,15 +871,22 @@ write_result store::write_generation_streamed(const object_key &                
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->ready != status::ok) {
         result.store_status =
-            state_->ready == status::invalid_config ? status::invalid_config : status::reconciliation_required;
+            state_->ready == status::invalid_config || state_->ready == status::authority_unavailable ?
+                state_->ready :
+                status::reconciliation_required;
         return result;
     }
     if (key_is_zero(key)) {
         return result;
     }
 
-    const std::string key_text = llama_snapshot_digest_hex(key);
-    auto              existing = state_->objects.find(key_text);
+    const std::string key_text  = llama_snapshot_digest_hex(key);
+    auto              existing  = state_->objects.find(key_text);
+    const auto        tombstone = state_->tombstones.find(key_text);
+    if (tombstone != state_->tombstones.end() && tombstone->second.storage_class != storage_class) {
+        result.store_status = status::class_conflict;
+        return result;
+    }
     if (existing != state_->objects.end()) {
         if (existing->second.storage_class != storage_class) {
             result.store_status = status::class_conflict;
@@ -633,13 +910,9 @@ write_result store::write_generation_streamed(const object_key &                
             result.snapshot_status = llama_snapshot_status::identity_mismatch;
             return result;
         }
-    }
-    const size_t class_objects =
-        storage_class == object_class::live ? state_->counters.live_objects : state_->counters.prefix_objects;
-    const size_t class_limit =
-        storage_class == object_class::live ? state_->cfg.max_live_objects : state_->cfg.max_prefix_objects;
-    if (existing == state_->objects.end() && class_objects >= class_limit) {
-        result.store_status = status::object_limit;
+    } else if (tombstone != state_->tombstones.end() && metadata.snapshot_generation <= tombstone->second.generation) {
+        result.store_status    = status::stale_generation;
+        result.snapshot_status = llama_snapshot_status::stale_generation;
         return result;
     }
 
@@ -665,17 +938,35 @@ write_result store::write_generation_streamed(const object_key &                
         result.store_status = status::prefix_quota_exceeded;
         return result;
     }
+    if (existing == state_->objects.end() && storage_class == object_class::live &&
+        state_->counters.live_objects >= state_->cfg.max_live_objects) {
+        result.store_status = status::object_limit;
+        return result;
+    }
+
+    const status object_ready = ensure_directory(fs::u8path(snapshot_cfg.root_path), injected.fail_object_parent_fsync);
+    if (object_ready != status::ok) {
+        state_->ready                          = status::reconciliation_required;
+        state_->counters.reconciliation_needed = true;
+        result.store_status                    = object_ready;
+        return result;
+    }
 
     const auto needs_eviction = [&]() {
-        const bool total_over = candidate > state_->cfg.live_quota_bytes ||
-                                committed_total(state_->counters) + reserved_total(state_->counters) >
-                                    state_->cfg.live_quota_bytes - candidate;
-        const bool prefix_over = storage_class == object_class::prefix &&
-                                 (state_->counters.prefix_committed_bytes + state_->counters.prefix_reserved_bytes >
-                                  state_->cfg.prefix_quota_bytes - candidate);
+        const uint64_t total_used = saturating_add(committed_total(state_->counters), reserved_total(state_->counters));
+        const bool     total_over =
+            candidate > state_->cfg.live_quota_bytes || total_used > state_->cfg.live_quota_bytes - candidate;
+        const uint64_t prefix_used =
+            saturating_add(state_->counters.prefix_committed_bytes, state_->counters.prefix_reserved_bytes);
+        const bool prefix_over =
+            storage_class == object_class::prefix && prefix_used > state_->cfg.prefix_quota_bytes - candidate;
         return total_over || prefix_over;
     };
-    while (needs_eviction()) {
+    const auto prefix_count_over = [&]() {
+        return existing == state_->objects.end() && storage_class == object_class::prefix &&
+               state_->counters.prefix_objects >= state_->cfg.max_prefix_objects;
+    };
+    while (prefix_count_over() || needs_eviction()) {
         auto victim = oldest_disposable_prefix(*state_, key_text);
         if (victim == state_->objects.end()) {
             result.store_status = has_leased_prefix(*state_, key_text) ?
@@ -693,7 +984,12 @@ write_result store::write_generation_streamed(const object_key &                
         result.evicted_prefixes.push_back(evicted_key);
     }
 
-    reserve(state_->counters, storage_class, candidate);
+    if (!reserve(state_->counters, storage_class, candidate)) {
+        state_->ready                          = status::reconciliation_required;
+        state_->counters.reconciliation_needed = true;
+        result.store_status                    = status::reconciliation_required;
+        return result;
+    }
     llama_snapshot_store              snapshot(snapshot_cfg);
     const llama_snapshot_write_result written = snapshot.write_generation_streamed(
         metadata, total_payload_bytes, source, cancelled, injected.snapshot, commit_fence);
@@ -703,24 +999,43 @@ write_result store::write_generation_streamed(const object_key &                
 
     if (!written.committed) {
         const llama_snapshot_cleanup_result cleanup = snapshot.cleanup_temporary_generations();
-        release(state_->counters, storage_class, candidate);
         if (cleanup.status != llama_snapshot_status::ok) {
             state_->ready                          = status::reconciliation_required;
             state_->counters.reconciliation_needed = true;
             result.store_status                    = status::reconciliation_required;
-        } else {
-            if (existing == state_->objects.end()) {
-                std::error_code remove_error;
-                fs::remove(fs::u8path(snapshot_cfg.root_path), remove_error);
-                if (remove_error) {
-                    state_->ready                          = status::reconciliation_required;
-                    state_->counters.reconciliation_needed = true;
-                    result.store_status                    = status::reconciliation_required;
-                    return result;
-                }
-            }
-            result.store_status = status::snapshot_error;
+            return result;
         }
+        const scanned_object after_failure = scan_object(state_->cfg, storage_class, key);
+        const bool expected_existing = existing != state_->objects.end() && after_failure.store_status == status::ok &&
+                                       after_failure.charged_bytes == existing->second.charged_bytes &&
+                                       after_failure.manifest.snapshot_generation == existing->second.generation;
+        const bool expected_empty =
+            existing == state_->objects.end() && after_failure.layout_valid &&
+            after_failure.store_status == status::not_found && after_failure.charged_bytes == 0 &&
+            after_failure.tombstone == (tombstone == state_->tombstones.end() ? 0 : tombstone->second.generation);
+        if (!expected_existing && !expected_empty) {
+            state_->ready                          = status::reconciliation_required;
+            state_->counters.reconciliation_needed = true;
+            result.store_status                    = status::reconciliation_required;
+            return result;
+        }
+        if (expected_empty && tombstone == state_->tombstones.end()) {
+            std::error_code remove_error;
+            fs::remove(fs::u8path(snapshot_cfg.root_path), remove_error);
+            if (remove_error || fsync_directory(class_path(state_->cfg, storage_class)) != status::ok) {
+                state_->ready                          = status::reconciliation_required;
+                state_->counters.reconciliation_needed = true;
+                result.store_status                    = status::reconciliation_required;
+                return result;
+            }
+        }
+        if (!release(state_->counters, storage_class, candidate)) {
+            state_->ready                          = status::reconciliation_required;
+            state_->counters.reconciliation_needed = true;
+            result.store_status                    = status::reconciliation_required;
+            return result;
+        }
+        result.store_status = status::snapshot_error;
         return result;
     }
 
@@ -731,22 +1046,31 @@ write_result store::write_generation_streamed(const object_key &                
         result.store_status                    = status::commit_uncertain;
         return result;
     }
-    release(state_->counters, storage_class, candidate);
+    object_record record;
+    record.storage_class = storage_class;
+    record.charged_bytes = scanned.charged_bytes;
+    record.generation    = scanned.manifest.snapshot_generation;
+    record.identity      = scanned.manifest.identity;
+    record.last_access   = ++state_->access_clock;
     if (existing != state_->objects.end()) {
-        remove_record(state_->counters, existing->second);
-        existing->second.charged_bytes = scanned.charged_bytes;
-        existing->second.generation    = scanned.manifest.snapshot_generation;
-        existing->second.identity      = scanned.manifest.identity;
-        existing->second.last_access   = ++state_->access_clock;
-        add_record(state_->counters, existing->second);
+        record.leases = existing->second.leases;
+    }
+    stats      updated  = state_->counters;
+    const bool released = release(updated, storage_class, candidate);
+    const bool removed  = existing == state_->objects.end() || remove_record(updated, existing->second);
+    if (!released || !removed || !add_record(updated, record) ||
+        updated.live_committed_bytes > state_->cfg.live_quota_bytes ||
+        updated.prefix_committed_bytes > state_->cfg.prefix_quota_bytes ||
+        committed_total(updated) > state_->cfg.live_quota_bytes) {
+        state_->ready                          = status::reconciliation_required;
+        state_->counters.reconciliation_needed = true;
+        result.store_status                    = status::commit_uncertain;
+        return result;
+    }
+    state_->counters = updated;
+    if (existing != state_->objects.end()) {
+        existing->second = std::move(record);
     } else {
-        object_record record;
-        record.storage_class = storage_class;
-        record.charged_bytes = scanned.charged_bytes;
-        record.generation    = scanned.manifest.snapshot_generation;
-        record.identity      = scanned.manifest.identity;
-        record.last_access   = ++state_->access_clock;
-        add_record(state_->counters, record);
         state_->objects.emplace(key_text, std::move(record));
     }
     result.charged_bytes = scanned.charged_bytes;
@@ -766,7 +1090,8 @@ open_result store::acquire(const object_key &              key,
     open_result                 result;
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->ready != status::ok) {
-        result.store_status = status::reconciliation_required;
+        result.store_status =
+            state_->ready == status::authority_unavailable ? state_->ready : status::reconciliation_required;
         return result;
     }
     const std::string key_text = llama_snapshot_digest_hex(key);
@@ -789,7 +1114,7 @@ open_result store::acquire(const object_key &              key,
             opened.status == llama_snapshot_status::ok ? status::reconciliation_required : status::snapshot_error;
         return result;
     }
-    result.lease.reset(new read_lease(object->second.leases, snapshot_cfg, opened.manifest));
+    result.lease.reset(new read_lease(state_, object->second.leases, snapshot_cfg, opened.manifest));
     object->second.leases->value.fetch_add(1, std::memory_order_release);
     object->second.last_access = ++state_->access_clock;
     result.store_status        = status::ok;
@@ -800,7 +1125,8 @@ erase_result store::erase(const object_key & key, object_class storage_class, ui
     erase_result                result;
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->ready != status::ok) {
-        result.store_status = status::reconciliation_required;
+        result.store_status =
+            state_->ready == status::authority_unavailable ? state_->ready : status::reconciliation_required;
         return result;
     }
     const std::string key_text = llama_snapshot_digest_hex(key);
@@ -823,26 +1149,37 @@ erase_result store::erase(const object_key & key, object_class storage_class, ui
         result.store_status = status::object_in_use;
         return result;
     }
-    const fs::path  path = object_path(state_->cfg, storage_class, key);
-    std::error_code error;
-    fs::remove_all(path, error);
-    if (error) {
-        result.store_status                    = status::io_error;
-        result.os_error                        = error.value();
+    const fs::path path      = object_path(state_->cfg, storage_class, key);
+    const status   published = publish_tombstone(path, expected_generation, &result.os_error);
+    if (published != status::ok) {
+        result.store_status                    = published;
         state_->ready                          = status::reconciliation_required;
         state_->counters.reconciliation_needed = true;
         return result;
     }
-    int sync_error = 0;
-    if (fsync_directory(path.parent_path(), &sync_error) != status::ok) {
-        result.store_status                    = status::commit_uncertain;
-        result.os_error                        = sync_error;
+    state_->tombstones[key_text] = { storage_class, expected_generation };
+    const status pruned          = prune_object(path, 0, expected_generation, &result.os_error);
+    if (pruned != status::ok) {
+        result.store_status                    = pruned;
+        state_->ready                          = status::reconciliation_required;
+        state_->counters.reconciliation_needed = true;
+        return result;
+    }
+    const scanned_object tombstone = scan_object(state_->cfg, storage_class, key);
+    if (!tombstone.layout_valid || tombstone.store_status != status::not_found || tombstone.charged_bytes != 0 ||
+        tombstone.tombstone != expected_generation) {
+        result.store_status                    = status::reconciliation_required;
         state_->ready                          = status::reconciliation_required;
         state_->counters.reconciliation_needed = true;
         return result;
     }
     result.released_bytes = object->second.charged_bytes;
-    remove_record(state_->counters, object->second);
+    if (!remove_record(state_->counters, object->second)) {
+        result.store_status                    = status::reconciliation_required;
+        state_->ready                          = status::reconciliation_required;
+        state_->counters.reconciliation_needed = true;
+        return result;
+    }
     state_->objects.erase(object);
     result.snapshot_status = llama_snapshot_status::ok;
     result.store_status    = status::ok;
