@@ -190,6 +190,15 @@ target_include_directories(test-server-prefix-cache PRIVATE ${PROJECT_SOURCE_DIR
 target_compile_features(test-server-prefix-cache PRIVATE cxx_std_17)
 
 llama_build_and_test(
+    test-server-kv-store.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-kv-store.cpp
+)
+target_include_directories(test-server-kv-store PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-kv-store PRIVATE cxx_std_17)
+
+llama_build_and_test(
     test-server-prefix-trace-replay.cpp
     ${PROJECT_SOURCE_DIR}/tools/server/server-prefix-cache.cpp
     ${PROJECT_SOURCE_DIR}/tools/server/server-scheduler.cpp
