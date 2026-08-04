@@ -20,6 +20,18 @@ bool llama_kv_cache_dsv4_supports_elastic_metal(
 // successful target Metal sparse reservation before it can be committed.
 void llama_kv_cache_dsv4_test_inject_physical_pressure(uint32_t count);
 
+struct llama_dsv4_cow_preflight_test_stats {
+    uint64_t source_ranges_submitted      = 0;
+    uint64_t destination_ranges_submitted = 0;
+    uint64_t copy_operations              = 0;
+};
+
+// Test-only observability for aggregate COW preflight ordering. Submitted
+// ranges have reached the atomic sparse reservation call; copy operations have
+// started moving a cache tensor segment.
+void                                llama_kv_cache_dsv4_test_reset_cow_preflight_stats();
+llama_dsv4_cow_preflight_test_stats llama_kv_cache_dsv4_test_get_cow_preflight_stats();
+
 enum llama_dsv4_memory_family {
     LLAMA_DSV4_MEMORY_RAW = 0,
     LLAMA_DSV4_MEMORY_CSA,
@@ -490,7 +502,7 @@ public:
 
 private:
     bool reserve_batch_ranges();
-    bool reserve_aggregate_pool();
+    bool reserve_aggregate_pool(std::vector<llama_dsv4_comp_allocation> & cow_allocations);
     void rollback_aggregate_pool();
 
     llama_kv_cache_dsv4 * kv = nullptr;

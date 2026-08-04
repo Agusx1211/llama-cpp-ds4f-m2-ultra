@@ -31,6 +31,9 @@ static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
 
 static std::atomic<uint32_t> dsv4_test_pressure_count = 0;
+static std::atomic<uint64_t> dsv4_test_cow_source_ranges      = 0;
+static std::atomic<uint64_t> dsv4_test_cow_destination_ranges = 0;
+static std::atomic<uint64_t> dsv4_test_cow_copy_operations    = 0;
 
 static uint64_t dsv4_hash_u64(uint64_t hash, uint64_t value) {
     // FNV-1a over an explicit little-endian integer encoding. This keeps the
@@ -78,6 +81,20 @@ static uint64_t dsv4_hash_cache(uint64_t hash, const llama_kv_cache * cache) {
 
 void llama_kv_cache_dsv4_test_inject_physical_pressure(uint32_t count) {
     dsv4_test_pressure_count.store(count, std::memory_order_release);
+}
+
+void llama_kv_cache_dsv4_test_reset_cow_preflight_stats() {
+    dsv4_test_cow_source_ranges.store(0, std::memory_order_release);
+    dsv4_test_cow_destination_ranges.store(0, std::memory_order_release);
+    dsv4_test_cow_copy_operations.store(0, std::memory_order_release);
+}
+
+llama_dsv4_cow_preflight_test_stats llama_kv_cache_dsv4_test_get_cow_preflight_stats() {
+    return {
+        dsv4_test_cow_source_ranges.load(std::memory_order_acquire),
+        dsv4_test_cow_destination_ranges.load(std::memory_order_acquire),
+        dsv4_test_cow_copy_operations.load(std::memory_order_acquire),
+    };
 }
 
 static bool dsv4_test_consume_physical_pressure() {
@@ -2979,6 +2996,7 @@ static void dsv4_copy_pool_segment(
         return;
     }
     for (uint32_t il : cache->get_layer_ids()) {
+        dsv4_test_cow_copy_operations.fetch_add(1, std::memory_order_relaxed);
         ggml_tensor * tensor = cache->get_k_storage(il);
         const size_t row_size = tensor->nb[1];
         std::vector<uint8_t> bytes((size_t) populated_rows*row_size);
@@ -2989,7 +3007,7 @@ static void dsv4_copy_pool_segment(
     }
 }
 
-bool llama_kv_cache_dsv4_context::reserve_aggregate_pool() {
+bool llama_kv_cache_dsv4_context::reserve_aggregate_pool(std::vector<llama_dsv4_comp_allocation> & cow_allocations) {
     if (!kv->is_aggregate_compressed() || ubatches.empty()) {
         return true;
     }
@@ -3098,17 +3116,8 @@ bool llama_kv_cache_dsv4_context::reserve_aggregate_pool() {
     comp_ticket_active = true;
 
     for (const llama_dsv4_comp_allocation & allocation : quote.allocations) {
-        if (!allocation.cow) {
-            continue;
-        }
-        if (allocation.family == llama_dsv4_comp_family::c4) {
-            dsv4_copy_pool_segment(kv->get_csa(), allocation.source_segment,
-                    allocation.destination_segment, allocation.populated_rows);
-            dsv4_copy_pool_segment(kv->get_lid(), allocation.source_segment,
-                    allocation.destination_segment, allocation.populated_rows);
-        } else {
-            dsv4_copy_pool_segment(kv->get_hca(), allocation.source_segment,
-                    allocation.destination_segment, allocation.populated_rows);
+        if (allocation.cow && allocation.populated_rows > 0) {
+            cow_allocations.push_back(allocation);
         }
     }
 
@@ -3172,11 +3181,48 @@ void llama_kv_cache_dsv4_context::rollback_aggregate_pool() {
 }
 
 bool llama_kv_cache_dsv4_context::reserve_batch_ranges() {
-    if (!reserve_aggregate_pool()) {
+    std::vector<llama_dsv4_comp_allocation> cow_allocations;
+    if (!reserve_aggregate_pool(cow_allocations)) {
         return false;
     }
 
     std::vector<dsv4_sparse_range> ranges;
+    uint64_t                       cow_source_ranges      = 0;
+    uint64_t                       cow_destination_ranges = 0;
+    const auto append_cow_segment = [&ranges](const llama_kv_cache * cache, uint32_t segment, uint32_t populated_rows,
+                                              llama_dsv4_memory_family family, uint64_t & appended_ranges) {
+        std::vector<int64_t> rows;
+        rows.reserve(populated_rows);
+        const int64_t first = (int64_t) segment * LLAMA_DSV4_COMP_SEGMENT_ROWS;
+        for (uint32_t row = 0; row < populated_rows; ++row) {
+            rows.push_back(first + row);
+        }
+        const size_t old_size = ranges.size();
+        if (!dsv4_sparse_append_k_rows(cache, std::move(rows), family, ranges)) {
+            return false;
+        }
+        appended_ranges += ranges.size() - old_size;
+        return true;
+    };
+    const auto append_cow_cache = [&](const llama_kv_cache * cache, const llama_dsv4_comp_allocation & allocation,
+                                      llama_dsv4_memory_family family) {
+        return append_cow_segment(cache, allocation.source_segment, allocation.populated_rows, family,
+                                  cow_source_ranges) &&
+               append_cow_segment(cache, allocation.destination_segment, allocation.populated_rows, family,
+                                  cow_destination_ranges);
+    };
+
+    for (const llama_dsv4_comp_allocation & allocation : cow_allocations) {
+        const bool appended = allocation.family == llama_dsv4_comp_family::c4 ?
+                                  append_cow_cache(kv->get_csa(), allocation, LLAMA_DSV4_MEMORY_CSA) &&
+                                      append_cow_cache(kv->get_lid(), allocation, LLAMA_DSV4_MEMORY_LID) :
+                                  append_cow_cache(kv->get_hca(), allocation, LLAMA_DSV4_MEMORY_HCA);
+        if (!appended) {
+            rollback_aggregate_pool();
+            return false;
+        }
+    }
+
     for (size_t i = 0; i < ubatches.size(); ++i) {
         if (!dsv4_sparse_append_slot(
                     kv->get_raw()->get_base(), ctx_raw->get_base_write_slot(i),
@@ -3203,6 +3249,10 @@ bool llama_kv_cache_dsv4_context::reserve_batch_ranges() {
 
     dsv4_sparse_transaction reservation;
     const auto reserve_status = reservation.reserve_ranges(ranges, last_batch_quote);
+    if (cow_source_ranges > 0) {
+        dsv4_test_cow_source_ranges.fetch_add(cow_source_ranges, std::memory_order_relaxed);
+        dsv4_test_cow_destination_ranges.fetch_add(cow_destination_ranges, std::memory_order_relaxed);
+    }
     if (reserve_status == dsv4_sparse_transaction::PRESSURE) {
         status = LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE;
         last_pressure_family_mask = reservation.limiting_family_mask();
@@ -3228,6 +3278,18 @@ bool llama_kv_cache_dsv4_context::reserve_batch_ranges() {
         reservation.log_failure(__func__);
         rollback_aggregate_pool();
         return false;
+    }
+
+    for (const llama_dsv4_comp_allocation & allocation : cow_allocations) {
+        if (allocation.family == llama_dsv4_comp_family::c4) {
+            dsv4_copy_pool_segment(kv->get_csa(), allocation.source_segment, allocation.destination_segment,
+                                   allocation.populated_rows);
+            dsv4_copy_pool_segment(kv->get_lid(), allocation.source_segment, allocation.destination_segment,
+                                   allocation.populated_rows);
+        } else {
+            dsv4_copy_pool_segment(kv->get_hca(), allocation.source_segment, allocation.destination_segment,
+                                   allocation.populated_rows);
+        }
     }
 
     batch_ranges_reserved = true;
