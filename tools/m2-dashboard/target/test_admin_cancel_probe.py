@@ -85,6 +85,101 @@ class AdminCancelProbeTests(unittest.TestCase):
                 [credential],
                 "credential object key",
             )
+        with self.assertRaisesRegex(probe.live.ProbeError, "reflected a credential"):
+            probe.assert_response_no_secrets(
+                probe.HttpResult(403, None, [("X-Debug", credential)]),
+                [credential],
+                "credential response header",
+            )
+
+    def test_cors_and_admin_response_contracts_are_exact(self) -> None:
+        origin = "http://127.0.0.1:8081"
+        preflight = probe.HttpResult(
+            200,
+            None,
+            [
+                ("Access-Control-Allow-Origin", origin),
+                ("Access-Control-Allow-Credentials", "false"),
+                ("Access-Control-Allow-Methods", "GET, POST"),
+                ("Access-Control-Allow-Headers", ", ".join(sorted(probe.PREFLIGHT_HEADERS))),
+            ],
+        )
+        probe.validate_preflight(preflight, origin, "preflight")
+        with self.assertRaisesRegex(probe.live.ProbeError, "methods differ"):
+            probe.validate_preflight(
+                probe.HttpResult(
+                    200,
+                    None,
+                    [
+                        ("Access-Control-Allow-Origin", origin),
+                        ("Access-Control-Allow-Credentials", "false"),
+                        ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+                        ("Access-Control-Allow-Headers", ", ".join(sorted(probe.PREFLIGHT_HEADERS))),
+                    ],
+                ),
+                origin,
+                "overbroad methods preflight",
+            )
+        with self.assertRaisesRegex(probe.live.ProbeError, "headers differ"):
+            probe.validate_preflight(
+                probe.HttpResult(
+                    200,
+                    None,
+                    [
+                        ("Access-Control-Allow-Origin", origin),
+                        ("Access-Control-Allow-Credentials", "false"),
+                        ("Access-Control-Allow-Methods", "GET, POST"),
+                        ("Access-Control-Allow-Headers", "Authorization"),
+                    ],
+                ),
+                origin,
+                "incomplete preflight",
+            )
+        with self.assertRaisesRegex(probe.live.ProbeError, "headers differ"):
+            probe.validate_preflight(
+                probe.HttpResult(
+                    200,
+                    None,
+                    [
+                        ("Access-Control-Allow-Origin", origin),
+                        ("Access-Control-Allow-Credentials", "false"),
+                        ("Access-Control-Allow-Methods", "GET, POST"),
+                        (
+                            "Access-Control-Allow-Headers",
+                            ", ".join(sorted({*probe.PREFLIGHT_HEADERS, "x-unexpected"})),
+                        ),
+                    ],
+                ),
+                origin,
+                "overbroad headers preflight",
+            )
+
+        admin = probe.HttpResult(
+            404,
+            {"error": {}},
+            [
+                ("Access-Control-Allow-Origin", origin),
+                ("Cache-Control", "no-store, no-cache, must-revalidate"),
+                ("Pragma", "no-cache"),
+                ("X-Content-Type-Options", "nosniff"),
+                ("Referrer-Policy", "no-referrer"),
+            ],
+        )
+        probe.validate_dashboard_response_headers(admin, origin, "admin")
+        probe.require_protected_error(
+            probe.HttpResult(401, {
+                "error": {"code": 401, "message": "denied", "type": "authentication_error"},
+            }, admin.headers[1:]),
+            401,
+            "authentication_error",
+            "protected authentication denial",
+        )
+        with self.assertRaisesRegex(probe.live.ProbeError, "persist a browser cookie"):
+            probe.validate_dashboard_response_headers(
+                probe.HttpResult(admin.status, admin.body, [*admin.headers, ("Set-Cookie", "secret=x")]),
+                origin,
+                "cookie admin",
+            )
 
     def test_trace_envelope_requires_exact_zero_overflow_count(self) -> None:
         result = probe.HttpResult(

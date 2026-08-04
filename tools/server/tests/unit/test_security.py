@@ -45,6 +45,11 @@ def test_incorrect_api_key(api_key: str):
     assert res.status_code == 401
     assert "error" in res.body
     assert res.body["error"]["type"] == "authentication_error"
+    assert res.headers["Cache-Control"] == "no-store, no-cache, must-revalidate"
+    assert res.headers["Pragma"] == "no-cache"
+    assert res.headers["X-Content-Type-Options"] == "nosniff"
+    assert res.headers["Referrer-Policy"] == "no-referrer"
+    assert "Set-Cookie" not in res.headers
 
 
 def test_correct_api_key():

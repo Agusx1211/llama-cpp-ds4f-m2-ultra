@@ -248,6 +248,10 @@ bool server_http_context::init(const common_params & params) {
             }),
             "application/json; charset=utf-8"
         );
+        res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+        res.set_header("Pragma", "no-cache");
+        res.set_header("X-Content-Type-Options", "nosniff");
+        res.set_header("Referrer-Policy", "no-referrer");
 
         SRV_WRN("%s", "unauthorized: Invalid API Key\n");
 

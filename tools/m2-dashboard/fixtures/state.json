@@ -107,7 +107,7 @@
       "cache_hit_tokens": 128000,
       "output_tokens": 0,
       "requested_output_tokens": 4096,
-      "blocker": "prefill lease",
+      "blocker": "<img src=/__audit/html-injection-sentinel onerror=\"localStorage.setItem('m2-dashboard-dom-xss', 'visible-field-executed')\">",
       "predicted_start_ms": [12000, 26000],
       "ttft_ms": null,
       "tbt_ms": null,
@@ -120,7 +120,7 @@
       "preemptions": 1,
       "dspark_cycles": 0,
       "content": {
-        "prompt": "<script>globalThis.pwned = true</script> Review the migration plan.",
+        "prompt": "<script>localStorage.setItem('m2-dashboard-xss', 'script-executed')</script> Review the migration plan.",
         "output": "",
         "retained": false
       }
@@ -148,7 +148,7 @@
       "preemptions": 0,
       "dspark_cycles": 0,
       "content": {
-        "prompt": "A long background request with <img src=x onerror=alert(1)>.",
+        "prompt": "A long background request with <img src=x onerror=\"localStorage.setItem('m2-dashboard-xss', 'handler-executed')\">.",
         "output": "",
         "retained": false
       }

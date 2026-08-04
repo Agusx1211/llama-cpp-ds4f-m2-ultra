@@ -28,7 +28,10 @@ Implemented here:
 - queue-locked `id:epoch` cancellation with idempotent in-flight handling and
   fail-closed stale, unknown, and terminal handles;
 - mandatory loopback Origin, JSON content type, custom CSRF proof, and
-  duplicate-security-header rejection for both POST routes; and
+  duplicate-security-header rejection for both POST routes;
+- exact narrow CORS plus no-store, no-cache, no-cookie, nosniff, and
+  no-referrer response auditing across authenticated and denied admin calls;
+- source and real-Chromium HTML/script and browser-storage audits; and
 - explicit unavailable markers for metrics not supplied by this vertical.
 
 Not implemented or claimed:
@@ -37,7 +40,6 @@ Not implemented or claimed:
 - pause/resume, reprioritization, cache mutation, or content reveal;
 - allocator, cache, disk, DSpark, capture, model, or process telemetry in the
   live registry-only view;
-- browser automation or browser-storage audits; or
 - a fresh dashboard/inference impact run for the cancel vertical (the existing
   read-only target gate remains available under `target/`).
 
@@ -49,6 +51,19 @@ npm test
 ```
 
 The tests use only Node's built-in test runner and standard library.
+
+The test-only `target/browser_security_audit_server.py` serves the unchanged
+dashboard, a bounded live mock, and a storage-report page for a real-browser
+audit. Set disposable sentinel credentials, run it on loopback, load fixture
+and live modes in Chromium, then visit `/__audit/storage.html`. A passing report
+has empty local/session storage, cookies, IndexedDB databases, CacheStorage
+keys, and service-worker registrations; at least one authenticated API request;
+`credentials_correct: true`; and `secret_in_url: false`. The mock records only
+those bounded outcomes, never credential values. The visible hostile fixture
+also names a same-origin image sentinel: `html_injection_requested: false`
+proves Chromium did not parse the attacker-controlled text as HTML even though
+the production CSP would block its inline handler. The audit page intentionally
+uses script and is not a production dashboard asset.
 
 ## Fixture preview
 
@@ -81,12 +96,18 @@ export LLAMA_SERVER_TRUSTED_FAST_REFILL_WINDOW_MS=30000
 llama-server ... \
   --api-key "$LLAMA_API_KEY" \
   --cors-origins localhost \
+  --no-cors-credentials \
+  --cors-methods 'GET, POST' \
   --cors-headers 'Authorization, Content-Type, X-Llama-Dashboard-CSRF, X-Llama-Trusted-Scheduling-Token, Last-Event-ID'
 ```
 
-The explicit CORS header list is required for a dashboard served from a
-different loopback port. In particular, browsers do not treat `Authorization`
-as covered by a wildcard `Access-Control-Allow-Headers` response.
+The disabled ambient credentials and exact CORS method/header lists are
+required for a dashboard served from a different loopback port. The dashboard
+uses `credentials: "omit"` and sends its two explicit credentials only as
+headers, so cookies and browser client certificates need no CORS permission.
+The narrow lists keep unused methods out of the browser surface; in particular,
+browsers do not treat `Authorization` as covered by a wildcard
+`Access-Control-Allow-Headers` response.
 
 Serve this directory from the same loopback hostname as llama-server. Ports
 may differ; hostnames must not. For example:
@@ -145,10 +166,15 @@ dashboard operator` to the original completion waiter, so a non-streaming
 client terminates instead of hanging after its slot is released.
 
 The dependency-free target probe starts its own long completion against an
-already-running direct server, discovers the new bound `id:epoch`, validates
-redacted detail and negative CSRF/origin/content-type/stale-handle cases,
-cancels that exact generation, checks contiguous lifecycle events, and submits
-a fresh completion afterward:
+already-running direct server configured with the localhost CORS flags above.
+It verifies allowed loopback and denied remote preflights, the complete
+credentialed request-header allow-list, no-store/nosniff/no-referrer/no-cookie
+admin responses, API-only/operator-only/wrong-credential/query/classification/
+CSRF/origin/content-type denials, and absence of credential reflection in
+response bodies and headers. It then discovers its new bound `id:epoch`,
+validates redacted detail and stale-handle rejection, cancels that exact
+generation, checks contiguous lifecycle events, and submits a fresh completion
+afterward:
 
 ```sh
 export M2_DASHBOARD_BASE_URL=http://127.0.0.1:18130

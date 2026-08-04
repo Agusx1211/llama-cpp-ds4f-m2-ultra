@@ -38,26 +38,74 @@ test("fixture script content remains inert data through redaction and text rende
     let rendered;
     setSafeText({ set textContent(value) { rendered = value; } }, prompt);
     assert.equal(rendered, prompt);
+
+    const visibleBlocker = snapshot.requests[0].blocker;
+    assert.match(visibleBlocker, /<img[^>]+onerror=/u);
+    setSafeText({ set textContent(value) { rendered = value; } }, visibleBlocker);
+    assert.equal(rendered, visibleBlocker);
 });
 
 test("dashboard sources avoid HTML injection and browser persistence primitives", async () => {
     const sourceRoot = new URL("../", import.meta.url);
     const libraryRoot = new URL("../lib/", import.meta.url);
     const libraryFiles = (await readdir(libraryRoot)).filter((name) => name.endsWith(".mjs"));
+    const index = await readFile(new URL("index.html", sourceRoot), "utf8");
     const sources = await Promise.all([
         new URL("dashboard.js", sourceRoot),
         ...libraryFiles.map((name) => new URL(name, libraryRoot)),
     ].map((url) => readFile(url, "utf8")));
     const combined = sources.join("\n");
-    for (const forbidden of [
+    for (const forbiddenHtmlSink of [
         ".innerHTML",
+        ".outerHTML",
         "insertAdjacentHTML",
         "document.write",
+        "document.writeln",
+        "createContextualFragment",
+        "DOMParser",
+        ".srcdoc",
+        "eval(",
+        "new Function",
+    ]) {
+        assert.equal(combined.includes(forbiddenHtmlSink), false,
+            `forbidden HTML/script sink: ${forbiddenHtmlSink}`);
+    }
+    for (const forbiddenPersistencePrimitive of [
         "localStorage",
         "sessionStorage",
+        "indexedDB",
+        "openDatabase",
+        "cookieStore",
+        "document.cookie",
+        "navigator.credentials",
+        "navigator.storage",
+        "StorageManager",
+        "serviceWorker",
+        "caches.open",
+        "CacheStorage",
+        "BroadcastChannel",
+        "SharedWorker",
+        "window.name",
+        "showSaveFilePicker",
+        "showOpenFilePicker",
+        "FileSystemHandle",
+        "FileSystemDirectoryHandle",
+        "FileSystemFileHandle",
     ]) {
-        assert.equal(combined.includes(forbidden), false, `forbidden source primitive: ${forbidden}`);
+        assert.equal(combined.includes(forbiddenPersistencePrimitive), false,
+            `forbidden browser persistence primitive: ${forbiddenPersistencePrimitive}`);
     }
+    assert.match(index, /Content-Security-Policy[^>]+default-src 'self'/u);
+    assert.match(index, /script-src 'self'/u);
+    assert.match(index, /object-src 'none'/u);
+    assert.match(index, /base-uri 'none'/u);
+    assert.match(index, /form-action 'none'/u);
+    assert.doesNotMatch(index, /<script(?![^>]+\bsrc=)[^>]*>/iu);
+    assert.doesNotMatch(index, /\son[a-z]+\s*=/iu);
+    assert.doesNotMatch(index, /javascript:/iu);
+    assert.match(index, /<form[^>]+autocomplete="off"/u);
+    assert.match(index, /id="api-key"[^>]+autocomplete="off"/u);
+    assert.match(index, /id="operator-token"[^>]+autocomplete="off"/u);
 
     const networkMethods = [...combined.matchAll(/method:\s*"([A-Z]+)"/g)].map((match) => match[1]);
     assert.ok(networkMethods.length > 0, "expected explicit dashboard network methods");
@@ -67,6 +115,8 @@ test("dashboard sources avoid HTML injection and browser persistence primitives"
         "only request detail and cancel use POST");
     assert.match(combined, /X-Llama-Dashboard-CSRF/u);
     assert.match(combined, /"Content-Type": "application\/json"/u);
+    assert.match(combined, /addEventListener\("pagehide", stopActiveConnection\)/u);
+    assert.doesNotMatch(combined, /pagehide[^\n]+\bonce\b/u);
 });
 
 test("control intents are immutable, bounded, and explicitly transport-free", () => {
