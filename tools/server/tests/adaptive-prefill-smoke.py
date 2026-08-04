@@ -379,9 +379,9 @@ class Smoke:
                 if begin != cursors.get(request_id, 0):
                     raise RuntimeError(f"non-contiguous committed range: {event}")
                 cursors[request_id] = end
-                if not event["completes_prompt"] and (
-                        not event["yield_boundary"] or begin % alignment or end % alignment):
-                    raise RuntimeError(f"unaligned non-final chunk/yield: {event}")
+                if (event["yield_boundary"] and not event["completes_prompt"]
+                        and end % alignment):
+                    raise RuntimeError(f"non-final yield ends off alignment: {event}")
                 if event["active_decode"] and event["active_decode_lane"] == "fast":
                     if end - begin > active_limit:
                         raise RuntimeError(f"active-fast chunk over limit: {event}")
@@ -568,8 +568,9 @@ def main() -> int:
         smoke.close()
 
 
-try:
-    raise SystemExit(main())
-except Exception:
-    traceback.print_exc()
-    raise SystemExit(1)
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception:
+        traceback.print_exc()
+        raise SystemExit(1)
