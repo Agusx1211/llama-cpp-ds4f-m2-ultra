@@ -9,6 +9,7 @@
 
 #include "server-common.h"
 
+#include <algorithm>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -38,6 +39,14 @@ json format_error_response(const std::string & message, const enum error_type ty
             type_str = "permission_error";
             code = 403;
             break;
+        case ERROR_TYPE_OVERLOADED:
+            type_str = "overloaded_error";
+            code = 429;
+            break;
+        case ERROR_TYPE_TIMEOUT:
+            type_str = "timeout_error";
+            code = 408;
+            break;
         case ERROR_TYPE_NOT_SUPPORTED:
             type_str = "not_supported_error";
             code = 501;
@@ -56,6 +65,19 @@ json format_error_response(const std::string & message, const enum error_type ty
         {"message", message},
         {"type", type_str},
     };
+}
+
+uint32_t bounded_retry_after_seconds(uint64_t seconds) {
+    constexpr uint32_t min_seconds = 1;
+    constexpr uint32_t max_seconds = 60;
+    return static_cast<uint32_t>(std::min<uint64_t>(max_seconds, std::max<uint64_t>(min_seconds, seconds)));
+}
+
+std::string retry_after_header_value(const json & error_data) {
+    if (json_value(error_data, "code", 0) != 429) {
+        return {};
+    }
+    return std::to_string(bounded_retry_after_seconds(json_value<uint64_t>(error_data, "retry_after", 1)));
 }
 
 //

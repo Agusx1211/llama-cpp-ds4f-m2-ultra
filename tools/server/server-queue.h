@@ -5,10 +5,42 @@
 
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <vector>
 #include <unordered_set>
+
+enum class server_queue_post_code : uint8_t {
+    accepted = 0,
+    overloaded,
+    unavailable,
+};
+
+struct server_queue_post_result {
+    server_queue_post_code code                = server_queue_post_code::accepted;
+    int                    task_id             = -1;
+    uint32_t               retry_after_seconds = 0;
+
+    operator bool() const { return code == server_queue_post_code::accepted; }
+};
+
+struct server_queue_expiration {
+    int                                   task_id = -1;
+    server_request_runtime::deadline_kind kind    = server_request_runtime::deadline_kind::queue;
+};
+
+enum class server_queue_bind_code : uint8_t {
+    bound = 0,
+    expired,
+    rejected,
+};
+
+struct server_queue_bind_result {
+    server_queue_bind_code code = server_queue_bind_code::rejected;
+
+    operator bool() const { return code == server_queue_bind_code::bound; }
+};
 
 // struct for managing server tasks
 // in most cases, use server_response_reader to post new tasks and retrieve results
@@ -26,6 +58,7 @@ private:
     std::map<int, server_task> queue_user_tasks;
 
     server_request_runtime::request_runtime request_runtime;
+    std::function<uint64_t()>               monotonic_us;
 
     std::mutex mutex_tasks;
     std::condition_variable condition_tasks;
@@ -34,15 +67,17 @@ private:
     std::function<void(server_task &&)> callback_new_task;
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
+    std::function<void(server_queue_expiration)> callback_request_expired;
 
 public:
     server_queue();
+    server_queue(server_request_runtime::runtime_config config, std::function<uint64_t()> monotonic_us);
 
     // Add a new task to the end of the queue
-    int post(server_task && task, bool front = false);
+    server_queue_post_result post(server_task && task, bool front = false);
 
     // multi-task version of post()
-    int post(std::vector<server_task> && tasks, bool front = false);
+    server_queue_post_result post(std::vector<server_task> && tasks, bool front = false);
 
     // Add a new task, but defer until one slot is available
     void defer(server_task && task);
@@ -88,9 +123,10 @@ public:
         return queue_tasks_deferred.size();
     }
 
-    bool bind_slot(int id_task, int id_slot);
+    server_queue_bind_result bind_slot(int id_task, int id_slot);
     bool release_slot(int id_task, int id_slot);
     bool fail_task(int id_task);
+    size_t expire_requests();
 
     std::vector<server_request_registry::request_snapshot> request_snapshot();
     server_request_registry::event_log_snapshot request_events();
@@ -125,12 +161,20 @@ public:
         }
     }
 
+    void on_request_expired(std::function<void(server_queue_expiration)> callback) {
+        callback_request_expired = std::move(callback);
+    }
+
 private:
     static bool is_user_task(const server_task & task);
     static uint64_t runtime_id(int id_task);
-    server_request_runtime::request_metadata make_request_metadata(server_task & task);
-    bool enqueue_user_task(server_task && task);
-    void cleanup_pending_task(int id_target);
+    uint64_t now_us() const;
+    server_request_runtime::request_metadata make_request_metadata(server_task & task, uint64_t at_us);
+    server_request_runtime::admission_result enqueue_user_task(server_task && task, uint64_t at_us);
+    std::vector<server_queue_expiration> expire_requests_locked(uint64_t at_us);
+    void notify_expired(const std::vector<server_queue_expiration> & expired);
+    void erase_pending_payload(int id_target);
+    void cleanup_pending_task(int id_target, uint64_t at_us);
 };
 
 // struct for managing server responses

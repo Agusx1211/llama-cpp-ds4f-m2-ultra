@@ -1507,6 +1507,14 @@ private:
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
+        queue_tasks.on_request_expired([this](server_queue_expiration expiration) {
+            auto result = std::make_unique<server_task_result_error>();
+            result->id       = expiration.task_id;
+            result->err_type = ERROR_TYPE_TIMEOUT;
+            result->err_msg  = expiration.kind == server_request_runtime::deadline_kind::queue ?
+                                   "request queue deadline expired" : "request run deadline expired";
+            queue_results.send(std::move(result));
+        });
 
         metrics.init();
 
@@ -1901,8 +1909,11 @@ private:
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
 
-        if (!queue_tasks.bind_slot(slot.task->id, slot.id)) {
-            send_error(slot, "failed to bind durable request state", ERROR_TYPE_SERVER);
+        const auto binding = queue_tasks.bind_slot(slot.task->id, slot.id);
+        if (!binding) {
+            if (binding.code != server_queue_bind_code::expired) {
+                send_error(slot, "failed to bind durable request state", ERROR_TYPE_SERVER);
+            }
             slot.release();
             return false;
         }
@@ -4321,6 +4332,10 @@ struct server_res_generator : server_res_spipe {
     }
     void error(const json & error_data) {
         status = json_value(error_data, "code", 500);
+        const std::string retry_after = retry_after_header_value(error_data);
+        if (!retry_after.empty()) {
+            headers["Retry-After"] = retry_after;
+        }
         data = safe_json_to_str({{ "error", error_data }});
     }
 };

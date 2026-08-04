@@ -19,6 +19,18 @@ enum class result_code : uint8_t {
     registry_capacity,
     unknown_request,
     invalid_transition,
+    deadline_expired,
+};
+
+enum class deadline_kind : uint8_t {
+    queue = 0,
+    run,
+};
+
+struct expiration {
+    uint64_t      request_id  = 0;
+    deadline_kind kind        = deadline_kind::queue;
+    bool          was_running = false;
 };
 
 struct request_metadata {
@@ -29,11 +41,14 @@ struct request_metadata {
     int64_t                                    debt_us            = 0;
     server_request_registry::request_counts    counts;
     server_request_registry::request_estimates estimates;
+    uint64_t                                   queue_timeout_us = 0;
+    uint64_t                                   run_timeout_us   = 0;
 };
 
 struct admission_result {
     result_code                   code   = result_code::ok;
     server_scheduler::reason_code reason = server_scheduler::reason_code::none;
+    uint32_t                      retry_after_seconds = 0;
 
     operator bool() const { return code == result_code::ok; }
 };
@@ -47,9 +62,17 @@ struct dispatch_result {
 };
 
 struct runtime_config {
+    static constexpr uint64_t queue_timeout_default_us = 30ULL * 1000 * 1000;
+    static constexpr uint64_t run_timeout_default_us   = 10ULL * 60 * 1000 * 1000;
+
     server_scheduler::scheduler_config       scheduler;
     server_request_registry::registry_config registry;
+    uint64_t                                 default_queue_timeout_us     = queue_timeout_default_us;
+    uint64_t                                 default_run_timeout_us       = run_timeout_default_us;
+    uint32_t                                 overload_retry_after_seconds = 1;
 };
+
+bool is_overload(result_code code);
 
 // This adapter is deliberately task-payload agnostic. The server queue owns
 // movable work items; this object owns their durable scheduling and binding
@@ -62,6 +85,7 @@ class request_runtime {
     dispatch_result  take_next(uint64_t now_us);
     bool             mark_deferred(uint64_t request_id, uint64_t at_us);
     admission_result resume(uint64_t request_id, uint64_t at_us);
+    std::vector<expiration> expire_due(uint64_t now_us);
 
     bool bind_slot(uint64_t request_id, server_request_registry::slot_id slot, uint64_t at_us);
     bool release_slot(uint64_t request_id, server_request_registry::slot_id slot, uint64_t at_us);
@@ -81,9 +105,13 @@ class request_runtime {
         std::vector<server_request_registry::binding_lease> bindings;
         bool                                                scheduler_queued = false;
         server_request_registry::lifecycle                  terminal = server_request_registry::lifecycle::completed;
+        uint64_t                                            queue_deadline_us = 0;
+        uint64_t                                            run_timeout_us    = 0;
+        uint64_t                                            run_deadline_us   = 0;
     };
 
     admission_result enqueue(record & request, uint64_t at_us);
+    expiration       expire(std::map<uint64_t, record>::iterator it, deadline_kind kind, uint64_t at_us);
     bool             finish(std::map<uint64_t, record>::iterator it,
                             server_request_registry::lifecycle   terminal,
                             server_request_registry::reason_code reason,
@@ -92,6 +120,9 @@ class request_runtime {
     server_scheduler::scheduler               scheduler;
     server_request_registry::request_registry registry;
     std::map<uint64_t, record>                records;
+    uint64_t                                  default_queue_timeout_us;
+    uint64_t                                  default_run_timeout_us;
+    uint32_t                                  overload_retry_after_seconds;
 };
 
 }  // namespace server_request_runtime

@@ -152,6 +152,10 @@ struct server_task {
         uint64_t predicted_gpu_us = 0;
         uint64_t predicted_memory_bytes = 0;
         uint64_t predicted_output_tokens = 0;
+        // Zero selects the durable runtime's bounded server default. These are
+        // trusted server-side durations and are never read from client JSON.
+        uint64_t queue_timeout_us = 0;
+        uint64_t run_timeout_us   = 0;
     } scheduling;
 
     int id = -1; // to be filled by server_queue
@@ -518,6 +522,10 @@ struct server_task_result_rerank : server_task_result {
 struct server_task_result_error : server_task_result {
     error_type err_type = ERROR_TYPE_SERVER;
     std::string err_msg;
+
+    // Only used by ERROR_TYPE_OVERLOADED. The serialized HTTP layer clamps
+    // this to the public Retry-After contract before emitting the header.
+    uint32_t retry_after_seconds = 0;
 
     // for ERROR_TYPE_EXCEED_CONTEXT_SIZE
     int32_t n_prompt_tokens = 0;
