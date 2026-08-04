@@ -2286,11 +2286,6 @@ llama_kv_admission_status llama_context::kv_admission_prepare_ranges(
     quote.status = LLAMA_KV_ADMISSION_INVALID;
     id = 0;
 
-    auto * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
-    if (dsv4 == nullptr || dsv4->is_aggregate_compressed() || !cparams.kv_unified || cparams.n_seq_max != 2) {
-        quote.status = LLAMA_KV_ADMISSION_UNSUPPORTED;
-        return quote.status;
-    }
     if (spans == nullptr || n_spans == 0 || n_spans > 2) {
         return quote.status;
     }
@@ -2304,6 +2299,12 @@ llama_kv_admission_status llama_context::kv_admission_prepare_ranges(
             return quote.status;
         }
         seen[span.seq_id] = true;
+    }
+
+    auto * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
+    if (dsv4 == nullptr || dsv4->is_aggregate_compressed() || !cparams.kv_unified || cparams.n_seq_max != 2) {
+        quote.status = LLAMA_KV_ADMISSION_UNSUPPORTED;
+        return quote.status;
     }
     return reserve ? dsv4->reserve_admission(spans, n_spans, quote, id) :
                      dsv4->quote_admission(spans, n_spans, quote);
