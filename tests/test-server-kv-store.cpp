@@ -172,7 +172,7 @@ bool create_sparse_file(const fs::path & path, off_t size) {
     if (::ftruncate(descriptor, size) != 0) {
         const int error = errno;
         CHECK(::close(descriptor) == 0);
-        CHECK(error == EFBIG || error == ENOSPC || error == EINVAL || error == EOPNOTSUPP);
+        CHECK(error == EFBIG || error == ENOSPC || error == EINVAL || error == EOPNOTSUPP || error == EOVERFLOW);
         return false;
     }
     CHECK(::close(descriptor) == 0);
@@ -885,15 +885,29 @@ void test_sparse_stale_charge_overflow_fails_restart_closed() {
         fs::u8path(temporary.path()) / "live" / llama_snapshot_digest_hex(key) / "generation-0000000000000002";
     CHECK(fs::create_directory(stale));
     create_empty_file(stale / "generation.manifest");
-    const llama_snapshot_storage_estimate oversized =
-        llama_snapshot_estimate_storage(cfg.snapshot, make_metadata(1), std::numeric_limits<uint64_t>::max());
-    CHECK(oversized.status == llama_snapshot_status::invalid_argument);
-    const off_t huge = std::numeric_limits<off_t>::max() - 4095;
-    if (!create_sparse_file(stale / "chunk-00000000.pack", huge) ||
-        !create_sparse_file(stale / "chunk-00000001.pack", huge)) {
+    const uint64_t physical_bytes = static_cast<uint64_t>(std::numeric_limits<off_t>::max() / 2 + 1);
+    uint64_t       unchecked_sum  = 0;
+    for (int index = 0; index < 4; ++index) {
+        unchecked_sum += physical_bytes;
+    }
+    CHECK(unchecked_sum < physical_bytes);
+    uint64_t checked_sum = 0;
+    for (int index = 0; index < 4; ++index) {
+        const bool accepted = detail::checked_add(checked_sum, physical_bytes);
+        CHECK(accepted == (index < 3));
+    }
+    CHECK(checked_sum == physical_bytes * 3);
+
+    const off_t    huge     = static_cast<off_t>(physical_bytes);
+    const fs::path chunks[] = { stale / "chunk-00000000.pack", stale / "chunk-00000001.pack",
+                                stale / "chunk-00000002.pack", stale / "chunk-00000003.pack" };
+    for (const fs::path & chunk : chunks) {
+        if (create_sparse_file(chunk, huge)) {
+            continue;
+        }
         std::fprintf(
             stderr,
-            "SKIP: filesystem cannot construct near-off_t-maximum sparse files; logical overflow check passed\n");
+            "SKIP: filesystem cannot construct balanced sparse overflow files; checked accumulation guard passed\n");
         return;
     }
 

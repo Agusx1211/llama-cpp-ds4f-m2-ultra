@@ -26,6 +26,18 @@ struct lease_counter {
     std::atomic<size_t> value{ 0 };
 };
 
+namespace detail {
+
+bool checked_add(uint64_t & target, uint64_t value) {
+    if (value > std::numeric_limits<uint64_t>::max() - target) {
+        return false;
+    }
+    target += value;
+    return true;
+}
+
+}  // namespace detail
+
 namespace {
 
 struct object_record {
@@ -341,14 +353,6 @@ status ensure_directory(const fs::path & path, bool fail_parent_fsync) {
     return fsync_directory(parent);
 }
 
-bool checked_add(uint64_t & target, uint64_t value) {
-    if (value > std::numeric_limits<uint64_t>::max() - target) {
-        return false;
-    }
-    target += value;
-    return true;
-}
-
 uint64_t saturating_add(uint64_t lhs, uint64_t rhs) {
     return rhs > std::numeric_limits<uint64_t>::max() - lhs ? std::numeric_limits<uint64_t>::max() : lhs + rhs;
 }
@@ -382,7 +386,7 @@ status count_generation_files(const fs::path & path, uint64_t & bytes, int & os_
         }
         const uintmax_t file_bytes = iterator->file_size(error);
         if (error || file_bytes > std::numeric_limits<uint64_t>::max() ||
-            !checked_add(bytes, static_cast<uint64_t>(file_bytes))) {
+            !detail::checked_add(bytes, static_cast<uint64_t>(file_bytes))) {
             os_error = error.value();
             return status::reconciliation_required;
         }
@@ -419,7 +423,7 @@ scanned_object scan_object(const config & cfg, object_class storage_class, const
             has_current                = true;
             const uintmax_t file_bytes = iterator->file_size(error);
             if (error || file_bytes > std::numeric_limits<uint64_t>::max() ||
-                !checked_add(result.charged_bytes, static_cast<uint64_t>(file_bytes))) {
+                !detail::checked_add(result.charged_bytes, static_cast<uint64_t>(file_bytes))) {
                 result.os_error = error.value();
                 return result;
             }
@@ -544,14 +548,14 @@ uint64_t reserved_total(const stats & counters) {
 
 bool add_record(stats & counters, const object_record & record) {
     if (record.storage_class == object_class::live) {
-        if (!checked_add(counters.live_committed_bytes, record.charged_bytes) ||
+        if (!detail::checked_add(counters.live_committed_bytes, record.charged_bytes) ||
             counters.live_objects == std::numeric_limits<size_t>::max()) {
             counters.live_committed_bytes = std::numeric_limits<uint64_t>::max();
             return false;
         }
         ++counters.live_objects;
     } else {
-        if (!checked_add(counters.prefix_committed_bytes, record.charged_bytes) ||
+        if (!detail::checked_add(counters.prefix_committed_bytes, record.charged_bytes) ||
             counters.prefix_objects == std::numeric_limits<size_t>::max()) {
             counters.prefix_committed_bytes = std::numeric_limits<uint64_t>::max();
             return false;
@@ -850,7 +854,7 @@ bool has_leased_prefix(const shared_state & state, const std::string & excluded_
 bool reserve(stats & counters, object_class storage_class, uint64_t bytes) {
     uint64_t & reserved =
         storage_class == object_class::live ? counters.live_reserved_bytes : counters.prefix_reserved_bytes;
-    return checked_add(reserved, bytes);
+    return detail::checked_add(reserved, bytes);
 }
 
 bool release(stats & counters, object_class storage_class, uint64_t bytes) {

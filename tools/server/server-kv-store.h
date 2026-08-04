@@ -37,6 +37,15 @@ enum class status : uint8_t {
 
 const char * status_name(status value);
 
+namespace detail {
+
+// Shared checked accumulation used while reconstructing on-disk quota
+// charges. The narrow detail seam lets tests exercise the exact overflow
+// guard without requiring a filesystem to allocate multi-exabyte sparse files.
+bool checked_add(uint64_t & target, uint64_t value);
+
+}  // namespace detail
+
 struct config {
     // snapshot.root_path names the one physical-device pool. Object stores are
     // placed below live/ and prefix/ and inherit the remaining format limits.
