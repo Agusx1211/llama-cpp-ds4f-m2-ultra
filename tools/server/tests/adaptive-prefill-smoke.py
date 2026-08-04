@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 import pathlib
-import sys
 import threading
 import time
 import traceback
@@ -21,6 +20,12 @@ from typing import Any
 TOKEN_HEADER = "X-Llama-Trusted-Scheduling-Token"
 LANE_HEADER = "X-Llama-Trusted-Lane"
 TAG_HEADER = "X-Llama-Benchmark-Tag"
+
+SEQUENTIAL_BURST_MODE = "sequential-bursts"
+ORDINARY_PROMPT_TOKENS = 17
+MAX_SEQUENTIAL_BURSTS = 4
+TRACE_EVENTS_PER_PROMPT_TOKEN = 4
+TRACE_EVENT_HEADROOM = 32
 
 
 def now_ns() -> int:
@@ -50,6 +55,7 @@ class Result:
     content_parts: list[str] = dataclasses.field(default_factory=list)
     progress: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     error: str = ""
+    intended_launch_ns: int = 0
 
     @property
     def content(self) -> str:
@@ -75,7 +81,115 @@ class Result:
         }
         if retain_ids:
             result["token_ids"] = self.tokens
+        if self.intended_launch_ns:
+            result.update({
+                "intended_launch_ns": self.intended_launch_ns,
+                "actual_launch_ns": self.start_ns,
+                "launch_lag_ms": (self.start_ns - self.intended_launch_ns) / 1e6,
+                "ttft_ms": (self.first_token_ns - self.start_ns) / 1e6 if self.first_token_ns else None,
+            })
         return result
+
+
+def sequential_burst_mode(config: dict[str, Any]) -> bool:
+    return config.get("mode") == SEQUENTIAL_BURST_MODE
+
+
+def expected_trusted_requests(config: dict[str, Any]) -> dict[str, tuple[str, int]]:
+    requests = config["requests"]
+    reference = requests["reference"]
+    low = requests["trusted_low"]
+    expected = {
+        "reference-before": ("fast", int(reference["prompt_tokens"])),
+        "reference-after": ("fast", int(reference["prompt_tokens"])),
+        "low-8k": ("low", int(low["prompt_tokens"])),
+    }
+    if sequential_burst_mode(config):
+        bursts = requests["fast_bursts"]
+        expected.update({
+            "isolated-low": ("low", int(low["prompt_tokens"])),
+            "isolated-burst": ("fast", int(bursts["prompt_tokens"])),
+            **{
+                f"burst-{ordinal:02d}": ("fast", int(bursts["prompt_tokens"]))
+                for ordinal in range(int(bursts["count"]))
+            },
+        })
+    else:
+        fast = requests["isolated_and_sustained_fast"]
+        expected.update({
+            "isolated-fast": ("fast", int(fast["prompt_tokens"])),
+            "sustained-fast": ("fast", int(fast["prompt_tokens"])),
+        })
+    return expected
+
+
+def required_trace_capacity(config: dict[str, Any]) -> int:
+    # A maximally fragmented prompt can select/release an owner and stage/commit
+    # once per token. The fixed margin covers authenticated snapshots and any
+    # owner handoff that occurs without advancing a prompt cursor.
+    expected = expected_trusted_requests(config)
+    prompt_tokens = ORDINARY_PROMPT_TOKENS + sum(prompt for _, prompt in expected.values())
+    registrations = 1 + len(expected)
+    return TRACE_EVENT_HEADROOM + registrations + TRACE_EVENTS_PER_PROMPT_TOKEN * prompt_tokens
+
+
+def validate_trace_preflight(snapshot: dict[str, Any], config: dict[str, Any]) -> dict[str, int]:
+    if snapshot.get("schema") != 1 or snapshot.get("overflow_events") != 0:
+        raise RuntimeError("trace preflight schema/overflow gate failed")
+    events = snapshot.get("events", [])
+    if snapshot.get("total_events") != 0 or events:
+        raise RuntimeError("sequential burst smoke requires an empty scheduler trace")
+    required = required_trace_capacity(config)
+    capacity = int(snapshot.get("capacity", 0))
+    if capacity < required:
+        raise RuntimeError(
+            f"scheduler trace capacity={capacity} is below required worst-case capacity={required}")
+    return {"capacity": capacity, "required_capacity": required}
+
+
+def require_result(result: Result) -> None:
+    if result.error or result.status != 200:
+        raise RuntimeError(f"request status/error gate failed: {result.summary(False)}")
+    if result.reported_tokens_predicted != result.requested_tokens:
+        raise RuntimeError(
+            f"{result.tag}: tokens_predicted={result.reported_tokens_predicted}, expected={result.requested_tokens}")
+    if len(result.tokens) != result.requested_tokens:
+        raise RuntimeError(
+            f"{result.tag}: token ID count={len(result.tokens)}, expected={result.requested_tokens}")
+    if not result.content:
+        raise RuntimeError(f"{result.tag}: empty output content")
+
+
+def require_exact_output(results: dict[str, Result], left: str, right: str) -> None:
+    if (results[left].tokens, results[left].content) != (results[right].tokens, results[right].content):
+        raise RuntimeError(f"exact output mismatch: {left} vs {right}")
+
+
+def validate_sequential_burst_results(results: dict[str, Result], count: int) -> list[dict[str, Any]]:
+    require_exact_output(results, "isolated-low", "low-8k")
+    low = results["low-8k"]
+    if not low.progress:
+        raise RuntimeError("mixed low request returned no prompt progress")
+
+    timings = []
+    for ordinal in range(count):
+        tag = f"burst-{ordinal:02d}"
+        burst = results[tag]
+        require_exact_output(results, "isolated-burst", tag)
+        if not burst.intended_launch_ns or burst.start_ns < burst.intended_launch_ns:
+            raise RuntimeError(f"{tag}: invalid intended/actual launch timestamps")
+        if not burst.first_token_ns or burst.first_token_ns < burst.start_ns or burst.first_token_ns >= low.end_ns:
+            raise RuntimeError(f"{tag}: first output did not precede low completion")
+        timings.append({
+            "tag": tag,
+            "intended_launch_ns": burst.intended_launch_ns,
+            "actual_launch_ns": burst.start_ns,
+            "first_token_ns": burst.first_token_ns,
+            "launch_lag_ms": (burst.start_ns - burst.intended_launch_ns) / 1e6,
+            "ttft_ms": (burst.first_token_ns - burst.start_ns) / 1e6,
+            "overlap_lead_ms": (low.end_ns - burst.first_token_ns) / 1e6,
+        })
+    return timings
 
 
 class Smoke:
@@ -95,6 +209,7 @@ class Smoke:
         self.low_done = threading.Event()
         self.sustained_first_token = threading.Event()
         self.ordinary_request_id = 0
+        self.trace_preflight: dict[str, int] | None = None
         self.events = (artifact / "client-events.jsonl").open("w", encoding="utf-8", buffering=1)
         self.events_lock = threading.Lock()
 
@@ -123,16 +238,19 @@ class Smoke:
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             return json.load(response)
 
-    def expect_403(self, request: urllib.request.Request, label: str) -> None:
+    def expect_http_error(self, request: urllib.request.Request, label: str, expected_status: int) -> None:
         try:
             urllib.request.urlopen(request, timeout=self.timeout)
         except urllib.error.HTTPError as error:
             (self.artifact / f"{label}-response.json").write_bytes(error.read())
-            if error.code != 403:
-                raise RuntimeError(f"{label}: HTTP {error.code}, expected 403") from error
-            self.emit("expected_rejection", label=label, status=403)
+            if error.code != expected_status:
+                raise RuntimeError(f"{label}: HTTP {error.code}, expected {expected_status}") from error
+            self.emit("expected_rejection", label=label, status=expected_status)
             return
         raise RuntimeError(f"{label} unexpectedly succeeded")
+
+    def expect_403(self, request: urllib.request.Request, label: str) -> None:
+        self.expect_http_error(request, label, 403)
 
     def credential_probes(self) -> None:
         trace_request = urllib.request.Request(
@@ -141,9 +259,21 @@ class Smoke:
         self.expect_403(trace_request, "api-only-trace")
         before = self.fetch_trace()
         body = {**self.common, "prompt": numeric_prompt(1, 811), "n_predict": 1}
+        encoded = json.dumps(body, separators=(",", ":")).encode()
+        scheduling_only = urllib.request.Request(
+            self.base_url + "/completion",
+            data=encoded,
+            headers={
+                "Content-Type": "application/json",
+                TOKEN_HEADER: self.scheduling_token,
+                LANE_HEADER: "fast",
+                TAG_HEADER: "scheduling-only-reject",
+            },
+            method="POST")
+        self.expect_http_error(scheduling_only, "scheduling-only-lane", 401)
         request = urllib.request.Request(
             self.base_url + "/completion",
-            data=json.dumps(body, separators=(",", ":")).encode(),
+            data=encoded,
             headers={
                 "Content-Type": "application/json",
                 **self.api_headers(),
@@ -153,13 +283,14 @@ class Smoke:
             method="POST")
         self.expect_403(request, "api-only-lane")
         if self.fetch_trace()["total_events"] != before["total_events"]:
-            raise RuntimeError("API-only rejection registered scheduler work")
+            raise RuntimeError("single-credential rejection registered scheduler work")
 
     def run_request(
         self, *, tag: str, lane: str, prompt_count: int, n_predict: int,
         salt: int, seed: int = 42, trusted: bool = True, forge_body: bool = False,
+        intended_launch_ns: int = 0,
     ) -> Result:
-        result = Result(tag, lane, prompt_count, n_predict)
+        result = Result(tag, lane, prompt_count, n_predict, intended_launch_ns=intended_launch_ns)
         body: dict[str, Any] = {
             **self.common,
             "prompt": numeric_prompt(prompt_count, salt),
@@ -175,8 +306,17 @@ class Smoke:
         request = urllib.request.Request(
             self.base_url + "/completion", data=encoded, headers=headers, method="POST")
         result.start_ns = now_ns()
-        self.emit("request_start", tag=tag, lane=lane, prompt_tokens=prompt_count,
-                  n_predict=n_predict, trusted=trusted)
+        start_fields = {
+            "tag": tag, "lane": lane, "prompt_tokens": prompt_count,
+            "n_predict": n_predict, "trusted": trusted,
+        }
+        if intended_launch_ns:
+            start_fields.update({
+                "intended_launch_ns": intended_launch_ns,
+                "actual_launch_ns": result.start_ns,
+                "launch_lag_ms": (result.start_ns - intended_launch_ns) / 1e6,
+            })
+        self.emit("request_start", **start_fields)
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 result.status = response.status
@@ -249,7 +389,7 @@ class Smoke:
     def ordinary_probe(self) -> None:
         before = self.fetch_trace()
         result = self.run_request(
-            tag="ordinary-forgery", lane="normal", prompt_count=17, n_predict=1,
+            tag="ordinary-forgery", lane="normal", prompt_count=ORDINARY_PROMPT_TOKENS, n_predict=1,
             salt=901, trusted=False, forge_body=True)
         self.require_result(result)
         after = self.fetch_trace()
@@ -261,13 +401,16 @@ class Smoke:
         if len(registrations) != 1:
             raise RuntimeError("ordinary forgery did not create exactly one registration")
         registration = registrations[0]
-        if (registration["lane"], registration["benchmark_tag"], int(registration["prompt_tokens"])) != ("normal", "", 17):
+        if (registration["lane"], registration["benchmark_tag"], int(registration["prompt_tokens"])) != (
+                "normal", "", ORDINARY_PROMPT_TOKENS):
             raise RuntimeError(f"ordinary JSON forged scheduler metadata: {registration}")
         self.ordinary_request_id = int(registration["request_id"])
         (self.artifact / "ordinary-forgery-trace-proof.json").write_text(
             json.dumps(registration, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     def execute(self) -> None:
+        if sequential_burst_mode(self.config):
+            self.trace_preflight = validate_trace_preflight(self.fetch_trace(), self.config)
         self.credential_probes()
         self.ordinary_probe()
         ref = self.config["requests"]["reference"]
@@ -276,6 +419,37 @@ class Smoke:
         bursts = self.config["requests"]["fast_bursts"]
         self.run_request(tag="reference-before", lane="fast", prompt_count=ref["prompt_tokens"],
                          n_predict=ref["n_predict"], salt=ref["salt"], seed=ref["seed"])
+        if sequential_burst_mode(self.config):
+            self.run_request(tag="isolated-low", lane="low", prompt_count=low["prompt_tokens"],
+                             n_predict=low["n_predict"], salt=low["salt"], seed=low["seed"])
+            self.run_request(tag="isolated-burst", lane="fast", prompt_count=bursts["prompt_tokens"],
+                             n_predict=bursts["n_predict"], salt=bursts["salt"], seed=bursts["seed"])
+            low_thread = self.start(tag="low-8k", lane="low", prompt_count=low["prompt_tokens"],
+                                    n_predict=low["n_predict"], salt=low["salt"], seed=low["seed"])
+            try:
+                self.wait_before_low_done(self.low_progress, "low prompt progress")
+                origin = now_ns()
+                for ordinal in range(int(bursts["count"])):
+                    intended = origin + ordinal * int(bursts["interval_seconds"]) * 1_000_000_000
+                    while True:
+                        if self.low_done.is_set():
+                            raise RuntimeError(f"low completed before burst-{ordinal:02d} launch")
+                        remaining_ns = intended - now_ns()
+                        if remaining_ns <= 0:
+                            break
+                        time.sleep(min(0.05, remaining_ns / 1e9))
+                    burst = self.run_request(
+                        tag=f"burst-{ordinal:02d}", lane="fast", prompt_count=bursts["prompt_tokens"],
+                        n_predict=bursts["n_predict"], salt=bursts["salt"], seed=bursts["seed"],
+                        intended_launch_ns=intended)
+                    require_result(burst)
+            finally:
+                low_thread.join()
+            self.run_request(tag="reference-after", lane="fast", prompt_count=ref["prompt_tokens"],
+                             n_predict=ref["n_predict"], salt=ref["salt"], seed=ref["seed"])
+            self.validate()
+            return
+
         self.run_request(tag="isolated-fast", lane="fast", prompt_count=fast["prompt_tokens"],
                          n_predict=fast["n_predict"], salt=fast["salt"], seed=fast["seed"])
         low_thread = self.start(tag="low-8k", lane="low", prompt_count=low["prompt_tokens"],
@@ -284,17 +458,6 @@ class Smoke:
         fast_thread = self.start(tag="sustained-fast", lane="fast", prompt_count=fast["prompt_tokens"],
                                  n_predict=fast["n_predict"], salt=fast["salt"], seed=fast["seed"])
         self.wait_before_low_done(self.sustained_first_token, "sustained-fast first output")
-        origin = now_ns()
-        burst_threads = []
-        for ordinal in range(int(bursts["count"])):
-            deadline = origin + ordinal * int(bursts["interval_seconds"]) * 1_000_000_000
-            while now_ns() < deadline:
-                time.sleep(min(0.05, (deadline - now_ns()) / 1e9))
-            burst_threads.append(self.start(
-                tag=f"burst-{ordinal:02d}", lane="fast", prompt_count=bursts["prompt_tokens"],
-                n_predict=bursts["n_predict"], salt=bursts["salt"], seed=bursts["seed"]))
-        for thread in burst_threads:
-            thread.join()
         fast_thread.join()
         low_thread.join()
         self.run_request(tag="reference-after", lane="fast", prompt_count=ref["prompt_tokens"],
@@ -303,16 +466,7 @@ class Smoke:
 
     @staticmethod
     def require_result(result: Result) -> None:
-        if result.error or result.status != 200:
-            raise RuntimeError(f"request status/error gate failed: {result.summary(False)}")
-        if result.reported_tokens_predicted != result.requested_tokens:
-            raise RuntimeError(
-                f"{result.tag}: tokens_predicted={result.reported_tokens_predicted}, expected={result.requested_tokens}")
-        if len(result.tokens) != result.requested_tokens:
-            raise RuntimeError(
-                f"{result.tag}: token ID count={len(result.tokens)}, expected={result.requested_tokens}")
-        if not result.content:
-            raise RuntimeError(f"{result.tag}: empty output content")
+        require_result(result)
 
     def validate_trace(self, snapshot: dict[str, Any]) -> dict[str, int]:
         events = snapshot.get("events", [])
@@ -323,13 +477,7 @@ class Smoke:
         if [event["sequence"] for event in events] != list(range(1, len(events) + 1)):
             raise RuntimeError("trace sequence is not contiguous")
         registrations = [event for event in events if event["event"] == "request_registered"]
-        expected = {
-            "reference-before": ("fast", 128), "reference-after": ("fast", 128),
-            "isolated-fast": ("fast", 128), "sustained-fast": ("fast", 128),
-            "low-8k": ("low", 8192),
-            **{f"burst-{i:02d}": ("fast", 128)
-               for i in range(self.config["requests"]["fast_bursts"]["count"])},
-        }
+        expected = expected_trusted_requests(self.config)
         request_ids: dict[str, int] = {}
         for tag, (lane, prompt_tokens) in expected.items():
             matches = [event for event in registrations if event["benchmark_tag"] == tag]
@@ -396,7 +544,8 @@ class Smoke:
                     raise RuntimeError(f"unexpected release reason: {event}")
                 if request_id == low_id and event["reason"] == "yielded":
                     end = int(event["end_token"])
-                    if not event["yield_boundary"] or not 0 < end < 8192 or end % alignment:
+                    low_prompt_tokens = self.config["requests"]["trusted_low"]["prompt_tokens"]
+                    if not event["yield_boundary"] or not 0 < end < low_prompt_tokens or end % alignment:
                         raise RuntimeError(f"low yielded off alignment: {event}")
                     low_aligned_yields += 1
                 owner = None
@@ -416,48 +565,73 @@ class Smoke:
         }
 
     def exact_pair(self, left: str, right: str) -> None:
-        if (self.results[left].tokens, self.results[left].content) != (
-                self.results[right].tokens, self.results[right].content):
-            raise RuntimeError(f"exact output mismatch: {left} vs {right}")
+        require_exact_output(self.results, left, right)
 
     def validate(self) -> None:
-        count = self.config["requests"]["fast_bursts"]["count"]
-        expected = {
-            "ordinary-forgery", "reference-before", "reference-after", "isolated-fast",
-            "sustained-fast", "low-8k", *{f"burst-{i:02d}" for i in range(count)},
-        }
+        count = int(self.config["requests"]["fast_bursts"]["count"])
+        expected = {"ordinary-forgery", *expected_trusted_requests(self.config)}
         if set(self.results) != expected:
             raise RuntimeError(f"request cardinality mismatch: {sorted(self.results)}")
         for result in self.results.values():
             self.require_result(result)
-        low, fast = self.results["low-8k"], self.results["sustained-fast"]
-        if not fast.first_token_ns or fast.first_token_ns >= low.end_ns:
-            raise RuntimeError("sustained-fast first output did not precede low completion")
         self.exact_pair("reference-before", "reference-after")
-        self.exact_pair("isolated-fast", "sustained-fast")
-        for ordinal in range(1, count):
-            self.exact_pair("burst-00", f"burst-{ordinal:02d}")
+        if sequential_burst_mode(self.config):
+            burst_timings = validate_sequential_burst_results(self.results, count)
+        else:
+            low, fast = self.results["low-8k"], self.results["sustained-fast"]
+            if not fast.first_token_ns or fast.first_token_ns >= low.end_ns:
+                raise RuntimeError("sustained-fast first output did not precede low completion")
+            self.exact_pair("isolated-fast", "sustained-fast")
         trace = self.fetch_trace()
         (self.artifact / "scheduler-trace.json").write_text(
             json.dumps(trace, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        summary = {
-            "schema": 1,
-            "status": "PASS",
-            "checks": {
-                "credential_composition": True,
-                "ordinary_json_forgery_normal": True,
-                "fast_output_before_low_completion": True,
-                "exact_tokens_predicted_and_id_cardinality": True,
-                "exact_reference_fast_and_configured_burst_outputs": True,
-                "exact_stage_commit_pairs": True,
-                "maximum_one_owner": True,
-                "low_commit_during_fast_decode": True,
-                "low_aligned_yield": True,
-            },
-            "overlap_lead_ms": (low.end_ns - fast.first_token_ns) / 1e6,
-            "requests": {tag: result.summary() for tag, result in sorted(self.results.items())},
-            "trace": self.validate_trace(trace),
-        }
+        trace_summary = self.validate_trace(trace)
+        if sequential_burst_mode(self.config):
+            low = self.results["low-8k"]
+            summary = {
+                "schema": 1,
+                "status": "PASS",
+                "mode": SEQUENTIAL_BURST_MODE,
+                "checks": {
+                    "credential_composition": True,
+                    "ordinary_json_forgery_normal": True,
+                    "every_burst_output_before_low_completion": True,
+                    "exact_tokens_predicted_and_id_cardinality": True,
+                    "exact_reference_burst_and_low_outputs": True,
+                    "exact_stage_commit_pairs": True,
+                    "maximum_one_owner": True,
+                    "low_commit_during_fast_decode": True,
+                    "low_aligned_yield": True,
+                    "trace_capacity_preflight": True,
+                },
+                "minimum_burst_overlap_lead_ms": min(
+                    (low.end_ns - self.results[f"burst-{ordinal:02d}"].first_token_ns) / 1e6
+                    for ordinal in range(count)),
+                "burst_timings": burst_timings,
+                "trace_capacity": self.trace_preflight,
+                "requests": {tag: result.summary() for tag, result in sorted(self.results.items())},
+                "trace": trace_summary,
+            }
+        else:
+            low, fast = self.results["low-8k"], self.results["sustained-fast"]
+            summary = {
+                "schema": 1,
+                "status": "PASS",
+                "checks": {
+                    "credential_composition": True,
+                    "ordinary_json_forgery_normal": True,
+                    "fast_output_before_low_completion": True,
+                    "exact_tokens_predicted_and_id_cardinality": True,
+                    "exact_reference_fast_and_configured_burst_outputs": True,
+                    "exact_stage_commit_pairs": True,
+                    "maximum_one_owner": True,
+                    "low_commit_during_fast_decode": True,
+                    "low_aligned_yield": True,
+                },
+                "overlap_lead_ms": (low.end_ns - fast.first_token_ns) / 1e6,
+                "requests": {tag: result.summary() for tag, result in sorted(self.results.items())},
+                "trace": trace_summary,
+            }
         (self.artifact / "summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(json.dumps(summary, indent=2, sort_keys=True))
@@ -482,6 +656,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-prompt-tokens", type=int, default=128)
     parser.add_argument("--fast-n-predict", type=int, default=512)
     parser.add_argument("--reference-n-predict", type=int, default=32)
+    parser.add_argument(
+        "--sequential-bursts", action="store_true",
+        help="run the two-slot low plus sequential fast-burst workload instead of the vertical 512-token workload")
     parser.add_argument("--burst-count", type=int, default=0)
     parser.add_argument("--burst-interval-seconds", type=int, default=2)
     parser.add_argument("--burst-n-predict", type=int, default=16)
@@ -491,7 +668,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
-    return {
+    config = {
         "trusted_contract": {"trace_endpoint": args.trace_endpoint},
         "requests": {
             "common": {
@@ -537,10 +714,12 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
             "active_fast_chunk_limit_tokens": args.active_fast_chunk_limit_tokens,
         },
     }
+    if args.sequential_bursts:
+        config["mode"] = SEQUENTIAL_BURST_MODE
+    return config
 
 
-def main() -> int:
-    args = parse_args()
+def validate_args(args: argparse.Namespace) -> None:
     if not args.api_key or not 32 <= len(args.scheduling_token) <= 256:
         raise ValueError("--api-key and a 32..256-byte --scheduling-token are required")
     if args.api_key == args.scheduling_token:
@@ -551,8 +730,19 @@ def main() -> int:
            args.burst_n_predict, args.alignment_tokens,
            args.active_fast_chunk_limit_tokens) <= 0:
         raise ValueError("prediction and alignment values must be positive")
-    if args.burst_count < 0:
-        raise ValueError("burst count must be nonnegative")
+    if args.sequential_bursts:
+        if not 1 <= args.burst_count <= MAX_SEQUENTIAL_BURSTS:
+            raise ValueError(
+                f"sequential burst mode requires --burst-count between 1 and {MAX_SEQUENTIAL_BURSTS}")
+        if args.burst_interval_seconds <= 0:
+            raise ValueError("sequential burst mode requires a positive --burst-interval-seconds")
+    elif args.burst_count != 0:
+        raise ValueError("--burst-count requires --sequential-bursts")
+
+
+def main() -> int:
+    args = parse_args()
+    validate_args(args)
 
     config = config_from_args(args)
     args.artifact.mkdir(parents=True, exist_ok=False)
