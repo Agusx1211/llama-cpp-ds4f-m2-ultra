@@ -291,6 +291,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-dsv4-resident-contract.cpp)
     target_include_directories(test-dsv4-resident-contract PRIVATE
         ${PROJECT_SOURCE_DIR}/src)
+    # Manual exact-model Phase 4 resident lifecycle gate. This target is
+    # intentionally not registered with CTest: it requires the pinned
+    # DeepSeek V4 Flash artifact and the target M2 Ultra sparse backend.
+    llama_build(test-dsv4-resident-model.cpp)
+    target_include_directories(test-dsv4-resident-model PRIVATE
+        ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-kv-iswa-resident-metadata.cpp)
     target_include_directories(test-kv-iswa-resident-metadata PRIVATE
         ${PROJECT_SOURCE_DIR}/src)
