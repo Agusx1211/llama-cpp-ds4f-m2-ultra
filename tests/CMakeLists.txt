@@ -131,6 +131,14 @@ target_include_directories(test-server-request-registry PRIVATE ${PROJECT_SOURCE
 target_compile_features(test-server-request-registry PRIVATE cxx_std_17)
 
 llama_build_and_test(
+    test-server-resident-request.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-resident-request.cpp
+)
+target_include_directories(test-server-resident-request PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-resident-request PRIVATE cxx_std_17)
+target_compile_definitions(test-server-resident-request PRIVATE SERVER_RESIDENT_REQUEST_TESTING=1)
+
+llama_build_and_test(
     test-server-request-runtime.cpp
     ${PROJECT_SOURCE_DIR}/tools/server/server-request-runtime.cpp
     ${PROJECT_SOURCE_DIR}/tools/server/server-request-registry.cpp
