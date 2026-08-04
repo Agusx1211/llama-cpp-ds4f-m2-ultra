@@ -300,6 +300,66 @@ test("stream-open retries stop at their configured bound", async () => {
     client.stop();
 });
 
+test("asynchronous stream failures exhaust the bounded retry schedule", async () => {
+    const snapshot = await loadSnapshot();
+    const timers = fakeTimers();
+    let openCalls = 0;
+    const client = new AdminStateClient({
+        getSnapshot: async () => snapshot,
+        openEvents: ({ onDisconnect }) => {
+            openCalls += 1;
+            queueMicrotask(() => onDisconnect(new Error(`async failure ${openCalls}`)));
+            return () => {};
+        },
+        streamRetryDelaysMs: [10, 20],
+        setTimer: timers.setTimer,
+        clearTimer: timers.clearTimer,
+    });
+
+    await client.start();
+    await Promise.resolve();
+    assert.equal(client.state.recovery.retryDelayMs, 10);
+    timers.runNext();
+    await Promise.resolve();
+    assert.equal(client.state.recovery.retryDelayMs, 20);
+    timers.runNext();
+    await Promise.resolve();
+
+    assert.equal(openCalls, 3);
+    assert.equal(client.state.connection, "error");
+    assert.equal(client.state.recovery.status, "error");
+    assert.equal(client.state.recovery.attempt, 3);
+    assert.equal(client.state.recovery.lastError, "async failure 3");
+    assert.equal(timers.pending.some((timer) => !timer.cancelled), false);
+    client.stop();
+});
+
+test("an established stream resets the consecutive failure retry budget", async () => {
+    const snapshot = await loadSnapshot();
+    const timers = fakeTimers();
+    const openings = [];
+    const client = new AdminStateClient({
+        getSnapshot: async () => snapshot,
+        openEvents: (connection) => {
+            openings.push(connection);
+            connection.onOpen();
+            return () => {};
+        },
+        streamRetryDelaysMs: [10, 20],
+        setTimer: timers.setTimer,
+        clearTimer: timers.clearTimer,
+    });
+
+    await client.start();
+    openings[0].onDisconnect(new Error("first established disconnect"));
+    assert.equal(client.state.recovery.retryDelayMs, 10);
+    timers.runNext();
+    openings[1].onDisconnect(new Error("second established disconnect"));
+    assert.equal(client.state.recovery.retryDelayMs, 10);
+    assert.equal(client.state.connection, "retry_wait");
+    client.stop();
+});
+
 test("bounded pending queue treats a local slow consumer as resnapshot pressure", async () => {
     const snapshot = await loadSnapshot();
     const events = await loadEvents();
@@ -404,10 +464,14 @@ test("fetch SSE transport sends the tracked Last-Event-ID header using GET", asy
         };
     };
     const messages = [];
+    let established = false;
     let disconnected = false;
     const open = createFetchSseTransport("/admin/v1/events", fetchImpl);
     const close = open({
         lastEventId: "100",
+        onOpen: () => {
+            established = true;
+        },
         onEvent: (message) => messages.push(message),
         onDisconnect: () => {
             disconnected = true;
@@ -418,6 +482,7 @@ test("fetch SSE transport sends the tracked Last-Event-ID header using GET", asy
     assert.equal(calls.length, 1);
     assert.equal(calls[0].options.method, "GET");
     assert.equal(calls[0].options.headers["Last-Event-ID"], "100");
+    assert.equal(established, true);
     assert.equal(messages[0].lastEventId, "101");
     assert.equal(disconnected, true);
     close();

@@ -326,10 +326,16 @@ export class AdminStateClient {
         this.closeStream();
         const streamGeneration = generation;
         let disconnected = false;
+        let streamEstablished = false;
         let close;
         try {
             close = this.openEvents({
                 lastEventId: this.state.lastEventId,
+                onOpen: () => {
+                    if (!this.stopped && !disconnected && streamGeneration === this.generation) {
+                        streamEstablished = true;
+                    }
+                },
                 onEvent: (message) => {
                     if (!this.stopped && !disconnected && streamGeneration === this.generation) {
                         this.enqueue(message);
@@ -338,7 +344,12 @@ export class AdminStateClient {
                 onDisconnect: (error) => {
                     if (!this.stopped && !disconnected && streamGeneration === this.generation) {
                         disconnected = true;
-                        this.scheduleStreamRetry("event_stream_disconnected", error, streamGeneration, 0);
+                        this.scheduleStreamRetry(
+                            "event_stream_disconnected",
+                            error,
+                            streamGeneration,
+                            streamEstablished ? 0 : retryIndex,
+                        );
                     }
                 },
             });

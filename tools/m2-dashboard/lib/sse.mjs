@@ -147,7 +147,7 @@ export function createFetchSseTransport(url, fetchImpl = globalThis.fetch, parse
         throw new Error("fetch is unavailable");
     }
 
-    return ({ lastEventId, onEvent, onDisconnect }) => {
+    return ({ lastEventId, onOpen = () => {}, onEvent, onDisconnect }) => {
         const controller = new AbortController();
         let closed = false;
 
@@ -175,6 +175,7 @@ export function createFetchSseTransport(url, fetchImpl = globalThis.fetch, parse
                 const parser = new SseParser(onEvent, parserOptions);
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
+                onOpen();
                 while (!closed) {
                     const { value, done } = await reader.read();
                     if (done) {

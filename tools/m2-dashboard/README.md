@@ -69,8 +69,13 @@ export LLAMA_SERVER_TRUSTED_SCHEDULING_TOKEN='replace-with-32-or-more-random-byt
 
 llama-server ... \
   --api-key "$LLAMA_API_KEY" \
-  --cors-origins localhost
+  --cors-origins localhost \
+  --cors-headers 'Authorization, X-Llama-Trusted-Scheduling-Token, Last-Event-ID'
 ```
+
+The explicit CORS header list is required for a dashboard served from a
+different loopback port. In particular, browsers do not treat `Authorization`
+as covered by a wildcard `Access-Control-Allow-Headers` response.
 
 Serve this directory from the same loopback hostname as llama-server. Ports
 may differ; hostnames must not. For example:
@@ -105,7 +110,7 @@ permit counts, lifecycle reasons, and redacted request identities only.
 
 ```text
 getSnapshot() -> immutable versioned snapshot
-openEvents({ lastEventId, onEvent, onDisconnect }) -> close function
+openEvents({ lastEventId, onOpen, onEvent, onDisconnect }) -> close function
 ```
 
 The live event adapter connects to authenticated SSE and honors
