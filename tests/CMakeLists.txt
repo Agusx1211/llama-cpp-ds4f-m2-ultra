@@ -300,6 +300,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-snapshot-worker.cpp)
     target_include_directories(test-snapshot-worker PRIVATE
         ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-snapshot-metal-staging.cpp)
+    target_include_directories(test-snapshot-metal-staging PRIVATE
+        ${PROJECT_SOURCE_DIR}/src)
+    if (TARGET ggml-metal AND NOT GGML_BACKEND_DL)
+        target_link_libraries(test-snapshot-metal-staging PRIVATE ggml-metal)
+        target_include_directories(test-snapshot-metal-staging PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+        target_compile_definitions(test-snapshot-metal-staging PRIVATE
+            GGML_TEST_METAL_SNAPSHOT_STAGING)
+    endif()
     llama_build_and_test(test-dsv4-sparse-accounting.cpp)
     target_include_directories(test-dsv4-sparse-accounting PRIVATE
         ${PROJECT_SOURCE_DIR}/src)

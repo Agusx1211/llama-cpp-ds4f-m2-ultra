@@ -39,6 +39,7 @@ add_library(llama
             llama-model.cpp
             llama-quant.cpp
             llama-sampler.cpp
+            llama-snapshot-metal-layout.cpp
             llama-snapshot-store.cpp
             llama-snapshot-worker.cpp
             llama-vocab.cpp
