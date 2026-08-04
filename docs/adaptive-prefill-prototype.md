@@ -5,6 +5,15 @@ Flash on the M2 Ultra. It deliberately uses two split-KV slots: unified
 multi-sequence Metal remains a separate bisection, and the 1M/64 production
 geometry is a later horizontal gate.
 
+The source at `66a16aa874a25106f4d90828170eae308e9369c8` passed this
+smoke on the M2 Ultra with the pinned DeepSeek V4 Flash UD-Q8_K_XL model. Fast
+output began 51.470 seconds before the 8K low request completed; isolated and
+mixed 512-token outputs matched exactly. The trace recorded 49 low commits
+during active fast decode, one aligned low handoff, one owner maximum, and no
+lost events. The run had zero swapouts, no critical memory pressure, and clean
+server teardown. This is a feasibility result for the geometry below, not a
+1M/64 production-performance claim.
+
 Build and launch on the M2 Ultra:
 
 ```sh
