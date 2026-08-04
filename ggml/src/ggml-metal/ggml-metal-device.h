@@ -362,6 +362,12 @@ struct ggml_metal_sparse_buffer_range {
     size_t size;
 };
 
+struct ggml_metal_sparse_buffer_move {
+    struct ggml_metal_sparse_buffer_range source;
+    // A null destination buffer releases the source mapping.
+    struct ggml_metal_sparse_buffer_range destination;
+};
+
 struct ggml_metal_sparse_pool_quote {
     uintptr_t pool_id;
     struct ggml_metal_sparse_usage usage;
@@ -391,6 +397,7 @@ static inline const char * ggml_metal_sparse_reservation_result_name(
 }
 
 typedef struct ggml_metal_sparse_reservation * ggml_metal_sparse_reservation_t;
+typedef struct ggml_metal_sparse_move * ggml_metal_sparse_move_t;
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);
 ggml_metal_buffer_t ggml_metal_buffer_init_sparse(
@@ -435,6 +442,18 @@ enum ggml_metal_sparse_reservation_result ggml_metal_sparse_reservation_commit(
 bool ggml_metal_sparse_reservation_rollback(ggml_metal_sparse_reservation_t reservation);
 bool ggml_metal_sparse_reservation_cancel  (ggml_metal_sparse_reservation_t reservation);
 void ggml_metal_sparse_reservation_free    (ggml_metal_sparse_reservation_t reservation);
+
+// A move quote validates every source/destination aperture and snapshots all
+// sparse-pool generations without mutating mappings. Commit locks every pool
+// in address order, rejects stale generations, preallocates all operation
+// storage, then transfers ownership without a partial-failure path.
+enum ggml_metal_sparse_reservation_result ggml_metal_buffers_sparse_move_quote(
+        const struct ggml_metal_sparse_buffer_move * moves,
+        size_t n_moves,
+        ggml_metal_sparse_move_t * quote);
+enum ggml_metal_sparse_reservation_result ggml_metal_sparse_move_commit(
+        ggml_metal_sparse_move_t quote);
+void ggml_metal_sparse_move_free(ggml_metal_sparse_move_t quote);
 
 bool ggml_metal_buffer_sparse_map_write(
         ggml_metal_buffer_t buf,

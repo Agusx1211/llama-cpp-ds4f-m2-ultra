@@ -1878,8 +1878,10 @@ llama_dsv4_resident_detach_quote llama_dsv4_quote_resident_detach_layout(llama_d
 
     // The scalar rollback selector can travel in a future resident handle.
     // Aggregate compressed roots already have an execution-independent owner.
-    // Raw/SWA and every state plane remain fixed to ordinary per-sequence
-    // tensor slices, and paired target/draft ownership needs a coordinator.
+    // The static policy covers the default raw/SWA layout; the live cache
+    // quote may add its opt-in sparse aperture. Every state plane remains
+    // fixed to per-sequence tensor slices, and paired target/draft ownership
+    // needs a coordinator.
     result.detachable_components = LLAMA_DSV4_RESIDENT_ROLLBACK_INDEX;
     if (aggregate_compressed) {
         result.detachable_components |= LLAMA_DSV4_RESIDENT_COMPRESSED;
@@ -2008,10 +2010,22 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     dsv4_make_k_only(hparams_raw);
 
+    // Raw/SWA resident apertures double virtual address space but alias the
+    // same physical pages while parked. A divisor of two therefore keeps one
+    // full execution allocation plus sparse COW slack, rather than sizing the
+    // heap as if only one of n_seq_max execution streams could be active.
+    const bool raw_resident_enabled = std::getenv("LLAMA_DSV4_RAW_RESIDENT_ENABLE") != nullptr;
+    ggml_backend_buffer_type_t raw_resident_buft = raw_resident_enabled && offload && n_seq_max > 1 ?
+            dsv4_sparse_buft(model, 2) : nullptr;
+    const uint32_t raw_resident_slots = raw_resident_buft != nullptr ? n_seq_max : 0;
+    if (raw_resident_enabled && raw_resident_buft == nullptr) {
+        LLAMA_LOG_WARN("%s: raw/SWA resident ownership requested without target sparse storage\n", __func__);
+    }
+
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
             model, hparams_raw, type_k, type_v,
             v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_pad,
-            nullptr, filter_raw, reuse, nullptr);
+            nullptr, filter_raw, reuse, nullptr, raw_resident_buft, raw_resident_slots);
 
     dsv4_make_k_only(hparams_csa);
     dsv4_make_k_only(hparams_hca);
@@ -2142,6 +2156,10 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
             uint32_t n_ubatch,
             bool embd_all) {
     GGML_UNUSED(embd_all);
+
+    // Cover raw prepare's temporary metadata mutations and hand off without a
+    // detach window to the raw graph context's own lifetime lease.
+    [[maybe_unused]] auto raw_prepare_lease = kv_raw->acquire_resident_batch_lease();
 
     const bool raw_per_seq  = kv_raw->get_base()->get_n_stream() != 1;
     const bool comp_per_seq = csa_state->get_n_stream() > 1;
@@ -2520,6 +2538,14 @@ llama_dsv4_memory_usage_snapshot llama_kv_cache_dsv4::memory_usage_snapshot() co
 }
 
 void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    // The lease closes the gap between the fail-closed handle check and the
+    // DSV4 header write. A new detach cannot land until the complete state
+    // operation reaches its terminal boundary.
+    [[maybe_unused]] auto raw_state_lease =
+            seq_id < 0 ? kv_raw->acquire_resident_batch_lease() : nullptr;
+    if (seq_id < 0 && kv_raw->has_resident_handles()) {
+        throw std::runtime_error("DSV4 raw/SWA resident handles are not serializable");
+    }
     if (aggregate_compressed && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
         throw std::runtime_error("full DSV4 state write is not yet supported by the aggregate compressed pool");
     }
@@ -2558,6 +2584,11 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    [[maybe_unused]] auto raw_state_lease =
+            seq_id < 0 ? kv_raw->acquire_resident_batch_lease() : nullptr;
+    if (seq_id < 0 && kv_raw->has_resident_handles()) {
+        throw std::runtime_error("DSV4 raw/SWA resident handles cannot survive whole-cache restore");
+    }
     if (aggregate_compressed && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
         throw std::runtime_error("full DSV4 state restore is not yet supported by the aggregate compressed pool");
     }
@@ -2669,7 +2700,19 @@ llama_dsv4_resident_detach_quote llama_kv_cache_dsv4::quote_resident_detach(
     llama_dsv4_resident_detach_request request) const {
     const uint32_t rollback_index =
         request.seq_id >= 0 && (uint32_t) request.seq_id < n_seq_max ? rs_idx[request.seq_id] : 0;
-    return llama_dsv4_quote_resident_detach_layout(request, n_seq_max, rollback_index, aggregate_compressed);
+    auto result = llama_dsv4_quote_resident_detach_layout(
+            request, n_seq_max, rollback_index, aggregate_compressed);
+    if (result.status == llama_dsv4_resident_status::invalid_scope ||
+            result.status == llama_dsv4_resident_status::invalid_sequence) {
+        return result;
+    }
+    if (kv_raw->quote_resident_detach(request.seq_id).status == llama_kv_iswa_resident_status::ok) {
+        result.detachable_components |= LLAMA_DSV4_RESIDENT_RAW_SWA;
+        result.unsupported_components = result.required_components & ~result.detachable_components;
+        result.status = result.unsupported_components == 0 ? llama_dsv4_resident_status::ok :
+                                                             llama_dsv4_resident_status::unsupported_components;
+    }
+    return result;
 }
 
 uint32_t llama_kv_cache_dsv4::get_n_rs_seq() const {
@@ -2795,6 +2838,7 @@ static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv
 llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv) :
     kv_base(kv->get_base()),
     kv_swa(kv->get_swa()),
+    resident_batch_lease(kv->acquire_resident_batch_lease()),
     ctx_base_mem(nullptr),
     ctx_swa_mem(nullptr),
     n_kv(kv_swa->get_size()),
@@ -2809,6 +2853,7 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
         bool optimize) :
     kv_base(kv->get_base()),
     kv_swa(kv->get_swa()),
+    resident_batch_lease(),
     ctx_base_mem(kv->get_base()->init_update(lctx, optimize)),
     ctx_swa_mem(kv->get_swa()->init_update(lctx, optimize)),
     n_kv(kv_swa->get_size()),
@@ -2824,6 +2869,7 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
         std::vector<llama_ubatch> ubatches_write) :
     kv_base(kv->get_base()),
     kv_swa(kv->get_swa()),
+    resident_batch_lease(kv->acquire_resident_batch_lease()),
     sinfos_base_write(std::move(sinfos_base_write)),
     sinfos_write(std::move(sinfos_swa_write)),
     sinfos_read(std::move(sinfos_swa_read)),

@@ -7,11 +7,26 @@
 
 #include <unordered_map>
 #include <vector>
+#include <mutex>
 
 struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+
+void llama_kv_cache_fail_stream_copy_after_for_test(int successful_cache_updates);
+
+// Shared only by the dormant raw/SWA resident path. Keeping this separate from
+// the ordinary cache state makes the disabled path pay no locking or mutation-
+// tracking cost.
+struct llama_kv_cache_resident_guard {
+    std::recursive_mutex mutex;
+    uint64_t version[2] = { 1, 1 };
+    uint32_t pending_updates[2] = { 0, 0 };
+    bool update_active[2] = { false, false };
+    uint32_t active_batches = 0;
+    uint32_t parked_handles = 0;
+};
 
 //
 // llama_kv_cache
@@ -113,7 +128,8 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-        ggml_backend_buffer_type_t buft_override = nullptr);
+        ggml_backend_buffer_type_t buft_override = nullptr,
+        uint32_t n_resident = 0);
 
     ~llama_kv_cache() = default;
 
@@ -233,14 +249,20 @@ private:
         ggml_tensor * k;
         ggml_tensor * v;
 
+        ggml_tensor * k_resident;
+        ggml_tensor * v_resident;
+
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+        std::vector<ggml_tensor *> k_resident_stream;
+        std::vector<ggml_tensor *> v_resident_stream;
     };
 
     bool v_trans = true;  // the value tensor is transposed
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
+    const uint32_t n_resident = 0;
 
     // required padding
     const uint32_t n_pad = 1;
@@ -322,6 +344,25 @@ private:
 
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+
+    bool resident_execution_layout(llama_seq_id seq_id) const;
+    bool resident_execution_empty(llama_seq_id seq_id) const;
+    llama_kv_cells resident_copy_cells(llama_seq_id seq_id) const;
+    uint32_t resident_copy_head(llama_seq_id seq_id) const;
+    void resident_clear_execution(llama_seq_id seq_id);
+    void resident_restore_execution(llama_seq_id seq_id, llama_kv_cells cells, uint32_t head);
+    void resident_append_views(uint32_t slot, bool resident, std::vector<ggml_tensor *> & views) const;
+
+    void resident_bind_guard(std::shared_ptr<llama_kv_cache_resident_guard> guard, uint32_t plane);
+    std::unique_lock<std::recursive_mutex> resident_lock() const;
+    void resident_note_mutation();
+    void resident_finish_update(size_t copied_streams, bool applied);
+
+    std::shared_ptr<llama_kv_cache_resident_guard> resident_guard;
+    uint32_t resident_plane = 0;
+
+    friend class llama_kv_cache_iswa;
+    friend class llama_kv_cache_context;
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
@@ -341,8 +382,7 @@ public:
     llama_kv_cache_context(
             llama_kv_cache * kv,
             llama_context * lctx,
-            bool do_shift,
-            stream_copy_info sc_info);
+            bool do_shift);
 
     // used to create a batch processing context from a batch
     llama_kv_cache_context(
@@ -407,8 +447,8 @@ public:
 private:
     llama_memory_status status;
 
-    llama_kv_cache * kv;
-    llama_context * lctx;
+    llama_kv_cache * kv = nullptr;
+    llama_context * lctx = nullptr;
 
     //
     // update context
@@ -417,6 +457,13 @@ private:
     bool do_shift = false;
 
     stream_copy_info sc_info;
+
+    // Number of queued stream-copy pairs represented by sc_info while the
+    // resident guard is enabled. They stay visible in the cache queue until a
+    // successful update completes, so a dropped context cannot lose work.
+    size_t resident_copied_streams = 0;
+    bool resident_update_owned = false;
+    bool update_apply_consumed = false;
 
     //
     // batch processing context

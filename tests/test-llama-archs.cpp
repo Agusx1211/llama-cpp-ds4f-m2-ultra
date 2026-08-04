@@ -79,7 +79,8 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 
 static void usage(char ** argv) {
     printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] "
-           "[--dsv4-restore-only] [--dsv4-aggregate-only] [--dsv4-selector-only]\n", argv[0]);
+           "[--dsv4-restore-only] [--dsv4-aggregate-only] [--dsv4-selector-only] "
+           "[--dsv4-raw-resident-only]\n", argv[0]);
 }
 
 class scoped_env_override {
@@ -1499,6 +1500,232 @@ static bool compare_dsv4_trace(
     return trace_nmse <= 1.0e-8 && max_abs_error <= 1.0e-5;
 }
 
+static bool dsv4_sparse_physical_accounting_equal(
+        const llama_dsv4_sparse_pool_usage & lhs,
+        const llama_dsv4_sparse_pool_usage & rhs) {
+    return lhs.page_size             == rhs.page_size &&
+           lhs.virtual_pages         == rhs.virtual_pages &&
+           lhs.physical_pages        == rhs.physical_pages &&
+           lhs.free_pages            == rhs.free_pages &&
+           lhs.reserved_pages        == rhs.reserved_pages &&
+           lhs.mapped_mappings       == rhs.mapped_mappings &&
+           lhs.unique_physical_pages == rhs.unique_physical_pages &&
+           lhs.shared_physical_pages == rhs.shared_physical_pages &&
+           lhs.shared_mappings       == rhs.shared_mappings &&
+           lhs.refcount_sum          == rhs.refcount_sum &&
+           lhs.refcount_max          == rhs.refcount_max &&
+           lhs.cow_allocations       == rhs.cow_allocations &&
+           lhs.cow_pages             == rhs.cow_pages;
+}
+
+static bool dsv4_raw_usage_equivalent(
+        const llama_dsv4_family_usage & lhs,
+        const llama_dsv4_family_usage & rhs) {
+    return lhs.family == LLAMA_DSV4_MEMORY_RAW && rhs.family == LLAMA_DSV4_MEMORY_RAW &&
+           lhs.placement_sparse == rhs.placement_sparse &&
+           lhs.logical_capacity_rows == rhs.logical_capacity_rows &&
+           lhs.logical_mapped_rows == rhs.logical_mapped_rows &&
+           lhs.sequence_mapped_rows == rhs.sequence_mapped_rows &&
+           lhs.pools.size() == rhs.pools.size() &&
+           dsv4_sparse_physical_accounting_equal(lhs.total, rhs.total);
+}
+
+static llama_token dsv4_argmax_token(const std::vector<float> & logits) {
+    GGML_ASSERT(!logits.empty());
+    return (llama_token) std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
+}
+
+static void dsv4_assert_raw_only_quote(const llama_dsv4_resident_detach_quote & quote) {
+    const uint32_t state_planes = LLAMA_DSV4_RESIDENT_CSA_STATE |
+            LLAMA_DSV4_RESIDENT_HCA_STATE | LLAMA_DSV4_RESIDENT_LID_STATE;
+    GGML_ASSERT(quote.status == llama_dsv4_resident_status::unsupported_components);
+    GGML_ASSERT((quote.detachable_components & LLAMA_DSV4_RESIDENT_RAW_SWA) != 0);
+    GGML_ASSERT((quote.unsupported_components & LLAMA_DSV4_RESIDENT_COMPRESSED) != 0);
+    GGML_ASSERT((quote.unsupported_components & state_planes) == state_planes);
+}
+
+static bool test_dsv4_raw_resident_device(size_t seed, ggml_backend_dev_t dev) {
+    static constexpr uint32_t n_seq_max  = 2;
+    static constexpr uint32_t n_ctx_seq  = 512;
+    static constexpr uint32_t n_swa      = 32;
+    static constexpr uint32_t n_prompt   = n_swa + 1;
+    static constexpr llama_seq_id parked = 0;
+    static constexpr llama_seq_id survivor = 1;
+
+    if (!dsv4_test_has_elastic_pages(dev, n_seq_max)) {
+        return true;
+    }
+
+    scoped_env_override enable_raw_resident("LLAMA_DSV4_RAW_RESIDENT_ENABLE", "1");
+    scoped_env_override disable_aggregate("LLAMA_DSV4_AGGREGATE_POOL_DISABLE", "1");
+    scoped_env_override clear_force_aggregate("LLAMA_DSV4_AGGREGATE_POOL_FORCE", nullptr);
+
+    const auto tokens_parked = get_tokens(n_prompt + 2, 128, seed + 70);
+    const auto tokens_survivor = get_tokens(n_prompt + 2, 128, seed + 71);
+    const auto make_test = [&] {
+        return std::make_unique<dsv4_test_context>(
+                seed, dev, n_seq_max, false, 2*n_prompt, 1,
+                n_seq_max*n_ctx_seq, n_prompt);
+    };
+    auto paused = make_test();
+    auto reference = make_test();
+
+    auto * paused_memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(paused->lctx.get()));
+    auto * reference_memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(reference->lctx.get()));
+    GGML_ASSERT(paused_memory != nullptr && reference_memory != nullptr);
+    auto * raw = paused_memory->get_raw();
+    GGML_ASSERT(raw != nullptr && raw->get_base()->get_size() == n_ctx_seq && raw->get_swa()->get_size() == n_ctx_seq);
+
+    const auto initial_raw_usage = paused_memory->memory_usage_snapshot().families[LLAMA_DSV4_MEMORY_RAW];
+    GGML_ASSERT(initial_raw_usage.placement_sparse && !initial_raw_usage.pools.empty());
+
+    const auto decode_prompt = [&](dsv4_test_context & test, const char * label) {
+        for (uint32_t pos = 0; pos < n_prompt; ++pos) {
+            test.add(tokens_parked[pos], pos, { parked });
+        }
+        for (uint32_t pos = 0; pos < n_prompt; ++pos) {
+            test.add(tokens_survivor[pos], pos, { survivor });
+        }
+        test.decode(label);
+        const std::array<std::vector<float>, 2> logits = {
+            dsv4_logits_ith(test, n_prompt - 1),
+            dsv4_logits_ith(test, 2*n_prompt - 1),
+        };
+        test.clear_batch();
+        return logits;
+    };
+
+    const auto paused_prompt = decode_prompt(*paused, "raw-resident paused prompt");
+    const auto reference_prompt = decode_prompt(*reference, "raw-resident reference prompt");
+    bool all_ok = compare_dsv4_trace(
+            "raw-resident-prompt", "parked", reference_prompt[0], paused_prompt[0]);
+    all_ok = compare_dsv4_trace(
+            "raw-resident-prompt", "survivor", reference_prompt[1], paused_prompt[1]) && all_ok;
+
+    GGML_ASSERT(raw->get_base()->get_cells(parked).get_used() == n_prompt);
+    GGML_ASSERT(raw->get_swa()->get_cells(parked).get_used() == n_prompt);
+    GGML_ASSERT(raw->seq_pos_max(parked) == (llama_pos) n_swa);
+
+    const auto whole_quote = paused_memory->quote_resident_detach(
+            { parked, llama_dsv4_resident_scope::single_context });
+    dsv4_assert_raw_only_quote(whole_quote);
+
+    const uint32_t base_used = raw->get_base()->get_cells(parked).get_used();
+    const uint32_t swa_used  = raw->get_swa()->get_cells(parked).get_used();
+    const auto before_detach = paused_memory->memory_usage_snapshot().families[LLAMA_DSV4_MEMORY_RAW];
+    auto raw_quote = raw->quote_resident_detach(parked);
+    GGML_ASSERT(raw_quote.status == llama_kv_iswa_resident_status::ok);
+    auto detached = raw->detach_resident(raw_quote);
+    GGML_ASSERT(detached.status == llama_kv_iswa_resident_status::ok);
+    GGML_ASSERT(raw->get_base()->get_cells(parked).get_used() == 0);
+    GGML_ASSERT(raw->get_swa()->get_cells(parked).get_used() == 0);
+    GGML_ASSERT(raw->seq_pos_max(parked) == -1);
+    const auto while_parked = paused_memory->memory_usage_snapshot().families[LLAMA_DSV4_MEMORY_RAW];
+    GGML_ASSERT(dsv4_sparse_physical_accounting_equal(before_detach.total, while_parked.total));
+
+    const auto decode_one = [](dsv4_test_context & test,
+                               llama_token token,
+                               llama_pos pos,
+                               llama_seq_id seq_id,
+                               const char * label) {
+        test.add(token, pos, { seq_id });
+        test.decode(label);
+        auto logits = dsv4_logits_ith(test, 0);
+        test.clear_batch();
+        return logits;
+    };
+    const auto paused_survivor = decode_one(
+            *paused, tokens_survivor[n_prompt], n_prompt, survivor,
+            "raw-resident survivor while parked");
+    const auto reference_survivor = decode_one(
+            *reference, tokens_survivor[n_prompt], n_prompt, survivor,
+            "raw-resident reference survivor");
+    all_ok = compare_dsv4_trace(
+            "raw-resident-parked", "survivor", reference_survivor, paused_survivor) && all_ok;
+    GGML_ASSERT(dsv4_argmax_token(paused_survivor) == dsv4_argmax_token(reference_survivor));
+
+    GGML_ASSERT(raw->attach_resident(detached.resident, parked) == llama_kv_iswa_resident_status::ok);
+    GGML_ASSERT(raw->get_base()->get_cells(parked).get_used() == base_used);
+    GGML_ASSERT(raw->get_swa()->get_cells(parked).get_used() == swa_used);
+    GGML_ASSERT(raw->seq_pos_max(parked) == (llama_pos) n_swa);
+    const auto after_attach = paused_memory->memory_usage_snapshot().families[LLAMA_DSV4_MEMORY_RAW];
+    const auto reference_after_survivor =
+            reference_memory->memory_usage_snapshot().families[LLAMA_DSV4_MEMORY_RAW];
+    GGML_ASSERT(dsv4_raw_usage_equivalent(after_attach, reference_after_survivor));
+
+    const auto decode_pair = [&](dsv4_test_context & test, const char * label) {
+        test.add(tokens_parked[n_prompt], n_prompt, { parked });
+        test.add(tokens_survivor[n_prompt + 1], n_prompt + 1, { survivor });
+        test.decode(label);
+        const std::array<std::vector<float>, 2> logits = {
+            dsv4_logits_ith(test, 0), dsv4_logits_ith(test, 1),
+        };
+        test.clear_batch();
+        return logits;
+    };
+    const auto paused_pair = decode_pair(*paused, "raw-resident resumed pair");
+    const auto reference_pair = decode_pair(*reference, "raw-resident reference pair");
+    for (size_t i = 0; i < paused_pair.size(); ++i) {
+        const char * sequence = i == 0 ? "parked" : "survivor";
+        all_ok = compare_dsv4_trace(
+                "raw-resident-resumed", sequence, reference_pair[i], paused_pair[i]) && all_ok;
+        GGML_ASSERT(dsv4_argmax_token(paused_pair[i]) == dsv4_argmax_token(reference_pair[i]));
+    }
+    GGML_ASSERT(dsv4_raw_usage_equivalent(
+            paused_memory->memory_usage_snapshot().families[LLAMA_DSV4_MEMORY_RAW],
+            reference_memory->memory_usage_snapshot().families[LLAMA_DSV4_MEMORY_RAW]));
+
+    auto survivor_detached = raw->detach_resident(raw->quote_resident_detach(survivor));
+    GGML_ASSERT(survivor_detached.status == llama_kv_iswa_resident_status::ok);
+    GGML_ASSERT(raw->release_resident(survivor_detached.resident) == llama_kv_iswa_resident_status::ok);
+
+    auto remapped = raw->detach_resident(raw->quote_resident_detach(parked));
+    GGML_ASSERT(remapped.status == llama_kv_iswa_resident_status::ok);
+    GGML_ASSERT(raw->attach_resident(remapped.resident, survivor) == llama_kv_iswa_resident_status::ok);
+    GGML_ASSERT(raw->get_base()->get_cells(parked).get_used() == 0);
+    GGML_ASSERT(raw->get_swa()->get_cells(parked).get_used() == 0);
+    GGML_ASSERT(raw->get_base()->get_cells(survivor).get_used() == base_used + 1);
+    GGML_ASSERT(raw->get_swa()->get_cells(survivor).get_used() == swa_used + 1);
+    const auto remapped_whole_quote = paused_memory->quote_resident_detach(
+            { survivor, llama_dsv4_resident_scope::single_context });
+    dsv4_assert_raw_only_quote(remapped_whole_quote);
+    auto remapped_back = raw->detach_resident(raw->quote_resident_detach(survivor));
+    GGML_ASSERT(remapped_back.status == llama_kv_iswa_resident_status::ok);
+    GGML_ASSERT(raw->attach_resident(remapped_back.resident, parked) == llama_kv_iswa_resident_status::ok);
+
+    const auto before_clear_cycle =
+            paused_memory->memory_usage_snapshot().families[LLAMA_DSV4_MEMORY_RAW];
+    auto clear_cycle = raw->detach_resident(raw->quote_resident_detach(parked));
+    GGML_ASSERT(clear_cycle.status == llama_kv_iswa_resident_status::ok);
+    raw->clear(false);
+    GGML_ASSERT(raw->get_base()->get_cells(parked).get_used() == 0);
+    GGML_ASSERT(raw->get_swa()->get_cells(parked).get_used() == 0);
+    GGML_ASSERT(raw->attach_resident(clear_cycle.resident, parked) == llama_kv_iswa_resident_status::ok);
+    GGML_ASSERT(dsv4_raw_usage_equivalent(
+            before_clear_cycle,
+            paused_memory->memory_usage_snapshot().families[LLAMA_DSV4_MEMORY_RAW]));
+
+    const auto paused_after_clear = decode_one(
+            *paused, tokens_parked[n_prompt + 1], n_prompt + 1, parked,
+            "raw-resident continuation after parked clear");
+    const auto reference_after_clear = decode_one(
+            *reference, tokens_parked[n_prompt + 1], n_prompt + 1, parked,
+            "raw-resident reference after parked clear");
+    all_ok = compare_dsv4_trace(
+            "raw-resident-clear", "parked", reference_after_clear, paused_after_clear) && all_ok;
+    GGML_ASSERT(dsv4_argmax_token(paused_after_clear) == dsv4_argmax_token(reference_after_clear));
+
+    auto final_detached = raw->detach_resident(raw->quote_resident_detach(parked));
+    GGML_ASSERT(final_detached.status == llama_kv_iswa_resident_status::ok);
+    GGML_ASSERT(raw->release_resident(final_detached.resident) == llama_kv_iswa_resident_status::ok);
+    const auto released_usage = paused_memory->memory_usage_snapshot().families[LLAMA_DSV4_MEMORY_RAW];
+    GGML_ASSERT(dsv4_raw_usage_equivalent(initial_raw_usage, released_usage));
+
+    printf("DSV4 raw/SWA resident continuation (%s): %s; window=%u, cycles=3, release baseline exact\n",
+            ggml_backend_dev_description(dev), all_ok ? "OK" : "FAIL", n_swa);
+    return all_ok;
+}
+
 static bool test_dsv4_elastic_borrow(size_t seed, ggml_backend_dev_t dev) {
     static constexpr uint32_t n_ctx_total = 512;
     static constexpr uint32_t n_tokens = 300;
@@ -2171,6 +2398,24 @@ static int test_dsv4_parallel(size_t seed) {
     return all_ok ? 0 : 1;
 }
 
+static int test_dsv4_raw_resident(size_t seed) {
+    bool all_ok = true;
+    bool tested = false;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dsv4_test_has_elastic_pages(dev, 2)) {
+            continue;
+        }
+        tested = true;
+        printf("DSV4 raw/SWA resident lifecycle on %s\n", ggml_backend_dev_description(dev));
+        all_ok = test_dsv4_raw_resident_device(seed, dev) && all_ok;
+    }
+    if (!tested) {
+        printf("DSV4 raw/SWA resident lifecycle: SKIP (target elastic Metal unavailable)\n");
+    }
+    return all_ok ? 0 : 1;
+}
+
 static int test_dsv4_aggregate(size_t seed) {
     test_dsv4_aggregate_selector();
     bool all_ok = true;
@@ -2535,6 +2780,7 @@ int main(int argc, char ** argv) {
     bool dsv4_restore_only = false;
     bool dsv4_aggregate_only = false;
     bool dsv4_selector_only = false;
+    bool dsv4_raw_resident_only = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -2582,6 +2828,10 @@ int main(int argc, char ** argv) {
             dsv4_selector_only = true;
             continue;
         }
+        if (strcmp(argv[i], "--dsv4-raw-resident-only") == 0) {
+            dsv4_raw_resident_only = true;
+            continue;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
@@ -2598,6 +2848,9 @@ int main(int argc, char ** argv) {
         if (dsv4_selector_only) {
             return test_dsv4_aggregate_selector();
         }
+        if (dsv4_raw_resident_only) {
+            return test_dsv4_raw_resident(seed);
+        }
         const int backends_result = test_backends(arch, seed, log_level);
         if (backends_result != 0) {
             return backends_result;
@@ -2607,6 +2860,10 @@ int main(int argc, char ** argv) {
         }
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_DEEPSEEK4) {
             test_dsv4_mtp(seed);
+            const int raw_resident_result = test_dsv4_raw_resident(seed);
+            if (raw_resident_result != 0) {
+                return raw_resident_result;
+            }
             return test_dsv4_parallel(seed);
         }
         return 0;

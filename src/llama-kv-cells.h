@@ -131,6 +131,11 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
 
+            if (res.pos[j] != -1) {
+                res.used.insert(j);
+                res.seq_pos_add(j);
+            }
+
             assert(shift[idx] == 0);
         }
 
@@ -149,6 +154,11 @@ public:
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
+
+            if (res.pos[j] != -1) {
+                res.used.insert(j);
+                res.seq_pos_add(j);
+            }
 
             assert(shift[idx] == 0);
         }
@@ -327,6 +337,30 @@ public:
         }
 
         return -1;
+    }
+
+    bool seq_replace(llama_seq_id old_seq_id, llama_seq_id new_seq_id) {
+        assert(old_seq_id >= 0 && old_seq_id < LLAMA_MAX_SEQ);
+        assert(new_seq_id >= 0 && new_seq_id < LLAMA_MAX_SEQ);
+
+        for (uint32_t i = 0; i < pos.size(); ++i) {
+            if (!is_empty(i) && (seq_count(i) != 1 || !seq_has(i, old_seq_id))) {
+                return false;
+            }
+        }
+        if (old_seq_id == new_seq_id) {
+            return true;
+        }
+        for (uint32_t i = 0; i < pos.size(); ++i) {
+            if (is_empty(i)) {
+                continue;
+            }
+            seq[i].reset(old_seq_id);
+            seq[i].set(new_seq_id);
+            seq_pos_dec(old_seq_id, pos[i]);
+            seq_pos_inc(new_seq_id, pos[i]);
+        }
+        return true;
     }
 
     // the minimum position of sequence seq_id currently present in any of the cells

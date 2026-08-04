@@ -72,6 +72,109 @@ struct ggml_metal_sparse_ticket_accounting {
     enum ggml_metal_sparse_ticket_state state;
 };
 
+// One page-granular ownership transfer. destination == SIZE_MAX releases the
+// source mapping instead of moving it to another virtual page. The source and
+// destination sets of a transaction must be pairwise disjoint.
+struct ggml_metal_sparse_page_move {
+    size_t source;
+    size_t destination;
+};
+
+// Validate a complete ownership transfer without changing allocator state.
+// source_physical snapshots the source mappings for the later no-fail apply;
+// selected is two bytes per virtual page (source bit 0, destination bit 1).
+// A quoted generation is checked by the caller while the pool lock is held.
+static inline enum ggml_metal_sparse_plan_status ggml_metal_sparse_plan_page_move(
+        size_t n_virtual,
+        size_t n_physical,
+        const uint32_t * v2p,
+        const uint32_t * p_ref,
+        const struct ggml_metal_sparse_page_move * moves,
+        size_t n_moves,
+        uint32_t * source_physical,
+        uint8_t * selected) {
+    if (n_virtual > UINT32_MAX || n_physical > UINT32_MAX ||
+            (n_virtual > 0 && (v2p == NULL || selected == NULL)) ||
+            (n_physical > 0 && p_ref == NULL) ||
+            (n_moves > 0 && (moves == NULL || source_physical == NULL))) {
+        return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+    }
+
+    memset(selected, 0, n_virtual*sizeof(*selected));
+    for (size_t i = 0; i < n_moves; ++i) {
+        const size_t source = moves[i].source;
+        const size_t destination = moves[i].destination;
+        if (source >= n_virtual ||
+                (destination != SIZE_MAX && destination >= n_virtual) ||
+                destination == source || (selected[source] & 1u) != 0 ||
+                (selected[source] & 2u) != 0 ||
+                (destination != SIZE_MAX && selected[destination] != 0)) {
+            return GGML_METAL_SPARSE_PLAN_INVALID_RANGE;
+        }
+        selected[source] |= 1u;
+        if (destination != SIZE_MAX) {
+            selected[destination] |= 2u;
+        }
+
+        const uint32_t source_p = v2p[source];
+        source_physical[i] = source_p;
+        if (source_p != UINT32_MAX &&
+                (source_p >= n_physical || p_ref[source_p] == 0)) {
+            return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+        }
+        if (destination != SIZE_MAX) {
+            const uint32_t destination_p = v2p[destination];
+            if (destination_p != UINT32_MAX &&
+                    (destination_p >= n_physical || p_ref[destination_p] == 0)) {
+                return GGML_METAL_SPARSE_PLAN_INVALID_STATE;
+            }
+        }
+    }
+    return GGML_METAL_SPARSE_PLAN_OK;
+}
+
+// Apply a successfully planned ownership transfer. This function allocates
+// nothing and has no partial-failure path. Physical refcounts include virtual
+// mappings only: moving a source mapping transfers its reference unchanged;
+// replacing or releasing a mapping decrements exactly one reference.
+static inline void ggml_metal_sparse_apply_page_move(
+        size_t n_physical,
+        uint32_t * v2p,
+        uint32_t * p_ref,
+        uint32_t * free_pages,
+        size_t * n_free,
+        const struct ggml_metal_sparse_page_move * moves,
+        const uint32_t * source_physical,
+        size_t n_moves) {
+    for (size_t i = 0; i < n_moves; ++i) {
+        const size_t destination = moves[i].destination;
+        if (destination == SIZE_MAX) {
+            continue;
+        }
+        const uint32_t old_p = v2p[destination];
+        if (old_p == UINT32_MAX) {
+            continue;
+        }
+        v2p[destination] = UINT32_MAX;
+        if (--p_ref[old_p] == 0) {
+            free_pages[(*n_free)++] = old_p;
+        }
+    }
+
+    for (size_t i = 0; i < n_moves; ++i) {
+        const size_t source = moves[i].source;
+        const size_t destination = moves[i].destination;
+        const uint32_t source_p = source_physical[i];
+        v2p[source] = UINT32_MAX;
+        if (destination != SIZE_MAX) {
+            v2p[destination] = source_p;
+        } else if (source_p != UINT32_MAX && --p_ref[source_p] == 0) {
+            free_pages[(*n_free)++] = source_p;
+        }
+    }
+    (void) n_physical;
+}
+
 // Mark page tiles selected by ranges relative to a containing view. The
 // offsets are not absolute buffer offsets; callers provide the view's total
 // byte size separately.
