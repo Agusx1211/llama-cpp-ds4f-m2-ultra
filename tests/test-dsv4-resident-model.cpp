@@ -10,7 +10,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <memory>
+#include <sstream>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -19,16 +23,55 @@
 
 namespace {
 
-constexpr uint32_t N_CTX        = 512;
-constexpr uint32_t N_BATCH      = 512;
-constexpr uint32_t N_UBATCH     = 512;
+constexpr uint32_t N_CTX        = 1024;
+constexpr uint32_t N_BATCH      = 1024;
+constexpr uint32_t N_UBATCH     = 1024;
 constexpr uint32_t N_SEQ_MAX    = 3;
 constexpr uint32_t N_RS_SEQ     = 5;
 constexpr uint32_t N_OUTPUTS    = 3;
 constexpr double   NMSE_LIMIT   = 1.0e-8;
 constexpr double   MAXABS_LIMIT = 1.0e-5;
 
-constexpr std::array<uint32_t, 6> BOUNDARIES = { 3, 4, 5, 127, 128, 129 };
+constexpr std::array<uint32_t, 9> BOUNDARIES = { 3, 4, 5, 127, 128, 129, 255, 256, 260 };
+
+constexpr uint32_t MODEL_MANIFEST_VERSION = 1;
+constexpr uint32_t MODEL_SHARD_COUNT      = 5;
+constexpr uint64_t MODEL_TOTAL_FILE_BYTES = UINT64_C(161869615520);
+constexpr const char * MODEL_PREFIX       = "DeepSeek-V4-Flash-0731-UD-Q8_K_XL";
+constexpr const char * MODEL_ARCH          = "deepseek4";
+constexpr const char * MODEL_NAME          = "Deepseek-V4-Flash-0731";
+constexpr const char * MODEL_SIZE_LABEL    = "256x8.4B";
+constexpr const char * MODEL_QUANT_LABEL   = "UD-Q8_K_XL";
+constexpr uint32_t MODEL_QUANT_VERSION    = 2;
+constexpr uint32_t MODEL_FILE_TYPE        = 38; // LLAMA_FTYPE_MOSTLY_MXFP4_MOE.
+constexpr std::array<uint64_t, MODEL_SHARD_COUNT> MODEL_SHARD_BYTES = {
+    UINT64_C(5257408), UINT64_C(49215492960), UINT64_C(49700372160), UINT64_C(49466495968), UINT64_C(13481997024),
+};
+constexpr std::array<const char *, MODEL_SHARD_COUNT> MODEL_SHARD_SHA256 = {
+    "d13ce8f90855547bdaebe7312f531a1f2c4f822178d3103951f27fe884395cfa",
+    "3da2f2443063f83635986f9b67fa7e8e3d03c53b81a9a08d2007936612423610",
+    "7d622a7760d359ec9257b3493ad531e3bf0bfbe6f6533267e16e6dde8153ddce",
+    "6ed2bce452214f156b85e7c5f7d4fc242a3052f409d1b90a61422f60669c2de3",
+    "ea4727af4888fdca0fff796ec81ac2f3ebb43c310b2feb4798f41d82744b42ea",
+};
+
+// Scope/nonclaims: this gate covers one target context and deterministic token
+// batches only. It does not exercise target+draft pairing, rollback depths,
+// sampler/grammar/tool/LoRA state, speculative stochastic decoding, server
+// pause/resume, asynchronous pressure, or thermal/cooldown behavior.
+
+struct model_shard_manifest {
+    uint32_t     index = 0;
+    std::string  filename;
+    uint64_t     bytes = 0;
+    std::string  sha256;
+};
+
+struct model_manifest {
+    uint32_t                         version = 0;
+    std::map<std::string, std::string> fields;
+    std::array<model_shard_manifest, MODEL_SHARD_COUNT> shards;
+};
 
 using model_ptr   = std::unique_ptr<llama_model, decltype(&llama_model_free)>;
 using context_ptr = std::unique_ptr<llama_context, decltype(&llama_free)>;
@@ -67,6 +110,210 @@ void expect(bool condition, const std::string & message) {
     if (!condition) {
         fail(message);
     }
+}
+
+std::string trim(std::string value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+std::vector<std::string> split(const std::string & value, char delimiter) {
+    std::vector<std::string> result;
+    std::stringstream        stream(value);
+    std::string              item;
+    while (std::getline(stream, item, delimiter)) {
+        result.push_back(item);
+    }
+    return result;
+}
+
+uint64_t parse_u64(const std::string & value, const char * field) {
+    size_t  consumed = 0;
+    uint64_t result   = 0;
+    try {
+        result = std::stoull(value, &consumed, 10);
+    } catch (...) {
+        fail(std::string("manifest ") + field + " is not an unsigned integer");
+    }
+    expect(consumed == value.size(), std::string("manifest ") + field + " has trailing data");
+    return result;
+}
+
+void expect_manifest_field(const model_manifest & manifest, const char * key, const char * expected) {
+    const auto it = manifest.fields.find(key);
+    expect(it != manifest.fields.end() && it->second == expected,
+           std::string("pinned model manifest ") + key + " mismatch");
+}
+
+model_manifest read_model_manifest(const std::string & manifest_path) {
+    std::ifstream input(manifest_path);
+    expect(input.good(), "pinned model manifest could not be opened");
+
+    model_manifest result;
+    std::string   line;
+    while (std::getline(input, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        if (line.rfind("shard=", 0) == 0) {
+            const auto fields = split(line.substr(6), '|');
+            expect(fields.size() == 4, "pinned model manifest shard entry is malformed");
+            const uint32_t index = (uint32_t) parse_u64(fields[0], "shard index");
+            expect(index >= 1 && index <= MODEL_SHARD_COUNT, "pinned model manifest shard index is out of range");
+            auto & shard = result.shards[index - 1];
+            expect(shard.index == 0, "pinned model manifest contains a duplicate shard");
+            shard.index    = index;
+            shard.filename = trim(fields[1]);
+            shard.bytes    = parse_u64(fields[2], "shard bytes");
+            shard.sha256   = trim(fields[3]);
+            continue;
+        }
+        const auto separator = line.find('=');
+        expect(separator != std::string::npos && separator != 0, "pinned model manifest field is malformed");
+        const std::string key   = trim(line.substr(0, separator));
+        const std::string value = trim(line.substr(separator + 1));
+        expect(!key.empty() && !value.empty(), "pinned model manifest has an empty field");
+        expect(result.fields.emplace(key, value).second, "pinned model manifest contains a duplicate field");
+    }
+
+    expect(input.eof(), "pinned model manifest read failed");
+    expect_manifest_field(result, "model_prefix", MODEL_PREFIX);
+    expect_manifest_field(result, "architecture", MODEL_ARCH);
+    expect_manifest_field(result, "name", MODEL_NAME);
+    expect_manifest_field(result, "size_label", MODEL_SIZE_LABEL);
+    expect_manifest_field(result, "quantization_label", MODEL_QUANT_LABEL);
+    expect_manifest_field(result, "quantization_version", "2");
+    expect_manifest_field(result, "file_type", "38");
+    expect_manifest_field(result, "total_file_bytes", "161869615520");
+    expect_manifest_field(result, "shard_count", "5");
+    result.version = (uint32_t) parse_u64(result.fields.at("manifest_version"), "manifest_version");
+    expect(result.version == MODEL_MANIFEST_VERSION, "pinned model manifest version is unsupported");
+
+    uint64_t total_bytes = 0;
+    for (uint32_t index = 0; index < MODEL_SHARD_COUNT; ++index) {
+        const auto & shard = result.shards[index];
+        expect(shard.index == index + 1, "pinned model manifest is missing a shard");
+        const std::string expected_name = std::string(MODEL_PREFIX) + "-" +
+                                           (index < 9 ? "0000" : "000") + std::to_string(index + 1) + "-of-00005.gguf";
+        expect(shard.filename == expected_name, "pinned model manifest shard filename mismatch");
+        expect(shard.bytes == MODEL_SHARD_BYTES[index], "pinned model manifest shard size is not pinned");
+        expect(shard.sha256 == MODEL_SHARD_SHA256[index], "pinned model manifest shard digest is not pinned");
+        expect(shard.sha256.size() == 64, "pinned model manifest shard digest length mismatch");
+        for (const char digit : shard.sha256) {
+            expect((digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f'),
+                   "pinned model manifest shard digest is not lowercase hexadecimal");
+        }
+        total_bytes += shard.bytes;
+    }
+    expect(total_bytes == MODEL_TOTAL_FILE_BYTES, "pinned model manifest shard sizes do not add up");
+    return result;
+}
+
+std::string shell_quote(const std::string & value) {
+    std::string result = "'";
+    for (const char character : value) {
+        if (character == '\'') {
+            result += "'\\''";
+        } else {
+            result += character;
+        }
+    }
+    result += "'";
+    return result;
+}
+
+std::string sha256_file(const std::filesystem::path & path) {
+    const std::string command = "shasum -a 256 -- " + shell_quote(path.string()) + " 2>/dev/null";
+    FILE *            pipe    = ::popen(command.c_str(), "r");
+    expect(pipe != nullptr, "pinned model digest helper could not be started");
+    char output[256] = {};
+    const bool read_ok = std::fgets(output, sizeof(output), pipe) != nullptr;
+    const int  status  = ::pclose(pipe);
+    expect(read_ok && status == 0, "pinned model digest helper failed");
+    const std::string line = trim(output);
+    const auto        separator = line.find_first_of(" \t");
+    expect(separator != std::string::npos, "pinned model digest helper output is malformed");
+    const std::string digest = line.substr(0, separator);
+    expect(digest.size() == 64, "pinned model digest helper returned an invalid digest");
+    return digest;
+}
+
+void verify_model_files(const std::string & model_path, const model_manifest & manifest) {
+    const std::filesystem::path first = std::filesystem::path(model_path);
+    expect(first.filename() == manifest.shards[0].filename,
+           "exact-model gate requires the pinned canonical first shard filename");
+    expect(std::filesystem::exists(first) && std::filesystem::is_regular_file(first) &&
+               !std::filesystem::is_symlink(first),
+           "pinned model first shard is missing, non-regular, or a symlink");
+
+    uint64_t total_bytes = 0;
+    for (const auto & shard : manifest.shards) {
+        const std::filesystem::path path = first.parent_path() / shard.filename;
+        expect(std::filesystem::exists(path) && std::filesystem::is_regular_file(path) &&
+                   !std::filesystem::is_symlink(path),
+               "pinned model shard is missing, non-regular, or a symlink: " + path.string());
+        const uint64_t bytes = std::filesystem::file_size(path);
+        expect(bytes == shard.bytes, "pinned model shard byte size mismatch: " + path.string());
+        const std::string digest = sha256_file(path);
+        expect(digest == shard.sha256, "pinned model shard SHA-256 mismatch: " + path.string());
+        std::fprintf(stderr, "resident-model identity shard=%u name=%s bytes=%llu sha256=%s\n", shard.index,
+                     shard.filename.c_str(), (unsigned long long) bytes, digest.c_str());
+        total_bytes += bytes;
+    }
+    expect(total_bytes == MODEL_TOTAL_FILE_BYTES, "pinned model total file size mismatch");
+}
+
+void verify_target_metal_device() {
+    ggml_backend_reg_t metal = ggml_backend_reg_by_name("Metal");
+    expect(metal != nullptr, "exact-model gate requires the Metal backend registry");
+    bool found_target = false;
+    for (size_t index = 0; index < ggml_backend_reg_dev_count(metal); ++index) {
+        ggml_backend_dev_t device = ggml_backend_reg_dev_get(metal, index);
+        const char *        name = ggml_backend_dev_name(device);
+        const char *        desc = ggml_backend_dev_description(device);
+        std::fprintf(stderr, "resident-model backend=%s device=%s description=%s\n", ggml_backend_reg_name(metal),
+                     name != nullptr ? name : "(null)", desc != nullptr ? desc : "(null)");
+        if (desc != nullptr && std::strcmp(desc, "Apple M2 Ultra") == 0) {
+            expect(ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU,
+                   "exact-model M2 Ultra device is not reported as a GPU");
+            found_target = true;
+        }
+    }
+    expect(found_target, "exact-model gate requires an Apple M2 Ultra Metal device");
+}
+
+std::string model_meta(const llama_model * model, const char * key) {
+    char value[256] = {};
+    expect(llama_model_meta_val_str(model, key, value, sizeof(value)) >= 0,
+           std::string("exact-model metadata key is missing: ") + key);
+    return value;
+}
+
+void verify_model_metadata(const llama_model * model, const model_manifest & manifest) {
+    expect(model_meta(model, "general.architecture") == MODEL_ARCH, "exact-model architecture metadata mismatch");
+    expect(model_meta(model, "general.name") == MODEL_NAME, "exact-model name metadata mismatch");
+    expect(model_meta(model, "general.size_label") == MODEL_SIZE_LABEL,
+           "exact-model size-label metadata mismatch");
+    expect(model_meta(model, "general.quantization_version") == std::to_string(MODEL_QUANT_VERSION),
+           "exact-model quantization-version metadata mismatch");
+    expect(model_meta(model, "general.file_type") == std::to_string(MODEL_FILE_TYPE),
+           "exact-model file-type metadata mismatch");
+    expect(llama_model_ftype(model) == (llama_ftype) MODEL_FILE_TYPE,
+           "exact-model runtime quantization type mismatch");
+    const uint64_t model_bytes = llama_model_size(model);
+    expect(model_bytes > 0 && model_bytes <= MODEL_TOTAL_FILE_BYTES,
+           "exact-model loaded tensor size is outside pinned file-size bounds");
+    std::fprintf(stderr,
+                 "resident-model identity architecture=%s name=%s size_label=%s quantization=%s file_type=%u "
+                 "tensor_bytes=%llu manifest_bytes=%llu\n",
+                 MODEL_ARCH, MODEL_NAME, MODEL_SIZE_LABEL, MODEL_QUANT_LABEL, MODEL_FILE_TYPE,
+                 (unsigned long long) model_bytes,
+                 (unsigned long long) parse_u64(manifest.fields.at("total_file_bytes"), "total_file_bytes"));
 }
 
 bool env_is_one(const char * name) {
@@ -118,12 +365,15 @@ struct phase_logits {
     std::array<std::vector<float>, 3> values;
 };
 
-struct decode_ledger {
+// This records rows submitted to llama_decode. It is intentionally not an
+// authoritative KV-write or recomputation signal: backend graph work is
+// allowed to fuse, replay, or defer operations behind one submission.
+struct submission_ledger {
     std::array<std::vector<uint32_t>, N_SEQ_MAX> writes;
 
     void record(llama_seq_id sequence, llama_pos position) {
-        expect(sequence >= 0 && sequence < (llama_seq_id) N_SEQ_MAX, "ledger sequence out of range");
-        expect(position >= 0, "ledger position out of range");
+        expect(sequence >= 0 && sequence < (llama_seq_id) N_SEQ_MAX, "submission sequence out of range");
+        expect(position >= 0, "submission position out of range");
         auto & sequence_writes = writes[(size_t) sequence];
         if ((size_t) position >= sequence_writes.size()) {
             sequence_writes.resize((size_t) position + 1, 0);
@@ -154,7 +404,7 @@ model_plan make_model_plan(uint32_t n_vocab) {
     expect(n_vocab > 1, "model vocabulary is too small");
     model_plan plan;
     plan.n_vocab                    = n_vocab;
-    constexpr uint32_t MAX_POSITION = 140;
+    constexpr uint32_t MAX_POSITION = 300;
     for (uint32_t role = 0; role < plan.tokens.size(); ++role) {
         plan.tokens[role].resize(MAX_POSITION);
         for (uint32_t position = 0; position < MAX_POSITION; ++position) {
@@ -195,7 +445,7 @@ context_ptr make_context(llama_model * model, graph_counter & counter) {
 phase_logits decode_rows(llama_context *                context,
                          const std::vector<row_input> & rows,
                          uint32_t                       n_vocab,
-                         decode_ledger *                ledger = nullptr) {
+                         submission_ledger *            ledger = nullptr) {
     expect(!rows.empty() && rows.size() <= N_BATCH, "invalid decode row count");
     uint32_t n_outputs = 0;
     for (const auto & row : rows) {
@@ -206,11 +456,20 @@ phase_logits decode_rows(llama_context *                context,
     expect(n_outputs > 0 && n_outputs <= N_OUTPUTS, "invalid decode output count");
 
     llama_batch batch = llama_batch_init((int32_t) rows.size(), 0, N_SEQ_MAX);
+    if (batch.token == nullptr || batch.pos == nullptr || batch.n_seq_id == nullptr || batch.seq_id == nullptr ||
+        batch.logits == nullptr) {
+        llama_batch_free(batch);
+        fail("llama_batch_init returned an incomplete batch allocation");
+    }
     batch.n_tokens    = (int32_t) rows.size();
     for (size_t i = 0; i < rows.size(); ++i) {
         const auto & row = rows[i];
         if (ledger != nullptr) {
             ledger->record(row.sequence, row.position);
+        }
+        if (batch.seq_id[i] == nullptr) {
+            llama_batch_free(batch);
+            fail("llama_batch_init returned a missing sequence-id row");
         }
         batch.token[i]     = row.token;
         batch.pos[i]       = row.position;
@@ -247,7 +506,7 @@ phase_logits decode_history(llama_context *    context,
                             uint32_t           boundary,
                             llama_seq_id       source_sequence,
                             llama_seq_id       survivor_sequence,
-                            decode_ledger *    ledger = nullptr) {
+                            submission_ledger * ledger = nullptr) {
     std::vector<row_input> rows;
     rows.reserve(2 * (boundary + 1));
     for (uint32_t position = 0; position <= boundary; ++position) {
@@ -259,7 +518,7 @@ phase_logits decode_history(llama_context *    context,
     return decode_rows(context, rows, plan.n_vocab, ledger);
 }
 
-void expect_prompt_ledger(const decode_ledger & ledger,
+void expect_prompt_ledger(const submission_ledger & ledger,
                           llama_seq_id          source_sequence,
                           llama_seq_id          survivor_sequence,
                           uint32_t              boundary) {
@@ -267,18 +526,18 @@ void expect_prompt_ledger(const decode_ledger & ledger,
         const bool expected = sequence == source_sequence || sequence == survivor_sequence;
         for (uint32_t position = 0; position <= boundary; ++position) {
             expect(ledger.count(sequence, (llama_pos) position) == (expected ? 1u : 0u),
-                   "prompt sequence ledger was not written exactly once");
+                   "prompt sequence submission was not recorded exactly once");
         }
         if (expected) {
             expect(ledger.writes[(size_t) sequence].size() == boundary + 1,
-                   "prompt sequence ledger contains an unexpected position");
+                   "prompt sequence submission contains an unexpected position");
         } else {
-            expect(ledger.writes[(size_t) sequence].empty(), "prompt sequence ledger populated an unrelated sequence");
+            expect(ledger.writes[(size_t) sequence].empty(), "prompt sequence submission populated an unrelated sequence");
         }
     }
 }
 
-void expect_exact_positions(const decode_ledger &                                 ledger,
+void expect_exact_positions(const submission_ledger &                              ledger,
                             const std::array<std::vector<llama_pos>, N_SEQ_MAX> & expected,
                             const char *                                          phase) {
     for (llama_seq_id sequence = 0; sequence < (llama_seq_id) N_SEQ_MAX; ++sequence) {
@@ -295,7 +554,7 @@ void expect_exact_positions(const decode_ledger &                               
         for (size_t position = 0; position < n_positions; ++position) {
             const uint32_t expected_count = position < expected_counts.size() ? expected_counts[position] : 0;
             const uint32_t actual_count   = position < actual_counts.size() ? actual_counts[position] : 0;
-            expect(actual_count == expected_count, std::string(phase) + " decode position ledger mismatch");
+            expect(actual_count == expected_count, std::string(phase) + " decode submission ledger mismatch");
         }
     }
 }
@@ -313,7 +572,7 @@ phase_logits decode_resumed(llama_context *    context,
                             const model_plan & plan,
                             uint32_t           boundary,
                             llama_seq_id       source_sequence,
-                            decode_ledger *    ledger = nullptr) {
+                            submission_ledger * ledger = nullptr) {
     return decode_rows(context,
                        {
                            { 0, source_sequence, (llama_pos) boundary + 1, plan.token(0, boundary + 1), true },
@@ -898,7 +1157,7 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary) {
         const auto oracle_memory_baseline = memory->memory_usage_snapshot();
         const auto oracle_comp_baseline   = memory->get_comp_pool()->memory_usage_snapshot();
 
-        decode_ledger  oracle_prompt_ledger;
+        submission_ledger oracle_prompt_ledger;
         const uint64_t oracle_before_prompt      = counter.evaluations;
         const uint64_t oracle_asks_before_prompt = counter.asks;
         oracle_prompt = decode_history(oracle.get(), plan, boundary, 2, 1, &oracle_prompt_ledger);
@@ -912,7 +1171,7 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary) {
         oracle_evaluations.parked_asks            = counter.asks - oracle_asks_before_parked;
         const uint64_t oracle_before_resumed      = counter.evaluations;
         const uint64_t oracle_asks_before_resumed = counter.asks;
-        decode_ledger  oracle_resumed_ledger;
+        submission_ledger oracle_resumed_ledger;
         oracle_resumed = decode_resumed(oracle.get(), plan, boundary, 2, &oracle_resumed_ledger);
         oracle_evaluations.resumed_evaluations = counter.evaluations - oracle_before_resumed;
         oracle_evaluations.resumed_asks        = counter.asks - oracle_asks_before_resumed;
@@ -950,6 +1209,7 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary) {
     const auto initial_binding0       = comp_binding(comp_pool, 0, "candidate creation");
     const auto initial_binding1       = comp_binding(comp_pool, 1, "candidate creation");
     const auto initial_binding2       = comp_binding(comp_pool, 2, "candidate creation");
+    const auto initial_info1          = comp_handle_info(comp_pool, initial_binding1, "candidate creation");
     const auto resident_before_detach = memory->resident_usage();
     expect_resident_usage(resident_before_detach, 0, 0, "candidate creation", boundary);
     const auto memory_baseline = memory->memory_usage_snapshot();
@@ -961,7 +1221,7 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary) {
                std::string(phase) + " rollback index changed during resident transaction");
     };
     validate_memory_snapshot(memory_baseline, "candidate creation", boundary);
-    decode_ledger      prompt_ledger;
+    submission_ledger prompt_ledger;
     const uint64_t     candidate_before_prompt      = counter.evaluations;
     const uint64_t     candidate_asks_before_prompt = counter.asks;
     const phase_logits candidate_prompt = decode_history(candidate.get(), plan, boundary, 0, 1, &prompt_ledger);
@@ -1085,20 +1345,21 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary) {
     expect(stale_attach.status == llama_dsv4_resident_status::stale_handle,
            "consumed resident handle was accepted after attach");
     expect(llama_memory_seq_pos_max(llama_get_memory(candidate.get()), 2) == (llama_pos) boundary,
-           "attached source position ledger was recomputed or lost");
+           "attached source position state was changed unexpectedly");
     expect(llama_memory_seq_pos_max(llama_get_memory(candidate.get()), 1) == (llama_pos) boundary + 1,
            "resident attach altered the survivor sequence");
 
     const uint64_t     candidate_before_resumed      = counter.evaluations;
     const uint64_t     candidate_asks_before_resumed = counter.asks;
-    decode_ledger      resumed_ledger;
+    submission_ledger resumed_ledger;
     const phase_logits candidate_resumed = decode_resumed(candidate.get(), plan, boundary, 2, &resumed_ledger);
-    // Ownership APIs have no callback into the model graph. Equal callback
-    // deltas for resumed execution are the strongest public no-replay signal;
-    // backend work hidden inside one graph evaluation is not externally visible.
+    // Callback deltas compare graph scheduling shape only. They do not prove
+    // that the submitted rows were written exactly once or that no backend
+    // replay occurred; the submission ledger above is deliberately scoped to
+    // caller-visible batch construction for that reason.
     expect(counter.evaluations - candidate_before_resumed == oracle_evaluations.resumed_evaluations &&
                counter.asks - candidate_asks_before_resumed == oracle_evaluations.resumed_asks,
-           "candidate resumed graph-evaluation count differs from oracle (possible prompt replay)");
+           "candidate resumed graph-evaluation shape differs from oracle");
     expect_exact_positions(resumed_ledger,
                            { std::vector<llama_pos>{ 1 }, std::vector<llama_pos>{ (llama_pos) boundary + 2 },
                              std::vector<llama_pos>{ (llama_pos) boundary + 1 } },
@@ -1173,6 +1434,21 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary) {
     expect(comp_pool->get_handle(initial_binding0, released_source_info) == llama_dsv4_comp_status::handle_not_found,
            "released source compressed handle remained addressable");
     expect(counter.evaluations == callback_before_release, "resident release changed graph callback count");
+    const auto final_binding0 = comp_binding(comp_pool, 0, "released");
+    const auto final_binding1 = comp_binding(comp_pool, 1, "released");
+    const auto final_binding2 = comp_binding(comp_pool, 2, "released");
+    expect(final_binding0 == replacement_info_before_release.id && final_binding2 == destination_info_before_release.id &&
+               final_binding1 == survivor_info_before_second_detach.id && final_binding0 != initial_binding0 &&
+               final_binding2 != initial_binding2,
+           "resident release did not preserve the expected per-sequence binding identities");
+    expect_comp_handle_info_equal(initial_info1, comp_handle_info(comp_pool, final_binding1, "released"),
+                                  "released survivor handle");
+    expect_comp_handle_info_equal(replacement_info_before_release,
+                                  comp_handle_info(comp_pool, final_binding0, "released"),
+                                  "released replacement handle");
+    expect_comp_handle_info_equal(destination_info_before_release,
+                                  comp_handle_info(comp_pool, final_binding2, "released"),
+                                  "released destination handle");
     const auto resident_after_release = memory->resident_usage();
     expect_resident_transition(resident_after_second_detach, resident_after_release, "released", boundary);
     expect_resident_usage(resident_after_release, 0, 0, "released", boundary);
@@ -1222,6 +1498,25 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary) {
     expect(final_comp.epoch >= comp_baseline.epoch, "compressed pool epoch regressed after clear");
     compare_comp_baseline(comp_baseline, final_comp, "final", boundary);
     expect_resident_usage(memory->resident_usage(), 0, 0, "final", boundary);
+    expect_logical_rows(final_memory, { -1, -1, -1 }, "final", boundary);
+    for (llama_seq_id sequence = 0; sequence < (llama_seq_id) N_SEQ_MAX; ++sequence) {
+        expect(llama_memory_seq_pos_max(llama_get_memory(candidate.get()), sequence) == -1,
+               "final clear left a per-sequence position populated");
+    }
+    expect(comp_binding(comp_pool, 0, "final") == final_binding0 &&
+               comp_binding(comp_pool, 1, "final") == final_binding1 &&
+               comp_binding(comp_pool, 2, "final") == final_binding2,
+           "final clear changed compressed binding identities");
+    expect_comp_handle_info_equal(replacement_info_before_release,
+                                  comp_handle_info(comp_pool, final_binding0, "final"), "final replacement handle");
+    expect_comp_handle_info_equal(initial_info1, comp_handle_info(comp_pool, final_binding1, "final"),
+                                  "final survivor handle");
+    expect_comp_handle_info_equal(destination_info_before_release,
+                                  comp_handle_info(comp_pool, final_binding2, "final"), "final destination handle");
+    llama_dsv4_comp_handle_info removed_info;
+    expect(comp_pool->get_handle(initial_binding0, removed_info) == llama_dsv4_comp_status::handle_not_found &&
+               comp_pool->get_handle(initial_binding2, removed_info) == llama_dsv4_comp_status::handle_not_found,
+           "final clear resurrected an obsolete compressed handle");
     expect_rs_idx("final");
 }
 
@@ -1235,25 +1530,51 @@ bool silent_progress(float /* progress */, void * /* user_data */) {
     return true;
 }
 
-bool parse_model_path(int argc, char ** argv, std::string & path) {
-    if (argc == 2 && (std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0)) {
-        std::printf("usage: %s --model <first-shard.gguf>\n", argv[0]);
+bool parse_arguments(int argc, char ** argv, std::string & model_path, std::string & manifest_path, bool & help) {
+    help = argc == 2 && (std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0);
+    if (help) {
+        std::printf("usage: %s --model <first-shard.gguf> --manifest <pinned.manifest>\n", argv[0]);
         return false;
     }
-    if (argc != 3 || (std::strcmp(argv[1], "--model") != 0 && std::strcmp(argv[1], "-m") != 0)) {
-        std::fprintf(stderr, "usage: %s --model <first-shard.gguf>\n", argv[0]);
+    if (argc != 5) {
+        std::fprintf(stderr, "usage: %s --model <first-shard.gguf> --manifest <pinned.manifest>\n", argv[0]);
         return false;
     }
-    path = argv[2];
-    return !path.empty();
+    for (int index = 1; index < argc; index += 2) {
+        const char * option = argv[index];
+        const char * value  = argv[index + 1];
+        if (std::strcmp(option, "--model") == 0 || std::strcmp(option, "-m") == 0) {
+            if (!model_path.empty()) {
+                std::fprintf(stderr, "duplicate --model argument\n");
+                return false;
+            }
+            model_path = value;
+        } else if (std::strcmp(option, "--manifest") == 0 || std::strcmp(option, "-M") == 0) {
+            if (!manifest_path.empty()) {
+                std::fprintf(stderr, "duplicate --manifest argument\n");
+                return false;
+            }
+            manifest_path = value;
+        } else {
+            std::fprintf(stderr, "unknown resident-model argument: %s\n", option);
+            return false;
+        }
+    }
+    if (model_path.empty() || manifest_path.empty()) {
+        std::fprintf(stderr, "resident-model requires both --model and --manifest\n");
+        return false;
+    }
+    return true;
 }
 
 }  // namespace
 
 int main(int argc, char ** argv) {
     std::string model_path;
-    if (!parse_model_path(argc, argv, model_path)) {
-        return argc == 2 && (std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0) ? 0 : 2;
+    std::string manifest_path;
+    bool        help = false;
+    if (!parse_arguments(argc, argv, model_path, manifest_path, help)) {
+        return help ? 0 : 2;
     }
     if (!env_is_one("LLAMA_DSV4_COMPOSITE_RESIDENT_ENABLE") || !env_is_one("LLAMA_DSV4_AGGREGATE_POOL_FORCE") ||
         std::getenv("LLAMA_DSV4_AMX_COEXEC") != nullptr) {
@@ -1264,23 +1585,30 @@ int main(int argc, char ** argv) {
     }
 
     try {
-        backend_scope      backend;
+        const model_manifest manifest = read_model_manifest(manifest_path);
+        // Validate the supplied path before the platform gate so wrong-model
+        // failure paths are deterministic even on a non-Metal host. Hashing
+        // only proceeds after the canonical five-shard layout is present.
+        verify_model_files(model_path, manifest);
+        backend_scope backend;
+        verify_target_metal_device();
         llama_model_params model_params = llama_model_default_params();
         model_params.n_gpu_layers       = 999;
         model_params.split_mode         = LLAMA_SPLIT_MODE_LAYER;
         model_params.progress_callback  = silent_progress;
         model_ptr model(llama_model_load_from_file(model_path.c_str(), model_params), llama_model_free);
         expect(model != nullptr, "failed to load exact DeepSeek V4 Flash model");
+        verify_model_metadata(model.get(), manifest);
         const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         expect(n_vocab > 1, "exact model vocabulary is empty");
         std::fprintf(stderr,
                      "resident-model start n_ctx=%u n_batch=%u n_ubatch=%u n_seq_max=%u n_rs_seq=%u "
-                     "n_outputs_max=%u flash_attn=1 boundaries=6\n",
-                     N_CTX, N_BATCH, N_UBATCH, N_SEQ_MAX, N_RS_SEQ, N_OUTPUTS);
+                     "n_outputs_max=%u flash_attn=1 boundaries=%zu\n",
+                     N_CTX, N_BATCH, N_UBATCH, N_SEQ_MAX, N_RS_SEQ, N_OUTPUTS, BOUNDARIES.size());
         for (uint32_t boundary : BOUNDARIES) {
             run_boundary(model.get(), n_vocab, boundary);
         }
-        std::fprintf(stderr, "resident-model complete boundaries=6\n");
+        std::fprintf(stderr, "resident-model complete boundaries=%zu\n", BOUNDARIES.size());
         return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "resident-model failure: %s\n", error.what());
