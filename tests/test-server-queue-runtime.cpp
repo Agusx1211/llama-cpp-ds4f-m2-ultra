@@ -4,8 +4,10 @@
 
 #include "server-queue.h"
 
+#include <condition_variable>
 #include <cstdio>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -39,8 +41,11 @@ struct test_partial_result : server_task_result {
     }
 };
 
-server_task make_user(server_queue & queue, server_task::trusted_lane lane, uint64_t arrival_us) {
-    server_task task(SERVER_TASK_TYPE_COMPLETION);
+server_task make_user(server_queue &              queue,
+                      server_task::trusted_lane lane,
+                      uint64_t                   arrival_us,
+                      server_task_type           type = SERVER_TASK_TYPE_COMPLETION) {
+    server_task task(type);
     task.id                          = queue.get_new_id();
     task.scheduling.lane             = lane;
     task.scheduling.arrival_us       = arrival_us;
@@ -50,6 +55,53 @@ server_task make_user(server_queue & queue, server_task::trusted_lane lane, uint
     task.scheduling.queue_timeout_us = std::numeric_limits<uint64_t>::max();
     task.scheduling.run_timeout_us   = std::numeric_limits<uint64_t>::max();
     return task;
+}
+
+void bind_only(server_queue & queue, int task_id, int slot_id) {
+    queue.on_new_task([&](server_task && selected) {
+        require(selected.id == task_id, "dispatch expected publication task");
+        require(queue.bind_slot(selected.id, slot_id), "bind publication task");
+        queue.terminate();
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+}
+
+server_task_result_ptr make_final_result(server_task_type type, int task_id) {
+    server_task_result_ptr result;
+    switch (type) {
+        case SERVER_TASK_TYPE_COMPLETION:
+            result = std::make_unique<server_task_result_cmpl_final>();
+            break;
+        case SERVER_TASK_TYPE_EMBEDDING:
+            result = std::make_unique<server_task_result_embd>();
+            break;
+        case SERVER_TASK_TYPE_RERANK:
+            result = std::make_unique<server_task_result_rerank>();
+            break;
+        default:
+            throw std::runtime_error("unsupported publication fixture type");
+    }
+    result->id = task_id;
+    return result;
+}
+
+void send_timeout_result(server_response & responses, server_queue_expiration event) {
+    auto error      = std::make_unique<server_task_result_error>();
+    error->id       = event.task_id;
+    error->err_type = ERROR_TYPE_TIMEOUT;
+    error->err_msg  = event.kind == server_request_runtime::deadline_kind::run ? "request run deadline exceeded" :
+                                                                                 "request queue deadline exceeded";
+    responses.send(std::move(error));
+}
+
+void require_timeout_only(server_response & responses, int task_id, const char * message) {
+    auto result = responses.recv_with_timeout({ task_id }, 0);
+    auto error  = dynamic_cast<server_task_result_error *>(result.get());
+    require(error != nullptr && error->err_type == ERROR_TYPE_TIMEOUT, message);
+    require(responses.recv_with_timeout({ task_id }, 0) == nullptr,
+            "terminal timeout leaves no queued success result");
 }
 
 void test_internal_and_three_lane_dispatch() {
@@ -447,6 +499,217 @@ void test_passive_child_cancellation() {
             "passive-child cancellation retires independently");
 }
 
+void test_final_result_publication_deadline_gate() {
+    const std::vector<server_task_type> result_types = {
+        SERVER_TASK_TYPE_COMPLETION,
+        SERVER_TASK_TYPE_EMBEDDING,
+        SERVER_TASK_TYPE_RERANK,
+    };
+
+    auto run_case = [](server_task_type type, uint64_t epoch_us, bool deadline_wins) {
+        auto config                     = test_runtime_config();
+        config.default_queue_timeout_us = 100;
+        config.default_run_timeout_us   = 10;
+        uint64_t        now_us = epoch_us;
+        server_queue    queue(config, [&] { return now_us; });
+        server_response responses;
+        int expiration_callbacks = 0;
+        queue.on_request_expired([&](server_queue_expiration event) {
+            ++expiration_callbacks;
+            send_timeout_result(responses, event);
+        });
+
+        server_task task                 = make_user(queue, server_task::trusted_lane::normal, 0, type);
+        task.scheduling.queue_timeout_us = 0;
+        task.scheduling.run_timeout_us   = 0;
+        const int task_id                = task.id;
+        responses.add_waiting_task_id(task_id);
+        require_posted(queue.post(std::move(task)), task_id, "post gated final publication");
+        bind_only(queue, task_id, 0);
+
+        now_us = epoch_us + (deadline_wins ? 10 : 9);
+        const bool published = queue.publish_slot_result(responses, task_id, 0,
+                                                         server_queue_result_kind::final,
+                                                         make_final_result(type, task_id));
+        require(published != deadline_wins,
+                "completion, embedding, or rerank publication obeys the exact run boundary");
+        if (deadline_wins) {
+            require_timeout_only(responses, task_id, "exact-boundary final publication returns timeout");
+            require(expiration_callbacks == 1 && queue.release_slot(task_id, 0) &&
+                        queue.request_summary().active_requests == 0,
+                    "exact-boundary final timeout retires its slot exactly once");
+        } else {
+            auto success = responses.recv_with_timeout({ task_id }, 0);
+            require(success != nullptr && !success->is_error() && success->is_stop(),
+                    "pre-boundary final publication emits exactly one success");
+            now_us = epoch_us + 10;
+            require(queue.expire_requests() == 0 && expiration_callbacks == 0 &&
+                        queue.request_summary().active_requests == 0 &&
+                        responses.recv_with_timeout({ task_id }, 0) == nullptr,
+                    "committed final success cannot be overwritten by a later timeout");
+        }
+    };
+
+    uint64_t epoch_us = 1000;
+    for (server_task_type type : result_types) {
+        run_case(type, epoch_us, true);
+        epoch_us += 100;
+    }
+    for (server_task_type type : result_types) {
+        run_case(type, epoch_us, false);
+        epoch_us += 100;
+    }
+}
+
+void test_stream_result_publication_deadline_gate() {
+    auto config                     = test_runtime_config();
+    config.default_queue_timeout_us = 100;
+    config.default_run_timeout_us   = 10;
+    uint64_t        now_us          = 3000;
+    server_queue    queue(config, [&] { return now_us; });
+    server_response responses;
+    int             expiration_callbacks = 0;
+    queue.on_request_expired([&](server_queue_expiration event) {
+        ++expiration_callbacks;
+        send_timeout_result(responses, event);
+    });
+
+    server_task streaming                 = make_user(queue, server_task::trusted_lane::fast, 0);
+    streaming.scheduling.queue_timeout_us = 0;
+    streaming.scheduling.run_timeout_us   = 0;
+    streaming.params.stream               = true;
+    const int streaming_id                = streaming.id;
+    responses.add_waiting_task_id(streaming_id);
+    require_posted(queue.post(std::move(streaming)), streaming_id, "post streaming publication task");
+    bind_only(queue, streaming_id, 0);
+
+    now_us = 3009;
+    auto partial = std::make_unique<test_partial_result>();
+    partial->id  = streaming_id;
+    require(queue.publish_slot_result(responses, streaming_id, 0, server_queue_result_kind::partial,
+                                      std::move(partial)),
+            "streaming partial publishes before run deadline");
+    auto published_partial = responses.recv_with_timeout({ streaming_id }, 0);
+    require(published_partial != nullptr && !published_partial->is_error() && !published_partial->is_stop(),
+            "pre-boundary streaming partial is observable");
+
+    now_us = 3010;
+    require(!queue.publish_slot_result(responses, streaming_id, 0, server_queue_result_kind::final,
+                                       make_final_result(SERVER_TASK_TYPE_COMPLETION, streaming_id)),
+            "streaming final is denied at exact run deadline");
+    require_timeout_only(responses, streaming_id, "streaming final exact boundary returns timeout");
+    require(expiration_callbacks == 1 && queue.release_slot(streaming_id, 0),
+            "streaming final timeout retires once after an earlier partial");
+    queue.on_new_task([&](server_task && selected) {
+        require(selected.type == SERVER_TASK_TYPE_CANCEL && selected.id_target == streaming_id,
+                "streaming expiry queues its internal cancellation control");
+        queue.terminate();
+    });
+    queue.start_loop();
+
+    now_us = 3100;
+    server_task exact_partial                 = make_user(queue, server_task::trusted_lane::fast, 0);
+    exact_partial.scheduling.queue_timeout_us = 0;
+    exact_partial.scheduling.run_timeout_us   = 0;
+    exact_partial.params.stream               = true;
+    const int exact_partial_id                = exact_partial.id;
+    responses.add_waiting_task_id(exact_partial_id);
+    require_posted(queue.post(std::move(exact_partial)), exact_partial_id,
+                   "post exact-boundary streaming partial task");
+    bind_only(queue, exact_partial_id, 1);
+
+    now_us = 3110;
+    auto denied_partial = std::make_unique<test_partial_result>();
+    denied_partial->id  = exact_partial_id;
+    require(!queue.publish_slot_result(responses, exact_partial_id, 1, server_queue_result_kind::partial,
+                                       std::move(denied_partial)),
+            "streaming partial is denied at exact run deadline");
+    require_timeout_only(responses, exact_partial_id, "streaming partial exact boundary returns timeout");
+    require(expiration_callbacks == 2 && queue.release_slot(exact_partial_id, 1) &&
+                queue.request_summary().active_requests == 0,
+            "partial timeout emits once and leaks no success after terminal expiry");
+}
+
+void test_concurrent_update_publication_after_expiry() {
+    auto config                     = test_runtime_config();
+    config.default_queue_timeout_us = 100;
+    config.default_run_timeout_us   = 10;
+    uint64_t        now_us          = 4000;
+    server_queue    queue(config, [&] { return now_us; });
+    server_response responses;
+    std::mutex              rendezvous_mutex;
+    std::condition_variable rendezvous;
+    bool                    update_entered = false;
+    bool                    expiry_done    = false;
+    bool                    published      = true;
+    int                     task_id        = -1;
+    int                     expiration_callbacks = 0;
+    int                     cancellation_dispatches = 0;
+    int                     released_leases = 0;
+
+    queue.on_request_expired([&](server_queue_expiration event) {
+        ++expiration_callbacks;
+        send_timeout_result(responses, event);
+    });
+    queue.on_new_task([&](server_task && selected) {
+        if (selected.type == SERVER_TASK_TYPE_COMPLETION) {
+            require(queue.bind_slot(selected.id, 0), "bind concurrent update publication task");
+            return;
+        }
+        require(selected.type == SERVER_TASK_TYPE_CANCEL && selected.id_target == task_id,
+                "run expiry queues cancellation for concurrent update task");
+        ++cancellation_dispatches;
+        released_leases += queue.release_slot(selected.id_target, 0);
+        queue.terminate();
+    });
+    queue.on_update_slots([&] {
+        {
+            std::lock_guard<std::mutex> lock(rendezvous_mutex);
+            update_entered = true;
+        }
+        rendezvous.notify_one();
+        {
+            std::unique_lock<std::mutex> lock(rendezvous_mutex);
+            rendezvous.wait(lock, [&] { return expiry_done; });
+        }
+        auto partial = std::make_unique<test_partial_result>();
+        partial->id  = task_id;
+        published = queue.publish_slot_result(responses, task_id, 0, server_queue_result_kind::partial,
+                                              std::move(partial));
+    });
+    queue.on_sleeping_state([](bool) {});
+
+    server_task task                 = make_user(queue, server_task::trusted_lane::normal, 0);
+    task.scheduling.queue_timeout_us = 0;
+    task.scheduling.run_timeout_us   = 0;
+    task.params.stream               = true;
+    task_id                          = task.id;
+    responses.add_waiting_task_id(task_id);
+    require_posted(queue.post(std::move(task)), task_id, "post concurrent update publication task");
+
+    std::thread expirer([&] {
+        {
+            std::unique_lock<std::mutex> lock(rendezvous_mutex);
+            rendezvous.wait(lock, [&] { return update_entered; });
+        }
+        now_us = 4010;
+        require(queue.expire_requests() == 1, "concurrent sweep expires task at exact run deadline");
+        {
+            std::lock_guard<std::mutex> lock(rendezvous_mutex);
+            expiry_done = true;
+        }
+        rendezvous.notify_one();
+    });
+
+    queue.start_loop();
+    expirer.join();
+    require(!published, "callback_update_slots cannot publish after concurrent terminal expiry");
+    require_timeout_only(responses, task_id, "concurrent update race returns only timeout");
+    require(expiration_callbacks == 1 && cancellation_dispatches == 1 && released_leases == 1 &&
+                queue.request_summary().active_requests == 0,
+            "concurrent expiry performs exactly one timeout and one slot cleanup");
+}
+
 void test_bound_stream_timeout_and_cancel_race() {
     auto config                     = test_runtime_config();
     config.default_queue_timeout_us = 100;
@@ -473,7 +736,9 @@ void test_bound_stream_timeout_and_cancel_race() {
             require(queue.bind_slot(selected.id, 0), "bind streaming request");
             auto partial = std::make_unique<test_partial_result>();
             partial->id  = selected.id;
-            responses.send(std::move(partial));
+            require(queue.publish_slot_result(responses, selected.id, 0, server_queue_result_kind::partial,
+                                              std::move(partial)),
+                    "publish streaming response through durable terminal gate");
             queue.terminate();
             return;
         }
@@ -533,6 +798,9 @@ int main() {
         { "selected pre-bind deadline",   test_selected_request_expires_before_bind     },
         { "passive child deadlines",      test_passive_child_deadline_order             },
         { "passive child cancellation",   test_passive_child_cancellation               },
+        { "final publication gate",       test_final_result_publication_deadline_gate   },
+        { "stream publication gate",      test_stream_result_publication_deadline_gate  },
+        { "concurrent publication expiry", test_concurrent_update_publication_after_expiry },
         { "bound stream timeout",         test_bound_stream_timeout_and_cancel_race     },
     };
 

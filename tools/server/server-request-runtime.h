@@ -88,6 +88,7 @@ class request_runtime {
     std::vector<expiration> expire_due(uint64_t now_us);
 
     bool bind_slot(uint64_t request_id, server_request_registry::slot_id slot, uint64_t at_us);
+    bool can_publish(uint64_t request_id, server_request_registry::slot_id slot) const;
     bool release_slot(uint64_t request_id, server_request_registry::slot_id slot, uint64_t at_us);
     bool cancel(uint64_t request_id, uint64_t at_us);
     bool fail(uint64_t request_id, uint64_t at_us);

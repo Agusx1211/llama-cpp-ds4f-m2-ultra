@@ -42,6 +42,13 @@ struct server_queue_bind_result {
     operator bool() const { return code == server_queue_bind_code::bound; }
 };
 
+enum class server_queue_result_kind : uint8_t {
+    partial = 0,
+    final,
+};
+
+struct server_response;
+
 // struct for managing server tasks
 // in most cases, use server_response_reader to post new tasks and retrieve results
 struct server_queue {
@@ -124,6 +131,11 @@ public:
     }
 
     server_queue_bind_result bind_slot(int id_task, int id_slot);
+    bool publish_slot_result(server_response &          response,
+                             int                        id_task,
+                             int                        id_slot,
+                             server_queue_result_kind   kind,
+                             server_task_result_ptr &&  result);
     bool release_slot(int id_task, int id_slot);
     bool fail_task(int id_task);
     size_t expire_requests();

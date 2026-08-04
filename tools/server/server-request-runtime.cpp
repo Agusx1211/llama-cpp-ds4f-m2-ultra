@@ -297,6 +297,16 @@ bool request_runtime::bind_slot(uint64_t request_id, slot_id slot, uint64_t at_u
     return true;
 }
 
+bool request_runtime::can_publish(uint64_t request_id, slot_id slot) const {
+    const auto it = records.find(request_id);
+    if (it == records.end() || it->second.terminal != lifecycle::completed) {
+        return false;
+    }
+    const auto & bindings = it->second.bindings;
+    return std::any_of(bindings.begin(), bindings.end(),
+                       [slot](const binding_lease & value) { return value.slot == slot; });
+}
+
 bool request_runtime::release_slot(uint64_t request_id, slot_id slot, uint64_t at_us) {
     expire_due(at_us);
     auto it = records.find(request_id);

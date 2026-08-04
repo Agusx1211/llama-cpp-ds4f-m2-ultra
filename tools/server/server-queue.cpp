@@ -511,6 +511,34 @@ server_queue_bind_result server_queue::bind_slot(int id_task, int id_slot) {
                                server_queue_bind_code::rejected };
 }
 
+bool server_queue::publish_slot_result(server_response &         response,
+                                       int                       id_task,
+                                       int                       id_slot,
+                                       server_queue_result_kind  kind,
+                                       server_task_result_ptr && result) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    const uint64_t               at_us   = now_us();
+    auto                         expired = expire_requests_locked(at_us);
+    const bool active = id_task >= 0 && id_slot >= 0 &&
+                        request_runtime.can_publish(runtime_id(id_task),
+                                                    static_cast<server_request_registry::slot_id>(id_slot));
+    const bool final = kind == server_queue_result_kind::final;
+    const bool publish = active &&
+                         (!final || request_runtime.release_slot(
+                                        runtime_id(id_task),
+                                        static_cast<server_request_registry::slot_id>(id_slot), at_us));
+    if (publish) {
+        GGML_ASSERT(result && result->id == id_task);
+        // Keep the durable deadline/terminal decision and response insertion in
+        // one serialized transaction. A concurrent cancel or expiry therefore
+        // orders wholly before or wholly after this publication.
+        response.send(std::move(result));
+    }
+    lock.unlock();
+    notify_expired(expired);
+    return publish;
+}
+
 bool server_queue::release_slot(int id_task, int id_slot) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     const uint64_t               at_us    = now_us();
