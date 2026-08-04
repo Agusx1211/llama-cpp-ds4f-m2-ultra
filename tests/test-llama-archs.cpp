@@ -946,7 +946,7 @@ static bool test_dsv4_page_delta_boundaries(size_t seed, ggml_backend_dev_t dev)
     };
 
     const auto token_3 = decode_span(0, 3, "page-delta token-count 3");
-    GGML_ASSERT(dsv4_audit_has_family_range(token_3, LLAMA_DSV4_MEMORY_RAW, true));
+    GGML_ASSERT(dsv4_audit_has_family_range(token_3, LLAMA_DSV4_MEMORY_RAW, false));
     GGML_ASSERT(!dsv4_audit_has_family_range(token_3, LLAMA_DSV4_MEMORY_CSA, true));
     GGML_ASSERT(!dsv4_audit_has_family_range(token_3, LLAMA_DSV4_MEMORY_LID, true));
     GGML_ASSERT(!dsv4_audit_has_family_range(token_3, LLAMA_DSV4_MEMORY_HCA, false));
