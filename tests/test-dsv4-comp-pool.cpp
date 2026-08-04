@@ -818,6 +818,69 @@ void test_prepared_resident_attach_transaction() {
                   "release prepared retry lease");
 }
 
+void test_prepared_resident_detach_rollback() {
+    llama_dsv4_comp_pool pool({ 16, 16 });
+    const auto created = pool.create_handle();
+    expect_status(created.status, llama_dsv4_comp_status::ok, "create detach rollback handle");
+    expect_status(pool.bind(3, created.handle), llama_dsv4_comp_status::ok, "bind detach rollback handle");
+
+    auto cancelled = pool.quote_detach(3);
+    expect_status(cancelled.status, llama_dsv4_comp_status::ok, "quote cancellable detach");
+    expect_status(pool.rollback_detach(cancelled), llama_dsv4_comp_status::ok, "cancel prepared detach");
+    expect_status(pool.rollback_detach(cancelled), llama_dsv4_comp_status::ok, "repeat prepared detach cancel");
+    expect_status(pool.detach(cancelled).status, llama_dsv4_comp_status::stale_quote,
+                  "cancelled detach quote committed");
+
+    auto prepared = pool.quote_detach(3);
+    expect_status(prepared.status, llama_dsv4_comp_status::ok, "quote rollback detach");
+    const auto resident = pool.detach(prepared);
+    expect_status(resident.status, llama_dsv4_comp_status::ok, "commit rollback detach");
+    llama_dsv4_comp_handle_id rebound = 0;
+    expect_status(pool.get_binding(3, rebound), llama_dsv4_comp_status::binding_not_found,
+                  "detached execution retained binding");
+    prepared.execution_id              = 0;
+    prepared.pool_epoch                = UINT64_MAX;
+    prepared.resident.pool_id          = UINT64_MAX;
+    prepared.resident.lease_generation = UINT64_MAX;
+
+    size_t rollback_allocations = 0;
+    {
+        allocation_scope allocations;
+        const auto status = pool.rollback_detach(prepared);
+        rollback_allocations = allocations.finish();
+        expect_status(status, llama_dsv4_comp_status::ok, "rollback committed detach");
+    }
+    expect(rollback_allocations == 0, "committed detach rollback allocated");
+    expect_status(pool.rollback_detach(prepared), llama_dsv4_comp_status::ok,
+                  "committed detach rollback was not idempotent");
+    expect_status(pool.get_binding(3, rebound), llama_dsv4_comp_status::ok,
+                  "detach rollback did not restore binding");
+    expect(rebound == created.handle, "detach rollback restored a different handle");
+    expect_status(pool.release(resident.resident), llama_dsv4_comp_status::stale_handle,
+                  "rolled-back resident lease remained valid");
+
+    const auto retried = pool.detach(pool.quote_detach(3));
+    expect_status(retried.status, llama_dsv4_comp_status::ok, "retry detach after rollback");
+    expect(retried.resident.lease_generation > resident.resident.lease_generation,
+           "detach rollback allowed resident generation ABA");
+    expect_status(pool.release(retried.resident), llama_dsv4_comp_status::ok,
+                  "release retried resident handle");
+
+    const auto other_created = pool.create_handle();
+    expect_status(other_created.status, llama_dsv4_comp_status::ok, "create stale rollback handle");
+    expect_status(pool.bind(4, other_created.handle), llama_dsv4_comp_status::ok, "bind stale rollback handle");
+    auto stale = pool.quote_detach(4);
+    expect_status(pool.detach(stale).status, llama_dsv4_comp_status::ok, "commit stale rollback detach");
+    const auto mutation = pool.create_handle();
+    expect_status(mutation.status, llama_dsv4_comp_status::ok, "mutate pool after detach");
+    expect_status(pool.rollback_detach(stale), llama_dsv4_comp_status::stale_quote,
+                  "detach rollback ignored intervening mutation");
+    expect_status(pool.release(stale.resident), llama_dsv4_comp_status::ok,
+                  "release stale rollback resident");
+    expect_status(pool.remove_handle(mutation.handle), llama_dsv4_comp_status::ok,
+                  "remove stale rollback mutation handle");
+}
+
 void test_bounded_ticket_history_and_pool_identity() {
     {
         llama_dsv4_comp_pool   pool({ 0, 0 });
@@ -1046,6 +1109,7 @@ int main() {
         test_exhaustion_immutability_and_ticket_idempotence();
         test_copy_remove_cycles_return_accounting_baseline();
         test_resident_detach_attach_release_contract();
+        test_prepared_resident_detach_rollback();
         test_prepared_resident_attach_transaction();
         test_bounded_ticket_history_and_pool_identity();
         test_sixty_four_handle_rounded_capacity_contract();

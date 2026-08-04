@@ -102,6 +102,12 @@ enum class resident_attach_state : uint8_t {
     rolled_back,
 };
 
+enum class resident_detach_state : uint8_t {
+    prepared,
+    committed,
+    rolled_back,
+};
+
 uint32_t populated_rows_in_segment(uint64_t visible_rows, uint32_t logical_segment) {
     const uint64_t start = static_cast<uint64_t>(logical_segment) * LLAMA_DSV4_COMP_SEGMENT_ROWS;
     if (visible_rows <= start) {
@@ -171,6 +177,9 @@ struct llama_dsv4_comp_detach_plan {
     llama_dsv4_comp_handle_id            handle                       = 0;
     uint64_t                             expected_handle_generation   = 0;
     uint64_t                             expected_resident_generation = 0;
+    uint64_t                             commit_epoch                 = 0;
+    std::map<uint32_t, llama_dsv4_comp_handle_id> detached_binding;
+    resident_detach_state                state = resident_detach_state::prepared;
 };
 
 struct llama_dsv4_comp_attach_plan {
@@ -692,7 +701,8 @@ llama_dsv4_comp_detach_quote llama_dsv4_comp_pool::quote_detach(uint32_t executi
 
 llama_dsv4_comp_resident_result llama_dsv4_comp_pool::detach(const llama_dsv4_comp_detach_quote & quote) {
     llama_dsv4_comp_resident_result result;
-    if (!quote.plan || quote.plan->owner != pimpl->identity) {
+    if (!quote.plan || quote.plan->owner != pimpl->identity ||
+        quote.plan->state != resident_detach_state::prepared) {
         result.status = llama_dsv4_comp_status::stale_quote;
         return result;
     }
@@ -718,10 +728,19 @@ llama_dsv4_comp_resident_result llama_dsv4_comp_pool::detach(const llama_dsv4_co
         return result;
     }
 
-    pimpl->bindings.erase(binding_it);
+    auto node = pimpl->bindings.extract(binding_it);
+    auto retained = quote.plan->detached_binding.insert(std::move(node));
+    if (!retained.inserted) {
+        const auto restored = pimpl->bindings.insert(std::move(retained.node));
+        (void) restored;
+        result.status = llama_dsv4_comp_status::stale_quote;
+        return result;
+    }
     handle_it->second.resident_owned = true;
     ++handle_it->second.resident_generation;
     ++pimpl->epoch;
+    quote.plan->commit_epoch = pimpl->epoch;
+    quote.plan->state        = resident_detach_state::committed;
     result.status   = llama_dsv4_comp_status::ok;
     result.resident = {
         pimpl->identity->id,
@@ -730,6 +749,49 @@ llama_dsv4_comp_resident_result llama_dsv4_comp_pool::detach(const llama_dsv4_co
         handle_it->second.resident_generation,
     };
     return result;
+}
+
+llama_dsv4_comp_status llama_dsv4_comp_pool::rollback_detach(
+        const llama_dsv4_comp_detach_quote & quote) {
+    if (!quote.plan || quote.plan->owner != pimpl->identity) {
+        return llama_dsv4_comp_status::stale_quote;
+    }
+    if (quote.plan->state == resident_detach_state::rolled_back) {
+        return llama_dsv4_comp_status::ok;
+    }
+    if (quote.plan->state == resident_detach_state::prepared) {
+        quote.plan->state = resident_detach_state::rolled_back;
+        return llama_dsv4_comp_status::ok;
+    }
+    if (pimpl->busy()) {
+        return llama_dsv4_comp_status::busy;
+    }
+    if (quote.plan->commit_epoch != pimpl->epoch) {
+        return llama_dsv4_comp_status::stale_quote;
+    }
+
+    const auto handle_it = pimpl->handles.find(quote.plan->handle);
+    if (handle_it == pimpl->handles.end() || !handle_it->second.resident_owned ||
+        handle_it->second.generation != quote.plan->expected_handle_generation ||
+        handle_it->second.resident_generation != quote.plan->expected_resident_generation + 1 ||
+        pimpl->bindings.count(quote.plan->execution_id) != 0 || pimpl->is_bound(quote.plan->handle)) {
+        return llama_dsv4_comp_status::stale_quote;
+    }
+
+    auto node = quote.plan->detached_binding.extract(quote.plan->execution_id);
+    if (node.empty()) {
+        return llama_dsv4_comp_status::stale_quote;
+    }
+    auto inserted = pimpl->bindings.insert(std::move(node));
+    if (!inserted.inserted) {
+        const auto restored = quote.plan->detached_binding.insert(std::move(inserted.node));
+        (void) restored;
+        return llama_dsv4_comp_status::stale_quote;
+    }
+    handle_it->second.resident_owned = false;
+    ++pimpl->epoch;
+    quote.plan->state = resident_detach_state::rolled_back;
+    return llama_dsv4_comp_status::ok;
 }
 
 llama_dsv4_comp_attach_quote llama_dsv4_comp_pool::quote_attach(

@@ -139,7 +139,7 @@ struct llama_dsv4_comp_detach_quote {
     llama_dsv4_comp_resident_handle resident;
 
   private:
-    std::shared_ptr<const llama_dsv4_comp_detach_plan> plan;
+    std::shared_ptr<llama_dsv4_comp_detach_plan> plan;
     friend class llama_dsv4_comp_pool;
 };
 
@@ -252,12 +252,14 @@ class llama_dsv4_comp_pool {
 
     // quote_detach is a fail-before-mutation preflight. detach consumes the
     // exact quote and transfers one uniquely bound compressed root into a
-    // generation-checked resident lease. Prepared attach preallocates its map
-    // node and can be committed and rolled back without allocation. A rollback
-    // after commit restores the exact resident lease if no intervening pool
-    // mutation occurred. release is the only operation that destroys it.
+    // generation-checked resident lease. rollback_detach restores the original
+    // execution binding without allocation if no intervening mutation occurred.
+    // Prepared attach likewise preallocates its map node and can be committed
+    // and rolled back without allocation. release is the only operation that
+    // destroys a resident root.
     llama_dsv4_comp_detach_quote    quote_detach(uint32_t execution_id) const;
     llama_dsv4_comp_resident_result detach(const llama_dsv4_comp_detach_quote & quote);
+    llama_dsv4_comp_status          rollback_detach(const llama_dsv4_comp_detach_quote & quote);
     llama_dsv4_comp_attach_quote    quote_attach(llama_dsv4_comp_resident_handle resident,
                                                  uint32_t execution_id) const;
     llama_dsv4_comp_status          commit_attach(const llama_dsv4_comp_attach_quote & quote);
