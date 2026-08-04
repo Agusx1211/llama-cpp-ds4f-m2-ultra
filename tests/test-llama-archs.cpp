@@ -954,6 +954,25 @@ static llama_dsv4_sparse_page_delta_test_audit dsv4_assert_page_delta_audit(bool
     return audit;
 }
 
+static void dsv4_assert_admission_quote_matches_audit(
+        const llama_kv_admission_quote & quote,
+        const llama_dsv4_sparse_page_delta_test_audit & audit) {
+    uint64_t target_mappings = 0;
+    uint64_t required_pages = 0;
+    uint64_t new_pages = 0;
+    uint64_t cow_pages = 0;
+    for (const auto & pool : audit.pools) {
+        target_mappings += pool.reserved_quote.target_mappings;
+        required_pages += pool.reserved_quote.required_pages;
+        new_pages += pool.reserved_quote.new_pages;
+        cow_pages += pool.reserved_quote.cow_pages;
+    }
+    GGML_ASSERT(target_mappings == quote.target_mappings);
+    GGML_ASSERT(required_pages == quote.required_pages);
+    GGML_ASSERT(new_pages == quote.new_pages);
+    GGML_ASSERT(cow_pages == quote.cow_pages);
+}
+
 static bool dsv4_audit_has_family_range(const llama_dsv4_sparse_page_delta_test_audit & audit,
                                         llama_dsv4_memory_family                        family,
                                         bool                                            zero_offset) {
@@ -1155,6 +1174,58 @@ static bool test_dsv4_admission_lifecycle(size_t seed, ggml_backend_dev_t dev) {
     GGML_ASSERT(dsv4_usage_snapshot_equal(baseline, memory->memory_usage_snapshot()) &&
             "armed prefill cancellation leaked reserved pages");
 
+    // Admit a fresh sequence beside the exact next position of an already
+    // populated sequence. The two ranges must remain one reservation so the
+    // mixed preflight is fully covered rather than falling back after launch.
+    ticket = nullptr;
+    GGML_ASSERT(llama_kv_admission_reserve_ranges(test.lctx.get(), &single, 1, &quote, &ticket) ==
+            LLAMA_KV_ADMISSION_FEASIBLE);
+    GGML_ASSERT(ticket != nullptr && llama_kv_admission_arm(ticket));
+    const auto continuation_tokens = get_tokens(8, 128, seed + 72);
+    for (uint32_t pos = 0; pos < 4; ++pos) {
+        test.add(continuation_tokens[pos], pos, { 0 });
+    }
+    test.decode("admission continuation source");
+    llama_kv_admission_free(ticket);
+
+    const std::array<llama_kv_admission_span, 2> continuation = {{
+        { 1, 0, 7 },
+        { 0, 4, 5 },
+    }};
+    llama_kv_admission_quote continuation_quote = {};
+    GGML_ASSERT(llama_kv_admission_quote_ranges(
+            test.lctx.get(), continuation.data(), continuation.size(), &continuation_quote) ==
+            LLAMA_KV_ADMISSION_FEASIBLE);
+    GGML_ASSERT(continuation_quote.target_mappings > 0);
+    const llama_kv_admission_span stale_frontier = { 0, 3, 5 };
+    GGML_ASSERT(llama_kv_admission_quote_ranges(test.lctx.get(), &stale_frontier, 1, &quote) ==
+            LLAMA_KV_ADMISSION_INVALID);
+
+    {
+        dsv4_page_delta_audit_scope continuation_audit_scope;
+        llama_kv_cache_dsv4_test_reset_page_delta_audit();
+        ticket = nullptr;
+        GGML_ASSERT(llama_kv_admission_reserve_ranges(
+                test.lctx.get(), continuation.data(), continuation.size(), &continuation_quote, &ticket) ==
+                LLAMA_KV_ADMISSION_FEASIBLE);
+        GGML_ASSERT(ticket != nullptr && llama_kv_admission_arm(ticket));
+        test.clear_batch();
+        test.add(continuation_tokens[4], 4, { 0 });
+        for (uint32_t pos = 0; pos < 3; ++pos) {
+            test.add(continuation_tokens[pos + 5], pos, { 1 });
+        }
+        test.decode("mixed active continuation admission");
+        const auto continuation_audit = dsv4_assert_page_delta_audit(true, false);
+        dsv4_assert_admission_quote_matches_audit(continuation_quote, continuation_audit);
+        llama_kv_admission_free(ticket);
+    }
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 0) == 4);
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 1) == 2);
+
+    llama_memory_clear(llama_get_memory(test.lctx.get()), true);
+    GGML_ASSERT(dsv4_usage_footprint_equal(baseline, memory->memory_usage_snapshot()) &&
+            "mixed continuation admission did not return to baseline after logical clear");
+
     const std::array<llama_kv_admission_span, 2> family = {{
         { 0, 0, 8 },
         { 1, 0, 7 },
@@ -1177,20 +1248,7 @@ static bool test_dsv4_admission_lifecycle(size_t seed, ggml_backend_dev_t dev) {
     const auto audit = dsv4_assert_page_delta_audit(true, false);
     GGML_ASSERT(audit.family_range_count[LLAMA_DSV4_MEMORY_RAW] > 0);
     GGML_ASSERT(audit.family_range_bytes[LLAMA_DSV4_MEMORY_RAW] > 0);
-    uint64_t audited_target_mappings = 0;
-    uint64_t audited_required_pages = 0;
-    uint64_t audited_new_pages = 0;
-    uint64_t audited_cow_pages = 0;
-    for (const auto & pool : audit.pools) {
-        audited_target_mappings += pool.reserved_quote.target_mappings;
-        audited_required_pages += pool.reserved_quote.required_pages;
-        audited_new_pages += pool.reserved_quote.new_pages;
-        audited_cow_pages += pool.reserved_quote.cow_pages;
-    }
-    GGML_ASSERT(audited_target_mappings == quote.target_mappings);
-    GGML_ASSERT(audited_required_pages == quote.required_pages);
-    GGML_ASSERT(audited_new_pages == quote.new_pages);
-    GGML_ASSERT(audited_cow_pages == quote.cow_pages);
+    dsv4_assert_admission_quote_matches_audit(quote, audit);
     llama_kv_admission_free(ticket);
     GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 0) == 3);
     GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 1) == 2);

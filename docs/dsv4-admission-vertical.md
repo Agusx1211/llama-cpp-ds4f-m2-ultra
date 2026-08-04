@@ -8,15 +8,17 @@ Ultra geometry:
 - exactly two server slots with unified elastic KV (`-np 2 -kvu`);
 - context shifting and multimodal input disabled;
 - full uncached prompts (the vertical forces `cache_prompt=false`);
-- no global or per-request LoRA adapters; and
-- an idle launch cohort. A one-slot request waits while the other slot is
-  active; a parallel two-completion family is quoted and reserved atomically.
+- no global or per-request LoRA adapters;
+- atomic admission for a parallel two-completion family; and
+- one fresh singleton beside one independent active generator when both output
+  budgets are finite. The active slot's exact next position joins the new
+  prompt reservation; other mixed-active shapes still wait.
 
-That intentional one-slot wait remains visible through the normal request
-snapshot and admin-dashboard event stream as reason `admission_wait`. Generic
-slot exhaustion continues to report `capacity_blocked`, so an operator playing
-with this vertical can distinguish its physical-admission rule from ordinary
-server contention.
+An intentional policy or physical-capacity wait remains visible through the
+normal request snapshot and admin-dashboard event stream as reason
+`admission_wait`. Generic slot exhaustion continues to report
+`capacity_blocked`, so an operator playing with this vertical can distinguish
+its physical-admission rule from ordinary server contention.
 
 Enable it in addition to the normal target launch command:
 
@@ -35,18 +37,19 @@ pressure is deferred while another request owns the cohort; pressure with the
 cohort idle returns HTTP 503.
 
 The lower API first produces a mutation-free range quote, then atomically
-reserves all family ranges. Arming the ticket does not map pages. The first
-covered DSV4 preflight consumes and commits the exact reservation at the normal
-last-safe point before graph submission. Destroying the ticket before that
-preflight cancels the reservation; after consumption, ordinary sequence clear
-owns the committed mappings.
+reserves all ranges. A range begins at zero for a fresh sequence or at the exact
+frontier of an active sequence. Arming the ticket does not map pages. The first
+fully covered DSV4 preflight consumes and commits the exact reservation at the
+normal last-safe point before graph submission. Destroying the ticket before
+that preflight cancels the reservation; after consumption, ordinary sequence
+clear owns the committed mappings.
 
 The range planner is O(layers × family members), not O(prompt tokens). The
 unified runtime must select affine compressed sparse storage; aggregate
-compressed pools, prompt reuse, context shift, mixed active/admitted batches,
-and configurations wider than two slots remain outside this vertical. Fixed
-split KV is fully allocated at startup and therefore cannot exercise the
-physical sparse-page admission contract.
+compressed pools, prompt reuse, context shift, unlimited or shared-family
+active continuations, and configurations wider than two slots remain outside
+this vertical. Fixed split KV is fully allocated at startup and therefore
+cannot exercise the physical sparse-page admission contract.
 
 Host validation:
 
@@ -62,5 +65,6 @@ ctest --test-dir build-host --output-on-failure \
 
 The sparse reservation lifecycle test compiles on the host and skips without
 target Metal. Run the last command from a Metal-enabled M2 Ultra build to check
-quote immutability, armed-ticket cancellation, two-member preflight consumption,
-quote identity, and return to baseline after sequence clear.
+quote immutability, armed-ticket cancellation, mixed active/fresh and
+two-member preflight consumption, quote identity, and return to baseline after
+sequence clear.

@@ -1962,14 +1962,34 @@ private:
             return result;
         }
 
-        // The first vertical admits only an idle cohort. This guarantees the
-        // first target preflight contains no unrelated sequence whose pages
-        // would need a separate reservation while the family ticket commits.
-        const bool other_active = std::any_of(slots.begin(), slots.end(), [&](const server_slot & slot) {
-            return slot.is_processing() &&
-                    std::find(family_slots.begin(), family_slots.end(), &slot) == family_slots.end();
-        });
-        if (other_active) {
+        // Widen the idle-only prototype by exactly one vertical slice: a fresh
+        // singleton may share the next target batch with one independent,
+        // finite generator. Its next logical position joins the same atomic
+        // reservation, so consume_admission() still requires full batch
+        // coverage and never falls back after launch.
+        std::vector<server_slot *> active_continuations;
+        for (server_slot & slot : slots) {
+            if (!slot.is_processing() ||
+                    std::find(family_slots.begin(), family_slots.end(), &slot) != family_slots.end()) {
+                continue;
+            }
+
+            const int32_t effective_n_predict = slot.task->params.n_predict != -1 ?
+                    slot.task->params.n_predict : params_base.n_predict;
+            const bool finite_independent_generator =
+                    family_slots.size() == 1 &&
+                    slot.state == SLOT_STATE_GENERATING &&
+                    !slot.task->is_parent() && !slot.task->is_child() &&
+                    slot.has_next_token &&
+                    effective_n_predict >= 0 && slot.n_decoded < effective_n_predict;
+            if (!finite_independent_generator) {
+                result.status = admission_gate_status::deferred;
+                return result;
+            }
+
+            active_continuations.push_back(&slot);
+        }
+        if (family_slots.size() + active_continuations.size() > 2) {
             result.status = admission_gate_status::deferred;
             return result;
         }
@@ -2015,9 +2035,22 @@ private:
             spans.push_back({ slot.id, 0, (llama_pos) plan.span_tokens });
         }
 
+        for (server_slot * active : active_continuations) {
+            const llama_pos pos_begin = active->prompt.tokens.pos_next();
+            if (pos_begin < 0 || pos_begin >= active->n_ctx) {
+                result.status = admission_gate_status::deferred;
+                return result;
+            }
+            spans.push_back({ active->id, pos_begin, pos_begin + 1 });
+        }
+
         llama_kv_admission_quote quote = {};
         const auto quote_status = llama_kv_admission_quote_ranges(ctx_tgt, spans.data(), spans.size(), &quote);
         if (quote_status == LLAMA_KV_ADMISSION_PRESSURE) {
+            if (!active_continuations.empty()) {
+                result.status = admission_gate_status::deferred;
+                return result;
+            }
             send_error(result_task, "temporary DSV4 physical KV capacity is unavailable", ERROR_TYPE_UNAVAILABLE);
             result.status = admission_gate_status::rejected;
             return result;
@@ -2033,6 +2066,10 @@ private:
                 ctx_tgt, spans.data(), spans.size(), &quote, &ticket);
         result.ticket.reset(ticket);
         if (reserve_status == LLAMA_KV_ADMISSION_PRESSURE) {
+            if (!active_continuations.empty()) {
+                result.status = admission_gate_status::deferred;
+                return result;
+            }
             send_error(result_task, "temporary DSV4 physical KV capacity is unavailable", ERROR_TYPE_UNAVAILABLE);
             result.status = admission_gate_status::rejected;
             return result;

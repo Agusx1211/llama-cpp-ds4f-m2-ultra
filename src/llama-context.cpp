@@ -2293,9 +2293,12 @@ llama_kv_admission_status llama_context::kv_admission_prepare_ranges(
     bool seen[2] = { false, false };
     for (size_t i = 0; i < n_spans; ++i) {
         const auto & span = spans[i];
+        const llama_pos seq_pos_max =
+                span.seq_id >= 0 && span.seq_id < 2 ? memory->seq_pos_max(span.seq_id) : -1;
+        const bool starts_at_frontier = seq_pos_max < 0 ? span.pos_begin == 0 : span.pos_begin == seq_pos_max + 1;
         if (span.seq_id < 0 || span.seq_id >= 2 || seen[span.seq_id] ||
-                span.pos_begin != 0 || span.pos_end <= span.pos_begin ||
-                (uint32_t) span.pos_end > n_ctx_seq() || memory->seq_pos_max(span.seq_id) >= 0) {
+                span.pos_begin < 0 || span.pos_end <= span.pos_begin ||
+                (uint32_t) span.pos_end > n_ctx_seq() || !starts_at_frontier) {
             return quote.status;
         }
         seen[span.seq_id] = true;

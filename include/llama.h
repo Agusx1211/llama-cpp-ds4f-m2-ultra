@@ -975,12 +975,12 @@ extern "C" {
         uint64_t physical_pages;
     };
 
-    // Target-specific, prefill admission contract for DeepSeek V4. A span is
-    // one contiguous future logical range for one execution sequence. The
-    // server currently uses [0, prompt + decode runway) spans in the target
-    // unified elastic KV mode, with prompt reuse disabled, so the allocator
-    // can quote the exact virtual destinations before any family member starts
-    // prefill.
+    // Target-specific admission contract for DeepSeek V4. A span is one
+    // contiguous future logical range for one execution sequence. It must
+    // begin at zero for an empty sequence or exactly one position beyond an
+    // active sequence's current frontier. The server uses this in target
+    // unified elastic KV mode, with prompt reuse disabled, to admit a fresh
+    // prefill alone or atomically with one finite active continuation.
     struct llama_kv_admission_span {
         llama_seq_id seq_id;
         llama_pos    pos_begin;
@@ -1021,9 +1021,9 @@ extern "C" {
 
     // Atomically reserve the exact quoted ranges. Deleting an unarmed ticket
     // rolls its reservation back. Arming transfers the reservation to the
-    // DSV4 memory; the first covered prefill preflight consumes and commits it
-    // at the existing last-safe point before graph submission. Deleting an
-    // armed but unconsumed ticket also rolls the reservation back.
+    // DSV4 memory; the first preflight fully covered by the ticket consumes and
+    // commits it at the existing last-safe point before graph submission.
+    // Deleting an armed but unconsumed ticket also rolls the reservation back.
     LLAMA_API enum llama_kv_admission_status llama_kv_admission_reserve_ranges(
             struct llama_context * ctx,
             const struct llama_kv_admission_span * spans,
