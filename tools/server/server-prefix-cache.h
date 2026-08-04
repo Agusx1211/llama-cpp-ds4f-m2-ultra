@@ -173,6 +173,127 @@ class server_prefix_policy {
     std::unique_ptr<impl> data;
 };
 
+// Session IDs are compared together with every compatibility field. Internal
+// hashes may narrow lookup candidates but never authorize cross-session or
+// cross-model reuse.
+struct server_prefix_session_key {
+    server_prefix_identity identity;
+    std::string            session_id;
+
+    bool operator==(const server_prefix_session_key & other) const;
+};
+
+struct server_prefix_session_owner {
+    uint64_t handle_id  = 0;
+    uint64_t generation = 0;
+
+    bool operator==(const server_prefix_session_owner & other) const;
+};
+
+struct server_prefix_session_version {
+    server_prefix_session_owner owner;
+    uint64_t                    turn_id = 0;
+
+    bool operator==(const server_prefix_session_version & other) const;
+};
+
+struct server_prefix_session_anchor {
+    server_prefix_policy_key    prefix;
+    server_prefix_session_owner owner;
+    uint64_t                    turn_id            = 0;
+    uint64_t                    unique_bytes       = 0;
+    double                      saved_prefill_ms   = 0.0;
+    uint32_t                    message_end_tokens = 0;
+
+    bool operator==(const server_prefix_session_anchor & other) const;
+};
+
+struct server_prefix_session_record {
+    server_prefix_session_anchor anchor;
+    uint64_t                     expires_at_tick = 0;
+
+    bool operator==(const server_prefix_session_record & other) const;
+};
+
+struct server_prefix_session_update {
+    server_prefix_session_key                    key;
+    server_prefix_session_anchor                 anchor;
+    std::optional<server_prefix_session_version> expected_current;
+    uint64_t                                     now_tick = 0;
+};
+
+enum class server_prefix_session_status : uint8_t {
+    inserted,
+    replaced,
+    invalid_argument,
+    capacity,
+    conflict,
+    stale_generation,
+    stale_turn,
+};
+
+struct server_prefix_session_result {
+    server_prefix_session_status                status = server_prefix_session_status::invalid_argument;
+    std::optional<server_prefix_session_record> displaced;
+    uint64_t                                    expires_at_tick = 0;
+};
+
+struct server_prefix_session_config {
+    size_t   max_sessions           = 8192;
+    size_t   max_session_id_bytes   = 256;
+    size_t   max_architecture_bytes = 64;
+    // The serialized owner chooses a monotonic tick unit and supplies every
+    // now_tick. Entries are live on [publication, expires_at_tick).
+    uint64_t ttl_ticks              = 3600000;
+
+    // Deterministic test seam. Exact key equality remains authoritative.
+    bool force_hash_collisions = false;
+};
+
+struct server_prefix_session_stats {
+    size_t   entries      = 0;
+    size_t   active       = 0;
+    size_t   expired      = 0;
+    size_t   peak_entries = 0;
+    uint64_t insertions   = 0;
+    uint64_t replacements = 0;
+    uint64_t expirations  = 0;
+    uint64_t erases       = 0;
+};
+
+struct server_prefix_session_expired {
+    server_prefix_session_key    key;
+    server_prefix_session_record record;
+};
+
+class server_prefix_session_cache {
+  public:
+    explicit server_prefix_session_cache(server_prefix_session_config config = {});
+    ~server_prefix_session_cache();
+
+    server_prefix_session_cache(const server_prefix_session_cache &)             = delete;
+    server_prefix_session_cache & operator=(const server_prefix_session_cache &) = delete;
+
+    server_prefix_session_result replace(const server_prefix_session_update & update);
+
+    std::optional<server_prefix_session_record> lookup(const server_prefix_session_key & key, uint64_t now_tick) const;
+
+    std::optional<server_prefix_session_record> erase(const server_prefix_session_key &     key,
+                                                      const server_prefix_session_version & expected);
+
+    // Expired records deliberately consume bounded capacity until this call
+    // returns their exact owners for physical cleanup. A successful replace
+    // similarly returns its one displaced record; failures mutate nothing.
+    std::vector<server_prefix_session_expired> expire(uint64_t now_tick);
+
+    void                        clear();
+    server_prefix_session_stats stats(uint64_t now_tick) const;
+
+  private:
+    struct impl;
+    std::unique_ptr<impl> data;
+};
+
 class server_prefix_radix {
   public:
     explicit server_prefix_radix(server_prefix_radix_config config = {});
