@@ -410,8 +410,14 @@ model_file_snapshots verify_model_files(const std::string &                 mode
 }
 
 ggml_backend_dev_t verify_target_metal_device() {
-    ggml_backend_reg_t metal = ggml_backend_reg_by_name("Metal");
-    expect(metal != nullptr, "exact-model gate requires the Metal backend registry");
+    // The in-tree Metal backend advertises the historical short registry name
+    // "MTL" (GGML_METAL_NAME); accept the older "Metal" spelling as a
+    // compatibility fallback for alternate backend builds.
+    ggml_backend_reg_t metal = ggml_backend_reg_by_name("MTL");
+    if (metal == nullptr) {
+        metal = ggml_backend_reg_by_name("Metal");
+    }
+    expect(metal != nullptr, "exact-model gate requires the Metal/MTL backend registry");
     ggml_backend_dev_t target = nullptr;
     for (size_t index = 0; index < ggml_backend_reg_dev_count(metal); ++index) {
         ggml_backend_dev_t device = ggml_backend_reg_dev_get(metal, index);
