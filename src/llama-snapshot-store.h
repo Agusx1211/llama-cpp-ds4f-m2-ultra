@@ -103,11 +103,18 @@ struct llama_snapshot_faults {
     uint64_t                   fail_after_bytes            = std::numeric_limits<uint64_t>::max();
     llama_snapshot_write_fault write_fault                 = llama_snapshot_write_fault::none;
     bool                       fail_before_manifest_commit = false;
+    // Test-only deterministic race seams around the publication fence. The
+    // store calls these after its final ordinary cancellation check.
+    std::function<void()>      before_manifest_commit_fence;
+    std::function<void()>      after_manifest_commit_fence;
     // Test-only crash seam. Ordinary errors and cancellation always clean up.
     bool                       preserve_failed_generation  = false;
 };
 
 using llama_snapshot_cancel_check = std::function<bool(uint32_t durable_chunks)>;
+// Called exactly once immediately before current.manifest publication. A true
+// result establishes that cancellation is too late; false aborts publication.
+using llama_snapshot_commit_fence = std::function<bool()>;
 
 struct llama_snapshot_chunk_info {
     uint32_t              index          = 0;
@@ -147,6 +154,32 @@ struct llama_snapshot_read_result {
     int                   os_error = 0;
 };
 
+struct llama_snapshot_read_into_result {
+    llama_snapshot_status status        = llama_snapshot_status::invalid_argument;
+    uint64_t              payload_bytes = 0;
+    int                   os_error      = 0;
+};
+
+struct llama_snapshot_chunk_source_result {
+    llama_snapshot_status status   = llama_snapshot_status::invalid_argument;
+    const uint8_t *       data     = nullptr;
+    uint64_t              size     = 0;
+    int                   os_error = 0;
+};
+
+// A streamed write acquires chunks in ascending logical order. Every
+// successful acquire is paired with exactly one release after the store has
+// finished hashing and writing that view. Implementations may block in
+// acquire() while a bounded staging producer makes the requested chunk ready.
+class llama_snapshot_chunk_source_i {
+  public:
+    virtual ~llama_snapshot_chunk_source_i() = default;
+
+    virtual llama_snapshot_chunk_source_result acquire(
+            uint32_t index, uint64_t logical_offset, uint64_t size) noexcept = 0;
+    virtual void release(uint32_t index) noexcept = 0;
+};
+
 struct llama_snapshot_cleanup_result {
     llama_snapshot_status status   = llama_snapshot_status::invalid_argument;
     uint32_t              removed  = 0;
@@ -166,9 +199,24 @@ class llama_snapshot_store {
                                                  const llama_snapshot_cancel_check & cancelled = {},
                                                  const llama_snapshot_faults &       faults    = {});
 
+    // Worker-facing streaming seam. It preserves the same publication and
+    // cleanup protocol as write_generation() without requiring a full payload
+    // vector. Calls remain externally serialized per store.
+    llama_snapshot_write_result write_generation_streamed(
+            const llama_snapshot_metadata &     metadata,
+            uint64_t                            total_payload_bytes,
+            llama_snapshot_chunk_source_i &     source,
+            const llama_snapshot_cancel_check & cancelled = {},
+            const llama_snapshot_faults &       faults       = {},
+            const llama_snapshot_commit_fence & commit_fence = {});
+
     llama_snapshot_open_result    open_current(const llama_snapshot_identity & expected_identity) const;
     llama_snapshot_status         validate(const llama_snapshot_manifest & manifest, int * os_error = nullptr) const;
     llama_snapshot_read_result    read_chunk(const llama_snapshot_manifest & manifest, uint32_t chunk_index) const;
+    llama_snapshot_read_into_result read_chunk_into(const llama_snapshot_manifest & manifest,
+                                                    uint32_t chunk_index,
+                                                    uint8_t * destination,
+                                                    size_t destination_size) const;
     llama_snapshot_read_result    read_all(const llama_snapshot_manifest & manifest) const;
     llama_snapshot_cleanup_result cleanup_temporary_generations();
 

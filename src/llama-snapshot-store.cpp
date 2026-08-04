@@ -606,8 +606,92 @@ std::vector<uint8_t> chunk_header(const llama_snapshot_manifest & manifest, cons
 }
 
 void remove_path_best_effort(const fs::path & path) {
-    std::error_code error;
-    fs::remove_all(path, error);
+    try {
+        std::error_code error;
+        fs::remove_all(path, error);
+    } catch (...) {
+    }
+}
+
+struct generation_cleanup_guard {
+    const fs::path & partial_path;
+    const fs::path & final_path;
+    const fs::path & current_tmp;
+    bool             preserve;
+    bool             final_created = false;
+    bool             committed     = false;
+
+    ~generation_cleanup_guard() {
+        if (preserve || committed) {
+            return;
+        }
+        remove_path_best_effort(final_created ? final_path : partial_path);
+        ::unlink(current_tmp.c_str());
+    }
+};
+
+struct chunk_release_guard {
+    llama_snapshot_chunk_source_i * source;
+    uint32_t                         index;
+
+    ~chunk_release_guard() { source->release(index); }
+};
+
+class vector_chunk_source final : public llama_snapshot_chunk_source_i {
+  public:
+    explicit vector_chunk_source(const std::vector<uint8_t> & payload) : payload(payload) {}
+
+    llama_snapshot_chunk_source_result acquire(
+            uint32_t, uint64_t logical_offset, uint64_t size) noexcept override {
+        if (logical_offset > payload.size() || size > payload.size() - logical_offset) {
+            return { llama_snapshot_status::invalid_argument, nullptr, 0, 0 };
+        }
+        return {
+            llama_snapshot_status::ok,
+            payload.data() + static_cast<size_t>(logical_offset),
+            size,
+            0,
+        };
+    }
+
+    void release(uint32_t) noexcept override {}
+
+  private:
+    const std::vector<uint8_t> & payload;
+};
+
+operation_result pread_all(int descriptor, uint8_t * destination, size_t size, off_t offset) {
+    size_t done = 0;
+    while (done < size) {
+        const ssize_t count = ::pread(descriptor, destination + done, size - done, offset + static_cast<off_t>(done));
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return { llama_snapshot_status::io_error, errno };
+        }
+        if (count == 0) {
+            return { llama_snapshot_status::truncated, 0 };
+        }
+        done += static_cast<size_t>(count);
+    }
+    return {};
+}
+
+uint32_t read_u32_le(const uint8_t * bytes) {
+    uint32_t value = 0;
+    for (unsigned shift = 0; shift < 32; shift += 8) {
+        value |= static_cast<uint32_t>(bytes[shift / 8]) << shift;
+    }
+    return value;
+}
+
+uint64_t read_u64_le(const uint8_t * bytes) {
+    uint64_t value = 0;
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+        value |= static_cast<uint64_t>(bytes[shift / 8]) << shift;
+    }
+    return value;
 }
 
 }  // namespace
@@ -698,194 +782,231 @@ llama_snapshot_write_result llama_snapshot_store::write_generation(const llama_s
                                                                    const std::vector<uint8_t> &        payload,
                                                                    const llama_snapshot_cancel_check & cancelled,
                                                                    const llama_snapshot_faults &       faults) {
+    vector_chunk_source source(payload);
+    return write_generation_streamed(metadata, payload.size(), source, cancelled, faults);
+}
+
+llama_snapshot_write_result llama_snapshot_store::write_generation_streamed(
+        const llama_snapshot_metadata &     metadata,
+        uint64_t                            total_payload_bytes,
+        llama_snapshot_chunk_source_i &     source,
+        const llama_snapshot_cancel_check & cancelled,
+        const llama_snapshot_faults &       faults,
+        const llama_snapshot_commit_fence & commit_fence) {
     llama_snapshot_write_result result;
-    result.generation                   = metadata.snapshot_generation;
-    const operation_result config_check = config_status(cfg);
-    if (config_check.status != llama_snapshot_status::ok || metadata.snapshot_generation == 0 ||
-        metadata.request_generation == 0 || !valid_identity(metadata.identity) || faults.max_write_size == 0 ||
-        (faults.write_fault == llama_snapshot_write_fault::none &&
-         faults.fail_after_bytes != std::numeric_limits<uint64_t>::max()) ||
-        payload.size() > cfg.max_snapshot_bytes) {
-        result.status = llama_snapshot_status::invalid_argument;
-        return result;
-    }
-    const uint64_t chunk_count = payload.empty() ?
-                                     0 :
-                                     static_cast<uint64_t>(payload.size()) / cfg.chunk_payload_bytes +
-                                         (static_cast<uint64_t>(payload.size()) % cfg.chunk_payload_bytes != 0);
-    if (chunk_count > cfg.max_chunks) {
-        result.status = llama_snapshot_status::chunk_too_large;
-        return result;
-    }
-    if (cancelled && cancelled(0)) {
-        result.status = llama_snapshot_status::cancelled;
-        return result;
-    }
-
-    const fs::path   root      = fs::u8path(cfg.root_path);
-    operation_result operation = ensure_root(root);
-    if (operation.status != llama_snapshot_status::ok) {
-        result.status   = operation.status;
-        result.os_error = operation.os_error;
-        return result;
-    }
-
-    llama_snapshot_manifest previous;
-    const operation_result  previous_result =
-        load_manifest(cfg, root / "current.manifest", llama_snapshot_status::no_current_generation, previous);
-    const bool has_previous = previous_result.status == llama_snapshot_status::ok;
-    if (!has_previous && previous_result.status != llama_snapshot_status::no_current_generation) {
-        result.status   = previous_result.status;
-        result.os_error = previous_result.os_error;
-        return result;
-    }
-    if (has_previous && (previous.physical_device_id != cfg.physical_device_id ||
-                         previous.physical_device_queues != cfg.physical_device_queues)) {
-        result.status = llama_snapshot_status::device_mismatch;
-        return result;
-    }
-    if (has_previous && previous.identity != metadata.identity) {
-        result.status = llama_snapshot_status::identity_mismatch;
-        return result;
-    }
-    if (has_previous && previous.snapshot_generation == metadata.snapshot_generation) {
-        result.status = llama_snapshot_status::generation_exists;
-        return result;
-    }
-    if (has_previous && previous.snapshot_generation > metadata.snapshot_generation) {
-        result.status = llama_snapshot_status::stale_generation;
-        return result;
-    }
-
-    llama_snapshot_manifest manifest;
-    manifest.format_version         = LLAMA_SNAPSHOT_FORMAT_VERSION;
-    manifest.snapshot_generation    = metadata.snapshot_generation;
-    manifest.request_generation     = metadata.request_generation;
-    manifest.identity               = metadata.identity;
-    manifest.physical_device_id     = cfg.physical_device_id;
-    manifest.physical_device_queues = cfg.physical_device_queues;
-    manifest.chunk_payload_limit    = cfg.chunk_payload_bytes;
-    manifest.total_payload_bytes    = payload.size();
-    manifest.chunks.reserve(static_cast<size_t>(chunk_count));
-    uint64_t offset = 0;
-    for (uint32_t index = 0; index < chunk_count; ++index) {
-        const uint64_t            size = std::min<uint64_t>(cfg.chunk_payload_bytes, payload.size() - offset);
-        llama_snapshot_chunk_info chunk;
-        chunk.index          = index;
-        chunk.logical_offset = offset;
-        chunk.payload_bytes  = size;
-        chunk.checksum       = llama_snapshot_sha256(payload.data() + offset, static_cast<size_t>(size));
-        manifest.chunks.push_back(chunk);
-        offset += size;
-    }
-    const std::vector<uint8_t> manifest_bytes = serialize_manifest(manifest);
-    if (manifest_bytes.size() > cfg.max_manifest_bytes) {
-        result.status = llama_snapshot_status::manifest_too_large;
-        return result;
-    }
-
-    const fs::path  partial_path = root / generation_name(metadata.snapshot_generation, true);
-    const fs::path  final_path   = root / generation_name(metadata.snapshot_generation, false);
-    std::error_code exists_error;
-    if (fs::exists(partial_path, exists_error) || fs::exists(final_path, exists_error) || exists_error) {
-        result.status   = exists_error ? llama_snapshot_status::io_error : llama_snapshot_status::generation_exists;
-        result.os_error = exists_error.value();
-        return result;
-    }
-    std::error_code create_error;
-    if (!fs::create_directory(partial_path, create_error) || create_error) {
-        result.status   = llama_snapshot_status::io_error;
-        result.os_error = create_error.value();
-        return result;
-    }
-
-    bool       final_created = false;
-    const auto fail          = [&](operation_result failure) {
-        if (!faults.preserve_failed_generation) {
-            remove_path_best_effort(final_created ? final_path : partial_path);
-            ::unlink((root / "current.manifest.tmp").c_str());
+    result.generation = metadata.snapshot_generation;
+    try {
+        const operation_result config_check = config_status(cfg);
+        if (config_check.status != llama_snapshot_status::ok || metadata.snapshot_generation == 0 ||
+            metadata.request_generation == 0 || !valid_identity(metadata.identity) || faults.max_write_size == 0 ||
+            (faults.write_fault == llama_snapshot_write_fault::none &&
+             faults.fail_after_bytes != std::numeric_limits<uint64_t>::max()) ||
+            total_payload_bytes > cfg.max_snapshot_bytes) {
+            result.status = llama_snapshot_status::invalid_argument;
+            return result;
         }
-        result.status   = failure.status;
-        result.os_error = failure.os_error;
-        return result;
-    };
-
-    fault_writer writer{ faults };
-    for (const llama_snapshot_chunk_info & chunk : manifest.chunks) {
-        if (cancelled && cancelled(chunk.index)) {
-            return fail({ llama_snapshot_status::cancelled, 0 });
+        const uint64_t chunk_count = total_payload_bytes == 0 ?
+                                         0 :
+                                         total_payload_bytes / cfg.chunk_payload_bytes +
+                                             (total_payload_bytes % cfg.chunk_payload_bytes != 0);
+        if (chunk_count > cfg.max_chunks || chunk_count > UINT32_MAX) {
+            result.status = llama_snapshot_status::chunk_too_large;
+            return result;
         }
-        const std::vector<uint8_t> header = chunk_header(manifest, chunk);
-        operation =
-            write_file(partial_path / chunk_name(chunk.index),
-                       {
-                           { header.data(),                         header.size()                            },
-                           { payload.data() + chunk.logical_offset, static_cast<size_t>(chunk.payload_bytes) }
-        },
-                       writer, true);
+        if (cancelled && cancelled(0)) {
+            result.status = llama_snapshot_status::cancelled;
+            return result;
+        }
+
+        const fs::path   root      = fs::u8path(cfg.root_path);
+        operation_result operation = ensure_root(root);
+        if (operation.status != llama_snapshot_status::ok) {
+            result.status   = operation.status;
+            result.os_error = operation.os_error;
+            return result;
+        }
+
+        llama_snapshot_manifest previous;
+        const operation_result  previous_result =
+            load_manifest(cfg, root / "current.manifest", llama_snapshot_status::no_current_generation, previous);
+        const bool has_previous = previous_result.status == llama_snapshot_status::ok;
+        if (!has_previous && previous_result.status != llama_snapshot_status::no_current_generation) {
+            result.status   = previous_result.status;
+            result.os_error = previous_result.os_error;
+            return result;
+        }
+        if (has_previous && (previous.physical_device_id != cfg.physical_device_id ||
+                             previous.physical_device_queues != cfg.physical_device_queues)) {
+            result.status = llama_snapshot_status::device_mismatch;
+            return result;
+        }
+        if (has_previous && previous.identity != metadata.identity) {
+            result.status = llama_snapshot_status::identity_mismatch;
+            return result;
+        }
+        if (has_previous && previous.snapshot_generation == metadata.snapshot_generation) {
+            result.status = llama_snapshot_status::generation_exists;
+            return result;
+        }
+        if (has_previous && previous.snapshot_generation > metadata.snapshot_generation) {
+            result.status = llama_snapshot_status::stale_generation;
+            return result;
+        }
+
+        llama_snapshot_manifest manifest;
+        manifest.format_version         = LLAMA_SNAPSHOT_FORMAT_VERSION;
+        manifest.snapshot_generation    = metadata.snapshot_generation;
+        manifest.request_generation     = metadata.request_generation;
+        manifest.identity               = metadata.identity;
+        manifest.physical_device_id     = cfg.physical_device_id;
+        manifest.physical_device_queues = cfg.physical_device_queues;
+        manifest.chunk_payload_limit    = cfg.chunk_payload_bytes;
+        manifest.total_payload_bytes    = total_payload_bytes;
+        manifest.chunks.reserve(static_cast<size_t>(chunk_count));
+        uint64_t offset = 0;
+        for (uint32_t index = 0; index < chunk_count; ++index) {
+            llama_snapshot_chunk_info chunk;
+            chunk.index          = index;
+            chunk.logical_offset = offset;
+            chunk.payload_bytes  = std::min<uint64_t>(cfg.chunk_payload_bytes, total_payload_bytes - offset);
+            manifest.chunks.push_back(chunk);
+            offset += chunk.payload_bytes;
+        }
+        if (serialize_manifest(manifest).size() > cfg.max_manifest_bytes) {
+            result.status = llama_snapshot_status::manifest_too_large;
+            return result;
+        }
+
+        const fs::path  partial_path = root / generation_name(metadata.snapshot_generation, true);
+        const fs::path  final_path   = root / generation_name(metadata.snapshot_generation, false);
+        const fs::path  current_tmp  = root / "current.manifest.tmp";
+        std::error_code exists_error;
+        if (fs::exists(partial_path, exists_error) || fs::exists(final_path, exists_error) || exists_error) {
+            result.status = exists_error ? llama_snapshot_status::io_error : llama_snapshot_status::generation_exists;
+            result.os_error = exists_error.value();
+            return result;
+        }
+        std::error_code create_error;
+        if (!fs::create_directory(partial_path, create_error) || create_error) {
+            result.status   = llama_snapshot_status::io_error;
+            result.os_error = create_error.value();
+            return result;
+        }
+
+        generation_cleanup_guard cleanup{
+            partial_path,
+            final_path,
+            current_tmp,
+            faults.preserve_failed_generation,
+        };
+        const auto fail = [&](operation_result failure) {
+            result.status   = failure.status;
+            result.os_error = failure.os_error;
+            return result;
+        };
+
+        fault_writer writer{ faults };
+        for (llama_snapshot_chunk_info & chunk : manifest.chunks) {
+            if (cancelled && cancelled(chunk.index)) {
+                return fail({ llama_snapshot_status::cancelled, 0 });
+            }
+            const llama_snapshot_chunk_source_result staged =
+                source.acquire(chunk.index, chunk.logical_offset, chunk.payload_bytes);
+            if (staged.status != llama_snapshot_status::ok) {
+                return fail({ staged.status, staged.os_error });
+            }
+            chunk_release_guard release{ &source, chunk.index };
+            if (staged.size != chunk.payload_bytes || (staged.size != 0 && staged.data == nullptr)) {
+                return fail({ llama_snapshot_status::invalid_argument, 0 });
+            }
+            chunk.checksum                  = llama_snapshot_sha256(staged.data, static_cast<size_t>(staged.size));
+            const std::vector<uint8_t> header = chunk_header(manifest, chunk);
+            operation = write_file(partial_path / chunk_name(chunk.index),
+                                   {
+                                       { header.data(), header.size() },
+                                       { staged.data, static_cast<size_t>(staged.size) },
+                                   },
+                                   writer, true);
+            if (operation.status != llama_snapshot_status::ok) {
+                return fail(operation);
+            }
+            if (cancelled && cancelled(chunk.index + 1)) {
+                return fail({ llama_snapshot_status::cancelled, 0 });
+            }
+        }
+
+        const std::vector<uint8_t> manifest_bytes = serialize_manifest(manifest);
+        operation = write_file(partial_path / "generation.manifest",
+                               {
+                                   { manifest_bytes.data(), manifest_bytes.size() },
+                               },
+                               writer, true);
         if (operation.status != llama_snapshot_status::ok) {
             return fail(operation);
         }
-        if (cancelled && cancelled(chunk.index + 1)) {
+        operation = fsync_directory(partial_path);
+        if (operation.status != llama_snapshot_status::ok) {
+            return fail(operation);
+        }
+        if (cancelled && cancelled(static_cast<uint32_t>(manifest.chunks.size()))) {
             return fail({ llama_snapshot_status::cancelled, 0 });
         }
-    }
-
-    operation = write_file(partial_path / "generation.manifest",
-                           {
-                               { manifest_bytes.data(), manifest_bytes.size() }
-    },
-                           writer, true);
-    if (operation.status != llama_snapshot_status::ok) {
-        return fail(operation);
-    }
-    operation = fsync_directory(partial_path);
-    if (operation.status != llama_snapshot_status::ok) {
-        return fail(operation);
-    }
-    if (cancelled && cancelled(static_cast<uint32_t>(manifest.chunks.size()))) {
-        return fail({ llama_snapshot_status::cancelled, 0 });
-    }
-    if (::rename(partial_path.c_str(), final_path.c_str()) != 0) {
-        return fail({ llama_snapshot_status::io_error, errno });
-    }
-    final_created = true;
-    operation     = fsync_directory(root);
-    if (operation.status != llama_snapshot_status::ok) {
-        return fail(operation);
-    }
-    if (faults.fail_before_manifest_commit) {
-        return fail({ llama_snapshot_status::io_error, EIO });
-    }
-
-    const fs::path current_tmp = root / "current.manifest.tmp";
-    operation                  = write_file(current_tmp,
-                                            {
-                               { manifest_bytes.data(), manifest_bytes.size() }
-    },
-                                            writer, false);
-    if (operation.status != llama_snapshot_status::ok) {
-        return fail(operation);
-    }
-    if (cancelled && cancelled(static_cast<uint32_t>(manifest.chunks.size()))) {
-        return fail({ llama_snapshot_status::cancelled, 0 });
-    }
-    if (::rename(current_tmp.c_str(), (root / "current.manifest").c_str()) != 0) {
-        return fail({ llama_snapshot_status::io_error, errno });
-    }
-    result.committed = true;
-    operation        = fsync_directory(root);
-    if (operation.status != llama_snapshot_status::ok) {
-        result.status   = llama_snapshot_status::commit_uncertain;
-        result.os_error = operation.os_error;
+        if (::rename(partial_path.c_str(), final_path.c_str()) != 0) {
+            return fail({ llama_snapshot_status::io_error, errno });
+        }
+        cleanup.final_created = true;
+        operation             = fsync_directory(root);
+        if (operation.status != llama_snapshot_status::ok) {
+            return fail(operation);
+        }
+        if (faults.fail_before_manifest_commit) {
+            return fail({ llama_snapshot_status::io_error, EIO });
+        }
+        operation = write_file(current_tmp,
+                               {
+                                   { manifest_bytes.data(), manifest_bytes.size() },
+                               },
+                               writer, false);
+        if (operation.status != llama_snapshot_status::ok) {
+            return fail(operation);
+        }
+        if (cancelled && cancelled(static_cast<uint32_t>(manifest.chunks.size()))) {
+            return fail({ llama_snapshot_status::cancelled, 0 });
+        }
+        if (faults.before_manifest_commit_fence) {
+            faults.before_manifest_commit_fence();
+        }
+        if (commit_fence && !commit_fence()) {
+            return fail({ llama_snapshot_status::cancelled, 0 });
+        }
+        if (faults.after_manifest_commit_fence) {
+            faults.after_manifest_commit_fence();
+        }
+        if (::rename(current_tmp.c_str(), (root / "current.manifest").c_str()) != 0) {
+            return fail({ llama_snapshot_status::io_error, errno });
+        }
+        result.committed = true;
+        cleanup.committed = true;
+        operation = fsync_directory(root);
+        if (operation.status != llama_snapshot_status::ok) {
+            result.status   = llama_snapshot_status::commit_uncertain;
+            result.os_error = operation.os_error;
+            return result;
+        }
+        if (has_previous && previous.snapshot_generation != metadata.snapshot_generation) {
+            remove_path_best_effort(root / generation_name(previous.snapshot_generation, false));
+        }
+        result.status = llama_snapshot_status::ok;
+        return result;
+    } catch (const std::bad_alloc &) {
+        result.status   = result.committed ? llama_snapshot_status::commit_uncertain : llama_snapshot_status::io_error;
+        result.os_error = ENOMEM;
+        return result;
+    } catch (...) {
+        result.status   = result.committed ? llama_snapshot_status::commit_uncertain : llama_snapshot_status::io_error;
+        result.os_error = EIO;
         return result;
     }
-
-    if (has_previous && previous.snapshot_generation != metadata.snapshot_generation) {
-        remove_path_best_effort(root / generation_name(previous.snapshot_generation, false));
-    }
-    result.status = llama_snapshot_status::ok;
-    return result;
 }
 
 llama_snapshot_open_result llama_snapshot_store::open_current(const llama_snapshot_identity & expected_identity) const {
@@ -927,60 +1048,109 @@ llama_snapshot_read_result llama_snapshot_store::read_chunk(const llama_snapshot
         result.status = llama_snapshot_status::invalid_argument;
         return result;
     }
+    const uint64_t payload_bytes = manifest.chunks[chunk_index].payload_bytes;
+    if (payload_bytes > SIZE_MAX) {
+        result.status = llama_snapshot_status::invalid_argument;
+        return result;
+    }
+    try {
+        result.payload.resize(static_cast<size_t>(payload_bytes));
+    } catch (const std::bad_alloc &) {
+        result.status   = llama_snapshot_status::io_error;
+        result.os_error = ENOMEM;
+        return result;
+    }
+    const llama_snapshot_read_into_result read =
+        read_chunk_into(manifest, chunk_index, result.payload.data(), result.payload.size());
+    result.status   = read.status;
+    result.os_error = read.os_error;
+    if (read.status != llama_snapshot_status::ok) {
+        result.payload.clear();
+    }
+    return result;
+}
+
+llama_snapshot_read_into_result llama_snapshot_store::read_chunk_into(
+        const llama_snapshot_manifest & manifest,
+        uint32_t                        chunk_index,
+        uint8_t *                       destination,
+        size_t                          destination_size) const {
+    llama_snapshot_read_into_result result;
+    const operation_result          shape = validate_manifest_shape(cfg, manifest, true);
+    if (shape.status != llama_snapshot_status::ok) {
+        result.status = shape.status;
+        return result;
+    }
+    if (chunk_index >= manifest.chunks.size()) {
+        result.status = llama_snapshot_status::invalid_argument;
+        return result;
+    }
     const llama_snapshot_chunk_info & expected = manifest.chunks[chunk_index];
-    std::vector<uint8_t>              bytes;
-    const uint64_t                    max_file_bytes = LLAMA_SNAPSHOT_CHUNK_ALIGNMENT + expected.payload_bytes;
-    const operation_result            loaded         = read_file_bounded(
-        fs::u8path(cfg.root_path) / generation_name(manifest.snapshot_generation, false) / chunk_name(chunk_index),
-        max_file_bytes, llama_snapshot_status::missing_chunk, llama_snapshot_status::trailing_data, bytes);
-    if (loaded.status != llama_snapshot_status::ok) {
-        result.status   = loaded.status;
-        result.os_error = loaded.os_error;
+    if (expected.payload_bytes > destination_size || (expected.payload_bytes != 0 && destination == nullptr)) {
+        result.status = llama_snapshot_status::invalid_argument;
         return result;
     }
-    if (bytes.size() < LLAMA_SNAPSHOT_CHUNK_ALIGNMENT) {
-        result.status = llama_snapshot_status::truncated;
+
+    const fs::path path = fs::u8path(cfg.root_path) /
+                          generation_name(manifest.snapshot_generation, false) / chunk_name(chunk_index);
+    const int descriptor = ::open(path.c_str(), O_RDONLY);
+    if (descriptor < 0) {
+        result.status   = errno == ENOENT ? llama_snapshot_status::missing_chunk : llama_snapshot_status::io_error;
+        result.os_error = errno;
         return result;
     }
-    byte_reader reader{ bytes, 0, CHUNK_FIXED_FIELDS_BYTES };
-    if (!std::equal(std::begin(CHUNK_MAGIC), std::end(CHUNK_MAGIC), bytes.begin())) {
-        result.status = llama_snapshot_status::format_error;
-        return result;
+    const auto finish = [&](llama_snapshot_status status, int os_error = 0) {
+        llama_snapshot_read_into_result value;
+        value.status        = status;
+        value.payload_bytes = status == llama_snapshot_status::ok ? expected.payload_bytes : 0;
+        value.os_error      = os_error;
+        if (::close(descriptor) != 0 && value.status == llama_snapshot_status::ok) {
+            value.status        = llama_snapshot_status::io_error;
+            value.payload_bytes = 0;
+            value.os_error      = errno;
+        }
+        return value;
+    };
+
+    struct stat file_status{};
+    if (::fstat(descriptor, &file_status) != 0) {
+        return finish(llama_snapshot_status::io_error, errno);
     }
-    reader.cursor                      = 8;
-    uint32_t              version      = 0;
-    uint32_t              header_size  = 0;
-    uint64_t              generation   = 0;
-    uint32_t              index        = 0;
-    uint32_t              reserved     = 0;
-    uint64_t              payload_size = 0;
-    llama_snapshot_digest checksum;
-    if (!reader.read_u32(version) || !reader.read_u32(header_size) || !reader.read_u64(generation) ||
-        !reader.read_u32(index) || !reader.read_u32(reserved) || !reader.read_u64(payload_size) ||
-        !reader.read_digest(checksum) || version != LLAMA_SNAPSHOT_CHUNK_FORMAT_VERSION ||
-        header_size != LLAMA_SNAPSHOT_CHUNK_ALIGNMENT || generation != manifest.snapshot_generation ||
-        index != expected.index || reserved != 0 || payload_size != expected.payload_bytes ||
-        checksum != expected.checksum) {
-        result.status = llama_snapshot_status::format_error;
-        return result;
+    if (!S_ISREG(file_status.st_mode) || file_status.st_size < 0) {
+        return finish(llama_snapshot_status::format_error);
     }
     const uint64_t expected_file_size = LLAMA_SNAPSHOT_CHUNK_ALIGNMENT + expected.payload_bytes;
-    if (bytes.size() < expected_file_size) {
-        result.status = llama_snapshot_status::truncated;
-        return result;
+    if (static_cast<uint64_t>(file_status.st_size) < expected_file_size) {
+        return finish(llama_snapshot_status::truncated);
     }
-    if (bytes.size() > expected_file_size) {
-        result.status = llama_snapshot_status::trailing_data;
-        return result;
+    if (static_cast<uint64_t>(file_status.st_size) > expected_file_size) {
+        return finish(llama_snapshot_status::trailing_data);
     }
-    result.payload.assign(bytes.begin() + LLAMA_SNAPSHOT_CHUNK_ALIGNMENT, bytes.end());
-    if (llama_snapshot_sha256(result.payload.data(), result.payload.size()) != expected.checksum) {
-        result.payload.clear();
-        result.status = llama_snapshot_status::checksum_mismatch;
-        return result;
+
+    std::array<uint8_t, CHUNK_FIXED_FIELDS_BYTES> header{};
+    operation_result loaded = pread_all(descriptor, header.data(), header.size(), 0);
+    if (loaded.status != llama_snapshot_status::ok) {
+        return finish(loaded.status, loaded.os_error);
     }
-    result.status = llama_snapshot_status::ok;
-    return result;
+    llama_snapshot_digest checksum{};
+    std::copy_n(header.data() + 40, checksum.size(), checksum.begin());
+    if (!std::equal(std::begin(CHUNK_MAGIC), std::end(CHUNK_MAGIC), header.begin()) ||
+        read_u32_le(header.data() + 8) != LLAMA_SNAPSHOT_CHUNK_FORMAT_VERSION ||
+        read_u32_le(header.data() + 12) != LLAMA_SNAPSHOT_CHUNK_ALIGNMENT ||
+        read_u64_le(header.data() + 16) != manifest.snapshot_generation ||
+        read_u32_le(header.data() + 24) != expected.index || read_u32_le(header.data() + 28) != 0 ||
+        read_u64_le(header.data() + 32) != expected.payload_bytes || checksum != expected.checksum) {
+        return finish(llama_snapshot_status::format_error);
+    }
+    loaded = pread_all(
+        descriptor, destination, static_cast<size_t>(expected.payload_bytes), LLAMA_SNAPSHOT_CHUNK_ALIGNMENT);
+    if (loaded.status != llama_snapshot_status::ok) {
+        return finish(loaded.status, loaded.os_error);
+    }
+    if (llama_snapshot_sha256(destination, static_cast<size_t>(expected.payload_bytes)) != expected.checksum) {
+        return finish(llama_snapshot_status::checksum_mismatch);
+    }
+    return finish(llama_snapshot_status::ok);
 }
 
 llama_snapshot_status llama_snapshot_store::validate(const llama_snapshot_manifest & manifest, int * os_error) const {

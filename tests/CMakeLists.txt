@@ -297,6 +297,25 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-snapshot-store.cpp)
     target_include_directories(test-snapshot-store PRIVATE
         ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-snapshot-worker.cpp)
+    target_include_directories(test-snapshot-worker PRIVATE
+        ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-snapshot-metal-staging.cpp)
+    target_include_directories(test-snapshot-metal-staging PRIVATE
+        ${PROJECT_SOURCE_DIR}/src)
+    if (TARGET ggml-metal AND NOT GGML_BACKEND_DL)
+        target_link_libraries(test-snapshot-metal-staging PRIVATE ggml-metal)
+        target_include_directories(test-snapshot-metal-staging PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+        target_compile_definitions(test-snapshot-metal-staging PRIVATE
+            GGML_TEST_METAL_SNAPSHOT_STAGING)
+    else()
+        llama_test(test-snapshot-metal-staging
+            NAME test-snapshot-metal-staging-require-m2-unavailable
+            ARGS --require-m2-ultra)
+        set_tests_properties(test-snapshot-metal-staging-require-m2-unavailable PROPERTIES
+            WILL_FAIL TRUE)
+    endif()
     llama_build_and_test(test-dsv4-sparse-accounting.cpp)
     target_include_directories(test-dsv4-sparse-accounting PRIVATE
         ${PROJECT_SOURCE_DIR}/src)

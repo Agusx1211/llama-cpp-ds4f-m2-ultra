@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -256,6 +257,14 @@ void test_round_trip_and_multi_chunk_ordering() {
                "chunk payload is not 64 KiB aligned");
         offset += chunk.payload_bytes;
     }
+    std::array<uint8_t, 64> staged{};
+    const auto              staged_read = store.read_chunk_into(manifest, 0, staged.data(), staged.size());
+    expect_status(staged_read.status, llama_snapshot_status::ok, "direct staged chunk read");
+    expect(staged_read.payload_bytes == staged.size() &&
+               std::equal(staged.begin(), staged.end(), payload.begin()),
+           "direct staged chunk payload");
+    expect_status(store.read_chunk_into(manifest, 0, staged.data(), staged.size() - 1).status,
+                  llama_snapshot_status::invalid_argument, "undersized staged read buffer");
     expect(assembled == payload, "chunk assembly order");
     expect_status(store.validate(manifest), llama_snapshot_status::ok, "multi-chunk validation");
     expect(store.read_all(manifest).payload == payload, "multi-chunk read_all");
