@@ -166,18 +166,28 @@ struct request_registry::impl {
         return current && *current == lease ? result_code::ok : result_code::stale_lease;
     }
 
-    void append_event(registry_event event) {
+    void append_event(registry_event event) noexcept {
         event.sequence = next_event_sequence++;
         ++total_events;
         if (config.event_capacity == 0) {
             ++dropped_events;
             return;
         }
-        if (event_ring.size() == config.event_capacity) {
+
+        try {
+            // Append before dropping the oldest event so allocation failure
+            // cannot damage the durable request transition or the retained
+            // log. The event ring is diagnostic and may drop this event under
+            // memory pressure; request state remains authoritative.
+            event_ring.push_back(event);
+        } catch (...) {
+            ++dropped_events;
+            return;
+        }
+        if (event_ring.size() > config.event_capacity) {
             event_ring.pop_front();
             ++dropped_events;
         }
-        event_ring.push_back(event);
     }
 
     static registry_event make_event(const request_snapshot & request,
@@ -562,7 +572,7 @@ operation_result request_registry::remove_terminal(request_handle handle, reason
     if (found != result_code::ok) {
         return { found, false };
     }
-    const request_snapshot request = it->second;
+    const request_snapshot & request = it->second;
     if (!is_terminal(request.state)) {
         return { result_code::not_terminal, false };
     }
@@ -570,6 +580,9 @@ operation_result request_registry::remove_terminal(request_handle handle, reason
         return { result_code::active_bindings, false };
     }
 
+    // Build the scalar event before erasing the request, without copying its
+    // bindings vector. Removal follows a durable terminal transition and must
+    // not introduce another allocation/failure point.
     registry_event event  = impl::make_event(request, event_kind::removed, reason, at_us);
     event.lifecycle_after = lifecycle::absent;
     event.queue_after     = queue_state::none;

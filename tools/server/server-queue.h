@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <list>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -57,9 +58,12 @@ private:
     bool running  = false;
     bool sleeping = false;
     bool req_stop_sleeping = false;
+    bool update_requested  = false;
+    int  protected_terminal_family = -1;
     int64_t time_last_task = 0;
 
     // queues
+    std::list<server_task> queue_terminal_controls;
     std::deque<server_task> queue_tasks;
     std::deque<server_task> queue_tasks_deferred;
     std::map<int, server_task> queue_user_tasks;
@@ -76,6 +80,9 @@ private:
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
     std::function<void(server_queue_expiration)> callback_request_expired;
+    server_response *                            expiration_response = nullptr;
+    std::function<void(size_t)>                  prepare_terminal_control_hook_for_tests;
+    size_t                                      prepare_terminal_control_count = 0;
 
 public:
     server_queue();
@@ -140,9 +147,15 @@ public:
                              int                        id_slot,
                              server_queue_result_kind   kind,
                              server_task_result_ptr &&  result);
+    bool fail_task_with_result(server_response & response, int id_task, server_task_result_ptr && result);
+    size_t fail_family_with_results(server_response &                    response,
+                                    int                                  id_family,
+                                    std::vector<server_task_result_ptr> && results);
     bool release_slot(int id_task, int id_slot);
     bool fail_task(int id_task);
     size_t expire_requests();
+    void request_update();
+    void begin_family_terminal_handoff(int id_family);
 
     std::vector<server_request_registry::request_snapshot> request_snapshot();
     server_request_registry::event_log_snapshot request_events();
@@ -182,6 +195,13 @@ public:
         callback_request_expired = std::move(callback);
     }
 
+    void set_expiration_response(server_response & response) {
+        expiration_response = &response;
+    }
+
+    // Deterministic pre-terminal allocation/failure seam used by host tests.
+    void set_prepare_terminal_control_hook_for_tests(std::function<void(size_t)> hook);
+
 private:
     static bool is_user_task(const server_task & task);
     static uint64_t runtime_id(int id_task);
@@ -190,12 +210,23 @@ private:
     server_request_runtime::admission_result validate_user_family(const server_task & task) const;
     server_request_runtime::admission_result enqueue_user_task(server_task && task, uint64_t at_us);
     server_queue_expiration record_expiration_locked(const server_request_runtime::expiration & event);
-    void enqueue_expiration_cancel_locked(const server_request_runtime::expiration & event);
     std::vector<server_queue_expiration> expire_requests_locked(uint64_t at_us);
     void notify_expired(const server_queue_expiration & expired);
     void notify_expired(const std::vector<server_queue_expiration> & expired);
     void erase_pending_payload(int id_target);
+    int canonical_cancel_target(int id_target) const;
+    bool has_terminal_control(int id_target) const;
     void cleanup_pending_task(int id_target, uint64_t at_us);
+    bool fail_task_locked(int id_task, uint64_t at_us, std::list<server_task> & prepared_controls);
+    std::list<server_task> prepare_expiration_controls(
+        const std::vector<server_request_runtime::expiration> & expirations);
+    std::list<server_task> prepare_expiration_control(
+        const server_request_runtime::expiration & expiration);
+    std::list<server_task> prepare_failure_control(int id_task);
+    std::list<server_task> prepare_posted_cancel(server_task && task);
+    void before_terminal_control_prepare();
+    void commit_terminal_controls(std::list<server_task> & prepared) noexcept;
+    server_queue_expiration expire_one_locked(const server_request_runtime::expiration & planned, uint64_t at_us);
 };
 
 // struct for managing server responses
@@ -213,7 +244,60 @@ private:
     std::mutex mutex_results;
     std::condition_variable condition_results;
 
+    std::function<void(size_t)> prepare_send_hook_for_tests;
+    size_t                      prepare_send_count = 0;
+
 public:
+    class prepared_send {
+      public:
+        prepared_send(prepared_send &&) = default;
+        prepared_send & operator=(prepared_send &&) = default;
+
+        prepared_send(const prepared_send &) = delete;
+        prepared_send & operator=(const prepared_send &) = delete;
+
+        // Reservation happens before the durable request gate. With capacity
+        // already owned and a noexcept unique_ptr move, commit cannot fail
+        // after the gate consumes a final request binding.
+        void commit(server_task_result_ptr && result) noexcept;
+
+      private:
+        friend struct server_response;
+
+        prepared_send(server_response & response, int id_task);
+
+        server_response *       response = nullptr;
+        std::unique_lock<std::mutex> lock;
+        bool                    waiting   = false;
+        bool                    committed = false;
+    };
+
+    class prepared_batch {
+      public:
+        prepared_batch(prepared_batch &&) = default;
+        prepared_batch & operator=(prepared_batch &&) = default;
+
+        prepared_batch(const prepared_batch &) = delete;
+        prepared_batch & operator=(const prepared_batch &) = delete;
+
+        void commit(server_task_result_ptr && result) noexcept;
+
+      private:
+        friend struct server_response;
+
+        prepared_batch(server_response & response, const std::vector<int> & id_tasks);
+
+        server_response *          response  = nullptr;
+        std::unique_lock<std::mutex> lock;
+        size_t                     capacity_remaining = 0;
+    };
+
+    prepared_send prepare_send(int id_task);
+    prepared_batch prepare_batch(const std::vector<int> & id_tasks);
+
+    // Deterministic pre-gate allocation/failure seam used by host tests.
+    void set_prepare_send_hook_for_tests(std::function<void(size_t)> hook);
+
     // add the id_task to the list of tasks waiting for response
     void add_waiting_task_id(int id_task);
 

@@ -5,7 +5,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iterator>
 #include <limits>
+#include <optional>
+#include <type_traits>
 #include <utility>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -36,6 +39,16 @@ server_queue_post_result rejected_post(const server_request_runtime::admission_r
     const bool overload = server_request_runtime::is_overload(admission.code);
     return { overload ? server_queue_post_code::overloaded : server_queue_post_code::unavailable, task_id,
              overload ? bounded_retry_after_seconds(admission.retry_after_seconds) : 0 };
+}
+
+server_task_result_ptr make_timeout_result(const server_request_runtime::expiration & expiration) {
+    auto result      = std::make_unique<server_task_result_error>();
+    result->id       = static_cast<int>(expiration.request_id - 1);
+    result->err_type = ERROR_TYPE_TIMEOUT;
+    result->err_msg  = expiration.kind == server_request_runtime::deadline_kind::queue
+        ? "request queue deadline expired"
+        : "request run deadline expired";
+    return result;
 }
 
 server_scheduler::lane to_scheduler_lane(server_task::trusted_lane lane) {
@@ -139,11 +152,24 @@ server_queue_post_result server_queue::post(server_task && task, bool front) {
     GGML_ASSERT(task.id != -1);
     const uint64_t at_us   = now_us();
     auto           expired = expire_requests_locked(at_us);
-    // if this is cancel task make sure to clean up pending tasks
-    if (task.type == SERVER_TASK_TYPE_CANCEL) {
-        cleanup_pending_task(task.id_target, at_us);
+    const int      task_id = task.id;
+    const bool     is_cancel = task.type == SERVER_TASK_TYPE_CANCEL;
+    auto prepared_cancel = is_cancel ? prepare_posted_cancel(std::move(task)) : std::list<server_task>{};
+    if (is_cancel) {
+        // The queue node already exists. Durable cancellation, payload erase,
+        // and list splice therefore cannot strand a bound slot if allocation
+        // fails while posting the control.
+        const int id_target = canonical_cancel_target(prepared_cancel.front().id_target);
+        prepared_cancel.front().id_target = id_target;
+        if (protected_terminal_family != id_target || !has_terminal_control(id_target)) {
+            cleanup_pending_task(id_target, at_us);
+            commit_terminal_controls(prepared_cancel);
+        }
+        QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
+        lock.unlock();
+        notify_expired(expired);
+        return { server_queue_post_code::accepted, task_id, 0 };
     }
-    const int task_id = task.id;
     QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
     if (is_user_task(task)) {
         const auto family = validate_user_family(task);
@@ -192,10 +218,31 @@ server_queue_post_result server_queue::post(std::vector<server_task> && tasks, b
             return rejected_post(family, task.id);
         }
     }
+
+    std::list<server_task> prepared_cancels;
     for (auto & task : tasks) {
-        // if this is cancel task make sure to clean up pending tasks
+        if (task.type != SERVER_TASK_TYPE_CANCEL) {
+            continue;
+        }
+        task.id_target = canonical_cancel_target(task.id_target);
+        before_terminal_control_prepare();
+        prepared_cancels.emplace_back(std::move(task));
+    }
+    while (!prepared_cancels.empty()) {
+        const auto prepared_it = std::prev(prepared_cancels.end());
+        const int  id_target   = prepared_it->id_target;
+        std::list<server_task> prepared_cancel;
+        prepared_cancel.splice(prepared_cancel.begin(), prepared_cancels, prepared_it);
+        if (protected_terminal_family == id_target && has_terminal_control(id_target)) {
+            continue;
+        }
+        cleanup_pending_task(id_target, at_us);
+        commit_terminal_controls(prepared_cancel);
+    }
+
+    for (auto & task : tasks) {
         if (task.type == SERVER_TASK_TYPE_CANCEL) {
-            cleanup_pending_task(task.id_target, at_us);
+            continue;
         }
         QUE_DBG("new task, id = %d/%d, front = %d\n", task.id, (int) tasks.size(), front);
         if (is_user_task(task)) {
@@ -249,36 +296,145 @@ server_queue_expiration server_queue::record_expiration_locked(const server_requ
     return { task_id, event.kind };
 }
 
-void server_queue::enqueue_expiration_cancel_locked(const server_request_runtime::expiration & event) {
-    if (event.was_running) {
+std::list<server_task> server_queue::prepare_expiration_controls(
+        const std::vector<server_request_runtime::expiration> & expirations) {
+    std::list<server_task> result;
+    for (const auto & event : expirations) {
+        if (!event.was_running) {
+            continue;
+        }
         server_task cancel(SERVER_TASK_TYPE_CANCEL);
         cancel.id        = id++;
         cancel.id_target = static_cast<int>(event.request_id - 1);
-        queue_tasks.emplace_front(std::move(cancel));
+        before_terminal_control_prepare();
+        result.emplace_back(std::move(cancel));
+    }
+    return result;
+}
+
+std::list<server_task> server_queue::prepare_expiration_control(
+        const server_request_runtime::expiration & expiration) {
+    std::list<server_task> result;
+    if (!expiration.was_running) {
+        return result;
+    }
+    server_task cancel(SERVER_TASK_TYPE_CANCEL);
+    cancel.id        = id++;
+    cancel.id_target = static_cast<int>(expiration.request_id - 1);
+    before_terminal_control_prepare();
+    result.emplace_back(std::move(cancel));
+    return result;
+}
+
+std::list<server_task> server_queue::prepare_failure_control(int id_task) {
+    std::list<server_task> result;
+    if (id_task < 0 || !request_runtime.family_has_bindings(runtime_id(id_task))) {
+        return result;
+    }
+    if (has_terminal_control(id_task)) {
+        return result;
+    }
+    server_task cancel(SERVER_TASK_TYPE_CANCEL);
+    cancel.id        = id++;
+    cancel.id_target = id_task;
+    before_terminal_control_prepare();
+    result.emplace_back(std::move(cancel));
+    return result;
+}
+
+std::list<server_task> server_queue::prepare_posted_cancel(server_task && task) {
+    std::list<server_task> result;
+    before_terminal_control_prepare();
+    result.emplace_back(std::move(task));
+    return result;
+}
+
+void server_queue::before_terminal_control_prepare() {
+    const size_t attempt = ++prepare_terminal_control_count;
+    if (prepare_terminal_control_hook_for_tests) {
+        prepare_terminal_control_hook_for_tests(attempt);
     }
 }
 
+void server_queue::commit_terminal_controls(std::list<server_task> & prepared) noexcept {
+    if (prepared.empty()) {
+        return;
+    }
+    queue_terminal_controls.splice(queue_terminal_controls.begin(), prepared);
+    time_last_task = ggml_time_ms();
+    condition_tasks.notify_one();
+}
+
 std::vector<server_queue_expiration> server_queue::expire_requests_locked(uint64_t at_us) {
-    const auto                           runtime_expired = request_runtime.expire_due(at_us);
+    const auto planned = request_runtime.expirations_due(at_us);
     std::vector<server_queue_expiration> expired;
-    expired.reserve(runtime_expired.size());
+    expired.reserve(planned.size());
+    auto prepared_controls = prepare_expiration_controls(planned);
 
-    for (const auto & event : runtime_expired) {
-        expired.push_back(record_expiration_locked(event));
+    std::vector<int>                    expiration_ids;
+    std::vector<server_task_result_ptr> expiration_results;
+    std::optional<server_response::prepared_batch> prepared_results;
+    if (expiration_response != nullptr) {
+        expiration_ids.reserve(planned.size());
+        expiration_results.reserve(planned.size());
+        for (const auto & event : planned) {
+            expiration_ids.push_back(static_cast<int>(event.request_id - 1));
+            expiration_results.push_back(make_timeout_result(event));
+        }
+        prepared_results.emplace(expiration_response->prepare_batch(expiration_ids));
     }
 
-    // Running requests need their temporary slots released. Insert the
-    // cancellation controls in reverse so ascending durable request order is
-    // preserved at the front of the internal queue.
-    for (auto it = runtime_expired.rbegin(); it != runtime_expired.rend(); ++it) {
-        enqueue_expiration_cancel_locked(*it);
+    for (size_t i = 0; i < planned.size(); ++i) {
+        const auto & event = planned[i];
+        const auto committed = request_runtime.expire_prepared(event, at_us);
+        if (committed.request_id != 0) {
+            expired.push_back(record_expiration_locked(committed));
+            if (prepared_results) {
+                prepared_results->commit(std::move(expiration_results[i]));
+            }
+        }
     }
+    commit_terminal_controls(prepared_controls);
+    return expired;
+}
+
+server_queue_expiration server_queue::expire_one_locked(
+        const server_request_runtime::expiration & planned, uint64_t at_us) {
+    if (planned.request_id == 0) {
+        return {};
+    }
+    auto prepared_controls = prepare_expiration_control(planned);
+    if (expiration_response != nullptr) {
+        auto result   = make_timeout_result(planned);
+        auto prepared = expiration_response->prepare_send(static_cast<int>(planned.request_id - 1));
+        const auto committed = request_runtime.expire_prepared(planned, at_us);
+        if (committed.request_id == 0) {
+            return {};
+        }
+        const auto expired = record_expiration_locked(committed);
+        prepared.commit(std::move(result));
+        commit_terminal_controls(prepared_controls);
+        return expired;
+    }
+
+    const auto committed = request_runtime.expire_prepared(planned, at_us);
+    if (committed.request_id == 0) {
+        return {};
+    }
+    const auto expired = record_expiration_locked(committed);
+    commit_terminal_controls(prepared_controls);
     return expired;
 }
 
 void server_queue::notify_expired(const server_queue_expiration & expired) {
     if (callback_request_expired) {
-        callback_request_expired(expired);
+        try {
+            callback_request_expired(expired);
+        } catch (const std::exception & e) {
+            QUE_ERR("expiration observer failed, id_task = %d: %s\n", expired.task_id, e.what());
+        } catch (...) {
+            QUE_ERR("expiration observer failed, id_task = %d\n", expired.task_id);
+        }
     }
 }
 
@@ -409,6 +565,28 @@ void server_queue::set_physical_slot_capacity(size_t capacity) {
     physical_slot_capacity = capacity;
 }
 
+void server_queue::request_update() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    update_requested = true;
+    if (sleeping) {
+        req_stop_sleeping = true;
+    }
+    condition_tasks.notify_one();
+}
+
+void server_queue::begin_family_terminal_handoff(int id_family) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    GGML_ASSERT(id_family >= 0 &&
+                (protected_terminal_family < 0 || protected_terminal_family == id_family));
+    protected_terminal_family = id_family;
+}
+
+void server_queue::set_prepare_terminal_control_hook_for_tests(std::function<void(size_t)> hook) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    prepare_terminal_control_hook_for_tests = std::move(hook);
+    prepare_terminal_control_count = 0;
+}
+
 void server_queue::start_loop(int64_t idle_sleep_ms) {
     running = true;
     time_last_task = ggml_time_ms();
@@ -438,12 +616,20 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 notify_expired(expired);
                 continue;
             }
-            if (queue_tasks.empty() && request_runtime.queued_total() == 0) {
+            if (update_requested) {
+                update_requested = false;
+                lock.unlock();
+                break;
+            }
+            if (queue_terminal_controls.empty() && queue_tasks.empty() && request_runtime.queued_total() == 0) {
                 lock.unlock();
                 break;
             }
             server_task task;
-            if (!queue_tasks.empty()) {
+            if (!queue_terminal_controls.empty()) {
+                task = std::move(queue_terminal_controls.front());
+                queue_terminal_controls.pop_front();
+            } else if (!queue_tasks.empty()) {
                 task = std::move(queue_tasks.front());
                 queue_tasks.pop_front();
             } else {
@@ -489,7 +675,8 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 notify_expired(expired);
                 break;
             }
-            if (!running || !queue_tasks.empty() || request_runtime.queued_total() != 0) {
+            if (!running || update_requested || !queue_terminal_controls.empty() || !queue_tasks.empty() ||
+                request_runtime.queued_total() != 0) {
                 break; // go back to process new tasks or terminate
             }
 
@@ -516,7 +703,8 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             } else {
                 // wait for new tasks or timeout for checking sleeping condition
                 bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
-                    return (!queue_tasks.empty() || request_runtime.queued_total() != 0 || !running);
+                    return (update_requested || !queue_terminal_controls.empty() || !queue_tasks.empty() ||
+                            request_runtime.queued_total() != 0 || !running);
                 });
                 if (res) {
                     break; // new task arrived or terminate
@@ -539,13 +727,37 @@ void server_queue::erase_pending_payload(int id_target) {
         remove_target(entry.second);
     }
     queue_tasks.erase(std::remove_if(queue_tasks.begin(), queue_tasks.end(), remove_target), queue_tasks.end());
+    queue_terminal_controls.remove_if(remove_target);
     queue_tasks_deferred.erase(std::remove_if(queue_tasks_deferred.begin(), queue_tasks_deferred.end(), remove_target),
         queue_tasks_deferred.end());
+}
+
+int server_queue::canonical_cancel_target(int id_target) const {
+    if (id_target >= 0 && protected_terminal_family >= 0 &&
+        request_runtime.is_family_member(runtime_id(id_target), runtime_id(protected_terminal_family))) {
+        return protected_terminal_family;
+    }
+    return id_target;
+}
+
+bool server_queue::has_terminal_control(int id_target) const {
+    return std::any_of(queue_terminal_controls.begin(), queue_terminal_controls.end(),
+                       [id_target](const server_task & task) {
+                           return task.type == SERVER_TASK_TYPE_CANCEL && task.id_target == id_target;
+                       });
 }
 
 void server_queue::cleanup_pending_task(int id_target, uint64_t at_us) {
     // no need lock because this is called exclusively by post()
     if (id_target >= 0) {
+        if (protected_terminal_family >= 0 &&
+            request_runtime.is_family_member(runtime_id(id_target), runtime_id(protected_terminal_family))) {
+            // A staged-family error batch owns the first-terminal handoff but
+            // has not reserved every response slot yet. Keep the durable
+            // records/payloads intact; the already-prepared CANCEL node will
+            // run only after the forced retry clears this guard.
+            return;
+        }
         request_runtime.cancel(runtime_id(id_target), at_us);
         erase_pending_payload(id_target);
     }
@@ -575,23 +787,28 @@ bool server_queue::publish_slot_result(server_response &         response,
                                        server_task_result_ptr && result) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     GGML_ASSERT(result && result->id == id_task);
+    const uint64_t at_us = now_us();
+    const auto planned_expiration = id_task >= 0
+        ? request_runtime.expiration_due(runtime_id(id_task), at_us)
+        : server_request_runtime::expiration{};
     server_request_runtime::publication_result publication;
-    if (id_task >= 0 && id_slot >= 0) {
-        publication = request_runtime.gate_result_publication(
-            runtime_id(id_task), static_cast<server_request_registry::slot_id>(id_slot),
-            kind == server_queue_result_kind::final, now_us());
-    }
-
     server_queue_expiration expired;
-    if (publication.expired.request_id != 0) {
-        expired = record_expiration_locked(publication.expired);
-        enqueue_expiration_cancel_locked(publication.expired);
-    }
-    if (publication.publish) {
-        // Keep the durable deadline/terminal decision and response insertion in
-        // one serialized transaction. A concurrent cancel or expiry therefore
-        // orders wholly before or wholly after this publication.
-        response.send(std::move(result));
+    if (planned_expiration.request_id != 0) {
+        expired = expire_one_locked(planned_expiration, at_us);
+    } else {
+        auto prepared = response.prepare_send(id_task);
+        if (id_task >= 0 && id_slot >= 0) {
+            publication = request_runtime.gate_result_publication(
+                runtime_id(id_task), static_cast<server_request_registry::slot_id>(id_slot),
+                kind == server_queue_result_kind::final, at_us);
+        }
+
+        GGML_ASSERT(publication.expired.request_id == 0);
+        if (publication.publish) {
+            // Response storage was reserved before the durable gate. The terminal
+            // decision and no-throw insertion therefore remain one transaction.
+            prepared.commit(std::move(result));
+        }
     }
     lock.unlock();
     if (expired.task_id >= 0) {
@@ -600,18 +817,131 @@ bool server_queue::publish_slot_result(server_response &         response,
     return publication.publish;
 }
 
+bool server_queue::fail_task_with_result(server_response &         response,
+                                         int                       id_task,
+                                         server_task_result_ptr && result) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    GGML_ASSERT(result && result->id == id_task);
+    const uint64_t at_us = now_us();
+    const auto planned_expiration = id_task >= 0
+        ? request_runtime.expiration_due(runtime_id(id_task), at_us)
+        : server_request_runtime::expiration{};
+    server_queue_expiration expired;
+    bool                    failed = false;
+    {
+        if (planned_expiration.request_id != 0) {
+            expired = expire_one_locked(planned_expiration, at_us);
+        } else {
+            const auto status = id_task >= 0
+                ? request_runtime.failure_publication_status(runtime_id(id_task))
+                : server_request_runtime::failure_publication_result{};
+            if (status) {
+                auto prepared_failure_control = prepare_failure_control(id_task);
+                auto prepared = response.prepare_send(id_task);
+                const auto outcome = request_runtime.fail_for_publication(runtime_id(id_task), at_us);
+                GGML_ASSERT(outcome.code != server_request_runtime::failure_publication_code::transition_failed);
+                failed = static_cast<bool>(outcome);
+                GGML_ASSERT(failed);
+                erase_pending_payload(id_task);
+                commit_terminal_controls(prepared_failure_control);
+                prepared.commit(std::move(result));
+            }
+        }
+    }
+    lock.unlock();
+    if (expired.task_id >= 0) {
+        notify_expired(expired);
+    }
+    return failed;
+}
+
+size_t server_queue::fail_family_with_results(
+        server_response &                    response,
+        int                                  id_family,
+        std::vector<server_task_result_ptr> && results) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    const uint64_t               at_us = now_us();
+    GGML_ASSERT(id_family >= 0 &&
+                (protected_terminal_family < 0 || protected_terminal_family == id_family));
+    protected_terminal_family = id_family;
+
+    std::vector<int> ids;
+    std::vector<int> prepared_ids;
+    std::vector<server_request_runtime::expiration> planned_expirations;
+    std::vector<server_task_result_ptr> timeout_results;
+    ids.reserve(results.size());
+    prepared_ids.reserve(results.size());
+    planned_expirations.reserve(results.size());
+    timeout_results.reserve(results.size());
+    for (const auto & result : results) {
+        GGML_ASSERT(result && result->id >= 0);
+        ids.push_back(result->id);
+        const auto planned = request_runtime.expiration_due(runtime_id(result->id), at_us);
+        planned_expirations.push_back(planned);
+        timeout_results.push_back(planned.request_id != 0 ? make_timeout_result(planned) : nullptr);
+        if (planned.request_id != 0 || request_runtime.failure_publication_status(runtime_id(result->id))) {
+            prepared_ids.push_back(result->id);
+        }
+    }
+
+    if (prepared_ids.empty()) {
+        protected_terminal_family = -1;
+        return 0;
+    }
+
+    auto prepared_controls = prepare_failure_control(id_family);
+    std::vector<server_queue_expiration> expired;
+    expired.reserve(results.size());
+    size_t terminalized = 0;
+
+    {
+        auto prepared_results = response.prepare_batch(prepared_ids);
+        for (size_t i = 0; i < results.size(); ++i) {
+            const auto & planned = planned_expirations[i];
+            if (planned.request_id != 0) {
+                const auto committed = request_runtime.expire_prepared(planned, at_us);
+                GGML_ASSERT(committed.request_id == planned.request_id);
+                expired.push_back(record_expiration_locked(committed));
+                prepared_results.commit(std::move(timeout_results[i]));
+                ++terminalized;
+                continue;
+            }
+
+            const auto outcome = request_runtime.fail_one_for_publication(runtime_id(ids[i]), at_us);
+            GGML_ASSERT(outcome.code != server_request_runtime::failure_publication_code::transition_failed);
+            if (!outcome) {
+                continue;
+            }
+            erase_pending_payload(ids[i]);
+            prepared_results.commit(std::move(results[i]));
+            ++terminalized;
+        }
+    }
+    if (terminalized != 0) {
+        commit_terminal_controls(prepared_controls);
+    }
+    protected_terminal_family = -1;
+    lock.unlock();
+    notify_expired(expired);
+    return terminalized;
+}
+
 bool server_queue::release_slot(int id_task, int id_slot) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    const uint64_t at_us = now_us();
+    const auto planned_expiration = id_task >= 0
+        ? request_runtime.expiration_due(runtime_id(id_task), at_us)
+        : server_request_runtime::expiration{};
     server_request_runtime::release_result release;
+    server_queue_expiration expired;
+    if (planned_expiration.request_id != 0) {
+        expired = expire_one_locked(planned_expiration, at_us);
+    }
     if (id_task >= 0 && id_slot >= 0) {
         release = request_runtime.release_slot(runtime_id(id_task),
-                                               static_cast<server_request_registry::slot_id>(id_slot), now_us());
+                                               static_cast<server_request_registry::slot_id>(id_slot), at_us);
     }
-    server_queue_expiration expired;
-    if (release.expired.request_id != 0) {
-        expired = record_expiration_locked(release.expired);
-        enqueue_expiration_cancel_locked(release.expired);
-    }
+    GGML_ASSERT(release.expired.request_id == 0);
     lock.unlock();
     if (expired.task_id >= 0) {
         notify_expired(expired);
@@ -621,22 +951,33 @@ bool server_queue::release_slot(int id_task, int id_slot) {
 
 bool server_queue::fail_task(int id_task) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    const uint64_t               at_us   = now_us();
-    auto                         expired = expire_requests_locked(at_us);
-    const bool                   failed  = id_task >= 0 && request_runtime.fail(runtime_id(id_task), at_us);
-    if (failed) {
-        erase_pending_payload(id_task);
-        if (request_runtime.family_has_bindings(runtime_id(id_task))) {
-            server_task cancel(SERVER_TASK_TYPE_CANCEL);
-            cancel.id        = id++;
-            cancel.id_target = id_task;
-            queue_tasks.emplace_front(std::move(cancel));
-            time_last_task = ggml_time_ms();
-            condition_tasks.notify_one();
-        }
+    const uint64_t at_us = now_us();
+    const auto planned_expiration = id_task >= 0
+        ? request_runtime.expiration_due(runtime_id(id_task), at_us)
+        : server_request_runtime::expiration{};
+    auto prepared_failure_control    = prepare_failure_control(id_task);
+    server_queue_expiration expired;
+    bool                    failed = false;
+    if (planned_expiration.request_id != 0) {
+        expired = expire_one_locked(planned_expiration, at_us);
+    } else {
+        failed = fail_task_locked(id_task, at_us, prepared_failure_control);
     }
     lock.unlock();
-    notify_expired(expired);
+    if (expired.task_id >= 0) {
+        notify_expired(expired);
+    }
+    return failed;
+}
+
+bool server_queue::fail_task_locked(int id_task,
+                                    uint64_t at_us,
+                                    std::list<server_task> & prepared_controls) {
+    const bool failed = id_task >= 0 && request_runtime.fail(runtime_id(id_task), at_us);
+    if (failed) {
+        erase_pending_payload(id_task);
+        commit_terminal_controls(prepared_controls);
+    }
     return failed;
 }
 
@@ -755,19 +1096,78 @@ server_task_result_ptr server_response::recv(int id_task) {
     return recv(id_tasks);
 }
 
+server_response::prepared_send::prepared_send(server_response & response, int id_task) :
+    response(&response), lock(response.mutex_results) {
+    const size_t attempt = ++response.prepare_send_count;
+    if (response.prepare_send_hook_for_tests) {
+        response.prepare_send_hook_for_tests(attempt);
+    }
+    waiting = response.waiting_task_ids.find(id_task) != response.waiting_task_ids.end();
+    if (waiting) {
+        response.queue_results.reserve(response.queue_results.size() + 1);
+    }
+}
+
+void server_response::prepared_send::commit(server_task_result_ptr && result) noexcept {
+    if (committed) {
+        return;
+    }
+    committed = true;
+    if (!waiting) {
+        return;
+    }
+
+    GGML_ASSERT(response != nullptr && result && response->queue_results.size() < response->queue_results.capacity());
+    static_assert(std::is_nothrow_move_constructible<server_task_result_ptr>::value, "result handoff must not throw");
+    response->queue_results.emplace_back(std::move(result));
+    response->condition_results.notify_all();
+}
+
+server_response::prepared_batch::prepared_batch(
+        server_response & response, const std::vector<int> & id_tasks) :
+    response(&response), lock(response.mutex_results) {
+    for (int id_task : id_tasks) {
+        const size_t attempt = ++response.prepare_send_count;
+        if (response.prepare_send_hook_for_tests) {
+            response.prepare_send_hook_for_tests(attempt);
+        }
+        capacity_remaining += response.waiting_task_ids.find(id_task) != response.waiting_task_ids.end();
+    }
+    response.queue_results.reserve(response.queue_results.size() + capacity_remaining);
+}
+
+void server_response::prepared_batch::commit(server_task_result_ptr && result) noexcept {
+    GGML_ASSERT(response != nullptr && result);
+    if (response->waiting_task_ids.find(result->id) == response->waiting_task_ids.end()) {
+        return;
+    }
+    GGML_ASSERT(capacity_remaining > 0 &&
+                response->queue_results.size() < response->queue_results.capacity());
+    static_assert(std::is_nothrow_move_constructible<server_task_result_ptr>::value,
+                  "result handoff must not throw");
+    response->queue_results.emplace_back(std::move(result));
+    --capacity_remaining;
+    response->condition_results.notify_all();
+}
+
+server_response::prepared_send server_response::prepare_send(int id_task) {
+    return prepared_send(*this, id_task);
+}
+
+server_response::prepared_batch server_response::prepare_batch(const std::vector<int> & id_tasks) {
+    return prepared_batch(*this, id_tasks);
+}
+
+void server_response::set_prepare_send_hook_for_tests(std::function<void(size_t)> hook) {
+    std::unique_lock<std::mutex> lock(mutex_results);
+    prepare_send_hook_for_tests = std::move(hook);
+    prepare_send_count = 0;
+}
+
 void server_response::send(server_task_result_ptr && result) {
     RES_DBG("sending result for task id = %d\n", result->id);
-
-    std::unique_lock<std::mutex> lock(mutex_results);
-    for (const auto & id_task : waiting_task_ids) {
-        if (result->id == id_task) {
-            RES_DBG("task id = %d pushed to result queue\n", result->id);
-
-            queue_results.emplace_back(std::move(result));
-            condition_results.notify_all();
-            return;
-        }
-    }
+    auto prepared = prepare_send(result->id);
+    prepared.commit(std::move(result));
 }
 
 void server_response::broadcast(server_task_result_ptr && result) {

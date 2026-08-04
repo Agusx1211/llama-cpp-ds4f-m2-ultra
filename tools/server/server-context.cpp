@@ -4,6 +4,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-prefill.h"
 #include "server-schema.h"
 #include "server-scheduler.h"
 #include "server-stream.h"
@@ -63,6 +64,23 @@ static uint32_t server_n_outputs_max(const common_params & params) {
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
 }
 
+static server_scheduler::lane server_prefill_lane(server_task::trusted_lane lane) {
+    switch (lane) {
+        case server_task::trusted_lane::low:
+            return server_scheduler::lane::low;
+        case server_task::trusted_lane::normal:
+            return server_scheduler::lane::normal;
+        case server_task::trusted_lane::fast:
+            return server_scheduler::lane::fast;
+    }
+    return server_scheduler::lane::count;
+}
+
+static bool server_task_uses_request_runtime(server_task_type type) {
+    return type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL ||
+           type == SERVER_TASK_TYPE_EMBEDDING || type == SERVER_TASK_TYPE_RERANK;
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -71,6 +89,12 @@ enum slot_state {
     SLOT_STATE_PROCESSING_PROMPT,
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
+    // Final-prompt family postdecode runs before coordinator commit. These
+    // states are synchronous and never return to the scheduler.
+    SLOT_STATE_DONE_PROMPT_STAGED,
+    SLOT_STATE_GENERATING_STAGED,
+    SLOT_STATE_TERMINAL_STAGED,
+    SLOT_STATE_FAILED_PENDING,
 };
 
 struct server_slot; // forward declaration
@@ -332,6 +356,8 @@ struct server_slot {
     double t_prompt_processing = 0.0; // ms
     double t_token_generation = 0.0;  // ms
 
+    server_prefill::staged_member_disposition prefill_disposition;
+
     std::function<void(int /* id_slot */, int /* id_task */)> callback_on_release;
 
     // Speculative decoding stats
@@ -371,6 +397,8 @@ struct server_slot {
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
+
+        prefill_disposition = {};
 
         task_prev = std::move(task);
         task.reset();
@@ -1005,6 +1033,22 @@ private:
 
     server_metrics metrics;
     server_scheduler::kv_pressure_controller kv_pressure;
+    server_prefill::coordinator prefill;
+
+    server_prefill::staged_batch_lifecycle prefill_batch;
+
+    struct staged_publication {
+        int                      id_task = -1;
+        int                      id_slot = -1;
+        server_queue_result_kind kind    = server_queue_result_kind::partial;
+        server_task_result_ptr   result;
+        server_slot *            slot             = nullptr;
+        bool                     count_prediction = false;
+    };
+
+    std::vector<staged_publication> prefill_publications;
+    std::vector<server_slot *>      prefill_terminal_slots;
+    std::vector<server_slot *>      prefill_prompt_eval_slots;
 
     json json_ui_settings = json::object();
 
@@ -1102,6 +1146,11 @@ private:
                                 params_base.speculative.types.end(),
                                 COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
         spec_parallel_bypass = false;
+        prefill.reset();
+        prefill_batch = {};
+        prefill_publications.clear();
+        prefill_terminal_slots.clear();
+        prefill_prompt_eval_slots.clear();
         dspark_n_max_single = params_base.speculative.draft.n_max;
         dspark_n_max_active = dspark_n_max_single;
         dspark_p_min_single = params_base.speculative.draft.p_min;
@@ -1407,9 +1456,28 @@ private:
 
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
-            slot.callback_on_release = [this](int id_slot, int id_task) {
-                queue_tasks.release_slot(id_task, id_slot);
-                queue_tasks.pop_deferred_task(id_slot);
+            slot.callback_on_release = [this](int id_slot, int id_task) noexcept {
+                try {
+                    prefill.cancel_request(static_cast<uint64_t>(id_task) + 1);
+                } catch (...) {
+                    SRV_ERR("prefill release failed, id_task = %d, id_slot = %d\n", id_task, id_slot);
+                }
+                try {
+                    queue_tasks.release_slot(id_task, id_slot);
+                } catch (const std::exception & e) {
+                    SRV_ERR("slot release gate failed, id_task = %d, id_slot = %d: %s\n",
+                            id_task, id_slot, e.what());
+                } catch (...) {
+                    SRV_ERR("slot release gate failed, id_task = %d, id_slot = %d\n", id_task, id_slot);
+                }
+                try {
+                    queue_tasks.pop_deferred_task(id_slot);
+                } catch (const std::exception & e) {
+                    SRV_ERR("deferred-slot wake failed, id_task = %d, id_slot = %d: %s\n",
+                            id_task, id_slot, e.what());
+                } catch (...) {
+                    SRV_ERR("deferred-slot wake failed, id_task = %d, id_slot = %d\n", id_task, id_slot);
+                }
             };
 
             slot.reset();
@@ -1511,14 +1579,7 @@ private:
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
-        queue_tasks.on_request_expired([this](server_queue_expiration expiration) {
-            auto result = std::make_unique<server_task_result_error>();
-            result->id       = expiration.task_id;
-            result->err_type = ERROR_TYPE_TIMEOUT;
-            result->err_msg  = expiration.kind == server_request_runtime::deadline_kind::queue ?
-                                   "request queue deadline expired" : "request run deadline expired";
-            queue_results.send(std::move(result));
-        });
+        queue_tasks.set_expiration_response(queue_results);
 
         metrics.init();
 
@@ -2118,17 +2179,23 @@ private:
     }
 
     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
-        send_error(task.id, error, type);
+        send_error_impl(task.id, error, type, 0, 0, server_task_uses_request_runtime(task.type));
     }
 
     void send_error(const server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
-        send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx);
+        send_error_impl(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx, true);
     }
 
     void send_error(const int id_task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER, const int32_t n_prompt_tokens = 0, const int32_t n_ctx = 0) {
-        SRV_ERR("task id = %d, error: %s\n", id_task, error.c_str());
+        send_error_impl(id_task, error, type, n_prompt_tokens, n_ctx, false);
+    }
 
-        queue_tasks.fail_task(id_task);
+    server_task_result_ptr make_error_result(const int id_task,
+                                             const std::string & error,
+                                             const enum error_type type = ERROR_TYPE_SERVER,
+                                             const int32_t n_prompt_tokens = 0,
+                                             const int32_t n_ctx = 0) {
+        SRV_ERR("task id = %d, error: %s\n", id_task, error.c_str());
 
         if (type == ERROR_TYPE_EXCEED_CONTEXT_SIZE) {
             GGML_ASSERT(n_ctx > 0 && n_prompt_tokens > 0);
@@ -2141,7 +2208,21 @@ private:
         res->n_prompt_tokens = n_prompt_tokens;
         res->n_ctx           = n_ctx;
 
-        queue_results.send(std::move(res));
+        return res;
+    }
+
+    void send_error_impl(const int id_task,
+                         const std::string & error,
+                         const enum error_type type,
+                         const int32_t n_prompt_tokens,
+                         const int32_t n_ctx,
+                         bool durable_request) {
+        auto res = make_error_result(id_task, error, type, n_prompt_tokens, n_ctx);
+        if (durable_request) {
+            queue_tasks.fail_task_with_result(queue_results, id_task, std::move(res));
+        } else {
+            queue_results.send(std::move(res));
+        }
     }
 
     // Gate slot save/restore/erase on slot content (does it hold media),
@@ -2154,6 +2235,25 @@ private:
             return false;
         }
         return true;
+    }
+
+    bool publish_or_stage_prefill_result(server_slot &             slot,
+                                         server_queue_result_kind  kind,
+                                         server_task_result_ptr && result,
+                                         bool                      count_prediction = false) {
+        if (is_staged_prefill_family(slot)) {
+            prefill_publications.push_back({
+                slot.task->id,
+                slot.id,
+                kind,
+                std::move(result),
+                &slot,
+                count_prediction,
+            });
+            return false;
+        }
+        return queue_tasks.publish_slot_result(
+            queue_results, slot.task->id, slot.id, kind, std::move(result));
     }
 
     bool send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
@@ -2196,8 +2296,8 @@ private:
             res->timings = slot.get_timings();
         }
 
-        return queue_tasks.publish_slot_result(queue_results, slot.task->id, slot.id,
-                                               server_queue_result_kind::partial, std::move(res));
+        return publish_or_stage_prefill_result(
+            slot, server_queue_result_kind::partial, std::move(res));
     }
 
     bool send_final_response(server_slot & slot) {
@@ -2260,11 +2360,11 @@ private:
 
         res->generation_params = slot.task->params; // copy the parameters
 
-        return queue_tasks.publish_slot_result(queue_results, slot.task->id, slot.id,
-                                               server_queue_result_kind::final, std::move(res));
+        return publish_or_stage_prefill_result(
+            slot, server_queue_result_kind::final, std::move(res), true);
     }
 
-    bool send_embedding(const server_slot & slot, const llama_batch & batch) {
+    bool send_embedding(server_slot & slot, const llama_batch & batch) {
         auto res = std::make_unique<server_task_result_embd>();
         res->id        = slot.task->id;
         res->index     = slot.task->index;
@@ -2306,11 +2406,11 @@ private:
 
         SLT_DBG(slot, "%s", "sending embeddings\n");
 
-        return queue_tasks.publish_slot_result(queue_results, slot.task->id, slot.id,
-                                               server_queue_result_kind::final, std::move(res));
+        return publish_or_stage_prefill_result(
+            slot, server_queue_result_kind::final, std::move(res));
     }
 
-    bool send_rerank(const server_slot & slot, const llama_batch & batch) {
+    bool send_rerank(server_slot & slot, const llama_batch & batch) {
         auto res = std::make_unique<server_task_result_rerank>();
         res->id       = slot.task->id;
         res->index    = slot.task->index;
@@ -2338,8 +2438,8 @@ private:
 
         SLT_DBG(slot, "sending rerank result, res.score = %f\n", res->score);
 
-        return queue_tasks.publish_slot_result(queue_results, slot.task->id, slot.id,
-                                               server_queue_result_kind::final, std::move(res));
+        return publish_or_stage_prefill_result(
+            slot, server_queue_result_kind::final, std::move(res));
     }
 
     //
@@ -2800,12 +2900,29 @@ private:
         }
     }
 
+    bool is_staged_prefill_family(const server_slot & slot) const {
+        if (!slot.task) {
+            return false;
+        }
+        const uint64_t request_id = static_cast<uint64_t>(slot.task->id) + 1;
+        const uint64_t parent_request_id = slot.task->id_parent >= 0
+            ? static_cast<uint64_t>(slot.task->id_parent) + 1
+            : 0;
+        return prefill_batch.owns_family_task(request_id, parent_request_id);
+    }
+
     void iterate(std::vector<server_slot> & slots, std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
             try {
                 callback(slot);
             } catch (const std::exception & e) {
+                if (is_staged_prefill_family(slot)) {
+                    throw;
+                }
                 SLT_ERR(slot, "got exception: %s\n", e.what());
+                if (!slot.task) {
+                    continue;
+                }
                 send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                 slot.release();
             }
@@ -2817,7 +2934,13 @@ private:
             try {
                 callback(*slot);
             } catch (const std::exception & e) {
+                if (is_staged_prefill_family(*slot)) {
+                    throw;
+                }
                 SLT_ERR(*slot, "got exception: %s\n", e.what());
+                if (!slot->task) {
+                    continue;
+                }
                 send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                 slot->release();
             }
@@ -2830,6 +2953,184 @@ private:
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
             }
+        }
+    }
+
+    void abort_incomplete_prefill_batch() {
+        const auto plan = prefill_batch.abort_plan();
+        if (!plan.clear_prompt_state) {
+            return;
+        }
+
+        const auto lease = prefill_batch.lease();
+        if (plan.abort_coordinator) {
+            GGML_ASSERT(prefill.abort_chunk(lease));
+        }
+
+        // Staging advances the parent's logical prompt, llama_decode can mutate
+        // target before draft processing fails, and a prepared child can hold
+        // a copied KV prefix. Clear the whole family before any slot release.
+        for (auto & slot : slots) {
+            if (slot.is_processing() && is_staged_prefill_family(slot)) {
+                slot.prompt_clear();
+            }
+        }
+        prefill_publications.clear();
+        prefill_terminal_slots.clear();
+        prefill_prompt_eval_slots.clear();
+        prefill_batch.reset();
+    }
+
+    void fail_staged_prefill_family(const std::string & reason) {
+        const uint64_t family_request_id = prefill_batch.lease().request_id;
+        const int      id_family         = static_cast<int>(family_request_id - 1);
+        queue_tasks.begin_family_terminal_handoff(id_family);
+        abort_incomplete_prefill_batch();
+        std::vector<server_slot *> family;
+        std::vector<server_slot *> failures;
+        try {
+            family.reserve(slots.size());
+            failures.reserve(slots.size());
+            for (server_slot & slot : slots) {
+                if (!slot.is_processing() || !slot.task) {
+                    continue;
+                }
+                const int slot_family = slot.task->id_parent >= 0 ? slot.task->id_parent : slot.task->id;
+                if (slot_family != id_family) {
+                    continue;
+                }
+                family.push_back(&slot);
+                if (slot.prefill_disposition.may_publish_failure_terminal()) {
+                    failures.push_back(&slot);
+                }
+            }
+
+            std::vector<server_task_result_ptr> results;
+            results.reserve(failures.size());
+            for (server_slot * slot : failures) {
+                results.push_back(make_error_result(slot->task->id, reason, ERROR_TYPE_SERVER,
+                                                    slot->task->n_tokens(), slot->n_ctx));
+            }
+            queue_tasks.fail_family_with_results(queue_results, id_family, std::move(results));
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to prepare staged-family terminals, id_family = %d: %s\n", id_family, e.what());
+            // No family transition/control is committed until every member's
+            // response slot is prepared. Retain all undisposed members and
+            // force another update turn before the queue can go idle.
+            for (server_slot & slot : slots) {
+                if (!slot.is_processing() || !slot.task) {
+                    continue;
+                }
+                const int slot_family = slot.task->id_parent >= 0 ? slot.task->id_parent : slot.task->id;
+                if (slot_family == id_family && slot.prefill_disposition.may_publish_failure_terminal()) {
+                    slot.state = SLOT_STATE_FAILED_PENDING;
+                }
+            }
+            queue_tasks.request_update();
+            return;
+        }
+
+        for (server_slot * slot : failures) {
+            slot->prefill_disposition.record_terminal_handoff();
+        }
+        for (server_slot * slot : family) {
+            slot->release();
+        }
+    }
+
+    void retry_pending_prefill_failures() {
+        while (true) {
+            int id_family = -1;
+            for (const server_slot & slot : slots) {
+                if (slot.state == SLOT_STATE_FAILED_PENDING && slot.task) {
+                    id_family = slot.task->id_parent >= 0 ? slot.task->id_parent : slot.task->id;
+                    break;
+                }
+            }
+            if (id_family < 0) {
+                return;
+            }
+
+            std::vector<server_slot *> family;
+            std::vector<server_slot *> failures;
+            try {
+                family.reserve(slots.size());
+                failures.reserve(slots.size());
+                for (server_slot & slot : slots) {
+                    if (!slot.is_processing() || !slot.task) {
+                        continue;
+                    }
+                    const int slot_family = slot.task->id_parent >= 0 ? slot.task->id_parent : slot.task->id;
+                    if (slot_family != id_family) {
+                        continue;
+                    }
+                    family.push_back(&slot);
+                    if (slot.state == SLOT_STATE_FAILED_PENDING &&
+                        slot.prefill_disposition.may_publish_failure_terminal()) {
+                        failures.push_back(&slot);
+                    }
+                }
+
+                std::vector<server_task_result_ptr> results;
+                results.reserve(failures.size());
+                for (server_slot * slot : failures) {
+                    results.push_back(make_error_result(
+                        slot->task->id, "staged family failed; retrying terminal publication",
+                        ERROR_TYPE_SERVER, slot->task->n_tokens(), slot->n_ctx));
+                }
+                queue_tasks.fail_family_with_results(queue_results, id_family, std::move(results));
+            } catch (const std::exception & e) {
+                SRV_ERR("staged-family terminal retry failed, id_family = %d: %s\n", id_family, e.what());
+                queue_tasks.request_update();
+                return;
+            }
+
+            for (server_slot * slot : failures) {
+                slot->prefill_disposition.record_terminal_handoff();
+            }
+            for (server_slot * slot : family) {
+                slot->release();
+            }
+        }
+    }
+
+    void flush_prefill_publications() {
+        for (auto & publication : prefill_publications) {
+            GGML_ASSERT(publication.result && publication.slot && publication.slot->task);
+            const bool published = queue_tasks.publish_slot_result(
+                queue_results,
+                publication.id_task,
+                publication.id_slot,
+                publication.kind,
+                std::move(publication.result));
+            if (publication.kind == server_queue_result_kind::final) {
+                publication.slot->prefill_disposition.record_terminal_handoff();
+            }
+            if (publication.slot->prefill_disposition.take_prompt_metric()) {
+                metrics.on_prompt_eval(*publication.slot);
+            }
+            if (published && publication.count_prediction &&
+                publication.slot->prefill_disposition.take_prediction_metric()) {
+                metrics.on_prediction(*publication.slot);
+            }
+        }
+        prefill_publications.clear();
+        for (server_slot * slot : prefill_prompt_eval_slots) {
+            if (slot->prefill_disposition.take_prompt_metric()) {
+                metrics.on_prompt_eval(*slot);
+            }
+        }
+        prefill_prompt_eval_slots.clear();
+    }
+
+    void release_prefill_terminal_slots() {
+        // Keep release callbacks inside the committed lifecycle guard. If one
+        // throws, the staged-family catch below clears and releases every
+        // remaining processing slot without attempting another publication.
+        auto terminal_slots = std::move(prefill_terminal_slots);
+        prefill_terminal_slots.clear();
+        for (server_slot * slot : terminal_slots) {
+            slot->release();
         }
     }
 
@@ -2877,6 +3178,8 @@ private:
         }
 #endif
 
+        retry_pending_prefill_failures();
+
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -2908,7 +3211,9 @@ private:
             batch.render();
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
+            abort_incomplete_prefill_batch();
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
+            return;
         }
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
@@ -2951,6 +3256,10 @@ private:
 #endif
 
                 if (outcome.action == decode_action::success) {
+                    if (prefill_batch) {
+                        GGML_ASSERT(prefill_batch.record_decoded_view(off, n_tokens));
+                    }
+
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;
 
@@ -2969,19 +3278,73 @@ private:
                 }
             } catch (const std::exception & e) {
                 SRV_ERR("decode() failed: %s\n", e.what());
+                abort_incomplete_prefill_batch();
                 abort_all_slots("decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
-                post_decode(n_tokens, off, batch_view);
+
+                if (prefill_batch) {
+                    auto family = staged_prefill_family_slots();
+                    std::vector<server_slot *> unrelated;
+                    unrelated.reserve(slots.size() - family.size());
+                    for (auto & slot : slots) {
+                        if (std::find(family.begin(), family.end(), &slot) == family.end()) {
+                            unrelated.push_back(&slot);
+                        }
+                    }
+
+                    // Unrelated decoded slots retain their ordinary per-slot
+                    // postdecode behavior. A staged-family failure below does
+                    // not invalidate their already successful target state.
+                    post_decode(n_tokens, off, batch_view, &unrelated);
+
+                    server_prefill::staged_view_result result;
+                    try {
+                        if (prefill_batch.ready_for_family_preparation()) {
+                            family = prepare_parent_family(prefill_batch.lease());
+                        }
+
+                        result = server_prefill::finish_decoded_view(
+                            prefill_batch,
+                            off,
+                            n_tokens,
+                            [&]() { post_decode(n_tokens, off, batch_view, &family); },
+                            [&](const server_prefill::chunk_lease & lease) {
+                                if (!staged_family_ready_to_commit(family, lease)) {
+                                    throw std::runtime_error("staged family did not finish postdecode");
+                                }
+                                return prefill.commit_chunk(lease);
+                            },
+                            [&](const server_prefill::chunk_lease &, bool activate_parent) {
+                                activate_staged_family(family, activate_parent);
+                                flush_prefill_publications();
+                                release_prefill_terminal_slots();
+                            });
+                        if (!result.valid) {
+                            throw std::runtime_error("staged family transaction rejected decoded view or commit");
+                        }
+                    } catch (const std::exception & e) {
+                        SRV_ERR("staged family post_decode() failed: %s\n", e.what());
+                        fail_staged_prefill_family(
+                            "staged family post_decode() failed: " + std::string(e.what()));
+                        break;
+                    }
+
+                } else {
+                    post_decode(n_tokens, off, batch_view);
+                }
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
+                abort_incomplete_prefill_batch();
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
         }
+
+        abort_incomplete_prefill_batch();
     }
 
     bool set_dspark_draft_options(int32_t n_max, float p_min) {
@@ -3146,18 +3509,28 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+        GGML_ASSERT(!prefill_batch && !prefill.snapshot().chunk_in_flight);
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
 
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
+        server_prefill::decode_activity prefill_decode;
 
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
+
+            const auto priority = server_prefill_lane(slot.task->scheduling.lane);
+            GGML_ASSERT(priority != server_scheduler::lane::count);
+            if (!prefill_decode.active ||
+                static_cast<uint8_t>(priority) > static_cast<uint8_t>(prefill_decode.highest_lane)) {
+                prefill_decode.highest_lane = priority;
+            }
+            prefill_decode.active = true;
 
             // check if we can batch this slot with the previous one
             if (!slot_batched) {
@@ -3281,6 +3654,22 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        std::vector<server_prefill::candidate> prefill_candidates;
+        prefill_candidates.reserve(slots.size());
+        for (const server_slot & slot : slots) {
+            if ((slot.state != SLOT_STATE_STARTED && slot.state != SLOT_STATE_PROCESSING_PROMPT) ||
+                !slot.task || slot.task->is_child()) {
+                continue;
+            }
+            prefill_candidates.push_back({
+                static_cast<uint64_t>(slot.task->id) + 1,
+                static_cast<uint64_t>(slot.task->id) + 1,
+                server_prefill_lane(slot.task->scheduling.lane),
+                slot.task->scheduling.arrival_us,
+            });
+        }
+        const auto prefill_owner = prefill.select_owner(prefill_candidates);
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -3310,6 +3699,11 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    const uint64_t request_id = static_cast<uint64_t>(slot.task->id) + 1;
+                    if (!prefill_owner || prefill_owner.request_id != request_id) {
+                        return;
+                    }
+
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
@@ -3608,6 +4002,14 @@ private:
                         }
                     }
 
+                    // Media encoding is not divisible into llama token chunks.
+                    // Never let it share an iteration with active decode; the
+                    // parent keeps ownership and resumes after decode drains.
+                    if (slot.prompt.n_tokens() < slot.task->n_tokens() &&
+                        input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL && prefill_decode.active) {
+                        return;
+                    }
+
                     const int64_t t_now = ggml_time_us();
                     slot.t_prompt_processing = (t_now - slot.t_start_process_prompt) / 1e3;
                     slot.print_timings_pp();
@@ -3660,32 +4062,99 @@ private:
                             break;
                         }
 
-                        // process the image
-                        size_t n_tokens_out = 0;
-                        int32_t res = slot.process_mtmd_chunk(cur_token_idx, n_tokens_out);
+                        const auto & chunk = input_tokens.find_chunk(cur_token_idx);
+                        const size_t media_tokens = mtmd_input_chunk_get_n_tokens(chunk.get());
+                        const uint64_t media_begin = static_cast<uint64_t>(cur_token_idx);
+                        const uint64_t media_end   = media_begin + media_tokens;
+                        const auto media_plan = server_prefill::plan_media_chunk(
+                            media_begin,
+                            media_end,
+                            static_cast<uint64_t>(slot.task->n_tokens()));
+                        if (!media_plan.decode_allowed) {
+                            send_error(slot,
+                                    "media must be followed by a text token; media-tail generation is not supported",
+                                    ERROR_TYPE_NOT_SUPPORTED);
+                            slot.prompt_clear();
+                            slot.release();
+                            return;
+                        }
+
+                        const auto media_lease = prefill.stage_chunk(
+                            request_id,
+                            media_begin,
+                            media_end,
+                            static_cast<uint64_t>(slot.task->n_tokens()));
+                        GGML_ASSERT(media_lease);
+
+                        const auto abort_media = [&]() {
+                            GGML_ASSERT(prefill.abort_chunk(media_lease));
+                            if (media_plan.clear_backend_on_failure) {
+                                slot.prompt_clear();
+                            }
+                        };
+
+                        // Media decode mutates the context outside server_batch.
+                        // Preflight its exact logical range before that mutation,
+                        // then commit only after both decode and prompt bookkeeping
+                        // succeed. Exceptions leave the coordinator at the prior
+                        // committed cursor.
+                        size_t  n_tokens_out = 0;
+                        int32_t res;
+                        try {
+                            res = slot.process_mtmd_chunk(cur_token_idx, n_tokens_out);
+                            if (res == 0) {
+                                GGML_ASSERT(n_tokens_out == media_tokens);
+                                slot.prompt.tokens.push_back(chunk.get()); // copy
+                            }
+                        } catch (...) {
+                            abort_media();
+                            throw;
+                        }
                         if (res != 0) {
+                            abort_media();
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
                             slot.release();
-                            continue;
+                            return;
                         }
 
+                        GGML_ASSERT(prefill.commit_chunk(media_lease));
                         slot.n_prompt_tokens_processed += n_tokens_out;
 
-                        // add the image chunk to cache
-                        {
-                            const auto & chunk = input_tokens.find_chunk(cur_token_idx);
-                            slot.prompt.tokens.push_back(chunk.get()); // copy
-                        }
-
                         has_mtmd = true;
+                        if (media_lease.yield_boundary && !media_lease.completes_prompt) {
+                            // Re-enter owner selection after an aligned media
+                            // commit rather than crossing arbitrarily many
+                            // handoff points in this pre_decode iteration.
+                            return;
+                        }
+                    }
+
+                    server_prefill::chunk_limit chunk_limit = { true, static_cast<uint64_t>(slot.task->n_tokens()) };
+                    if (!slot.can_split() && prefill_decode.active) {
+                        // Indivisible embedding work cannot honor a mixed
+                        // decode token cap, so wait until decode drains.
+                        return;
+                    }
+                    if (slot.can_split() && slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                        chunk_limit = prefill.limit_chunk(
+                            request_id,
+                            static_cast<uint64_t>(slot.prompt.n_tokens()),
+                            static_cast<uint64_t>(slot.task->n_tokens()),
+                            static_cast<uint32_t>(n_batch - batch.size()),
+                            prefill_decode);
+                        if (!chunk_limit) {
+                            return;
+                        }
                     }
 
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() &&
+                           static_cast<uint64_t>(slot.prompt.n_tokens()) < chunk_limit.end_token &&
+                           batch.size() < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3747,6 +4216,19 @@ private:
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
+
+                    if (n_tokens_cur > 0) {
+                        GGML_ASSERT(!prefill_batch);
+                        GGML_ASSERT(prefill_publications.empty() && prefill_terminal_slots.empty() &&
+                                    prefill_prompt_eval_slots.empty());
+                        const auto lease = prefill.stage_chunk(
+                            request_id,
+                            static_cast<uint64_t>(n_tokens_start),
+                            static_cast<uint64_t>(slot.prompt.n_tokens()),
+                            static_cast<uint64_t>(slot.task->n_tokens()));
+                        GGML_ASSERT(lease);
+                        GGML_ASSERT(prefill_batch.begin(lease, n_tokens_prev, n_tokens_cur));
+                    }
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
@@ -3926,11 +4408,10 @@ private:
                     for (auto & slot : slots) {
                         if (slot.is_processing()) {
                             send_error(slot, err);
-                            slot.release();
-
                             // note: it's complicated to keep track of how much of the current batch has been
                             //       processed before the error occurred, so we simply clear the entire context
                             slot.prompt_clear();
+                            slot.release();
                         }
                     }
 
@@ -3959,48 +4440,122 @@ private:
             throw std::runtime_error("failed to process speculative batch");
         }
 
-        // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
-        for (auto & slot : slots) {
-            if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()) {
-                std::vector<server_slot *> children;
-                for (auto & other : slots) {
-                    if (other.state == SLOT_STATE_WAIT_OTHER && slot.task->id == other.task->id_parent) {
-                        children.push_back(&other);
-                    }
-                }
-
-                // all children slots should already launched by launch_slots_with_parent_task()
-                // copy state to the child slots
-                for (auto & child : children) {
-                    SLT_TRC(slot, " - copying state to child %d\n", child->id);
-
-                    GGML_ASSERT(child->state == SLOT_STATE_WAIT_OTHER);
-
-                    slot.copy_state_to(*child);
-                    child->state = SLOT_STATE_DONE_PROMPT;
-                }
-            }
-        }
-
         kv_pressure.reset_attempts();
         return {};
     }
 
-    void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
+    std::vector<server_slot *> prepare_parent_family(const server_prefill::chunk_lease & lease) {
+        GGML_ASSERT(lease.completes_prompt);
+
+        std::vector<server_slot *> family;
+        server_slot * parent = nullptr;
+        for (auto & slot : slots) {
+            if (slot.is_processing() && slot.task &&
+                static_cast<uint64_t>(slot.task->id) + 1 == lease.request_id) {
+                parent = &slot;
+                break;
+            }
+        }
+        GGML_ASSERT(parent != nullptr && parent->state == SLOT_STATE_DONE_PROMPT);
+        family.push_back(parent);
+        if (!parent->task->is_parent()) {
+            parent->state = SLOT_STATE_DONE_PROMPT_STAGED;
+            return family;
+        }
+
+        // launch_slots_with_parent_task() has already reserved every child.
+        // Prepare a complete KV/sampler snapshot, but keep children passive
+        // until the parent's actual post-decode work and exact commit succeed.
+        for (auto & child : slots) {
+            if (child.state != SLOT_STATE_WAIT_OTHER || !child.task ||
+                child.task->id_parent != parent->task->id) {
+                continue;
+            }
+            SLT_TRC(*parent, " - preparing state for child %d\n", child.id);
+            parent->copy_state_to(child);
+            family.push_back(&child);
+        }
+
+        for (server_slot * slot : family) {
+            slot->state = SLOT_STATE_DONE_PROMPT_STAGED;
+        }
+        return family;
+    }
+
+    std::vector<server_slot *> staged_prefill_family_slots() {
+        std::vector<server_slot *> family;
+        for (auto & slot : slots) {
+            if (slot.is_processing() && is_staged_prefill_family(slot)) {
+                family.push_back(&slot);
+            }
+        }
+        return family;
+    }
+
+    void activate_staged_family(const std::vector<server_slot *> & family, bool activate_parent) noexcept {
+        if (!activate_parent) {
+            return;
+        }
+        for (server_slot * slot : family) {
+            if (slot->state == SLOT_STATE_GENERATING_STAGED) {
+                slot->state = SLOT_STATE_GENERATING;
+            }
+        }
+    }
+
+    bool staged_family_ready_to_commit(const std::vector<server_slot *> & family,
+                                       const server_prefill::chunk_lease & lease) const {
+        if (!lease.completes_prompt) {
+            return true;
+        }
+        return !family.empty() && std::all_of(family.begin(), family.end(), [](const server_slot * slot) {
+            return slot != nullptr &&
+                (slot->state == SLOT_STATE_GENERATING_STAGED || slot->state == SLOT_STATE_TERMINAL_STAGED);
+        });
+    }
+
+    void finish_postdecode_slot(server_slot & slot) {
+        if (!is_staged_prefill_family(slot)) {
+            slot.release();
+            return;
+        }
+        slot.state = SLOT_STATE_TERMINAL_STAGED;
+        prefill_terminal_slots.push_back(&slot);
+    }
+
+    void validate_post_decode(int32_t                           n_batch_tokens,
+                              int32_t                           off,
+                              const std::vector<server_slot *> * selected_slots) {
+        iterate(slots, [&](server_slot & slot) {
+            if (selected_slots != nullptr &&
+                std::find(selected_slots->begin(), selected_slots->end(), &slot) == selected_slots->end()) {
+                return;
+            }
+            for (int32_t i : slot.spec_i_batch) {
+                if (i < off || i >= off + n_batch_tokens) {
+                    throw std::runtime_error(string_format(
+                        "speculative batch index %d is not inside the current sub-batch [%d, %d)",
+                        i, off, off + n_batch_tokens));
+                }
+            }
+        });
+    }
+
+    void post_decode(int32_t                    n_batch_tokens,
+                     int32_t                    off,
+                     llama_batch &              batch_view,
+                     const std::vector<server_slot *> * selected_slots = nullptr) {
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
         };
 
-        // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
-        // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
-        iterate(slots, [&](server_slot & slot) {
-            for (auto & i : slot.spec_i_batch) {
-                if (!is_inside_view(i)) {
-                    throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
-                }
-            }
-        });
+        auto is_selected = [&](const server_slot & slot) {
+            return selected_slots == nullptr ||
+                std::find(selected_slots->begin(), selected_slots->end(), &slot) != selected_slots->end();
+        };
+
+        validate_post_decode(n_batch_tokens, off, selected_slots);
 
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
             return params_base.special ||
@@ -4008,8 +4563,13 @@ private:
         };
 
         iterate(slots, [&](server_slot & slot) {
+            if (!is_selected(slot)) {
+                return;
+            }
+
             // optionally send prompt processing progress
-            if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
+            if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT ||
+                slot.state == SLOT_STATE_DONE_PROMPT_STAGED) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {
                     send_partial_response(slot, {}, true);
                 }
@@ -4020,31 +4580,33 @@ private:
                 return;
             }
 
-            if (slot.state == SLOT_STATE_DONE_PROMPT) {
+            if (slot.state == SLOT_STATE_DONE_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT_STAGED) {
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);
-                    slot.release();
                     slot.i_batch = -1;
+                    finish_postdecode_slot(slot);
                     return;
                 }
 
                 if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
                     send_rerank(slot, batch_view);
-                    slot.release();
                     slot.i_batch = -1;
+                    finish_postdecode_slot(slot);
                     return;
                 }
 
                 GGML_ASSERT(slot.task->need_sampling());
 
                 // prompt evaluated for next-token prediction
-                slot.state = SLOT_STATE_GENERATING;
+                slot.state = slot.state == SLOT_STATE_DONE_PROMPT_STAGED
+                    ? SLOT_STATE_GENERATING_STAGED
+                    : SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
-            } else if (slot.state != SLOT_STATE_GENERATING) {
+            } else if (slot.state != SLOT_STATE_GENERATING && slot.state != SLOT_STATE_GENERATING_STAGED) {
                 return;
             }
 
@@ -4075,7 +4637,12 @@ private:
                 slot.t_print_last = t_now;
                 slot.n_decoded_last = 0;
                 slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
-                metrics.on_prompt_eval(slot);
+                if (is_staged_prefill_family(slot)) {
+                    slot.prefill_disposition.defer_prompt_metric();
+                    prefill_prompt_eval_slots.push_back(&slot);
+                } else {
+                    metrics.on_prompt_eval(slot);
+                }
             }
 
             slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
@@ -4095,7 +4662,7 @@ private:
                 if (send_final_response(slot)) {
                     metrics.on_prediction(slot);
                 }
-                slot.release();
+                finish_postdecode_slot(slot);
 
                 return;
             }
@@ -4105,7 +4672,12 @@ private:
 
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
+            if (!is_selected(slot)) {
+                return;
+            }
+
+            if ((slot.state != SLOT_STATE_GENERATING && slot.state != SLOT_STATE_GENERATING_STAGED) ||
+                !slot.can_speculate() || slot.spec_draft.empty()) {
                 return;
             }
 
@@ -4226,7 +4798,7 @@ private:
                     if (send_final_response(slot)) {
                         metrics.on_prediction(slot);
                     }
-                    slot.release();
+                    finish_postdecode_slot(slot);
 
                     return;
                 }

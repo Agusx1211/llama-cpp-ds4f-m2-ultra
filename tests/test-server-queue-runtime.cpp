@@ -3,6 +3,7 @@
 #endif
 
 #include "server-queue.h"
+#include "server-prefill.h"
 
 #include <array>
 
@@ -126,13 +127,12 @@ server_task_result_ptr make_final_result(server_task_type type, int task_id) {
     return result;
 }
 
-void send_timeout_result(server_response & responses, server_queue_expiration event) {
-    auto error      = std::make_unique<server_task_result_error>();
-    error->id       = event.task_id;
-    error->err_type = ERROR_TYPE_TIMEOUT;
-    error->err_msg  = event.kind == server_request_runtime::deadline_kind::run ? "request run deadline exceeded" :
-                                                                                 "request queue deadline exceeded";
-    responses.send(std::move(error));
+server_task_result_ptr make_error_result(int task_id, const char * message) {
+    auto result      = std::make_unique<server_task_result_error>();
+    result->id       = task_id;
+    result->err_type = ERROR_TYPE_SERVER;
+    result->err_msg  = message;
+    return result;
 }
 
 void require_timeout_only(server_response & responses, int task_id, const char * message) {
@@ -302,6 +302,151 @@ void test_cancel_deferred_payload() {
     require(cancellation_dispatches == 1 && queue.queue_tasks_deferred_size() == 0 &&
                 queue.request_summary().active_requests == 0,
             "deferred cancellation removes payload and durable state exactly once");
+}
+
+void test_external_cancel_preparation_is_fault_atomic() {
+    {
+        server_queue queue;
+        server_task  task = make_user(queue, server_task::trusted_lane::normal, 35);
+        const int    task_id = task.id;
+        require_posted(queue.post(std::move(task)), task_id, "post single cancel fault fixture");
+
+        std::vector<bound_family_slot> bound;
+        bool cancellation_attempted = false;
+        bool preparation_failed     = false;
+        int  cancel_controls        = 0;
+        queue.on_new_task([&](server_task && selected) {
+            if (selected.type == SERVER_TASK_TYPE_CANCEL) {
+                ++cancel_controls;
+                require(selected.id_target == task_id && bound.size() == 1,
+                        "retried single cancellation dispatches its original target once");
+                bound.front().release();
+                queue.terminate();
+                return;
+            }
+            require(selected.id == task_id && queue.bind_slot(task_id, 0),
+                    "bind single cancel fault fixture");
+            bound.emplace_back(queue, 0, std::move(selected));
+        });
+        queue.on_update_slots([&] {
+            if (cancellation_attempted) {
+                return;
+            }
+            cancellation_attempted = true;
+            queue.set_prepare_terminal_control_hook_for_tests([](size_t attempt) {
+                if (attempt == 1) {
+                    throw std::runtime_error("injected single cancel node preparation failure");
+                }
+            });
+            try {
+                server_task cancel(SERVER_TASK_TYPE_CANCEL);
+                cancel.id        = queue.get_new_id();
+                cancel.id_target = task_id;
+                queue.post(std::move(cancel), true);
+            } catch (const std::runtime_error &) {
+                preparation_failed = true;
+            }
+            require(preparation_failed && cancel_controls == 0 &&
+                        queue.request_summary().active_requests == 1 &&
+                        queue.dispatch_permits().bound[static_cast<size_t>(server_scheduler::lane::normal)] == 1 &&
+                        bound.size() == 1 && bound.front().task,
+                    "single cancel allocation fault preserves durable binding, permit, and live payload");
+
+            queue.set_prepare_terminal_control_hook_for_tests({});
+            server_task retry(SERVER_TASK_TYPE_CANCEL);
+            retry.id        = queue.get_new_id();
+            retry.id_target = task_id;
+            require(queue.post(std::move(retry), true), "retry prepared single cancellation");
+        });
+        queue.on_sleeping_state([](bool) {});
+        queue.start_loop();
+        require(preparation_failed && cancel_controls == 1 &&
+                    queue.request_summary().active_requests == 0 &&
+                    queue.dispatch_permits().total == 0,
+                "single cancel retry retires exactly once without a permit leak");
+    }
+
+    {
+        server_queue queue;
+        queue.set_physical_slot_capacity(1);
+        std::array<int, 2> task_ids;
+        for (size_t i = 0; i < task_ids.size(); ++i) {
+            server_task task = make_user(queue, server_task::trusted_lane::normal, 40 + i);
+            task_ids[i] = task.id;
+            require_posted(queue.post(std::move(task)), task_ids[i], "post vector cancel fault fixture");
+        }
+
+        std::vector<bound_family_slot> bound;
+        bool cancellation_attempted = false;
+        bool preparation_failed     = false;
+        int  user_dispatches        = 0;
+        int  cancel_controls        = 0;
+        queue.on_new_task([&](server_task && selected) {
+            if (selected.type == SERVER_TASK_TYPE_CANCEL) {
+                ++cancel_controls;
+                if (selected.id_target == task_ids[0]) {
+                    require(bound.size() == 1, "vector retry retains the original bound payload");
+                    bound.front().release();
+                } else {
+                    require(selected.id_target == task_ids[1], "vector retry preserves cancellation order");
+                }
+                if (cancel_controls == 2) {
+                    queue.terminate();
+                }
+                return;
+            }
+
+            ++user_dispatches;
+            require(selected.id == task_ids[0] && queue.bind_slot(selected.id, 0),
+                    "physical cap binds only the first vector cancel fixture");
+            bound.emplace_back(queue, 0, std::move(selected));
+        });
+        queue.on_update_slots([&] {
+            if (cancellation_attempted) {
+                return;
+            }
+            cancellation_attempted = true;
+            queue.set_prepare_terminal_control_hook_for_tests([](size_t attempt) {
+                if (attempt == 2) {
+                    throw std::runtime_error("injected Nth vector cancel node preparation failure");
+                }
+            });
+
+            auto make_cancellations = [&]() {
+                std::vector<server_task> cancellations;
+                for (int id_target : task_ids) {
+                    server_task cancel(SERVER_TASK_TYPE_CANCEL);
+                    cancel.id_target = id_target;
+                    cancellations.push_back(std::move(cancel));
+                }
+                return cancellations;
+            };
+            try {
+                queue.post(make_cancellations(), true);
+            } catch (const std::runtime_error &) {
+                preparation_failed = true;
+            }
+            const auto snapshot = queue.request_snapshot();
+            const bool queued_payload_preserved = std::any_of(snapshot.begin(), snapshot.end(), [&](const auto & request) {
+                return request.handle.id == static_cast<uint64_t>(task_ids[1]) + 1 &&
+                       request.queue != server_request_registry::queue_state::none;
+            });
+            require(preparation_failed && cancel_controls == 0 && user_dispatches == 1 &&
+                        queue.request_summary().active_requests == task_ids.size() &&
+                        queue.dispatch_permits().bound[static_cast<size_t>(server_scheduler::lane::normal)] == 1 &&
+                        queued_payload_preserved,
+                    "Nth vector cancel fault preserves bound and queued durable payloads");
+
+            queue.set_prepare_terminal_control_hook_for_tests({});
+            require(queue.post(make_cancellations(), true), "retry fully prepared cancellation vector");
+        });
+        queue.on_sleeping_state([](bool) {});
+        queue.start_loop();
+        require(preparation_failed && user_dispatches == 1 && cancel_controls == 2 &&
+                    queue.request_summary().active_requests == 0 &&
+                    queue.dispatch_permits().total == 0,
+                "vector cancel retry suppresses queued dispatch and retires each target once");
+    }
 }
 
 void test_live_fast_queue_cap() {
@@ -771,10 +916,8 @@ void test_final_result_publication_deadline_gate() {
         server_queue    queue(config, [&] { return now_us; });
         server_response responses;
         int expiration_callbacks = 0;
-        queue.on_request_expired([&](server_queue_expiration event) {
-            ++expiration_callbacks;
-            send_timeout_result(responses, event);
-        });
+        queue.set_expiration_response(responses);
+        queue.on_request_expired([&](server_queue_expiration) { ++expiration_callbacks; });
 
         server_task task                 = make_user(queue, server_task::trusted_lane::normal, 0, type);
         task.scheduling.queue_timeout_us = 0;
@@ -818,6 +961,495 @@ void test_final_result_publication_deadline_gate() {
     }
 }
 
+void test_staged_family_publication_is_exception_safe_and_at_most_once() {
+    server_queue    queue;
+    server_response responses;
+    server_task     parent = make_family(queue, server_task::trusted_lane::normal, 2500);
+    const std::array<int, 3> family_ids = {
+        parent.id,
+        parent.child_tasks[0].id,
+        parent.child_tasks[1].id,
+    };
+    responses.add_waiting_task_ids(std::unordered_set<int>(family_ids.begin(), family_ids.end()));
+    std::vector<server_task> family_tasks;
+    family_tasks.push_back(std::move(parent));
+    require_posted(queue.post(std::move(family_tasks)), family_ids[0], "post publication-failure family");
+
+    queue.on_new_task([&](server_task && selected) {
+        require(selected.id == family_ids[0] && selected.child_tasks.size() == 2,
+                "publication-failure fixture dispatches the complete family");
+        for (size_t i = 0; i < selected.child_tasks.size(); ++i) {
+            require(queue.bind_slot(selected.child_tasks[i].id, static_cast<int>(i + 1)),
+                    "bind publication-failure child");
+        }
+        require(queue.bind_slot(selected.id, 0), "bind publication-failure parent");
+        queue.terminate();
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+
+    server_task unrelated = make_user(queue, server_task::trusted_lane::normal, 2501);
+    const int unrelated_id = unrelated.id;
+    responses.add_waiting_task_id(unrelated_id);
+    require_posted(queue.post(std::move(unrelated)), unrelated_id, "post unrelated publication probe");
+    bind_only(queue, unrelated_id, 3);
+
+    std::array<server_prefill::staged_member_disposition, 3> disposition;
+    for (auto & member : disposition) {
+        member.defer_prompt_metric();
+    }
+    int prompt_metrics     = 0;
+    int prediction_metrics = 0;
+
+    responses.set_prepare_send_hook_for_tests([](size_t attempt) {
+        if (attempt == 2) {
+            throw std::runtime_error("injected pre-gate response reservation failure");
+        }
+    });
+
+    require(queue.publish_slot_result(
+                responses, family_ids[0], 0, server_queue_result_kind::final,
+                make_final_result(SERVER_TASK_TYPE_COMPLETION, family_ids[0])),
+            "first family final reaches the real response queue");
+    disposition[0].record_terminal_handoff();
+    prompt_metrics += disposition[0].take_prompt_metric();
+    prediction_metrics += disposition[0].take_prediction_metric();
+
+    bool second_send_failed = false;
+    try {
+        queue.publish_slot_result(
+            responses, family_ids[1], 1, server_queue_result_kind::final,
+            make_final_result(SERVER_TASK_TYPE_COMPLETION, family_ids[1]));
+    } catch (const std::runtime_error &) {
+        second_send_failed = true;
+    }
+    require(second_send_failed && disposition[1].may_publish_failure_terminal(),
+            "Nth send fails before the durable terminal gate is consumed");
+
+    int error_terminals = 0;
+    for (size_t i = 0; i < family_ids.size(); ++i) {
+        if (!disposition[i].may_publish_failure_terminal()) {
+            continue;
+        }
+        require(queue.fail_task_with_result(
+                    responses, family_ids[i], make_error_result(family_ids[i], "staged family failed")),
+                "undisposed family member accepts one failure terminal");
+        disposition[i].record_terminal_handoff();
+        ++error_terminals;
+    }
+    require(error_terminals == 2 && prompt_metrics == 1 && prediction_metrics == 1,
+            "earlier accepted final keeps exactly-once metrics while failed siblings get one error");
+
+    require(queue.publish_slot_result(
+                responses, unrelated_id, 3, server_queue_result_kind::final,
+                make_final_result(SERVER_TASK_TYPE_COMPLETION, unrelated_id)),
+            "unrelated bound request remains publishable after family handoff failure");
+
+    for (size_t i = 0; i < family_ids.size(); ++i) {
+        auto terminal = responses.recv_with_timeout({ family_ids[i] }, 0);
+        require(terminal != nullptr && terminal->is_stop() &&
+                    terminal->is_error() == (i != 0) &&
+                    responses.recv_with_timeout({ family_ids[i] }, 0) == nullptr,
+                "each family task receives at most one terminal result");
+    }
+    auto unrelated_terminal = responses.recv_with_timeout({ unrelated_id }, 0);
+    require(unrelated_terminal != nullptr && !unrelated_terminal->is_error() && unrelated_terminal->is_stop() &&
+                responses.recv_with_timeout({ unrelated_id }, 0) == nullptr,
+            "unrelated request receives one unaffected final");
+
+    int cancellation_controls = 0;
+    queue.on_new_task([&](server_task && selected) {
+        require(selected.type == SERVER_TASK_TYPE_CANCEL,
+                "failed handoff cleanup dispatches only family cancellation controls");
+        const auto found = std::find(family_ids.begin(), family_ids.end(), selected.id_target);
+        require(found != family_ids.end(), "family cancellation targets a known child");
+        const int slot = static_cast<int>(std::distance(family_ids.begin(), found));
+        require(queue.release_slot(selected.id_target, slot), "family cancellation releases failed bound member");
+        if (++cancellation_controls == 2) {
+            queue.terminate();
+        }
+    });
+    queue.start_loop();
+    require(queue.request_summary().active_requests == 0 && queue.dispatch_permits().total == 0,
+            "exception-safe family publication retires all durable state");
+
+    server_queue    release_queue;
+    server_response release_responses;
+    server_task     release_parent = make_family(release_queue, server_task::trusted_lane::normal, 2600);
+    const std::array<int, 3> release_ids = {
+        release_parent.id,
+        release_parent.child_tasks[0].id,
+        release_parent.child_tasks[1].id,
+    };
+    release_responses.add_waiting_task_ids(std::unordered_set<int>(release_ids.begin(), release_ids.end()));
+    std::vector<server_task> release_tasks;
+    release_tasks.push_back(std::move(release_parent));
+    require_posted(release_queue.post(std::move(release_tasks)), release_ids[0],
+                   "post release-failure family");
+    release_queue.on_new_task([&](server_task && selected) {
+        for (size_t i = 0; i < selected.child_tasks.size(); ++i) {
+            require(release_queue.bind_slot(selected.child_tasks[i].id, static_cast<int>(i + 1)),
+                    "bind release-failure child");
+        }
+        require(release_queue.bind_slot(selected.id, 0), "bind release-failure parent");
+        release_queue.terminate();
+    });
+    release_queue.on_update_slots([] {});
+    release_queue.on_sleeping_state([](bool) {});
+    release_queue.start_loop();
+
+    std::array<server_prefill::staged_member_disposition, 3> release_disposition;
+    int release_prediction_metrics = 0;
+    for (size_t i = 0; i < release_ids.size(); ++i) {
+        require(release_queue.publish_slot_result(
+                    release_responses, release_ids[i], static_cast<int>(i), server_queue_result_kind::final,
+                    make_final_result(SERVER_TASK_TYPE_COMPLETION, release_ids[i])),
+                "all finals enqueue before injected release callback failure");
+        release_disposition[i].record_terminal_handoff();
+        release_prediction_metrics += release_disposition[i].take_prediction_metric();
+    }
+
+    bool release_callback_failed = false;
+    try {
+        throw std::runtime_error("injected post-final slot release callback failure");
+    } catch (const std::runtime_error &) {
+        release_callback_failed = true;
+    }
+    int duplicate_error_attempts = 0;
+    for (const auto & member : release_disposition) {
+        duplicate_error_attempts += member.may_publish_failure_terminal();
+    }
+    require(release_callback_failed && duplicate_error_attempts == 0 && release_prediction_metrics == 3,
+            "post-final release failure preserves metrics and suppresses every duplicate error terminal");
+    for (int id : release_ids) {
+        auto terminal = release_responses.recv_with_timeout({ id }, 0);
+        require(terminal != nullptr && !terminal->is_error() && terminal->is_stop() &&
+                    release_responses.recv_with_timeout({ id }, 0) == nullptr,
+                "release callback failure leaves exactly one final per family member");
+    }
+    require(release_queue.request_summary().active_requests == 0 &&
+                release_queue.dispatch_permits().total == 0,
+            "accepted family finals retire durable records before slot release callback");
+}
+
+void test_terminal_expiry_and_failure_preparation_are_atomic() {
+    auto config                     = test_runtime_config();
+    config.default_queue_timeout_us = 100;
+    config.default_run_timeout_us   = 10;
+
+    uint64_t        now_us = 6000;
+    server_queue    expiry_queue(config, [&] { return now_us; });
+    server_response expiry_responses;
+    expiry_queue.set_expiration_response(expiry_responses);
+    int expiry_callbacks = 0;
+    expiry_queue.on_request_expired([&](server_queue_expiration) {
+        ++expiry_callbacks;
+        throw std::runtime_error("injected post-terminal expiration observer failure");
+    });
+
+    server_task expiring                 = make_user(expiry_queue, server_task::trusted_lane::normal, 0);
+    expiring.scheduling.queue_timeout_us = 0;
+    expiring.scheduling.run_timeout_us   = 0;
+    const int expiring_id                = expiring.id;
+    expiry_responses.add_waiting_task_id(expiring_id);
+    require_posted(expiry_queue.post(std::move(expiring)), expiring_id,
+                   "post atomic expiry preparation task");
+    bind_only(expiry_queue, expiring_id, 0);
+    now_us = 6010;
+
+    expiry_responses.set_prepare_send_hook_for_tests([](size_t attempt) {
+        if (attempt == 1) {
+            throw std::runtime_error("injected timeout response reservation failure");
+        }
+    });
+    bool timeout_prepare_failed = false;
+    try {
+        expiry_queue.publish_slot_result(
+            expiry_responses, expiring_id, 0, server_queue_result_kind::final,
+            make_final_result(SERVER_TASK_TYPE_COMPLETION, expiring_id));
+    } catch (const std::runtime_error &) {
+        timeout_prepare_failed = true;
+    }
+    require(timeout_prepare_failed && expiry_callbacks == 0 &&
+                expiry_queue.request_summary().active_requests == 1 &&
+                expiry_queue.dispatch_permits().bound[static_cast<size_t>(server_scheduler::lane::normal)] == 1 &&
+                expiry_responses.recv_with_timeout({ expiring_id }, 0) == nullptr,
+            "timeout result reservation failure leaves durable request and slot untouched");
+
+    require(!expiry_queue.fail_task_with_result(
+                expiry_responses, expiring_id, make_error_result(expiring_id, "must lose to timeout")),
+            "exact-deadline failure result yields to prepared timeout terminal");
+    require_timeout_only(expiry_responses, expiring_id,
+                         "expired failure path emits one timeout and no SERVER terminal");
+    require(!expiry_queue.fail_task_with_result(
+                expiry_responses, expiring_id, make_error_result(expiring_id, "must stay timed out")) &&
+                expiry_responses.recv_with_timeout({ expiring_id }, 0) == nullptr,
+            "failure after a completed timeout sweep cannot publish a SERVER terminal");
+    require(expiry_callbacks == 1 && expiry_queue.release_slot(expiring_id, 0),
+            "prepared timeout retries and releases its bound slot once");
+    expiry_queue.on_new_task([&](server_task && selected) {
+        require(selected.type == SERVER_TASK_TYPE_CANCEL && selected.id_target == expiring_id,
+                "prepared timeout queues one allocation-free cancellation control");
+        expiry_queue.terminate();
+    });
+    expiry_queue.on_update_slots([] {});
+    expiry_queue.on_sleeping_state([](bool) {});
+    expiry_queue.start_loop();
+    require(expiry_queue.request_summary().active_requests == 0,
+            "timeout/failure race retires without duplicate durable state");
+
+    now_us = 7000;
+    server_queue    failure_queue(config, [&] { return now_us; });
+    server_response failure_responses;
+    server_task     failing                 = make_user(failure_queue, server_task::trusted_lane::normal, 0);
+    failing.scheduling.queue_timeout_us     = 0;
+    failing.scheduling.run_timeout_us       = 100;
+    const int failing_id                    = failing.id;
+    failure_responses.add_waiting_task_id(failing_id);
+    require_posted(failure_queue.post(std::move(failing)), failing_id,
+                   "post failure-result retry task");
+    bind_only(failure_queue, failing_id, 0);
+    failure_responses.set_prepare_send_hook_for_tests([](size_t attempt) {
+        if (attempt == 1) {
+            throw std::runtime_error("injected failure-result reservation failure");
+        }
+    });
+
+    bool failure_prepare_failed = false;
+    try {
+        failure_queue.fail_task_with_result(
+            failure_responses, failing_id, make_error_result(failing_id, "first failure attempt"));
+    } catch (const std::runtime_error &) {
+        failure_prepare_failed = true;
+    }
+    require(failure_prepare_failed && failure_queue.request_summary().active_requests == 1 &&
+                failure_queue.dispatch_permits().bound[static_cast<size_t>(server_scheduler::lane::normal)] == 1 &&
+                failure_responses.recv_with_timeout({ failing_id }, 0) == nullptr,
+            "failure-result reserve fault cannot release or falsely complete the active record");
+
+    require(failure_queue.fail_task_with_result(
+                failure_responses, failing_id, make_error_result(failing_id, "retried failure terminal")),
+            "retained failure result retries through the same pre-terminal preparation path");
+    require(!failure_queue.fail_task_with_result(
+                failure_responses, failing_id, make_error_result(failing_id, "duplicate failure terminal")),
+            "a live but already-failed binding rejects a second terminal handoff");
+    auto error = failure_responses.recv_with_timeout({ failing_id }, 0);
+    require(error != nullptr && error->is_error() && error->is_stop() &&
+                failure_responses.recv_with_timeout({ failing_id }, 0) == nullptr,
+            "failure retry emits exactly one SERVER terminal");
+    failure_queue.on_new_task([&](server_task && selected) {
+        require(selected.type == SERVER_TASK_TYPE_CANCEL && selected.id_target == failing_id,
+                "failure retry queues its preallocated cancellation control");
+        require(failure_queue.release_slot(failing_id, 0),
+                "failure retry cancellation releases failed binding");
+        failure_queue.terminate();
+    });
+    failure_queue.on_update_slots([] {});
+    failure_queue.on_sleeping_state([](bool) {});
+    failure_queue.start_loop();
+    require(failure_queue.request_summary().active_requests == 0 &&
+                failure_queue.dispatch_permits().total == 0,
+            "failure-result retry retires without false completion or permit leak");
+    failure_responses.set_prepare_send_hook_for_tests([](size_t) {
+        throw std::runtime_error("stale failure must not prepare response storage");
+    });
+    require(!failure_queue.fail_task_with_result(
+                failure_responses, failing_id, make_error_result(failing_id, "stale failure terminal")) &&
+                failure_responses.recv_with_timeout({ failing_id }, 0) == nullptr,
+            "a stale waiting ID cannot resurrect a removed durable request");
+    const int missing_id = failure_queue.get_new_id();
+    failure_responses.add_waiting_task_id(missing_id);
+    require(!failure_queue.fail_task_with_result(
+                failure_responses, missing_id, make_error_result(missing_id, "missing failure terminal")) &&
+                failure_responses.recv_with_timeout({ missing_id }, 0) == nullptr,
+            "a missing durable request cannot publish through a waiting response ID");
+
+    now_us = 8000;
+    server_queue    batch_queue(config, [&] { return now_us; });
+    server_response batch_responses;
+    batch_queue.set_expiration_response(batch_responses);
+    int batch_expiry_callbacks = 0;
+    batch_queue.on_request_expired([&](server_queue_expiration) { ++batch_expiry_callbacks; });
+
+    std::array<int, 2> batch_ids;
+    for (size_t i = 0; i < batch_ids.size(); ++i) {
+        server_task task               = make_user(batch_queue, server_task::trusted_lane::normal, 0);
+        task.scheduling.queue_timeout_us = 0;
+        task.scheduling.run_timeout_us   = 10;
+        batch_ids[i] = task.id;
+        batch_responses.add_waiting_task_id(task.id);
+        require_posted(batch_queue.post(std::move(task)), batch_ids[i],
+                       "post batched timeout preparation task");
+    }
+    size_t batch_bound = 0;
+    batch_queue.on_new_task([&](server_task && selected) {
+        require(batch_bound < batch_ids.size() && selected.id == batch_ids[batch_bound],
+                "batch timeout fixture dispatches in request order");
+        require(batch_queue.bind_slot(selected.id, static_cast<int>(batch_bound)),
+                "bind batched timeout fixture");
+        if (++batch_bound == batch_ids.size()) {
+            batch_queue.terminate();
+        }
+    });
+    batch_queue.on_update_slots([] {});
+    batch_queue.on_sleeping_state([](bool) {});
+    batch_queue.start_loop();
+
+    now_us = 8010;
+    batch_responses.set_prepare_send_hook_for_tests([](size_t attempt) {
+        if (attempt == 2) {
+            throw std::runtime_error("injected second batched timeout preparation failure");
+        }
+    });
+    bool batch_prepare_failed = false;
+    try {
+        batch_queue.expire_requests();
+    } catch (const std::runtime_error &) {
+        batch_prepare_failed = true;
+    }
+    require(batch_prepare_failed && batch_expiry_callbacks == 0 &&
+                batch_queue.request_summary().active_requests == batch_ids.size() &&
+                batch_queue.dispatch_permits().bound[static_cast<size_t>(server_scheduler::lane::normal)] ==
+                    batch_ids.size(),
+            "Nth batched timeout preparation failure leaves every durable request untouched");
+    for (int id_task : batch_ids) {
+        require(batch_responses.recv_with_timeout({ id_task }, 0) == nullptr,
+                "failed timeout batch publishes no partial prefix");
+    }
+
+    require(batch_queue.expire_requests() == batch_ids.size() &&
+                batch_expiry_callbacks == static_cast<int>(batch_ids.size()),
+            "fully prepared timeout batch commits every expiration together");
+    require(!batch_queue.fail_task_with_result(
+                batch_responses, batch_ids[0], make_error_result(batch_ids[0], "failure after timeout sweep")),
+            "failure after a timeout sweep cannot claim the still-bound terminal record");
+    for (size_t i = 0; i < batch_ids.size(); ++i) {
+        require_timeout_only(batch_responses, batch_ids[i],
+                             "retried timeout batch emits one timeout per request");
+        require(batch_queue.release_slot(batch_ids[i], static_cast<int>(i)),
+                "release each expired batched binding");
+    }
+    require(batch_queue.request_summary().active_requests == 0 &&
+                batch_queue.dispatch_permits().total == 0,
+            "batched timeout retry retires without partial state or permit leaks");
+}
+
+void test_family_failure_prepares_all_results_before_live_cancel() {
+    server_queue    queue;
+    server_response responses;
+    server_task     parent = make_family(queue, server_task::trusted_lane::normal, 5900);
+    const int       parent_id = parent.id;
+    std::array<int, 3> family_ids = {
+        parent_id,
+        parent.child_tasks[0].id,
+        parent.child_tasks[1].id,
+    };
+    for (int id_task : family_ids) {
+        responses.add_waiting_task_id(id_task);
+    }
+    std::vector<server_task> tasks;
+    tasks.push_back(std::move(parent));
+    require(queue.post(std::move(tasks)), "post family for atomic failure preparation");
+
+    std::vector<bound_family_slot> bound;
+    int update_turns   = 0;
+    int cancel_controls = 0;
+    int error_terminals = 0;
+
+    auto make_family_errors = [&]() {
+        std::vector<server_task_result_ptr> results;
+        results.reserve(family_ids.size());
+        for (int id_task : family_ids) {
+            results.push_back(make_error_result(id_task, "atomic family failure"));
+        }
+        return results;
+    };
+
+    queue.on_new_task([&](server_task && selected) {
+        if (selected.type == SERVER_TASK_TYPE_CANCEL) {
+            ++cancel_controls;
+            require(update_turns == 2 && selected.id_target == parent_id,
+                    "family release control cannot dispatch before the full response retry");
+            require(release_server_task_family_slots(bound, parent_id) == family_ids.size(),
+                    "one family control releases every failed member");
+            require(queue.request_summary().active_requests == 0 &&
+                        queue.dispatch_permits().total == 0,
+                    "family failure control retires every durable binding and permit");
+            queue.terminate();
+            return;
+        }
+
+        require(selected.id == parent_id && selected.child_tasks.size() == 2,
+                "atomic failure fixture dispatches the complete three-member family");
+        int id_slot = 0;
+        for (server_task & child : selected.child_tasks) {
+            require(queue.bind_slot(child.id, id_slot), "bind atomic failure child");
+            bound.emplace_back(queue, id_slot++, std::move(child));
+        }
+        require(queue.bind_slot(selected.id, id_slot), "bind atomic failure parent");
+        bound.emplace_back(queue, id_slot, std::move(selected));
+    });
+    queue.on_update_slots([&] {
+        ++update_turns;
+        if (update_turns == 1) {
+            responses.set_prepare_send_hook_for_tests([](size_t attempt) {
+                if (attempt == 2) {
+                    throw std::runtime_error("injected Nth family failure preparation fault");
+                }
+            });
+            bool preparation_failed = false;
+            try {
+                queue.fail_family_with_results(responses, parent_id, make_family_errors());
+            } catch (const std::runtime_error &) {
+                preparation_failed = true;
+            }
+            require(preparation_failed && cancel_controls == 0 &&
+                        queue.request_summary().active_requests == family_ids.size() &&
+                        queue.dispatch_permits().bound[static_cast<size_t>(server_scheduler::lane::normal)] ==
+                            family_ids.size(),
+                    "Nth family result fault leaves all members bound and no control visible");
+            for (int id_task : family_ids) {
+                require(responses.recv_with_timeout({ id_task }, 0) == nullptr,
+                        "failed family preparation publishes no terminal prefix");
+            }
+
+            server_task external_cancel(SERVER_TASK_TYPE_CANCEL);
+            external_cancel.id        = queue.get_new_id();
+            external_cancel.id_target = family_ids[1];
+            require(queue.post(std::move(external_cancel), true) && cancel_controls == 0 &&
+                        queue.request_summary().active_requests == family_ids.size() &&
+                        queue.dispatch_permits().bound[static_cast<size_t>(server_scheduler::lane::normal)] ==
+                            family_ids.size(),
+                    "external child CANCEL canonicalizes behind the protected family terminal retry");
+            server_task duplicate_parent_cancel(SERVER_TASK_TYPE_CANCEL);
+            duplicate_parent_cancel.id        = queue.get_new_id();
+            duplicate_parent_cancel.id_target = parent_id;
+            require(queue.post(std::move(duplicate_parent_cancel), true),
+                    "protected parent CANCEL deduplicates against the canonical child control");
+            responses.set_prepare_send_hook_for_tests({});
+            queue.request_update();
+            return;
+        }
+
+        require(update_turns == 2 &&
+                    queue.fail_family_with_results(responses, parent_id, make_family_errors()) == family_ids.size(),
+                "next live update commits the fully prepared family failure");
+        for (int id_task : family_ids) {
+            auto terminal = responses.recv_with_timeout({ id_task }, 0);
+            require(terminal != nullptr && terminal->is_error() && terminal->is_stop() &&
+                        responses.recv_with_timeout({ id_task }, 0) == nullptr,
+                    "family retry publishes exactly one terminal per member");
+            ++error_terminals;
+        }
+    });
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+
+    require(update_turns == 2 && cancel_controls == 1 && error_terminals == 3,
+            "live family retry orders all terminals before one release control");
+}
+
 void test_stream_result_publication_deadline_gate() {
     auto config                     = test_runtime_config();
     config.default_queue_timeout_us = 100;
@@ -826,10 +1458,8 @@ void test_stream_result_publication_deadline_gate() {
     server_queue    queue(config, [&] { return now_us; });
     server_response responses;
     int             expiration_callbacks = 0;
-    queue.on_request_expired([&](server_queue_expiration event) {
-        ++expiration_callbacks;
-        send_timeout_result(responses, event);
-    });
+    queue.set_expiration_response(responses);
+    queue.on_request_expired([&](server_queue_expiration) { ++expiration_callbacks; });
 
     server_task streaming                 = make_user(queue, server_task::trusted_lane::fast, 0);
     streaming.scheduling.queue_timeout_us = 0;
@@ -904,10 +1534,8 @@ void test_concurrent_update_publication_after_expiry() {
     int                     cancellation_dispatches = 0;
     int                     released_leases = 0;
 
-    queue.on_request_expired([&](server_queue_expiration event) {
-        ++expiration_callbacks;
-        send_timeout_result(responses, event);
-    });
+    queue.set_expiration_response(responses);
+    queue.on_request_expired([&](server_queue_expiration) { ++expiration_callbacks; });
     queue.on_new_task([&](server_task && selected) {
         if (selected.type == SERVER_TASK_TYPE_COMPLETION) {
             require(queue.bind_slot(selected.id, 0), "bind concurrent update publication task");
@@ -1620,15 +2248,8 @@ void test_bound_stream_timeout_and_cancel_race() {
     int                    released_leases         = 0;
     int                    expiration_callbacks    = 0;
 
-    queue.on_request_expired([&](server_queue_expiration event) {
-        ++expiration_callbacks;
-        auto error      = std::make_unique<server_task_result_error>();
-        error->id       = event.task_id;
-        error->err_type = ERROR_TYPE_TIMEOUT;
-        error->err_msg  = event.kind == server_request_runtime::deadline_kind::run ? "request run deadline exceeded" :
-                                                                                     "request queue deadline exceeded";
-        responses.send(std::move(error));
-    });
+    queue.set_expiration_response(responses);
+    queue.on_request_expired([&](server_queue_expiration) { ++expiration_callbacks; });
     queue.on_new_task([&](server_task && selected) {
         if (selected.type == SERVER_TASK_TYPE_COMPLETION) {
             require(queue.bind_slot(selected.id, 0), "bind streaming request");
@@ -1687,6 +2308,7 @@ int main() {
         { "deferred policy reentry",      test_deferred_request_reenters_policy         },
         { "cancel before dispatch",       test_cancel_before_dispatch                   },
         { "cancel deferred payload",      test_cancel_deferred_payload                  },
+        { "cancel preparation atomicity", test_external_cancel_preparation_is_fault_atomic },
         { "live fast queue cap",          test_live_fast_queue_cap                      },
         { "internal defer compatibility", test_internal_defer_path_is_preserved         },
         { "parallel child registration",  test_parallel_children_share_parent_admission },
@@ -1703,6 +2325,9 @@ int main() {
         { "bound parent family failure",      test_bound_parent_failure_releases_family_slots      },
         { "atomic family width",               test_family_width_admission_is_atomic                 },
         { "final publication gate",       test_final_result_publication_deadline_gate   },
+        { "staged family publication",    test_staged_family_publication_is_exception_safe_and_at_most_once },
+        { "atomic terminal preparation",  test_terminal_expiry_and_failure_preparation_are_atomic          },
+        { "atomic family failure",        test_family_failure_prepares_all_results_before_live_cancel       },
         { "stream publication gate",      test_stream_result_publication_deadline_gate  },
         { "concurrent publication expiry", test_concurrent_update_publication_after_expiry },
         { "publication scale isolation",  test_publication_gate_scales_without_global_sweep },

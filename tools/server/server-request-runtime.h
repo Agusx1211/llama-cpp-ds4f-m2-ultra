@@ -46,6 +46,19 @@ struct release_result {
     operator bool() const { return released; }
 };
 
+enum class failure_publication_code : uint8_t {
+    first_terminal = 0,
+    already_terminal,
+    unknown_request,
+    transition_failed,
+};
+
+struct failure_publication_result {
+    failure_publication_code code = failure_publication_code::unknown_request;
+
+    operator bool() const { return code == failure_publication_code::first_terminal; }
+};
+
 struct request_metadata {
     uint64_t                                   id                 = 0;
     server_scheduler::lane                     lane               = server_scheduler::lane::normal;
@@ -109,6 +122,9 @@ class request_runtime {
     dispatch_result  take_next(uint64_t now_us, size_t physical_slot_capacity = 64);
     bool             mark_deferred(uint64_t request_id, uint64_t at_us);
     admission_result resume(uint64_t request_id, uint64_t at_us);
+    expiration        expiration_due(uint64_t request_id, uint64_t at_us) const;
+    std::vector<expiration> expirations_due(uint64_t at_us) const;
+    expiration        expire_prepared(const expiration & planned, uint64_t at_us);
     std::vector<expiration> expire_due(uint64_t now_us);
 
     bool bind_slot(uint64_t request_id, server_request_registry::slot_id slot, uint64_t at_us);
@@ -119,8 +135,13 @@ class request_runtime {
     release_result release_slot(uint64_t request_id, server_request_registry::slot_id slot, uint64_t at_us);
     bool cancel(uint64_t request_id, uint64_t at_us);
     bool fail(uint64_t request_id, uint64_t at_us);
+    failure_publication_result failure_publication_status(uint64_t request_id) const;
+    failure_publication_result fail_for_publication(uint64_t request_id, uint64_t at_us);
+    failure_publication_result fail_one_for_publication(uint64_t request_id, uint64_t at_us);
 
     bool                                                   contains(uint64_t request_id) const;
+    bool                                                   is_family_member(uint64_t request_id,
+                                                                            uint64_t family_id) const;
     bool                                                   family_has_bindings(uint64_t request_id) const;
     size_t                                                 queued_total() const;
     std::vector<server_request_registry::request_snapshot> snapshot() const;
