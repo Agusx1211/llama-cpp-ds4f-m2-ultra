@@ -258,6 +258,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-dsv4-comp-pool.cpp)
     target_include_directories(test-dsv4-comp-pool PRIVATE
         ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-dsv4-resident-contract.cpp)
+    target_include_directories(test-dsv4-resident-contract PRIVATE
+        ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-snapshot-store.cpp)
     target_include_directories(test-snapshot-store PRIVATE
         ${PROJECT_SOURCE_DIR}/src)

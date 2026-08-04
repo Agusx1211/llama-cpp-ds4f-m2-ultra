@@ -27,13 +27,16 @@ enum class llama_dsv4_comp_status : uint8_t {
     ok,
     invalid_argument,
     handle_not_found,
+    stale_handle,
     binding_not_found,
     capacity_exhausted,
+    generation_exhausted,
     stale_quote,
     stale_ticket,
     busy,
     slot_occupied,
     handle_bound,
+    handle_resident,
 };
 
 const char * llama_dsv4_comp_status_name(llama_dsv4_comp_status status);
@@ -90,6 +93,7 @@ struct llama_dsv4_comp_memory_usage {
     uint64_t                     epoch                   = 0;
     uint32_t                     handles                 = 0;
     uint32_t                     bindings                = 0;
+    uint32_t                     resident_handles        = 0;
     uint32_t                     active_tickets          = 0;
     uint32_t                     retained_ticket_records = 0;
 };
@@ -106,6 +110,40 @@ struct llama_dsv4_comp_handle_info {
 struct llama_dsv4_comp_handle_result {
     llama_dsv4_comp_status    status = llama_dsv4_comp_status::invalid_argument;
     llama_dsv4_comp_handle_id handle = 0;
+};
+
+// A resident lease is an execution-independent ownership reference. The pool
+// identity prevents cross-pool aliasing, handle_generation protects the
+// compressed root, and lease_generation prevents an old detach/attach cycle
+// from addressing the same root after it becomes resident again.
+struct llama_dsv4_comp_resident_handle {
+    uint64_t                  pool_id           = 0;
+    llama_dsv4_comp_handle_id id                = 0;
+    uint64_t                  handle_generation = 0;
+    uint64_t                  lease_generation  = 0;
+
+    bool operator==(const llama_dsv4_comp_resident_handle & other) const {
+        return pool_id == other.pool_id && id == other.id && handle_generation == other.handle_generation &&
+               lease_generation == other.lease_generation;
+    }
+};
+
+struct llama_dsv4_comp_detach_plan;
+
+struct llama_dsv4_comp_detach_quote {
+    llama_dsv4_comp_status          status       = llama_dsv4_comp_status::invalid_argument;
+    uint32_t                        execution_id = UINT32_MAX;
+    uint64_t                        pool_epoch   = 0;
+    llama_dsv4_comp_resident_handle resident;
+
+  private:
+    std::shared_ptr<const llama_dsv4_comp_detach_plan> plan;
+    friend class llama_dsv4_comp_pool;
+};
+
+struct llama_dsv4_comp_resident_result {
+    llama_dsv4_comp_status          status = llama_dsv4_comp_status::invalid_argument;
+    llama_dsv4_comp_resident_handle resident;
 };
 
 struct llama_dsv4_comp_change {
@@ -178,6 +216,9 @@ struct llama_dsv4_comp_directory {
 class llama_dsv4_comp_pool {
   public:
     explicit llama_dsv4_comp_pool(llama_dsv4_comp_pool_config config);
+    // Resident leases are external ownership. Destroying or overwriting a pool
+    // while one remains outstanding terminates instead of silently releasing
+    // its segment references.
     ~llama_dsv4_comp_pool();
 
     llama_dsv4_comp_pool(const llama_dsv4_comp_pool &)             = delete;
@@ -195,6 +236,15 @@ class llama_dsv4_comp_pool {
     llama_dsv4_comp_status bind(uint32_t execution_id, llama_dsv4_comp_handle_id handle);
     llama_dsv4_comp_status unbind(uint32_t execution_id);
     llama_dsv4_comp_status get_binding(uint32_t execution_id, llama_dsv4_comp_handle_id & handle) const;
+
+    // quote_detach is a fail-before-mutation preflight. detach consumes the
+    // exact quote and transfers one uniquely bound compressed root into a
+    // generation-checked resident lease. attach consumes that lease into any
+    // free execution ID; release is the only operation that destroys it.
+    llama_dsv4_comp_detach_quote    quote_detach(uint32_t execution_id) const;
+    llama_dsv4_comp_resident_result detach(const llama_dsv4_comp_detach_quote & quote);
+    llama_dsv4_comp_status          attach(llama_dsv4_comp_resident_handle resident, uint32_t execution_id);
+    llama_dsv4_comp_status          release(llama_dsv4_comp_resident_handle resident);
 
     llama_dsv4_comp_quote          quote_batch(const llama_dsv4_comp_batch_plan & batch) const;
     llama_dsv4_comp_reserve_result try_reserve(const llama_dsv4_comp_quote & quote);

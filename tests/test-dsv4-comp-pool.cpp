@@ -496,6 +496,132 @@ void test_copy_remove_cycles_return_accounting_baseline() {
     expect(empty.c4.mapped_segments == 2 && empty.hca.mapped_segments == 2, "permanent ownership was released");
 }
 
+void test_resident_detach_attach_release_contract() {
+    llama_dsv4_comp_pool pool({ 8, 4 });
+    const auto           source = create_handle(pool);
+    commit_change(pool, source, llama_dsv4_comp_family::c4, 65);
+    commit_change(pool, source, llama_dsv4_comp_family::hca, 1);
+    expect_status(pool.bind(3, source), llama_dsv4_comp_status::ok, "bind resident source");
+
+    const auto quoted_usage = pool.memory_usage_snapshot();
+    auto       quote        = pool.quote_detach(3);
+    expect_status(quote.status, llama_dsv4_comp_status::ok, "quote resident detach");
+    expect(quote.execution_id == 3 && quote.resident.pool_id != 0 && quote.resident.id == source &&
+               quote.resident.handle_generation != 0 && quote.resident.lease_generation != 0,
+           "resident detach quote identity");
+    expect(pool.memory_usage_snapshot().epoch == quoted_usage.epoch, "resident quote mutated pool epoch");
+
+    const auto metadata_reservation = pool.try_reserve(pool.quote_batch({}));
+    expect_status(metadata_reservation.status, llama_dsv4_comp_status::ok, "reserve metadata ticket");
+    const auto busy_usage = pool.memory_usage_snapshot();
+    expect_status(pool.quote_detach(3).status, llama_dsv4_comp_status::busy, "detach quote ignored active ticket");
+    expect(pool.memory_usage_snapshot().epoch == busy_usage.epoch, "busy detach quote mutated pool");
+    expect_status(pool.cancel(metadata_reservation.ticket), llama_dsv4_comp_status::ok, "cancel metadata ticket");
+
+    expect_status(pool.bind(5, source), llama_dsv4_comp_status::ok, "legacy second binding was rejected");
+    const auto multiply_bound = pool.quote_detach(3);
+    expect_status(multiply_bound.status, llama_dsv4_comp_status::handle_bound, "detach accepted multiply-bound handle");
+    expect(pool.memory_usage_snapshot().bindings == 2, "failed multi-binding quote mutated bindings");
+    expect_status(pool.unbind(5), llama_dsv4_comp_status::ok, "remove legacy second binding");
+
+    const auto unrelated = create_handle(pool);
+    expect_status(pool.detach(quote).status, llama_dsv4_comp_status::stale_quote, "stale resident detach quote");
+    llama_dsv4_comp_handle_id still_bound = 0;
+    expect_status(pool.get_binding(3, still_bound), llama_dsv4_comp_status::ok, "stale detach removed source binding");
+    expect(still_bound == source && pool.memory_usage_snapshot().resident_handles == 0,
+           "stale detach changed ownership");
+    expect_status(pool.remove_handle(unrelated), llama_dsv4_comp_status::ok, "remove unrelated handle");
+
+    quote                            = pool.quote_detach(3);
+    const auto quoted_resident       = quote.resident;
+    quote.resident.pool_id           = UINT64_MAX;
+    quote.resident.id                = UINT64_MAX;
+    quote.resident.handle_generation = UINT64_MAX;
+    quote.resident.lease_generation  = UINT64_MAX;
+    const auto detached              = pool.detach(quote);
+    expect_status(detached.status, llama_dsv4_comp_status::ok, "detach resident source");
+    expect(detached.resident == quoted_resident,
+           "detach trusted mutable public quote fields instead of its validated plan");
+    expect_status(pool.get_binding(3, still_bound), llama_dsv4_comp_status::binding_not_found,
+                  "detached source remained execution-bound");
+    auto usage = pool.memory_usage_snapshot();
+    expect(usage.bindings == 0 && usage.resident_handles == 1, "detached resident accounting");
+    expect_family_equal(usage.c4, quoted_usage.c4, "detach changed C4 ownership");
+    expect_family_equal(usage.hca, quoted_usage.hca, "detach changed HCA ownership");
+
+    llama_dsv4_comp_pool other_pool({ 1, 1 });
+    const auto           other_handle = create_handle(other_pool);
+    expect_status(other_pool.bind(0, other_handle), llama_dsv4_comp_status::ok, "bind other pool handle");
+    const auto other_detached = other_pool.detach(other_pool.quote_detach(0));
+    expect_status(other_detached.status, llama_dsv4_comp_status::ok, "detach other pool handle");
+    expect_status(other_pool.attach(detached.resident, 0), llama_dsv4_comp_status::stale_handle,
+                  "cross-pool resident lease attached matching local IDs");
+    expect_status(other_pool.release(detached.resident), llama_dsv4_comp_status::stale_handle,
+                  "cross-pool resident lease released matching local IDs");
+    expect_status(other_pool.release(other_detached.resident), llama_dsv4_comp_status::ok,
+                  "release other pool resident");
+
+    expect_status(pool.bind(4, source), llama_dsv4_comp_status::handle_resident,
+                  "legacy bind consumed resident handle");
+    expect_status(pool.copy_handle(source).status, llama_dsv4_comp_status::handle_resident,
+                  "legacy copy aliased resident handle");
+    expect_status(pool.remove_handle(source), llama_dsv4_comp_status::handle_resident,
+                  "legacy remove released resident handle");
+    expect_status(quote_change(pool, source, llama_dsv4_comp_family::c4, 66).status,
+                  llama_dsv4_comp_status::handle_resident, "batch mutation changed resident handle");
+
+    const auto occupant = create_handle(pool);
+    expect_status(pool.bind(4, occupant), llama_dsv4_comp_status::ok, "bind occupied attach target");
+    const auto before_failed_attach = pool.memory_usage_snapshot();
+    expect_status(pool.attach(detached.resident, 4), llama_dsv4_comp_status::slot_occupied,
+                  "attach accepted occupied execution");
+    usage = pool.memory_usage_snapshot();
+    expect(usage.epoch == before_failed_attach.epoch && usage.resident_handles == 1 && usage.bindings == 1,
+           "failed attach mutated ownership");
+    expect_family_equal(usage.c4, before_failed_attach.c4, "failed attach changed C4 refs");
+    expect_family_equal(usage.hca, before_failed_attach.hca, "failed attach changed HCA refs");
+
+    expect_status(pool.attach(detached.resident, 3), llama_dsv4_comp_status::ok, "rollback resident detach");
+    expect_status(pool.get_binding(3, still_bound), llama_dsv4_comp_status::ok,
+                  "rollback did not restore source binding");
+    expect(still_bound == source && pool.memory_usage_snapshot().resident_handles == 0,
+           "rollback did not restore exact handle");
+    expect_status(pool.release(detached.resident), llama_dsv4_comp_status::stale_handle,
+                  "consumed resident lease released attached handle");
+
+    const auto detached_again = pool.detach(pool.quote_detach(3));
+    expect_status(detached_again.status, llama_dsv4_comp_status::ok, "second resident detach");
+    expect(detached_again.resident.lease_generation > detached.resident.lease_generation,
+           "resident generation did not advance across reuse");
+    expect_status(pool.attach(detached.resident, 3), llama_dsv4_comp_status::stale_handle,
+                  "old resident generation reattached reused handle");
+    expect_status(pool.release(detached.resident), llama_dsv4_comp_status::stale_handle,
+                  "old resident generation released reused handle");
+    expect_status(pool.attach(detached_again.resident, 7), llama_dsv4_comp_status::ok,
+                  "attach resident handle to a different execution");
+    expect_status(pool.get_binding(7, still_bound), llama_dsv4_comp_status::ok,
+                  "different execution did not receive resident handle");
+    expect(still_bound == source, "resident handle identity depended on parked execution ID");
+    expect_status(pool.release(detached_again.resident), llama_dsv4_comp_status::stale_handle,
+                  "attached lease remained externally releasable");
+    const auto detached_from_new_execution = pool.detach(pool.quote_detach(7));
+    expect_status(detached_from_new_execution.status, llama_dsv4_comp_status::ok, "detach from replacement execution");
+    expect(detached_from_new_execution.resident.lease_generation > detached_again.resident.lease_generation,
+           "replacement execution detach reused resident generation");
+    expect_status(pool.release(detached_from_new_execution.resident), llama_dsv4_comp_status::ok,
+                  "release exact resident generation");
+    expect_status(pool.release(detached_from_new_execution.resident), llama_dsv4_comp_status::stale_handle,
+                  "resident generation released twice");
+
+    usage = pool.memory_usage_snapshot();
+    expect(usage.handles == 1 && usage.bindings == 1 && usage.resident_handles == 0,
+           "resident release ownership baseline");
+    expect(usage.c4.free_segments == 8 && usage.hca.free_segments == 4,
+           "resident release leaked compressed segment refs");
+    expect_status(pool.unbind(4), llama_dsv4_comp_status::ok, "unbind attach occupant");
+    expect_status(pool.remove_handle(occupant), llama_dsv4_comp_status::ok, "remove attach occupant");
+}
+
 void test_bounded_ticket_history_and_pool_identity() {
     {
         llama_dsv4_comp_pool   pool({ 0, 0 });
@@ -723,6 +849,7 @@ int main() {
         test_atomic_candidate_directories_and_noncontiguous_bindings();
         test_exhaustion_immutability_and_ticket_idempotence();
         test_copy_remove_cycles_return_accounting_baseline();
+        test_resident_detach_attach_release_contract();
         test_bounded_ticket_history_and_pool_identity();
         test_sixty_four_handle_rounded_capacity_contract();
         test_deterministic_quotes_and_full_context_boundary();

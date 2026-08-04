@@ -141,6 +141,58 @@ void                                    llama_kv_cache_dsv4_test_enable_page_del
 void                                    llama_kv_cache_dsv4_test_reset_page_delta_audit();
 llama_dsv4_sparse_page_delta_test_audit llama_kv_cache_dsv4_test_get_page_delta_audit();
 
+enum llama_dsv4_resident_component : uint32_t {
+    LLAMA_DSV4_RESIDENT_RAW_SWA        = 1u << 0,
+    LLAMA_DSV4_RESIDENT_COMPRESSED     = 1u << 1,
+    LLAMA_DSV4_RESIDENT_CSA_STATE      = 1u << 2,
+    LLAMA_DSV4_RESIDENT_HCA_STATE      = 1u << 3,
+    LLAMA_DSV4_RESIDENT_LID_STATE      = 1u << 4,
+    LLAMA_DSV4_RESIDENT_ROLLBACK_INDEX = 1u << 5,
+    LLAMA_DSV4_RESIDENT_PAIRED_CONTEXT = 1u << 6,
+};
+
+enum class llama_dsv4_resident_scope : uint8_t {
+    single_context,
+    target_draft_pair,
+};
+
+enum class llama_dsv4_resident_status : uint8_t {
+    ok,
+    invalid_scope,
+    invalid_sequence,
+    unsupported_components,
+};
+
+const char * llama_dsv4_resident_status_name(llama_dsv4_resident_status status);
+
+struct llama_dsv4_resident_detach_request {
+    llama_seq_id              seq_id = -1;
+    llama_dsv4_resident_scope scope  = llama_dsv4_resident_scope::single_context;
+};
+
+// This is a capability quote, not an ownership handle. It snapshots the
+// rollback index and reports every execution-independent component before any
+// detach may begin. A target+draft request also requires a higher-level paired
+// context transaction; one cache instance cannot claim its counterpart.
+struct llama_dsv4_resident_detach_quote {
+    llama_dsv4_resident_status status                 = llama_dsv4_resident_status::unsupported_components;
+    llama_seq_id               seq_id                 = -1;
+    llama_dsv4_resident_scope  scope                  = llama_dsv4_resident_scope::single_context;
+    uint32_t                   rollback_index         = 0;
+    uint32_t                   required_components    = 0;
+    uint32_t                   detachable_components  = 0;
+    uint32_t                   unsupported_components = 0;
+};
+
+// Host-testable policy used by llama_kv_cache_dsv4::quote_resident_detach.
+// Current raw/SWA and compressor tensors are sequence-indexed ordinary
+// buffers, so aggregate compressed ownership alone can never make this quote
+// succeed. No sequence ID is reserved or parked by this function.
+llama_dsv4_resident_detach_quote llama_dsv4_quote_resident_detach_layout(llama_dsv4_resident_detach_request request,
+                                                                         uint32_t                           n_seq_max,
+                                                                         uint32_t rollback_index,
+                                                                         bool     aggregate_compressed);
+
 class llama_dsv4_comp_state {
 public:
     using stream_copy_info = llama_kv_cache::stream_copy_info;
@@ -286,6 +338,8 @@ public:
     uint32_t get_c4_logical_rows() const;
     uint32_t get_hca_logical_rows() const;
     llama_dsv4_comp_pool * get_comp_pool() const;
+
+    llama_dsv4_resident_detach_quote quote_resident_detach(llama_dsv4_resident_detach_request request) const;
 
     uint32_t get_n_rs_seq() const;
     const std::vector<uint32_t> & get_rs_idx() const;
