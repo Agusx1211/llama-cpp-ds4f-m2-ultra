@@ -8,6 +8,7 @@
 #include "ggml-metal-device.h"
 
 #include <cstdlib>
+#include <initializer_list>
 #include <limits>
 #include <type_traits>
 
