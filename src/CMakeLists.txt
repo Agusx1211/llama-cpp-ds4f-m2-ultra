@@ -40,6 +40,7 @@ add_library(llama
             llama-quant.cpp
             llama-sampler.cpp
             llama-snapshot-store.cpp
+            llama-snapshot-worker.cpp
             llama-vocab.cpp
             unicode-data.cpp
             unicode.cpp
