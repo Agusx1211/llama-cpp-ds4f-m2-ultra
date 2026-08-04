@@ -61,14 +61,21 @@ The opt-in horizontal runner keeps the same two split-KV slots but replaces the
 isolated/sustained 512-token pair with the shortest useful burst workload: an
 isolated 8K low oracle, an isolated 128/16 fast oracle, then the identical 8K
 low request alongside exactly four sequential 128/16 fast requests. Restart the
-server after setting the larger capacity in the server's environment:
+server after setting the larger trace and bounded-refill policy in the server's
+environment:
 
 ```sh
 export LLAMA_SERVER_BENCH_TRACE_CAPACITY=70000
+export LLAMA_SERVER_TRUSTED_FAST_REFILL_MAX_MEMBERS=4
+export LLAMA_SERVER_TRUSTED_FAST_REFILL_WINDOW_MS=30000
 ```
 
-Relaunch with the exact server command above so this value is present in the
-server process.
+Relaunch with the exact server command above so these values are present in the
+server process. Both refill variables are required: member limits from 3 through
+16 and windows from 1 through 30000 milliseconds are accepted. Missing,
+malformed, partial, or out-of-range settings leave refill disabled. Confirm the
+startup log reports `trusted fast refill enabled: at most 4 fast members within
+30000 ms per cohort` before running the client.
 
 Then run the client from the credentialed shell:
 
@@ -92,15 +99,16 @@ must likewise exactly match its isolated oracle. The reference before/after,
 stage/commit, one-owner, aligned-yield, active-fast chunk, trace overflow,
 cardinality, and output-hash gates remain enabled.
 
-The runner does not itself change admission. A server retaining the current
-closed-cohort rule will intentionally fail to admit a later burst while the low
-member remains bound. Enable a separately reviewed bounded fast-refill policy
-before using this as a passing target gate. Extending the 30-second queue
+The runner does not itself change admission. Without both bounded-refill
+variables above, the default closed-cohort rule intentionally leaves a later
+burst queued while the low member remains bound. Extending the 30-second queue
 deadline alone is not a fast-service result, and resident request parking is
-not required for this two-slot low-plus-one-fast-at-a-time geometry. Trace
-`cohort_id` identifies prefill ownership, not a runtime permit epoch; the
-runner's refill proof is the completed burst followed by new mixed-low progress
-before it launches the next request.
+not required for this two-slot low-plus-one-fast-at-a-time geometry. The member
+budget is cumulative for the live cohort: cancellation, timeout, or failure
+releases physical width but does not refund a claimed member. Trace `cohort_id`
+identifies prefill ownership, not a runtime permit epoch; the runner's refill
+proof is the completed burst followed by new mixed-low progress before it
+launches the next request.
 
 `PASS` requires exact `tokens_predicted` and token-ID cardinality for every
 request, identical token IDs and content for deterministic reference/fast
