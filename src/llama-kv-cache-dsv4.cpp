@@ -438,6 +438,10 @@ public:
             tensors.push_back(range.tensor);
             offsets.push_back(range.offset);
             sizes.push_back(range.size);
+            if (audit_state != nullptr) {
+                ++audit_state->result.family_range_count[range.family];
+                audit_state->result.family_range_bytes[range.family] += range.size;
+            }
             ggml_metal_sparse_usage snapshot = {};
             const int snapshot_result = usage(range.tensor, &snapshot);
             if (snapshot_result < 0) {

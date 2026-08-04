@@ -917,6 +917,12 @@ static bool dsv4_audit_has_family_range(const llama_dsv4_sparse_page_delta_test_
     return false;
 }
 
+static bool dsv4_audit_has_submitted_family_range(
+        const llama_dsv4_sparse_page_delta_test_audit & audit,
+        llama_dsv4_memory_family family) {
+    return audit.family_range_count[family] > 0 && audit.family_range_bytes[family] > 0;
+}
+
 static bool test_dsv4_page_delta_boundaries(size_t seed, ggml_backend_dev_t dev) {
     if (!dsv4_test_has_elastic_pages(dev, 2)) {
         return true;
@@ -946,7 +952,8 @@ static bool test_dsv4_page_delta_boundaries(size_t seed, ggml_backend_dev_t dev)
     };
 
     const auto token_3 = decode_span(0, 3, "page-delta token-count 3");
-    GGML_ASSERT(dsv4_audit_has_family_range(token_3, LLAMA_DSV4_MEMORY_RAW, false));
+    GGML_ASSERT(dsv4_audit_has_submitted_family_range(token_3, LLAMA_DSV4_MEMORY_RAW));
+    GGML_ASSERT(!dsv4_audit_has_family_range(token_3, LLAMA_DSV4_MEMORY_RAW, false));
     GGML_ASSERT(!dsv4_audit_has_family_range(token_3, LLAMA_DSV4_MEMORY_CSA, true));
     GGML_ASSERT(!dsv4_audit_has_family_range(token_3, LLAMA_DSV4_MEMORY_LID, true));
     GGML_ASSERT(!dsv4_audit_has_family_range(token_3, LLAMA_DSV4_MEMORY_HCA, false));

@@ -129,6 +129,8 @@ struct llama_dsv4_sparse_page_delta_test_audit {
     bool                                                 reserved   = false;
     bool                                                 committed  = false;
     bool                                                 cancelled  = false;
+    std::array<uint64_t, LLAMA_DSV4_MEMORY_FAMILY_COUNT> family_range_count = {};
+    std::array<uint64_t, LLAMA_DSV4_MEMORY_FAMILY_COUNT> family_range_bytes = {};
     std::vector<llama_dsv4_sparse_pool_delta_test_audit> pools;
 };
 
