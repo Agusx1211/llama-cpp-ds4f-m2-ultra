@@ -66,6 +66,13 @@ struct sparse_move_api {
 thread_local sparse_move_api sparse_move_test_override;
 thread_local bool sparse_move_test_fail_next_allocation = false;
 
+struct resident_lock_test_hook {
+    llama_kv_iswa_resident_lock_hook_for_test callback = nullptr;
+    void *                                    context  = nullptr;
+};
+
+thread_local resident_lock_test_hook resident_lock_hook;
+
 sparse_move_api llama_kv_iswa_sparse_move_api(const ggml_tensor * tensor) {
     if (sparse_move_test_override.quote != nullptr ||
             sparse_move_test_override.commit != nullptr ||
@@ -166,6 +173,10 @@ void llama_kv_iswa_fail_next_resident_allocation_for_test() {
     sparse_move_test_fail_next_allocation = true;
 }
 
+void llama_kv_iswa_set_resident_lock_hook_for_test(llama_kv_iswa_resident_lock_hook_for_test hook, void * context) {
+    resident_lock_hook = { hook, context };
+}
+
 struct llama_kv_cache_iswa::resident_impl {
     explicit resident_impl(uint32_t capacity) : slots(capacity, false) {}
 
@@ -178,6 +189,34 @@ struct llama_kv_cache_iswa::resident_impl {
     std::vector<bool>                                 slots;
     std::map<uint64_t, llama_kv_iswa_resident_record> handles;
 };
+
+llama_kv_iswa_resident_transaction::llama_kv_iswa_resident_transaction(
+    std::shared_ptr<llama_kv_cache_resident_guard> guard,
+    std::unique_lock<std::recursive_mutex>         lock) :
+    guard(std::move(guard)),
+    lock(std::move(lock)),
+    active(true) {
+    GGML_ASSERT(this->guard != nullptr && this->lock.owns_lock());
+    GGML_ASSERT(!this->guard->resident_transaction_active);
+    this->guard->resident_transaction_active = true;
+}
+
+llama_kv_iswa_resident_transaction::llama_kv_iswa_resident_transaction(
+    llama_kv_iswa_resident_transaction && other) noexcept :
+    guard(std::move(other.guard)),
+    lock(std::move(other.lock)),
+    active(other.active) {
+    other.active = false;
+}
+
+llama_kv_iswa_resident_transaction::~llama_kv_iswa_resident_transaction() {
+    if (!active) {
+        return;
+    }
+    GGML_ASSERT(guard != nullptr && lock.owns_lock());
+    GGML_ASSERT(guard->resident_transaction_active);
+    guard->resident_transaction_active = false;
+}
 
 struct llama_kv_iswa_resident_detach_plan {
     std::shared_ptr<const llama_kv_iswa_resident_identity> owner;
@@ -346,7 +385,20 @@ llama_kv_cache_iswa::~llama_kv_cache_iswa() {
 
 std::unique_lock<std::recursive_mutex> llama_kv_cache_iswa::lock_resident() const {
     if (resident) {
-        return std::unique_lock<std::recursive_mutex>(resident->guard->mutex);
+        const auto hook    = resident_lock_hook;
+        resident_lock_hook = {};
+        if (hook.callback == nullptr) {
+            return std::unique_lock<std::recursive_mutex>(resident->guard->mutex);
+        }
+
+        hook.callback(llama_kv_iswa_resident_lock_phase::before_lock, hook.context);
+        std::unique_lock<std::recursive_mutex> result(resident->guard->mutex, std::try_to_lock);
+        if (!result.owns_lock()) {
+            hook.callback(llama_kv_iswa_resident_lock_phase::lock_contended, hook.context);
+            result.lock();
+        }
+        hook.callback(llama_kv_iswa_resident_lock_phase::lock_acquired, hook.context);
+        return result;
     }
     return {};
 }
@@ -369,21 +421,12 @@ std::shared_ptr<void> llama_kv_cache_iswa::acquire_resident_batch_lease() const 
     return std::make_shared<llama_kv_iswa_batch_lease>(resident->guard);
 }
 
-bool llama_kv_cache_iswa::begin_resident_transaction() const {
-    [[maybe_unused]] auto resident_scope = lock_resident();
+llama_kv_iswa_resident_transaction llama_kv_cache_iswa::acquire_resident_transaction() const {
+    auto resident_scope = lock_resident();
     if (!resident || resident->guard->resident_transaction_active || !resident_is_quiescent()) {
-        return false;
+        return {};
     }
-    resident->guard->resident_transaction_active = true;
-    return true;
-}
-
-void llama_kv_cache_iswa::end_resident_transaction() const {
-    [[maybe_unused]] auto resident_scope = lock_resident();
-    if (!resident || !resident->guard->resident_transaction_active) {
-        std::terminate();
-    }
-    resident->guard->resident_transaction_active = false;
+    return llama_kv_iswa_resident_transaction(resident->guard, std::move(resident_scope));
 }
 
 bool llama_kv_cache_iswa::has_resident_handles() const {
@@ -435,11 +478,13 @@ void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
 }
 
 llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
+    [[maybe_unused]] auto resident_scope = lock_resident();
     // the base cache is a superset of the SWA cache, so we can just check the SWA cache
     return kv_swa->seq_pos_min(seq_id);
 }
 
 llama_pos llama_kv_cache_iswa::seq_pos_max(llama_seq_id seq_id) const {
+    [[maybe_unused]] auto resident_scope = lock_resident();
     return kv_swa->seq_pos_max(seq_id);
 }
 

@@ -2146,17 +2146,12 @@ struct dsv4_composite_record {
 
 class dsv4_raw_transaction_scope {
 public:
-    explicit dsv4_raw_transaction_scope(llama_kv_cache_iswa & raw) : raw(raw), active(raw.begin_resident_transaction()) {}
-    ~dsv4_raw_transaction_scope() {
-        if (active) {
-            raw.end_resident_transaction();
-        }
-    }
-    explicit operator bool() const { return active; }
+  explicit dsv4_raw_transaction_scope(llama_kv_cache_iswa & raw) : token(raw.acquire_resident_transaction()) {}
+
+  explicit operator bool() const { return static_cast<bool>(token); }
 
 private:
-    llama_kv_cache_iswa & raw;
-    bool active;
+  llama_kv_iswa_resident_transaction token;
 };
 
 } // namespace
@@ -2335,7 +2330,7 @@ llama_dsv4_resident_detach_quote llama_dsv4_composite_resident::quote_detach(
         result.status = dsv4_resident_status_from_raw(raw.status);
         return result;
     }
-    auto compressed = pimpl->compressed.quote_detach((uint32_t) request.seq_id);
+    auto compressed = pimpl->compressed.quote_detach_preserving_empty_execution((uint32_t) request.seq_id);
     if (compressed.status != llama_dsv4_comp_status::ok) {
         result.status = dsv4_resident_status_from_compressed(compressed.status);
         return result;

@@ -185,6 +185,10 @@ struct llama_dsv4_comp_detach_plan {
     uint64_t                             expected_resident_generation = 0;
     uint64_t                             commit_epoch                 = 0;
     std::map<uint32_t, llama_dsv4_comp_handle_id> detached_binding;
+    std::map<uint32_t, llama_dsv4_comp_handle_id>        replacement_binding;
+    std::map<llama_dsv4_comp_handle_id, resident_handle> replacement_handle;
+    llama_dsv4_comp_handle_id                            replacement_handle_id    = 0;
+    bool                                                 preserve_empty_execution = false;
     resident_detach_state                state = resident_detach_state::prepared;
 };
 
@@ -670,8 +674,24 @@ llama_dsv4_comp_status llama_dsv4_comp_pool::get_binding(uint32_t               
 }
 
 llama_dsv4_comp_detach_quote llama_dsv4_comp_pool::quote_detach(uint32_t execution_id) const {
+    return quote_detach_impl(execution_id, false);
+}
+
+llama_dsv4_comp_detach_quote llama_dsv4_comp_pool::quote_detach_preserving_empty_execution(
+    uint32_t execution_id) const {
+    return quote_detach_impl(execution_id, true);
+}
+
+llama_dsv4_comp_detach_quote llama_dsv4_comp_pool::quote_detach_impl(uint32_t execution_id,
+                                                                     bool     preserve_empty_execution) const {
     llama_dsv4_comp_detach_quote result;
-    auto                         plan = std::make_shared<llama_dsv4_comp_detach_plan>();
+    std::shared_ptr<llama_dsv4_comp_detach_plan> plan;
+    try {
+        plan = std::make_shared<llama_dsv4_comp_detach_plan>();
+    } catch (const std::bad_alloc &) {
+        result.status = llama_dsv4_comp_status::resource_exhausted;
+        return result;
+    }
     plan->owner                       = pimpl->identity;
     plan->pool_epoch                  = pimpl->epoch;
     plan->execution_id                = execution_id;
@@ -705,6 +725,25 @@ llama_dsv4_comp_detach_quote llama_dsv4_comp_pool::quote_detach(uint32_t executi
                       [&](const auto & binding) { return binding.second == binding_it->second; }) != 1) {
         result.status = plan->status = llama_dsv4_comp_status::handle_bound;
         return result;
+    }
+
+    if (preserve_empty_execution && pimpl->next_handle_id == 0) {
+        result.status = plan->status = llama_dsv4_comp_status::generation_exhausted;
+        return result;
+    }
+
+    if (preserve_empty_execution) {
+        try {
+            resident_handle replacement;
+            replacement.id = pimpl->next_handle_id;
+            plan->replacement_handle.emplace(replacement.id, replacement);
+            plan->replacement_binding.emplace(execution_id, replacement.id);
+            plan->replacement_handle_id    = replacement.id;
+            plan->preserve_empty_execution = true;
+        } catch (const std::bad_alloc &) {
+            result.status = plan->status = llama_dsv4_comp_status::resource_exhausted;
+            return result;
+        }
     }
 
     plan->handle                       = handle_it->first;
@@ -748,6 +787,13 @@ llama_dsv4_comp_resident_result llama_dsv4_comp_pool::detach(const llama_dsv4_co
         result.status = llama_dsv4_comp_status::stale_quote;
         return result;
     }
+    if (quote.plan->preserve_empty_execution &&
+        (quote.plan->replacement_handle_id == 0 || quote.plan->replacement_handle_id != pimpl->next_handle_id ||
+         pimpl->handles.count(quote.plan->replacement_handle_id) != 0 || quote.plan->replacement_handle.size() != 1 ||
+         quote.plan->replacement_binding.size() != 1)) {
+        result.status = llama_dsv4_comp_status::stale_quote;
+        return result;
+    }
 
     auto node = pimpl->bindings.extract(binding_it);
     auto retained = quote.plan->detached_binding.insert(std::move(node));
@@ -756,6 +802,38 @@ llama_dsv4_comp_resident_result llama_dsv4_comp_pool::detach(const llama_dsv4_co
         (void) restored;
         result.status = llama_dsv4_comp_status::stale_quote;
         return result;
+    }
+    if (quote.plan->preserve_empty_execution) {
+        auto replacement_handle = quote.plan->replacement_handle.extract(quote.plan->replacement_handle_id);
+        auto inserted_handle    = pimpl->handles.insert(std::move(replacement_handle));
+        if (!inserted_handle.inserted) {
+            const auto restored_binding =
+                pimpl->bindings.insert(quote.plan->detached_binding.extract(quote.plan->execution_id));
+            const auto restored_handle = quote.plan->replacement_handle.insert(std::move(inserted_handle.node));
+            if (!restored_binding.inserted || !restored_handle.inserted) {
+                std::terminate();
+            }
+            result.status = llama_dsv4_comp_status::stale_quote;
+            return result;
+        }
+        auto replacement_binding = quote.plan->replacement_binding.extract(quote.plan->execution_id);
+        auto inserted_binding    = pimpl->bindings.insert(std::move(replacement_binding));
+        if (!inserted_binding.inserted) {
+            const auto retained_handle =
+                quote.plan->replacement_handle.insert(pimpl->handles.extract(quote.plan->replacement_handle_id));
+            const auto restored_binding =
+                pimpl->bindings.insert(quote.plan->detached_binding.extract(quote.plan->execution_id));
+            const auto retained_binding = quote.plan->replacement_binding.insert(std::move(inserted_binding.node));
+            if (!retained_handle.inserted || !restored_binding.inserted || !retained_binding.inserted) {
+                std::terminate();
+            }
+            result.status = llama_dsv4_comp_status::stale_quote;
+            return result;
+        }
+        pimpl->next_handle_id =
+            quote.plan->replacement_handle_id == std::numeric_limits<llama_dsv4_comp_handle_id>::max() ?
+                0 :
+                quote.plan->replacement_handle_id + 1;
     }
     handle_it->second.resident_owned = true;
     ++handle_it->second.resident_generation;
@@ -792,11 +870,34 @@ llama_dsv4_comp_status llama_dsv4_comp_pool::rollback_detach(
     }
 
     const auto handle_it = pimpl->handles.find(quote.plan->handle);
+    const auto detached_binding_it    = quote.plan->detached_binding.find(quote.plan->execution_id);
+    const auto replacement_binding_it = pimpl->bindings.find(quote.plan->execution_id);
+    const auto replacement_handle_it  = pimpl->handles.find(quote.plan->replacement_handle_id);
+    const bool replacement_valid =
+        !quote.plan->preserve_empty_execution ||
+        (replacement_binding_it != pimpl->bindings.end() &&
+         replacement_binding_it->second == quote.plan->replacement_handle_id &&
+         replacement_handle_it != pimpl->handles.end() && !replacement_handle_it->second.resident_owned &&
+         replacement_handle_it->second.visible_c4_rows == 0 && replacement_handle_it->second.visible_hca_rows == 0 &&
+         replacement_handle_it->second.c4_segment_ids.empty() && replacement_handle_it->second.hca_segment_ids.empty());
     if (handle_it == pimpl->handles.end() || !handle_it->second.resident_owned ||
         handle_it->second.generation != quote.plan->expected_handle_generation ||
         handle_it->second.resident_generation != quote.plan->expected_resident_generation + 1 ||
-        pimpl->bindings.count(quote.plan->execution_id) != 0 || pimpl->is_bound(quote.plan->handle)) {
+        detached_binding_it == quote.plan->detached_binding.end() ||
+        detached_binding_it->second != quote.plan->handle || !replacement_valid ||
+        (!quote.plan->preserve_empty_execution && pimpl->bindings.count(quote.plan->execution_id) != 0) ||
+        pimpl->is_bound(quote.plan->handle)) {
         return llama_dsv4_comp_status::stale_quote;
+    }
+
+    if (quote.plan->preserve_empty_execution) {
+        auto binding_node     = pimpl->bindings.extract(replacement_binding_it);
+        auto handle_node      = pimpl->handles.extract(replacement_handle_it);
+        auto retained_binding = quote.plan->replacement_binding.insert(std::move(binding_node));
+        auto retained_handle  = quote.plan->replacement_handle.insert(std::move(handle_node));
+        if (!retained_binding.inserted || !retained_handle.inserted) {
+            std::terminate();
+        }
     }
 
     auto node = quote.plan->detached_binding.extract(quote.plan->execution_id);
@@ -806,7 +907,18 @@ llama_dsv4_comp_status llama_dsv4_comp_pool::rollback_detach(
     auto inserted = pimpl->bindings.insert(std::move(node));
     if (!inserted.inserted) {
         const auto restored = quote.plan->detached_binding.insert(std::move(inserted.node));
-        (void) restored;
+        if (!restored.inserted) {
+            std::terminate();
+        }
+        if (quote.plan->preserve_empty_execution) {
+            const auto replacement_handle_restored =
+                pimpl->handles.insert(quote.plan->replacement_handle.extract(quote.plan->replacement_handle_id));
+            const auto replacement_binding_restored =
+                pimpl->bindings.insert(quote.plan->replacement_binding.extract(quote.plan->execution_id));
+            if (!replacement_handle_restored.inserted || !replacement_binding_restored.inserted) {
+                std::terminate();
+            }
+        }
         return llama_dsv4_comp_status::stale_quote;
     }
     handle_it->second.resident_owned = false;

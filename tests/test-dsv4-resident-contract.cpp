@@ -1,17 +1,19 @@
-#include "llama-kv-cache-dsv4.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-model.h"
 #include "models/models.h"
 
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -82,6 +84,13 @@ int fake_commit_calls  = 0;
 bool fake_quote_throws = false;
 bool fake_commit_throws = false;
 
+struct fake_commit_pause {
+    std::promise<void>       entered;
+    std::shared_future<void> resume;
+};
+
+thread_local fake_commit_pause * fake_commit_pause_override = nullptr;
+
 int fake_quote(
         ggml_tensor * const * sources,
         ggml_tensor * const * destinations,
@@ -109,6 +118,12 @@ int fake_quote(
 
 int fake_commit(void * raw) {
     ++fake_commit_calls;
+    if (fake_commit_pause_override != nullptr) {
+        auto * pause               = fake_commit_pause_override;
+        fake_commit_pause_override = nullptr;
+        pause->entered.set_value();
+        pause->resume.wait();
+    }
     if (fake_commit_throws) {
         throw std::runtime_error("injected raw resident commit exception");
     }
@@ -161,6 +176,56 @@ struct vector_writer : llama_io_write_i {
     size_t n_bytes() override { return data.size(); }
     std::vector<uint8_t> data;
 };
+
+struct vector_reader : llama_io_read_i {
+    explicit vector_reader(const std::vector<uint8_t> & data) : data(data) {}
+
+    void read(void * dst, size_t size) override {
+        expect(offset <= data.size() && size <= data.size() - offset, "state reader overflow");
+        std::memcpy(dst, data.data() + offset, size);
+        offset += size;
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t tensor_offset, size_t size) override {
+        expect(offset <= data.size() && size <= data.size() - offset, "tensor reader overflow");
+        ggml_backend_tensor_set(tensor, data.data() + offset, tensor_offset, size);
+        offset += size;
+    }
+
+    size_t n_bytes() override { return offset; }
+
+    const std::vector<uint8_t> & data;
+    size_t                       offset = 0;
+};
+
+struct resident_lock_probe {
+    std::promise<void> before_lock;
+    std::promise<void> lock_contended;
+    std::promise<void> lock_acquired;
+    std::exception_ptr error;
+};
+
+void resident_lock_probe_hook(llama_kv_iswa_resident_lock_phase phase, void * context) {
+    auto & probe = *static_cast<resident_lock_probe *>(context);
+    if (phase == llama_kv_iswa_resident_lock_phase::before_lock) {
+        probe.before_lock.set_value();
+    } else if (phase == llama_kv_iswa_resident_lock_phase::lock_contended) {
+        probe.lock_contended.set_value();
+    } else {
+        probe.lock_acquired.set_value();
+    }
+}
+
+template <typename Action> std::thread start_resident_lock_probe(resident_lock_probe & probe, Action action) {
+    return std::thread([&probe, action = std::move(action)]() mutable {
+        try {
+            llama_kv_iswa_set_resident_lock_hook_for_test(resident_lock_probe_hook, &probe);
+            action();
+        } catch (...) {
+            probe.error = std::current_exception();
+        }
+    });
+}
 
 llama_hparams make_hparams() {
     llama_hparams hparams = {};
@@ -485,10 +550,20 @@ void test_composite_detach_attach_and_repeated_accounting() {
     expect(fixture.raw.get_base()->get_cells(0).get_used() == 0 &&
             fixture.raw.get_swa()->get_cells(0).get_used() == 0, "detach retained raw execution metadata");
     llama_dsv4_comp_handle_id binding = 0;
-    expect(fixture.compressed.get_binding(0, binding) == llama_dsv4_comp_status::binding_not_found,
-            "detach retained compressed execution binding");
-    expect(fixture.compressed.memory_usage_snapshot().resident_handles == 1,
-            "detach did not retain compressed root");
+    expect(fixture.compressed.get_binding(0, binding) == llama_dsv4_comp_status::ok && binding != fixture.roots[0],
+           "detach did not install a fresh compressed execution root");
+    llama_dsv4_comp_handle_info replacement;
+    expect(fixture.compressed.get_handle(binding, replacement) == llama_dsv4_comp_status::ok &&
+               replacement.visible_c4_rows == 0 && replacement.visible_hca_rows == 0 &&
+               replacement.c4_segment_ids.empty() && replacement.hca_segment_ids.empty(),
+           "detach replacement compressed root was not constructor-empty");
+    const auto detached_usage = fixture.compressed.memory_usage_snapshot();
+    expect(detached_usage.resident_handles == 1 && detached_usage.bindings == 2 && detached_usage.handles == 3,
+           "detach did not retain history alongside the empty execution root");
+    llama_dsv4_comp_batch_plan fresh_graph;
+    fresh_graph.graph_execution_ids = { 0 };
+    expect(fixture.compressed.quote_batch(fresh_graph).status == llama_dsv4_comp_status::ok,
+           "fresh graph could not address the detached source execution");
     expect(fixture.composite.quote_detach({ 1, llama_dsv4_resident_scope::single_context }).status ==
             llama_dsv4_resident_status::capacity_exhausted, "state aperture exhaustion was not fail-closed");
 
@@ -550,8 +625,9 @@ void test_composite_detach_attach_and_repeated_accounting() {
                 fixture.composite.quote_attach(cycle_detach.resident, destination)) ==
                 llama_dsv4_resident_status::ok, "repeated attach failed");
         const auto after = fixture.compressed.memory_usage_snapshot();
-        expect(same_comp_pages(stable, after) && after.resident_handles == 0 && after.bindings == 1,
-                "repeated cycle changed compressed page accounting");
+        expect(
+            same_comp_pages(stable, after) && after.resident_handles == 0 && after.bindings == 2 && after.handles == 2,
+            "repeated cycle changed compressed page accounting");
         expect(fixture.composite.usage().handles == 0 && fixture.composite.usage().occupied_slots == 0,
                 "repeated cycle leaked composite accounting");
         expect_state_snapshots(fixture.execution_states(), destination, source_state, "repeated attach");
@@ -568,8 +644,15 @@ void test_failure_rollback_and_retry() {
         const auto source_state = snapshot_all_depths(fixture.execution_states(), 0);
         auto quote = fixture.composite.quote_detach({ 0, llama_dsv4_resident_scope::single_context });
         fake_commit_status = GGML_DSV4_SPARSE_OOM;
-        expect(fixture.composite.detach(quote).status == llama_dsv4_resident_status::resource_exhausted,
-                "raw failure after compressed detach was not reported");
+        llama_dsv4_resident_result failed;
+        size_t                     rollback_allocations = 0;
+        {
+            allocation_scope allocations(true);
+            failed               = fixture.composite.detach(quote);
+            rollback_allocations = allocations.finish();
+        }
+        expect(failed.status == llama_dsv4_resident_status::resource_exhausted && rollback_allocations == 0,
+               "raw failure after compressed detach was not allocation-free rolled back");
         fake_commit_status = GGML_DSV4_SPARSE_OK;
         llama_dsv4_comp_handle_id binding = 0;
         expect(fixture.compressed.get_binding(0, binding) == llama_dsv4_comp_status::ok &&
@@ -639,6 +722,61 @@ void test_failure_rollback_and_retry() {
         expect(fixture.composite.attach(fixture.composite.quote_attach(detached.resident, 1)) ==
                 llama_dsv4_resident_status::ok, "attach retry failed");
     }
+}
+
+void test_detached_source_accepts_fresh_work_and_clear() {
+    backend_scope     backend;
+    composite_fixture fixture;
+    const auto        baseline = fixture.compressed.memory_usage_snapshot();
+    prepare_source(fixture);
+
+    const auto detached =
+        fixture.composite.detach(fixture.composite.quote_detach({ 0, llama_dsv4_resident_scope::single_context }));
+    expect(detached.status == llama_dsv4_resident_status::ok, "fresh-source detach failed");
+
+    llama_dsv4_comp_handle_id replacement = 0;
+    expect(
+        fixture.compressed.get_binding(0, replacement) == llama_dsv4_comp_status::ok && replacement != fixture.roots[0],
+        "fresh source has no replacement compressed root");
+
+    llama_dsv4_comp_batch_plan batch;
+    batch.graph_execution_ids = { 0 };
+    batch.changes             = {
+        { replacement, llama_dsv4_comp_family::c4,  1, {} },
+        { replacement, llama_dsv4_comp_family::hca, 1, {} },
+    };
+    const auto quote = fixture.compressed.quote_batch(batch);
+    expect(quote.status == llama_dsv4_comp_status::ok, "fresh source graph quote failed");
+    const auto reservation = fixture.compressed.try_reserve(quote);
+    expect(reservation.status == llama_dsv4_comp_status::ok &&
+               fixture.compressed.commit(reservation.ticket) == llama_dsv4_comp_status::ok,
+           "fresh source graph commit failed");
+
+    fixture.put_raw(0, 1, 7);
+    fill_state_sequence(fixture.csa_execution, 0, 0x91);
+    expect(fixture.raw.seq_rm(0, -1, -1), "fresh source raw seq_rm failed");
+    for (auto * state : fixture.execution_states()) {
+        state->clear(0, true);
+    }
+
+    // Mirrors aggregate clear_compressed(seq_id): the bound fresh root can be
+    // removed and replaced without touching the independently resident root.
+    expect(fixture.compressed.unbind(0) == llama_dsv4_comp_status::ok &&
+               fixture.compressed.remove_handle(replacement) == llama_dsv4_comp_status::ok,
+           "fresh source compressed clear could not remove its root");
+    const auto cleared = fixture.compressed.create_handle();
+    expect(cleared.status == llama_dsv4_comp_status::ok &&
+               fixture.compressed.bind(0, cleared.handle) == llama_dsv4_comp_status::ok,
+           "fresh source compressed clear could not install an empty root");
+    const auto during = fixture.compressed.memory_usage_snapshot();
+    expect(during.resident_handles == 1 && during.bindings == 2 && during.handles == 3,
+           "fresh source clear changed resident ownership accounting");
+
+    expect(fixture.composite.release(detached.resident) == llama_dsv4_resident_status::ok,
+           "resident release after fresh source reuse failed");
+    const auto after = fixture.compressed.memory_usage_snapshot();
+    expect(after.resident_handles == 0 && after.bindings == 2 && after.handles == 2 && same_comp_pages(baseline, after),
+           "fresh source lifecycle did not return to baseline accounting");
 }
 
 void test_busy_stale_occupied_and_release() {
@@ -750,15 +888,60 @@ void test_busy_stale_occupied_and_release() {
 void test_transaction_blocks_graph_and_destruction_fails_closed() {
     backend_scope backend;
     composite_fixture fixture;
-    expect(fixture.raw.begin_resident_transaction(), "begin raw transaction guard");
     bool graph_rejected = false;
-    try {
-        (void) fixture.raw.acquire_resident_batch_lease();
-    } catch (const std::exception &) {
-        graph_rejected = true;
+    {
+        auto transaction = fixture.raw.acquire_resident_transaction();
+        expect(static_cast<bool>(transaction), "acquire raw transaction guard");
+        try {
+            (void) fixture.raw.acquire_resident_batch_lease();
+        } catch (const std::exception &) {
+            graph_rejected = true;
+        }
     }
-    fixture.raw.end_resident_transaction();
     expect(graph_rejected, "resident transaction allowed a new graph lease");
+
+    const auto expect_excluded = [&](auto action, const std::string & phase) {
+        resident_lock_probe probe;
+        auto                before_lock_future    = probe.before_lock.get_future();
+        auto                lock_contended_future = probe.lock_contended.get_future();
+        auto                lock_acquired_future  = probe.lock_acquired.get_future();
+        std::thread         worker;
+        {
+            auto transaction = fixture.raw.acquire_resident_transaction();
+            expect(static_cast<bool>(transaction), phase + " transaction acquisition failed");
+            worker = start_resident_lock_probe(probe, action);
+            before_lock_future.wait();
+            lock_contended_future.wait();
+        }
+        lock_acquired_future.wait();
+        worker.join();
+        if (probe.error) {
+            std::rethrow_exception(probe.error);
+        }
+    };
+
+    expect_excluded([&]() { fixture.raw.clear(false); }, "raw clear");
+    expect_excluded([&]() { (void) fixture.raw.seq_rm(0, -1, -1); }, "raw seq_rm");
+    expect_excluded(
+        [&]() {
+            vector_writer writer;
+            fixture.raw.state_write(writer, 0, 0);
+        },
+        "raw state_write");
+    vector_writer serialized;
+    fixture.raw.state_write(serialized, 0, 0);
+    expect_excluded(
+        [&]() {
+            vector_reader reader(serialized.data);
+            fixture.raw.state_read(reader, 0, 0);
+        },
+        "raw state_read");
+    expect_excluded(
+        [&]() {
+            auto graph = fixture.raw.acquire_resident_batch_lease();
+            expect(graph != nullptr, "graph lease missing after transaction release");
+        },
+        "raw graph");
 
 #if defined(__unix__) || defined(__APPLE__)
     const pid_t child = fork();
@@ -782,6 +965,94 @@ void test_transaction_blocks_graph_and_destruction_fails_closed() {
 #endif
 }
 
+void test_composite_detach_retains_raw_transaction() {
+    backend_scope     backend;
+    composite_fixture fixture;
+    prepare_source(fixture);
+
+    vector_writer serialized;
+    fixture.raw.state_write(serialized, 1, 0);
+    auto quote = fixture.composite.quote_detach({ 0, llama_dsv4_resident_scope::single_context });
+    expect(quote.status == llama_dsv4_resident_status::ok, "composite exclusion detach quote failed");
+
+    std::promise<void> resume_commit;
+    fake_commit_pause  commit_pause;
+    commit_pause.resume = resume_commit.get_future().share();
+    auto commit_entered = commit_pause.entered.get_future();
+
+    llama_dsv4_resident_result detached;
+    std::exception_ptr         detach_error;
+    std::thread                detach_worker([&]() {
+        try {
+            fake_commit_pause_override = &commit_pause;
+            detached                   = fixture.composite.detach(quote);
+            fake_commit_pause_override = nullptr;
+        } catch (...) {
+            fake_commit_pause_override = nullptr;
+            detach_error               = std::current_exception();
+        }
+    });
+    commit_entered.wait();
+
+    constexpr size_t                                 operation_count = 5;
+    std::array<resident_lock_probe, operation_count> probes;
+    std::array<std::future<void>, operation_count>   before_lock;
+    std::array<std::future<void>, operation_count>   lock_contended;
+    std::array<std::future<void>, operation_count>   lock_acquired;
+    for (size_t i = 0; i < operation_count; ++i) {
+        before_lock[i]    = probes[i].before_lock.get_future();
+        lock_contended[i] = probes[i].lock_contended.get_future();
+        lock_acquired[i]  = probes[i].lock_acquired.get_future();
+    }
+
+    std::array<std::thread, operation_count> workers = {
+        start_resident_lock_probe(probes[0], [&]() { fixture.raw.clear(false); }),
+        start_resident_lock_probe(probes[1], [&]() { (void) fixture.raw.seq_rm(1, -1, -1); }),
+        start_resident_lock_probe(probes[2],
+                                  [&]() {
+                                      vector_writer writer;
+                                      fixture.raw.state_write(writer, 1, 0);
+                                  }),
+        start_resident_lock_probe(probes[3],
+                                  [&]() {
+                                      vector_reader reader(serialized.data);
+                                      fixture.raw.state_read(reader, 1, 0);
+                                  }),
+        start_resident_lock_probe(probes[4],
+                                  [&]() {
+                                      auto   graph   = fixture.raw.acquire_resident_batch_lease();
+                                      expect(graph != nullptr, "composite exclusion graph lease missing after detach");
+                                  }),
+    };
+
+    for (size_t i = 0; i < operation_count; ++i) {
+        before_lock[i].wait();
+        lock_contended[i].wait();
+    }
+    resume_commit.set_value();
+    detach_worker.join();
+    if (detach_error) {
+        std::rethrow_exception(detach_error);
+    }
+    expect(detached.status == llama_dsv4_resident_status::ok && fixture.composite.usage().handles == 1 &&
+               fixture.composite.usage().occupied_slots == 1,
+           "composite detach did not publish after retained raw transaction");
+
+    for (size_t i = 0; i < operation_count; ++i) {
+        lock_acquired[i].wait();
+        workers[i].join();
+        if (probes[i].error) {
+            std::rethrow_exception(probes[i].error);
+        }
+    }
+
+    llama_dsv4_comp_handle_id binding = 0;
+    expect(fixture.compressed.get_binding(0, binding) == llama_dsv4_comp_status::ok && binding != fixture.roots[0],
+           "composite exclusion detach did not publish the empty execution root");
+    expect(fixture.composite.release(detached.resident) == llama_dsv4_resident_status::ok,
+           "composite exclusion resident release failed");
+}
+
 }  // namespace
 
 int main() {
@@ -789,8 +1060,10 @@ int main() {
         test_current_layout_fails_closed();
         test_composite_detach_attach_and_repeated_accounting();
         test_failure_rollback_and_retry();
+        test_detached_source_accepts_fresh_work_and_clear();
         test_busy_stale_occupied_and_release();
         test_transaction_blocks_graph_and_destruction_fails_closed();
+        test_composite_detach_retains_raw_transaction();
     } catch (const std::exception & error) {
         std::cerr << "test-dsv4-resident-contract: " << error.what() << '\n';
         return 1;

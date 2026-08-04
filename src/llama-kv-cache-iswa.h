@@ -4,6 +4,7 @@
 #include "llama-kv-cache.h"
 
 #include <memory>
+#include <mutex>
 #include <vector>
 
 //
@@ -43,6 +44,20 @@ void llama_kv_iswa_set_resident_backend_override_for_test(
         llama_kv_iswa_resident_backend_override backend);
 void llama_kv_iswa_fail_next_resident_allocation_for_test();
 
+enum class llama_kv_iswa_resident_lock_phase : uint8_t {
+    before_lock,
+    lock_contended,
+    lock_acquired,
+};
+
+using llama_kv_iswa_resident_lock_hook_for_test = void (*)(llama_kv_iswa_resident_lock_phase phase, void * context);
+
+// One-shot, thread-local synchronization seam. The hook runs immediately
+// before and after the next outer ISWA resident-lock acquisition, then clears
+// itself before either callback so recursive coordinator calls cannot replay
+// it. Production leaves the hook unset.
+void llama_kv_iswa_set_resident_lock_hook_for_test(llama_kv_iswa_resident_lock_hook_for_test hook, void * context);
+
 struct llama_kv_iswa_resident_handle {
     uint64_t pool_id    = 0;
     uint64_t id         = 0;
@@ -79,6 +94,34 @@ struct llama_kv_iswa_resident_attach_quote {
 
   private:
     std::shared_ptr<llama_kv_iswa_resident_attach_plan> plan;
+    friend class llama_kv_cache_iswa;
+};
+
+// Move-only exclusive capability for a composite resident transaction. The
+// token retains the raw/SWA recursive mutex for its entire lifetime, so
+// ordinary cache mutation and graph preparation in other threads cannot enter
+// between component validation and publication. Coordinator calls on the
+// owning thread may safely re-enter the same mutex.
+class llama_kv_iswa_resident_transaction {
+  public:
+    llama_kv_iswa_resident_transaction() = default;
+    ~llama_kv_iswa_resident_transaction();
+
+    llama_kv_iswa_resident_transaction(const llama_kv_iswa_resident_transaction &)             = delete;
+    llama_kv_iswa_resident_transaction & operator=(const llama_kv_iswa_resident_transaction &) = delete;
+    llama_kv_iswa_resident_transaction(llama_kv_iswa_resident_transaction && other) noexcept;
+    llama_kv_iswa_resident_transaction & operator=(llama_kv_iswa_resident_transaction &&) = delete;
+
+    explicit operator bool() const { return active; }
+
+  private:
+    llama_kv_iswa_resident_transaction(std::shared_ptr<llama_kv_cache_resident_guard> guard,
+                                       std::unique_lock<std::recursive_mutex>         lock);
+
+    std::shared_ptr<llama_kv_cache_resident_guard> guard;
+    std::unique_lock<std::recursive_mutex>         lock;
+    bool                                           active = false;
+
     friend class llama_kv_cache_iswa;
 };
 
@@ -206,12 +249,11 @@ public:
     // rollback; destruction releases it.
     std::shared_ptr<void> acquire_resident_batch_lease() const;
 
-    // A composite DSV4 ownership transaction takes this exclusive lease only
-    // after all component quotes exist. It requires quiescence and prevents a
-    // new graph lease from beginning until the composite reaches a terminal
-    // commit or rollback boundary.
-    bool begin_resident_transaction() const;
-    void end_resident_transaction() const;
+    // A composite DSV4 ownership transaction takes this retained exclusive
+    // token only after all component quotes exist. It requires quiescence and
+    // excludes graph preparation plus every raw/SWA public mutation until the
+    // composite reaches a terminal commit or rollback boundary.
+    llama_kv_iswa_resident_transaction acquire_resident_transaction() const;
     bool has_resident_handles() const;
 
 private:

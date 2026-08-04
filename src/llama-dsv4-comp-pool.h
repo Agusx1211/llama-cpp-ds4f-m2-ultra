@@ -313,6 +313,7 @@ class llama_dsv4_comp_pool {
     // aggregate pool still owns its constructor-created empty root. These
     // prepared operations are intentionally private: abandoning one would
     // leave the pool's short exclusive transaction active.
+    llama_dsv4_comp_detach_quote  quote_detach_preserving_empty_execution(uint32_t execution_id) const;
     llama_dsv4_comp_attach_quote  quote_attach_replacing_empty(
                                              llama_dsv4_comp_resident_handle resident,
                                              uint32_t execution_id) const;
@@ -321,6 +322,7 @@ class llama_dsv4_comp_pool {
     llama_dsv4_comp_status        rollback_release(const llama_dsv4_comp_release_quote & quote);
 
     struct impl;
+    llama_dsv4_comp_detach_quote quote_detach_impl(uint32_t execution_id, bool preserve_empty_execution) const;
     llama_dsv4_comp_directory make_directory(llama_dsv4_comp_family             family,
                                              const std::vector<uint32_t> &      execution_ids,
                                              uint32_t                           logical_segments,
