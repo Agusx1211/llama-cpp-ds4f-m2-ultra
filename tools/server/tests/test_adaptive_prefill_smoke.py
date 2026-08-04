@@ -83,10 +83,9 @@ class AdaptivePrefillSmokeTests(unittest.TestCase):
             })
         self.assertEqual(SMOKE.required_trace_capacity(config), 69230)
 
-    def test_sequential_mode_bounds_count_and_interval(self) -> None:
-        for count in (1, 4):
-            SMOKE.validate_args(arguments(sequential_bursts=True, burst_count=count))
-        for count in (0, 5):
+    def test_sequential_mode_requires_exact_count_and_positive_interval(self) -> None:
+        SMOKE.validate_args(arguments(sequential_bursts=True, burst_count=4))
+        for count in (0, 1, 3, 5):
             with self.assertRaises(ValueError):
                 SMOKE.validate_args(arguments(sequential_bursts=True, burst_count=count))
         with self.assertRaises(ValueError):
@@ -117,23 +116,35 @@ class AdaptivePrefillSmokeTests(unittest.TestCase):
         }
         low = results["low-8k"]
         low.end_ns = 1000
-        low.progress = [{"processed": 128}]
         for ordinal in range(2):
             burst = results[f"burst-{ordinal:02d}"]
             burst.intended_launch_ns = 100 + ordinal * 100
             burst.start_ns = 110 + ordinal * 100
             burst.first_token_ns = 130 + ordinal * 100
             burst.end_ns = 150 + ordinal * 100
+        low.progress = [
+            {"processed": 128, "client_monotonic_ns": 175},
+            {"processed": 256, "client_monotonic_ns": 275},
+        ]
 
         timings = SMOKE.validate_sequential_burst_results(results, 2)
         self.assertEqual([timing["launch_lag_ms"] for timing in timings], [0.00001, 0.00001])
         self.assertEqual([timing["ttft_ms"] for timing in timings], [0.00002, 0.00002])
+        self.assertEqual([timing["low_progress_after_ns"] for timing in timings], [175, 275])
 
         results["burst-01"].tokens = [9, 9]
         with self.assertRaises(RuntimeError):
             SMOKE.validate_sequential_burst_results(results, 2)
         results["burst-01"].tokens = [7, 8]
         results["burst-01"].first_token_ns = low.end_ns
+        with self.assertRaises(RuntimeError):
+            SMOKE.validate_sequential_burst_results(results, 2)
+        results["burst-01"].first_token_ns = 230
+        results["burst-01"].end_ns = low.end_ns
+        with self.assertRaises(RuntimeError):
+            SMOKE.validate_sequential_burst_results(results, 2)
+        results["burst-01"].end_ns = 250
+        low.progress = [{"processed": 256, "client_monotonic_ns": 275}]
         with self.assertRaises(RuntimeError):
             SMOKE.validate_sequential_burst_results(results, 2)
 

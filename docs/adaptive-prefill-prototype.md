@@ -60,7 +60,7 @@ two-slot proof above.
 The opt-in horizontal runner keeps the same two split-KV slots but replaces the
 isolated/sustained 512-token pair with the shortest useful burst workload: an
 isolated 8K low oracle, an isolated 128/16 fast oracle, then the identical 8K
-low request alongside one to four sequential 128/16 fast requests. Restart the
+low request alongside exactly four sequential 128/16 fast requests. Restart the
 server after setting the larger capacity in the server's environment:
 
 ```sh
@@ -81,22 +81,26 @@ python3 tools/server/tests/adaptive-prefill-smoke.py \
   --artifact "/tmp/adaptive-prefill-bursts-$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
-Sequential-burst mode requires a count from one through four and a positive
-interval. Before sending any workload request it requires an empty trace and
+Sequential-burst mode requires exactly four requests and a positive interval.
+Before sending any workload request it requires an empty trace and
 checks the server's advertised capacity against a worst-case per-token event
 budget. It records each intended and actual launch time, launch lag, and TTFT.
-Every burst must return before the mixed low request completes and exactly
-match the isolated burst's token IDs and content; the mixed low result must
-likewise exactly match its isolated oracle. The reference before/after, prompt
-progress, stage/commit, one-owner, aligned-yield, active-fast chunk, trace
-overflow, cardinality, and output-hash gates remain enabled.
+Every burst must fully return before the mixed low request completes, exactly
+match the isolated burst's token IDs and content, and be followed by a fresh
+low prompt-progress frame before the next burst launches. The mixed low result
+must likewise exactly match its isolated oracle. The reference before/after,
+stage/commit, one-owner, aligned-yield, active-fast chunk, trace overflow,
+cardinality, and output-hash gates remain enabled.
 
 The runner does not itself change admission. A server retaining the current
 closed-cohort rule will intentionally fail to admit a later burst while the low
 member remains bound. Enable a separately reviewed bounded fast-refill policy
 before using this as a passing target gate. Extending the 30-second queue
 deadline alone is not a fast-service result, and resident request parking is
-not required for this two-slot low-plus-one-fast-at-a-time geometry.
+not required for this two-slot low-plus-one-fast-at-a-time geometry. Trace
+`cohort_id` identifies prefill ownership, not a runtime permit epoch; the
+runner's refill proof is the completed burst followed by new mixed-low progress
+before it launches the next request.
 
 `PASS` requires exact `tokens_predicted` and token-ID cardinality for every
 request, identical token IDs and content for deterministic reference/fast
