@@ -10,6 +10,10 @@
 #include <unordered_map>
 #include <vector>
 
+class dsv4_sparse_transaction;
+struct dsv4_sparse_range;
+struct llama_kv_cache_dsv4_admission_state;
+
 // True only for the target M2 Ultra Metal backend when placement-sparse
 // buffers can provide DSV4's elastic physical page pool.
 bool llama_kv_cache_dsv4_supports_elastic_metal(
@@ -291,7 +295,7 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
-    ~llama_kv_cache_dsv4() = default;
+    ~llama_kv_cache_dsv4();
 
     //
     // llama_memory_i
@@ -350,7 +354,44 @@ public:
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
     llama_dsv4_memory_usage_snapshot memory_usage_snapshot() const;
 
+    llama_kv_admission_status quote_admission(
+            const llama_kv_admission_span * spans,
+            size_t n_spans,
+            llama_kv_admission_quote & quote);
+    llama_kv_admission_status reserve_admission(
+            const llama_kv_admission_span * spans,
+            size_t n_spans,
+            llama_kv_admission_quote & quote,
+            uint64_t & id);
+
+    bool arm_admission(uint64_t id);
+    void cancel_admission(uint64_t id);
+
 private:
+    friend class llama_kv_cache_dsv4_context;
+
+    enum admission_consume_status {
+        ADMISSION_NO_MATCH,
+        ADMISSION_COMMITTED,
+        ADMISSION_ERROR,
+    };
+
+    uint64_t register_admission(
+            std::unique_ptr<dsv4_sparse_transaction> reservation,
+            const llama_kv_admission_span * spans,
+            size_t n_spans,
+            const llama_dsv4_batch_quote & quote,
+            uint32_t limiting_family_mask);
+    bool collect_admission_ranges(
+            const llama_kv_admission_span * spans,
+            size_t n_spans,
+            std::vector<dsv4_sparse_range> & ranges,
+            llama_dsv4_batch_quote & quote) const;
+    admission_consume_status consume_admission(
+            const std::vector<llama_ubatch> & ubatches,
+            llama_dsv4_batch_quote & quote,
+            uint32_t & limiting_family_mask);
+
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
     llama_hparams hparams_hca;
@@ -376,6 +417,8 @@ private:
     uint32_t hca_logical_rows = 0;
 
     uint64_t state_identity_hash = 0;
+
+    std::unique_ptr<llama_kv_cache_dsv4_admission_state> admission_state;
 
     void clear_compressed(llama_seq_id seq_id, bool data);
 };
@@ -606,6 +649,7 @@ public:
 
 private:
     bool reserve_batch_ranges();
+    bool collect_batch_ranges(std::vector<dsv4_sparse_range> & ranges);
     bool reserve_aggregate_pool(std::vector<llama_dsv4_comp_allocation> & cow_allocations);
     void rollback_aggregate_pool();
 

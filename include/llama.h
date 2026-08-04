@@ -975,6 +975,64 @@ extern "C" {
         uint64_t physical_pages;
     };
 
+    // Target-specific, prefill admission contract for DeepSeek V4. A span is
+    // one contiguous future logical range for one execution sequence. The
+    // server currently uses [0, prompt + decode runway) spans in split-KV
+    // mode, with prompt reuse disabled, so the allocator can quote the exact
+    // virtual destinations before any family member starts prefill.
+    struct llama_kv_admission_span {
+        llama_seq_id seq_id;
+        llama_pos    pos_begin;
+        llama_pos    pos_end;
+    };
+
+    enum llama_kv_admission_status {
+        LLAMA_KV_ADMISSION_UNSUPPORTED = 0,
+        LLAMA_KV_ADMISSION_FEASIBLE    = 1,
+        LLAMA_KV_ADMISSION_PRESSURE    = 2,
+        LLAMA_KV_ADMISSION_INVALID     = 3,
+        LLAMA_KV_ADMISSION_ERROR       = 4,
+    };
+
+    struct llama_kv_admission_quote {
+        enum llama_kv_admission_status status;
+        uint32_t limiting_family;
+        uint32_t limiting_family_mask;
+        uint64_t limiting_pool_id;
+        uint64_t target_mappings;
+        uint64_t required_pages;
+        uint64_t new_pages;
+        uint64_t cow_pages;
+        uint64_t free_pages;
+        uint64_t reserved_pages;
+        uint64_t physical_pages;
+    };
+
+    struct llama_kv_admission_ticket;
+
+    // Produce an allocator quote without changing logical sequence state,
+    // sparse mappings, or held page reservations.
+    LLAMA_API enum llama_kv_admission_status llama_kv_admission_quote_ranges(
+            struct llama_context * ctx,
+            const struct llama_kv_admission_span * spans,
+            size_t n_spans,
+            struct llama_kv_admission_quote * quote);
+
+    // Atomically reserve the exact quoted ranges. Deleting an unarmed ticket
+    // rolls its reservation back. Arming transfers the reservation to the
+    // DSV4 memory; the first covered prefill preflight consumes and commits it
+    // at the existing last-safe point before graph submission. Deleting an
+    // armed but unconsumed ticket also rolls the reservation back.
+    LLAMA_API enum llama_kv_admission_status llama_kv_admission_reserve_ranges(
+            struct llama_context * ctx,
+            const struct llama_kv_admission_span * spans,
+            size_t n_spans,
+            struct llama_kv_admission_quote * quote,
+            struct llama_kv_admission_ticket ** ticket);
+
+    LLAMA_API bool llama_kv_admission_arm(struct llama_kv_admission_ticket * ticket);
+    LLAMA_API void llama_kv_admission_free(struct llama_kv_admission_ticket * ticket);
+
     // Process a batch of tokens.
     // In contrast to llama_decode() - this call does not use KV cache.
     // For encode-decoder contexts, processes the batch using the encoder.

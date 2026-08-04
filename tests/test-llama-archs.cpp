@@ -1079,6 +1079,104 @@ static bool test_dsv4_physical_pressure(size_t seed, ggml_backend_dev_t dev) {
     return true;
 }
 
+static bool test_dsv4_admission_lifecycle(size_t seed, ggml_backend_dev_t dev) {
+    if (!dsv4_test_has_elastic_pages(dev, 2)) {
+        return true;
+    }
+
+    scoped_env_override disable_aggregate("LLAMA_DSV4_AGGREGATE_POOL_DISABLE", "1");
+    scoped_env_override clear_force_aggregate("LLAMA_DSV4_AGGREGATE_POOL_FORCE", nullptr);
+    dsv4_test_context test(seed, dev, 2, false, 16, 1, 512, 16);
+    auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(test.lctx.get()));
+    GGML_ASSERT(memory != nullptr && !memory->is_aggregate_compressed());
+    const auto baseline = memory->memory_usage_snapshot();
+
+    const llama_kv_admission_span single = { 0, 0, 8 };
+    llama_kv_admission_quote quote = {};
+    GGML_ASSERT(llama_kv_admission_quote_ranges(test.lctx.get(), &single, 1, &quote) ==
+            LLAMA_KV_ADMISSION_FEASIBLE);
+    GGML_ASSERT(quote.target_mappings > 0);
+    GGML_ASSERT(dsv4_usage_snapshot_equal(baseline, memory->memory_usage_snapshot()) &&
+            "mutation-free quote changed sparse usage");
+
+    llama_kv_admission_ticket * ticket = nullptr;
+    GGML_ASSERT(llama_kv_admission_reserve_ranges(test.lctx.get(), &single, 1, &quote, &ticket) ==
+            LLAMA_KV_ADMISSION_FEASIBLE);
+    GGML_ASSERT(ticket != nullptr);
+    GGML_ASSERT(llama_kv_admission_arm(ticket));
+    llama_kv_admission_free(ticket);
+    GGML_ASSERT(dsv4_usage_snapshot_equal(baseline, memory->memory_usage_snapshot()) &&
+            "armed prefill cancellation leaked reserved pages");
+
+    const std::array<llama_kv_admission_span, 2> family = {{
+        { 0, 0, 8 },
+        { 1, 0, 7 },
+    }};
+    ticket = nullptr;
+    dsv4_page_delta_audit_scope audit_scope;
+    llama_kv_cache_dsv4_test_reset_page_delta_audit();
+    GGML_ASSERT(llama_kv_admission_reserve_ranges(
+            test.lctx.get(), family.data(), family.size(), &quote, &ticket) == LLAMA_KV_ADMISSION_FEASIBLE);
+    GGML_ASSERT(ticket != nullptr && llama_kv_admission_arm(ticket));
+
+    const auto tokens = get_tokens(7, 128, seed + 73);
+    for (uint32_t pos = 0; pos < 4; ++pos) {
+        test.add(tokens[pos], pos, { 0 });
+    }
+    for (uint32_t pos = 0; pos < 3; ++pos) {
+        test.add(tokens[pos + 4], pos, { 1 });
+    }
+    test.decode("admission consume");
+    const auto audit = dsv4_assert_page_delta_audit(true, false);
+    GGML_ASSERT(audit.family_range_count[LLAMA_DSV4_MEMORY_RAW] > 0);
+    GGML_ASSERT(audit.family_range_bytes[LLAMA_DSV4_MEMORY_RAW] > 0);
+    uint64_t audited_target_mappings = 0;
+    uint64_t audited_required_pages = 0;
+    uint64_t audited_new_pages = 0;
+    uint64_t audited_cow_pages = 0;
+    for (const auto & pool : audit.pools) {
+        audited_target_mappings += pool.reserved_quote.target_mappings;
+        audited_required_pages += pool.reserved_quote.required_pages;
+        audited_new_pages += pool.reserved_quote.new_pages;
+        audited_cow_pages += pool.reserved_quote.cow_pages;
+    }
+    GGML_ASSERT(audited_target_mappings == quote.target_mappings);
+    GGML_ASSERT(audited_required_pages == quote.required_pages);
+    GGML_ASSERT(audited_new_pages == quote.new_pages);
+    GGML_ASSERT(audited_cow_pages == quote.cow_pages);
+    llama_kv_admission_free(ticket);
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 0) == 3);
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 1) == 2);
+
+    llama_memory_clear(llama_get_memory(test.lctx.get()), true);
+    GGML_ASSERT(dsv4_usage_snapshot_equal(baseline, memory->memory_usage_snapshot()) &&
+            "consumed admission did not return to baseline after logical clear");
+    return true;
+}
+
+static bool test_dsv4_admission_api_contract(size_t seed, ggml_backend_dev_t dev) {
+    if (dsv4_test_has_elastic_pages(dev, 2)) {
+        return true;
+    }
+
+    scoped_env_override disable_aggregate("LLAMA_DSV4_AGGREGATE_POOL_DISABLE", "1");
+    dsv4_test_context test(seed, dev, 2, false, 16, 1, 512, 16);
+    llama_kv_admission_quote quote = {};
+    const llama_kv_admission_span valid = { 0, 0, 8 };
+    GGML_ASSERT(llama_kv_admission_quote_ranges(nullptr, &valid, 1, &quote) == LLAMA_KV_ADMISSION_INVALID);
+    GGML_ASSERT(llama_kv_admission_quote_ranges(test.lctx.get(), nullptr, 1, &quote) == LLAMA_KV_ADMISSION_INVALID);
+
+    const llama_kv_admission_span invalid = { 0, 1, 8 };
+    GGML_ASSERT(llama_kv_admission_quote_ranges(test.lctx.get(), &invalid, 1, &quote) ==
+            LLAMA_KV_ADMISSION_INVALID);
+    const std::array<llama_kv_admission_span, 3> too_many = {{ valid, { 1, 0, 8 }, valid }};
+    GGML_ASSERT(llama_kv_admission_quote_ranges(test.lctx.get(), too_many.data(), too_many.size(), &quote) ==
+            LLAMA_KV_ADMISSION_INVALID);
+    GGML_ASSERT(llama_kv_admission_quote_ranges(test.lctx.get(), &valid, 1, &quote) ==
+            LLAMA_KV_ADMISSION_UNSUPPORTED);
+    return true;
+}
+
 static std::vector<float> run_dsv4_isolated(
         size_t seed,
         ggml_backend_dev_t dev,
@@ -2152,6 +2250,8 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     all_ok = test_dsv4_transactional_restore(seed, dev) && all_ok;
     all_ok = test_dsv4_elastic_borrow(seed, dev) && all_ok;
     all_ok = test_dsv4_physical_pressure(seed, dev) && all_ok;
+    all_ok = test_dsv4_admission_lifecycle(seed, dev) && all_ok;
+    all_ok = test_dsv4_admission_api_contract(seed, dev) && all_ok;
     for (const parallel_case & test_case : cases) {
         const dsv4_parallel_result parallel = run_dsv4_parallel(
                 seed, dev, tokens_a, tokens_b, n_prompt,

@@ -146,6 +146,17 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
     bool get_last_kv_pressure(llama_kv_pressure_info & info) const;
+    llama_kv_admission_status kv_admission_quote_ranges(
+            const llama_kv_admission_span * spans,
+            size_t n_spans,
+            llama_kv_admission_quote & quote);
+    llama_kv_admission_status kv_admission_reserve_ranges(
+            const llama_kv_admission_span * spans,
+            size_t n_spans,
+            llama_kv_admission_quote & quote,
+            uint64_t & id);
+    bool kv_admission_arm(uint64_t id);
+    void kv_admission_cancel(uint64_t id);
 
     //
     // state save/load
@@ -260,6 +271,13 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    llama_kv_admission_status kv_admission_prepare_ranges(
+            const llama_kv_admission_span * spans,
+            size_t n_spans,
+            llama_kv_admission_quote & quote,
+            bool reserve,
+            uint64_t & id);
+
     ggml_cgraph * graph_reserve_type(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx,
         llm_graph_type gtype, bool split_only = false, size_t * sizes = nullptr);

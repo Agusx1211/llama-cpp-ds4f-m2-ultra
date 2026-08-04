@@ -1,5 +1,6 @@
 #include "server-context.h"
 #include "server-admin-dashboard.h"
+#include "server-admission.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -53,6 +54,22 @@ static const bool SERVER_SPEC_SAMPLER_CLONE_OPT_DISABLED = []() {
     const char * env = std::getenv("LLAMA_SERVER_SPEC_SAMPLER_CLONE_OPT_DISABLE");
     return env != nullptr && env[0] == '1' && env[1] == '\0';
 }();
+
+// Exact two-slot DSV4 vertical. This remains opt-in until target-Metal
+// lifecycle/capacity validation is complete.
+static const bool SERVER_DSV4_ADMISSION_VERTICAL = []() {
+    const char * env = std::getenv("LLAMA_DSV4_ADMISSION_VERTICAL");
+    return env != nullptr && env[0] == '1' && env[1] == '\0';
+}();
+
+struct server_kv_admission_ticket_deleter {
+    void operator()(llama_kv_admission_ticket * ticket) const {
+        llama_kv_admission_free(ticket);
+    }
+};
+
+using server_kv_admission_ticket_ptr =
+        std::unique_ptr<llama_kv_admission_ticket, server_kv_admission_ticket_deleter>;
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
@@ -272,6 +289,10 @@ struct server_slot {
     std::unique_ptr<const server_task> task;
     std::unique_ptr<const server_task> task_prev; // used for debugging
 
+    // The family owner retains this handle through first prefill. Destruction
+    // cancels an armed reservation if preflight has not consumed it yet.
+    server_kv_admission_ticket_ptr kv_admission;
+
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
@@ -418,6 +439,8 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         prefill_disposition = {};
+
+        kv_admission.reset();
 
         task_prev = std::move(task);
         task.reset();
@@ -1431,6 +1454,25 @@ private:
             n_ctx_slot = n_ctx_train;
         }
 
+        if (SERVER_DSV4_ADMISSION_VERTICAL) {
+            if (params_base.n_parallel != 2 || params_base.kv_unified || params_base.ctx_shift || has_mmproj) {
+                SRV_ERR("%s", "LLAMA_DSV4_ADMISSION_VERTICAL requires exactly two split-KV text slots with context shift disabled\n");
+                return false;
+            }
+            const llama_kv_admission_span probe_span = { 0, 0, 1 };
+            llama_kv_admission_quote probe_quote = {};
+            const auto probe_status = llama_kv_admission_quote_ranges(
+                    ctx_tgt, &probe_span, 1, &probe_quote);
+            if (probe_status == LLAMA_KV_ADMISSION_UNSUPPORTED ||
+                    probe_status == LLAMA_KV_ADMISSION_INVALID ||
+                    probe_status == LLAMA_KV_ADMISSION_ERROR) {
+                SRV_ERR("%s", "LLAMA_DSV4_ADMISSION_VERTICAL requires target Metal sparse DSV4 split-KV storage\n");
+                return false;
+            }
+            params_base.cache_prompt = false;
+            SRV_INF("%s", "enabled exact DSV4 admission vertical: slots=2, cache_prompt=false, ctx_shift=false\n");
+        }
+
         slots.clear();
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
@@ -1892,6 +1934,116 @@ private:
             }
         }
         return output;
+    }
+
+    enum class admission_gate_status {
+        ready,
+        deferred,
+        rejected,
+    };
+
+    struct admission_gate_result {
+        admission_gate_status status = admission_gate_status::ready;
+        server_kv_admission_ticket_ptr ticket;
+    };
+
+    admission_gate_result prepare_dsv4_admission(
+            const std::vector<server_slot *> & family_slots,
+            const std::vector<server_task *> & family_tasks,
+            const server_task & result_task) {
+        admission_gate_result result;
+        if (!SERVER_DSV4_ADMISSION_VERTICAL) {
+            return result;
+        }
+        if (family_slots.empty() || family_slots.size() > 2 || family_slots.size() != family_tasks.size() ||
+                !params_base.lora_adapters.empty()) {
+            send_error(result_task, "request is outside the exact DSV4 admission geometry", ERROR_TYPE_NOT_SUPPORTED);
+            result.status = admission_gate_status::rejected;
+            return result;
+        }
+
+        // The first vertical admits only an idle cohort. This guarantees the
+        // first target preflight contains no unrelated sequence whose pages
+        // would need a separate reservation while the family ticket commits.
+        const bool other_active = std::any_of(slots.begin(), slots.end(), [&](const server_slot & slot) {
+            return slot.is_processing() &&
+                    std::find(family_slots.begin(), family_slots.end(), &slot) == family_slots.end();
+        });
+        if (other_active) {
+            result.status = admission_gate_status::deferred;
+            return result;
+        }
+
+        std::vector<llama_kv_admission_span> spans;
+        spans.reserve(family_slots.size());
+        for (size_t i = 0; i < family_slots.size(); ++i) {
+            server_slot & slot = *family_slots[i];
+            server_task & task = *family_tasks[i];
+            if (task.type != SERVER_TASK_TYPE_COMPLETION && task.type != SERVER_TASK_TYPE_INFILL) {
+                send_error(result_task, "only completion and infill use the exact DSV4 admission vertical",
+                        ERROR_TYPE_NOT_SUPPORTED);
+                result.status = admission_gate_status::rejected;
+                return result;
+            }
+            if (!task.params.lora.empty()) {
+                send_error(result_task, "per-request LoRA is not supported by the exact DSV4 admission vertical",
+                        ERROR_TYPE_NOT_SUPPORTED);
+                result.status = admission_gate_status::rejected;
+                return result;
+            }
+
+            // This vertical deliberately admits full, uncached prompts. Clear
+            // any idle logical residue before asking the range-native planner.
+            slot.prompt_clear();
+            task.params.cache_prompt = false;
+
+            const auto plan = server_dsv4_plan_admission(
+                    task.tokens.size(), task.params.n_predict, params_base.n_predict,
+                    (uint32_t) std::max(0, common_speculative_n_max(&task.params.speculative)), slot.n_ctx);
+            if (plan.status == server_dsv4_admission_status::context_overflow) {
+                send_error_impl(result_task.id,
+                        "prompt plus finite output budget exceeds the slot context",
+                        ERROR_TYPE_EXCEED_CONTEXT_SIZE, task.n_tokens(), slot.n_ctx, true);
+                result.status = admission_gate_status::rejected;
+                return result;
+            }
+            if (plan.status != server_dsv4_admission_status::ok) {
+                send_error(result_task, "invalid DSV4 admission request", ERROR_TYPE_INVALID_REQUEST);
+                result.status = admission_gate_status::rejected;
+                return result;
+            }
+            spans.push_back({ slot.id, 0, (llama_pos) plan.span_tokens });
+        }
+
+        llama_kv_admission_quote quote = {};
+        const auto quote_status = llama_kv_admission_quote_ranges(ctx_tgt, spans.data(), spans.size(), &quote);
+        if (quote_status == LLAMA_KV_ADMISSION_PRESSURE) {
+            send_error(result_task, "temporary DSV4 physical KV capacity is unavailable", ERROR_TYPE_UNAVAILABLE);
+            result.status = admission_gate_status::rejected;
+            return result;
+        }
+        if (quote_status != LLAMA_KV_ADMISSION_FEASIBLE) {
+            send_error(result_task, "DSV4 physical admission quote failed", ERROR_TYPE_UNAVAILABLE);
+            result.status = admission_gate_status::rejected;
+            return result;
+        }
+
+        llama_kv_admission_ticket * ticket = nullptr;
+        const auto reserve_status = llama_kv_admission_reserve_ranges(
+                ctx_tgt, spans.data(), spans.size(), &quote, &ticket);
+        result.ticket.reset(ticket);
+        if (reserve_status == LLAMA_KV_ADMISSION_PRESSURE) {
+            send_error(result_task, "temporary DSV4 physical KV capacity is unavailable", ERROR_TYPE_UNAVAILABLE);
+            result.status = admission_gate_status::rejected;
+            return result;
+        }
+        if (reserve_status != LLAMA_KV_ADMISSION_FEASIBLE || result.ticket == nullptr) {
+            send_error(result_task, "DSV4 physical admission reservation failed", ERROR_TYPE_UNAVAILABLE);
+            result.status = admission_gate_status::rejected;
+            return result;
+        }
+
+        return result;
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
@@ -2513,10 +2665,29 @@ private:
     }
 
     // launch multiple slots for parent + child tasks
-    bool launch_slots_with_parent_task(server_slot & parent_slot, std::vector<server_slot *> & child_slots, server_task && parent_task) {
+    bool launch_slots_with_parent_task(
+            server_slot & parent_slot,
+            std::vector<server_slot *> & child_slots,
+            server_task & parent_task,
+            bool & deferred) {
+        deferred = false;
         GGML_ASSERT(!parent_slot.is_processing());
         GGML_ASSERT(parent_task.is_parent());
         GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
+
+        std::vector<server_slot *> family_slots = child_slots;
+        family_slots.push_back(&parent_slot);
+        std::vector<server_task *> family_tasks;
+        family_tasks.reserve(parent_task.child_tasks.size() + 1);
+        for (server_task & child : parent_task.child_tasks) {
+            family_tasks.push_back(&child);
+        }
+        family_tasks.push_back(&parent_task);
+        auto admission = prepare_dsv4_admission(family_slots, family_tasks, parent_task);
+        if (admission.status != admission_gate_status::ready) {
+            deferred = admission.status == admission_gate_status::deferred;
+            return false;
+        }
 
         int id_parent = parent_task.id;
 
@@ -2555,6 +2726,36 @@ private:
             return false;
         }
 
+        if (admission.ticket != nullptr) {
+            if (!llama_kv_admission_arm(admission.ticket.get())) {
+                SRV_ERR("failed to arm DSV4 family admission ticket, id_task = %d\n", id_parent);
+                release_slots();
+                return false;
+            }
+            parent_slot.kv_admission = std::move(admission.ticket);
+        }
+
+        return true;
+    }
+
+    bool launch_single_slot_with_admission(server_slot & slot, server_task & task, bool & deferred) {
+        deferred = false;
+        auto admission = prepare_dsv4_admission({ &slot }, { &task }, task);
+        if (admission.status != admission_gate_status::ready) {
+            deferred = admission.status == admission_gate_status::deferred;
+            return false;
+        }
+        if (!launch_slot_with_task(slot, std::move(task))) {
+            return false;
+        }
+        if (admission.ticket != nullptr) {
+            if (!llama_kv_admission_arm(admission.ticket.get())) {
+                SRV_ERR("failed to arm DSV4 admission ticket, id_task = %d\n", slot.task->id);
+                slot.release();
+                return false;
+            }
+            slot.kv_admission = std::move(admission.ticket);
+        }
         return true;
     }
 
@@ -2654,13 +2855,27 @@ private:
                             queue_tasks.defer(std::move(task));
                             break;
                         }
-                        if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
+                        bool admission_deferred = false;
+                        if (!launch_slots_with_parent_task(*slot, child_slots, task, admission_deferred)) {
+                            if (admission_deferred) {
+                                SRV_DBG("DSV4 physical capacity is temporarily busy, defer family, id_task = %d\n", id_task);
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
                             break; // drop the task
                         }
-                    } else if (!launch_slot_with_task(*slot, std::move(task))) {
-                        SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
-                        break; // drop the task
+                    } else {
+                        bool admission_deferred = false;
+                        if (!launch_single_slot_with_admission(*slot, task, admission_deferred)) {
+                            if (admission_deferred) {
+                                SRV_DBG("DSV4 physical capacity is temporarily busy, defer task, id_task = %d\n", id_task);
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
+                            SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
+                            break; // drop the task
+                        }
                     }
 
                     if (params_base.cache_idle_slots) {

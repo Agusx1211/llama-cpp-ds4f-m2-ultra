@@ -314,6 +314,32 @@ static bool dsv4_sparse_append_k_rows(
     return true;
 }
 
+static bool dsv4_sparse_append_k_row_run(
+        const llama_kv_cache * kv,
+        int64_t row_begin,
+        int64_t row_end,
+        llama_dsv4_memory_family family,
+        std::vector<dsv4_sparse_range> & ranges) {
+    if (row_begin == row_end) {
+        return true;
+    }
+    const int64_t n_rows_total = (int64_t) kv->get_size()*kv->get_n_stream();
+    if (row_begin < 0 || row_end <= row_begin || row_end > n_rows_total) {
+        return false;
+    }
+    ranges.reserve(ranges.size() + kv->get_layer_ids().size());
+    for (uint32_t il : kv->get_layer_ids()) {
+        ggml_tensor * tensor = kv->get_k_storage(il);
+        ranges.push_back({
+            tensor,
+            (size_t) row_begin*tensor->nb[1],
+            (size_t) (row_end - row_begin)*tensor->nb[1],
+            family,
+        });
+    }
+    return true;
+}
+
 static bool dsv4_sparse_append_slot(
         const llama_kv_cache * kv,
         const llama_kv_cache::slot_info & sinfo,
@@ -382,11 +408,25 @@ public:
         }
     }
 
+    prepare_status quote_ranges(
+            const std::vector<dsv4_sparse_range> & ranges,
+            llama_dsv4_batch_quote & result) {
+        return prepare_ranges(ranges, result, false);
+    }
+
     prepare_status reserve_ranges(
             const std::vector<dsv4_sparse_range> & ranges,
             llama_dsv4_batch_quote & result) {
+        return prepare_ranges(ranges, result, true);
+    }
+
+private:
+    prepare_status prepare_ranges(
+            const std::vector<dsv4_sparse_range> & ranges,
+            llama_dsv4_batch_quote & result,
+            bool reserve_ticket) {
         n_ranges = ranges.size();
-        if (dsv4_test_page_delta_audit_enabled.load(std::memory_order_relaxed)) {
+        if (reserve_ticket && dsv4_test_page_delta_audit_enabled.load(std::memory_order_relaxed)) {
             audit_state = std::make_unique<dsv4_sparse_transaction_audit_state>();
         }
         for (size_t i = 0; i < result.families.size(); ++i) {
@@ -400,29 +440,35 @@ public:
         using cancel_fn = bool (*)(void *);
         using free_fn   = void (*)(void *);
 
-        dsv4_sparse_reserve_fn reserve     = nullptr;
+        dsv4_sparse_quote_fn quote = nullptr;
         ggml_tensor * proc_tensor = nullptr;
         for (const auto & range : ranges) {
-            reserve = (dsv4_sparse_reserve_fn) dsv4_backend_proc(
-                range.tensor, "ggml_backend_metal_dsv4_sparse_reserve_tensor_ranges");
-            if (reserve != nullptr) {
+            quote = (dsv4_sparse_quote_fn) dsv4_backend_proc(
+                range.tensor, "ggml_backend_metal_dsv4_sparse_quote_tensor_ranges");
+            if (quote != nullptr) {
                 proc_tensor = range.tensor;
                 break;
             }
         }
-        if (reserve == nullptr) {
+        if (quote == nullptr) {
             return SUCCESS;
         }
 
-        commit = (commit_fn) dsv4_backend_proc(
-                proc_tensor, "ggml_backend_metal_dsv4_sparse_reservation_commit");
-        cancel = (cancel_fn) dsv4_backend_proc(
-                proc_tensor, "ggml_backend_metal_dsv4_sparse_reservation_cancel");
-        free_ticket = (free_fn) dsv4_backend_proc(
-                proc_tensor, "ggml_backend_metal_dsv4_sparse_reservation_free");
+        dsv4_sparse_reserve_fn reserve = nullptr;
+        if (reserve_ticket) {
+            reserve = (dsv4_sparse_reserve_fn) dsv4_backend_proc(
+                    proc_tensor, "ggml_backend_metal_dsv4_sparse_reserve_tensor_ranges");
+            commit = (commit_fn) dsv4_backend_proc(
+                    proc_tensor, "ggml_backend_metal_dsv4_sparse_reservation_commit");
+            cancel = (cancel_fn) dsv4_backend_proc(
+                    proc_tensor, "ggml_backend_metal_dsv4_sparse_reservation_cancel");
+            free_ticket = (free_fn) dsv4_backend_proc(
+                    proc_tensor, "ggml_backend_metal_dsv4_sparse_reservation_free");
+        }
         usage = (dsv4_sparse_usage_fn) dsv4_backend_proc(proc_tensor, "ggml_backend_metal_dsv4_sparse_tensor_usage");
         usage_proc_available = usage != nullptr;
-        if (commit == nullptr || cancel == nullptr || free_ticket == nullptr || usage == nullptr) {
+        if (usage == nullptr || (reserve_ticket &&
+                (reserve == nullptr || commit == nullptr || cancel == nullptr || free_ticket == nullptr))) {
             phase = PHASE_PROC_LOOKUP;
             return ERROR;
         }
@@ -469,12 +515,6 @@ public:
         }
 
         if (audit_state != nullptr) {
-            auto * quote = (dsv4_sparse_quote_fn) dsv4_backend_proc(
-                proc_tensor, "ggml_backend_metal_dsv4_sparse_quote_tensor_ranges");
-            if (quote == nullptr) {
-                phase = PHASE_PROC_LOOKUP;
-                return ERROR;
-            }
             std::vector<ggml_metal_sparse_pool_quote> dry_pools(ranges.size());
             size_t                                    dry_n_pools       = 0;
             size_t                                    dry_limiting_pool = SIZE_MAX;
@@ -506,9 +546,11 @@ public:
         std::vector<ggml_metal_sparse_pool_quote> pools(ranges.size());
         size_t n_pools = 0;
         size_t limiting_pool = SIZE_MAX;
-        const auto status = reserve(
+        const auto status = reserve_ticket ? reserve(
                 tensors.data(), offsets.data(), sizes.data(), tensors.size(),
-                pools.data(), pools.size(), &n_pools, &limiting_pool, &ticket);
+                pools.data(), pools.size(), &n_pools, &limiting_pool, &ticket) : quote(
+                tensors.data(), offsets.data(), sizes.data(), tensors.size(),
+                pools.data(), pools.size(), &n_pools, &limiting_pool);
         backend_status = status;
         ticket_issued = ticket != nullptr;
         n_quoted_pools = n_pools;
@@ -565,7 +607,7 @@ public:
         // valid quote and ticket. Returning pressure here exercises the same
         // cancellation and propagation path as capacity exhaustion, without
         // committing a mapping or submitting a graph.
-        if (status == GGML_METAL_SPARSE_RESERVATION_OK && ticket != nullptr &&
+        if (reserve_ticket && status == GGML_METAL_SPARSE_RESERVATION_OK && ticket != nullptr &&
                 !pools.empty() && dsv4_test_consume_physical_pressure()) {
             const auto & pool = pools.front();
             const uint32_t family_mask = pool_family_masks.at(pool.pool_id);
@@ -581,12 +623,14 @@ public:
         if (status == GGML_METAL_SPARSE_RESERVATION_PRESSURE) {
             return PRESSURE;
         }
-        if (status != GGML_METAL_SPARSE_RESERVATION_OK || ticket == nullptr) {
+        if (status != GGML_METAL_SPARSE_RESERVATION_OK || (reserve_ticket && ticket == nullptr)) {
             phase = PHASE_RESERVE;
             return ERROR;
         }
         return SUCCESS;
     }
+
+public:
 
     ggml_metal_sparse_reservation_result commit_ranges() {
         if (ticket == nullptr) {
@@ -683,6 +727,40 @@ private:
     bool usage_proc_available = false;
     std::unique_ptr<dsv4_sparse_transaction_audit_state> audit_state;
 };
+
+struct llama_kv_cache_dsv4_admission_state {
+    struct entry {
+        bool armed = false;
+        std::vector<llama_kv_admission_span> spans;
+        std::unique_ptr<dsv4_sparse_transaction> reservation;
+        llama_dsv4_batch_quote quote;
+        uint32_t limiting_family_mask = 0;
+    };
+
+    uint64_t next_id = 1;
+    std::map<uint64_t, entry> entries;
+};
+
+static void dsv4_public_admission_quote(
+        const llama_dsv4_batch_quote & source,
+        llama_kv_admission_status status,
+        uint32_t limiting_family_mask,
+        llama_kv_admission_quote & result) {
+    result = {};
+    result.status = status;
+    result.limiting_family = source.limiting_family;
+    result.limiting_family_mask = limiting_family_mask;
+    result.limiting_pool_id = source.limiting_pool_id;
+    for (const auto & family : source.families) {
+        result.target_mappings += family.target_mappings;
+        result.required_pages += family.required_pages;
+        result.new_pages += family.new_pages;
+        result.cow_pages += family.cow_pages;
+        result.free_pages += family.free_pages;
+        result.reserved_pages += family.reserved_pages;
+        result.physical_pages += family.physical_pages;
+    }
+}
 
 static int64_t dsv4_stream_offset(uint32_t n_stream, llama_seq_id seq_id, uint32_t size) {
     if (n_stream <= 1) {
@@ -1914,7 +1992,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     n_seq_max(n_seq_max),
     n_rs_seq(n_rs_seq),
     n_rs_seq_active(n_rs_seq),
-    rs_idx(n_seq_max, 0) {
+    rs_idx(n_seq_max, 0),
+    admission_state(std::make_unique<llama_kv_cache_dsv4_admission_state>()) {
 
     const layer_filter_cb filter_raw = [&](int32_t il) {
         if (filter && !filter(il)) {
@@ -2149,6 +2228,208 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     // otherwise leak in (instance-specific garbage) and corrupt recall. Zero all
     // compressed buffers up front so reads of un-written rows are deterministic.
     clear_compressed(-1, true);
+}
+
+llama_kv_cache_dsv4::~llama_kv_cache_dsv4() = default;
+
+bool llama_kv_cache_dsv4::collect_admission_ranges(
+        const llama_kv_admission_span * spans,
+        size_t n_spans,
+        std::vector<dsv4_sparse_range> & ranges,
+        llama_dsv4_batch_quote & quote) const {
+    if (aggregate_compressed || spans == nullptr || n_spans == 0 || n_spans > 2) {
+        return false;
+    }
+
+    const auto append_span = [&](const llama_kv_admission_span & span) {
+        const int64_t raw_base_offset = dsv4_stream_offset(
+                kv_raw->get_base()->get_n_stream(), span.seq_id, kv_raw->get_base()->get_size());
+        const int64_t raw_swa_offset = dsv4_stream_offset(
+                kv_raw->get_swa()->get_n_stream(), span.seq_id, kv_raw->get_swa()->get_size());
+        if (!dsv4_sparse_append_k_row_run(
+                    kv_raw->get_base(), raw_base_offset + span.pos_begin, raw_base_offset + span.pos_end,
+                    LLAMA_DSV4_MEMORY_RAW, ranges) ||
+                !dsv4_sparse_append_k_row_run(
+                    kv_raw->get_swa(), raw_swa_offset + span.pos_begin, raw_swa_offset + span.pos_end,
+                    LLAMA_DSV4_MEMORY_RAW, ranges)) {
+            return false;
+        }
+        quote.families[LLAMA_DSV4_MEMORY_RAW].logical_rows += span.pos_end - span.pos_begin;
+
+        const auto append_compressed = [&](const llama_kv_cache * cache, uint32_t ratio,
+                                           llama_dsv4_memory_family family, bool needs_dummy) {
+            const int64_t stream_offset = dsv4_stream_offset(
+                    cache->get_n_stream(), span.seq_id, cache->get_size());
+            const int64_t row_begin = span.pos_begin/ratio;
+            const int64_t row_end = span.pos_end/ratio;
+            if (!dsv4_sparse_append_k_row_run(
+                        cache, stream_offset + row_begin, stream_offset + row_end, family, ranges)) {
+                return false;
+            }
+
+            // CSA/LID use the last per-stream row as the masked destination
+            // for every non-boundary compressor update. A [0, end) admission
+            // containing any token therefore reserves that fixed scratch row.
+            const int64_t dummy_row = stream_offset + cache->get_size() - 1;
+            const bool dummy_in_run = row_begin <= cache->get_size() - 1 && row_end > cache->get_size() - 1;
+            if (needs_dummy && !dummy_in_run &&
+                    !dsv4_sparse_append_k_row_run(cache, dummy_row, dummy_row + 1, family, ranges)) {
+                return false;
+            }
+            quote.families[family].logical_rows += row_end - row_begin;
+            return true;
+        };
+
+        return append_compressed(kv_csa.get(), DSV4_CSA_RATIO, LLAMA_DSV4_MEMORY_CSA, true) &&
+               append_compressed(kv_hca.get(), DSV4_HCA_RATIO, LLAMA_DSV4_MEMORY_HCA, false) &&
+               append_compressed(kv_lid.get(), DSV4_CSA_RATIO, LLAMA_DSV4_MEMORY_LID, true);
+    };
+
+    for (size_t i = 0; i < n_spans; ++i) {
+        if (!append_span(spans[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+llama_kv_admission_status llama_kv_cache_dsv4::quote_admission(
+        const llama_kv_admission_span * spans,
+        size_t n_spans,
+        llama_kv_admission_quote & quote) {
+    llama_dsv4_batch_quote internal_quote = {};
+    std::vector<dsv4_sparse_range> ranges;
+    if (!collect_admission_ranges(spans, n_spans, ranges, internal_quote)) {
+        dsv4_public_admission_quote(internal_quote, LLAMA_KV_ADMISSION_UNSUPPORTED, 0, quote);
+        return quote.status;
+    }
+
+    dsv4_sparse_transaction transaction;
+    const auto prepare_status = transaction.quote_ranges(ranges, internal_quote);
+    llama_kv_admission_status public_status = LLAMA_KV_ADMISSION_ERROR;
+    if (transaction.sparse_range_count() == 0) {
+        public_status = LLAMA_KV_ADMISSION_UNSUPPORTED;
+    } else if (prepare_status == dsv4_sparse_transaction::SUCCESS) {
+        public_status = LLAMA_KV_ADMISSION_FEASIBLE;
+    } else if (prepare_status == dsv4_sparse_transaction::PRESSURE) {
+        public_status = LLAMA_KV_ADMISSION_PRESSURE;
+    }
+    dsv4_public_admission_quote(internal_quote, public_status, transaction.limiting_family_mask(), quote);
+    return quote.status;
+}
+
+llama_kv_admission_status llama_kv_cache_dsv4::reserve_admission(
+        const llama_kv_admission_span * spans,
+        size_t n_spans,
+        llama_kv_admission_quote & quote,
+        uint64_t & id) {
+    llama_dsv4_batch_quote internal_quote = {};
+    std::vector<dsv4_sparse_range> ranges;
+    id = 0;
+    if (!collect_admission_ranges(spans, n_spans, ranges, internal_quote)) {
+        dsv4_public_admission_quote(internal_quote, LLAMA_KV_ADMISSION_UNSUPPORTED, 0, quote);
+        return quote.status;
+    }
+
+    auto reservation = std::make_unique<dsv4_sparse_transaction>();
+    const auto prepare_status = reservation->reserve_ranges(ranges, internal_quote);
+    llama_kv_admission_status public_status = LLAMA_KV_ADMISSION_ERROR;
+    if (reservation->sparse_range_count() == 0) {
+        public_status = LLAMA_KV_ADMISSION_UNSUPPORTED;
+    } else if (prepare_status == dsv4_sparse_transaction::SUCCESS) {
+        public_status = LLAMA_KV_ADMISSION_FEASIBLE;
+    } else if (prepare_status == dsv4_sparse_transaction::PRESSURE) {
+        public_status = LLAMA_KV_ADMISSION_PRESSURE;
+    }
+    dsv4_public_admission_quote(internal_quote, public_status, reservation->limiting_family_mask(), quote);
+    if (public_status == LLAMA_KV_ADMISSION_FEASIBLE) {
+        id = register_admission(std::move(reservation), spans, n_spans,
+                internal_quote, quote.limiting_family_mask);
+    }
+    return quote.status;
+}
+
+uint64_t llama_kv_cache_dsv4::register_admission(
+        std::unique_ptr<dsv4_sparse_transaction> reservation,
+        const llama_kv_admission_span * spans,
+        size_t n_spans,
+        const llama_dsv4_batch_quote & quote,
+        uint32_t limiting_family_mask) {
+    GGML_ASSERT(reservation != nullptr);
+    GGML_ASSERT(spans != nullptr);
+    GGML_ASSERT(n_spans > 0);
+
+    const uint64_t id = admission_state->next_id++;
+    llama_kv_cache_dsv4_admission_state::entry entry;
+    entry.spans.assign(spans, spans + n_spans);
+    entry.reservation = std::move(reservation);
+    entry.quote = quote;
+    entry.limiting_family_mask = limiting_family_mask;
+    const bool inserted = admission_state->entries.emplace(id, std::move(entry)).second;
+    GGML_ASSERT(inserted);
+    return id;
+}
+
+bool llama_kv_cache_dsv4::arm_admission(uint64_t id) {
+    const auto found = admission_state->entries.find(id);
+    if (found == admission_state->entries.end()) {
+        return false;
+    }
+    found->second.armed = true;
+    return true;
+}
+
+void llama_kv_cache_dsv4::cancel_admission(uint64_t id) {
+    admission_state->entries.erase(id);
+}
+
+llama_kv_cache_dsv4::admission_consume_status llama_kv_cache_dsv4::consume_admission(
+        const std::vector<llama_ubatch> & ubatches,
+        llama_dsv4_batch_quote & quote,
+        uint32_t & limiting_family_mask) {
+    if (aggregate_compressed || ubatches.empty()) {
+        return ADMISSION_NO_MATCH;
+    }
+
+    for (auto it = admission_state->entries.begin(); it != admission_state->entries.end(); ++it) {
+        auto & entry = it->second;
+        if (!entry.armed) {
+            continue;
+        }
+
+        bool covered = true;
+        for (const llama_ubatch & ubatch : ubatches) {
+            for (uint32_t i = 0; i < ubatch.n_tokens && covered; ++i) {
+                for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+                    const llama_seq_id seq_id = ubatch.seq_id[i][s];
+                    const llama_pos pos = ubatch.pos[i];
+                    const bool token_covered = std::any_of(
+                            entry.spans.begin(), entry.spans.end(),
+                            [&](const llama_kv_admission_span & span) {
+                                return span.seq_id == seq_id && pos >= span.pos_begin && pos < span.pos_end;
+                            });
+                    if (!token_covered) {
+                        covered = false;
+                        break;
+                    }
+                }
+            }
+            if (!covered) {
+                break;
+            }
+        }
+        if (!covered) {
+            continue;
+        }
+
+        quote = entry.quote;
+        limiting_family_mask = entry.limiting_family_mask;
+        const auto commit_status = entry.reservation->commit_ranges();
+        admission_state->entries.erase(it);
+        return commit_status == GGML_METAL_SPARSE_RESERVATION_OK ? ADMISSION_COMMITTED : ADMISSION_ERROR;
+    }
+
+    return ADMISSION_NO_MATCH;
 }
 
 llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
@@ -3430,6 +3711,15 @@ void llama_kv_cache_dsv4_context::rollback_aggregate_pool() {
 }
 
 bool llama_kv_cache_dsv4_context::reserve_batch_ranges() {
+    const auto admission_status = kv->consume_admission(ubatches, last_batch_quote, last_pressure_family_mask);
+    if (admission_status == llama_kv_cache_dsv4::ADMISSION_COMMITTED) {
+        batch_ranges_reserved = true;
+        return true;
+    }
+    if (admission_status == llama_kv_cache_dsv4::ADMISSION_ERROR) {
+        return false;
+    }
+
     std::vector<llama_dsv4_comp_allocation> cow_allocations;
     if (!reserve_aggregate_pool(cow_allocations)) {
         return false;
@@ -3472,28 +3762,9 @@ bool llama_kv_cache_dsv4_context::reserve_batch_ranges() {
         }
     }
 
-    for (size_t i = 0; i < ubatches.size(); ++i) {
-        if (!dsv4_sparse_append_slot(
-                    kv->get_raw()->get_base(), ctx_raw->get_base_write_slot(i),
-                    LLAMA_DSV4_MEMORY_RAW, ranges) ||
-                !dsv4_sparse_append_slot(
-                    kv->get_raw()->get_swa(), ctx_raw->get_swa_write_slot(i),
-                    LLAMA_DSV4_MEMORY_RAW, ranges) ||
-                !dsv4_sparse_append_k_rows(
-                    kv->get_csa(), plans_csa.at(i).state_write_idxs,
-                    LLAMA_DSV4_MEMORY_CSA, ranges) ||
-                !dsv4_sparse_append_k_rows(
-                    kv->get_hca(), plans_hca.at(i).state_write_idxs,
-                    LLAMA_DSV4_MEMORY_HCA, ranges) ||
-                !dsv4_sparse_append_k_rows(
-                    kv->get_lid(), plans_lid.at(i).state_write_idxs,
-                    LLAMA_DSV4_MEMORY_LID, ranges)) {
-            rollback_aggregate_pool();
-            return false;
-        }
-
-        last_batch_quote.families[LLAMA_DSV4_MEMORY_RAW].logical_rows +=
-                ctx_raw->get_n_backing_rows(i);
+    if (!collect_batch_ranges(ranges)) {
+        rollback_aggregate_pool();
+        return false;
     }
 
     dsv4_sparse_transaction reservation;
@@ -3542,6 +3813,32 @@ bool llama_kv_cache_dsv4_context::reserve_batch_ranges() {
     }
 
     batch_ranges_reserved = true;
+    return true;
+}
+
+bool llama_kv_cache_dsv4_context::collect_batch_ranges(std::vector<dsv4_sparse_range> & ranges) {
+    for (size_t i = 0; i < ubatches.size(); ++i) {
+        if (!dsv4_sparse_append_slot(
+                    kv->get_raw()->get_base(), ctx_raw->get_base_write_slot(i),
+                    LLAMA_DSV4_MEMORY_RAW, ranges) ||
+                !dsv4_sparse_append_slot(
+                    kv->get_raw()->get_swa(), ctx_raw->get_swa_write_slot(i),
+                    LLAMA_DSV4_MEMORY_RAW, ranges) ||
+                !dsv4_sparse_append_k_rows(
+                    kv->get_csa(), plans_csa.at(i).state_write_idxs,
+                    LLAMA_DSV4_MEMORY_CSA, ranges) ||
+                !dsv4_sparse_append_k_rows(
+                    kv->get_hca(), plans_hca.at(i).state_write_idxs,
+                    LLAMA_DSV4_MEMORY_HCA, ranges) ||
+                !dsv4_sparse_append_k_rows(
+                    kv->get_lid(), plans_lid.at(i).state_write_idxs,
+                    LLAMA_DSV4_MEMORY_LID, ranges)) {
+            return false;
+        }
+
+        last_batch_quote.families[LLAMA_DSV4_MEMORY_RAW].logical_rows +=
+                ctx_raw->get_n_backing_rows(i);
+    }
     return true;
 }
 

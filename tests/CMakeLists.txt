@@ -154,6 +154,13 @@ llama_build_and_test(
 target_include_directories(test-server-prefill PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_compile_features(test-server-prefill PRIVATE cxx_std_17)
 
+llama_build_and_test(
+    test-server-admission.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-admission.cpp
+)
+target_include_directories(test-server-admission PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-admission PRIVATE cxx_std_17)
+
 llama_build_and_test(test-server-trusted-scheduling.cpp)
 target_include_directories(test-server-trusted-scheduling PRIVATE
     ${PROJECT_SOURCE_DIR}

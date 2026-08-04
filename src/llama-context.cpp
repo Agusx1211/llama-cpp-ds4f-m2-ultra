@@ -2276,6 +2276,67 @@ bool llama_context::get_last_kv_pressure(llama_kv_pressure_info & info) const {
     return true;
 }
 
+llama_kv_admission_status llama_context::kv_admission_prepare_ranges(
+        const llama_kv_admission_span * spans,
+        size_t n_spans,
+        llama_kv_admission_quote & quote,
+        bool reserve,
+        uint64_t & id) {
+    quote = {};
+    quote.status = LLAMA_KV_ADMISSION_INVALID;
+    id = 0;
+
+    auto * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
+    if (dsv4 == nullptr || dsv4->is_aggregate_compressed() || cparams.kv_unified || cparams.n_seq_max != 2) {
+        quote.status = LLAMA_KV_ADMISSION_UNSUPPORTED;
+        return quote.status;
+    }
+    if (spans == nullptr || n_spans == 0 || n_spans > 2) {
+        return quote.status;
+    }
+
+    bool seen[2] = { false, false };
+    for (size_t i = 0; i < n_spans; ++i) {
+        const auto & span = spans[i];
+        if (span.seq_id < 0 || span.seq_id >= 2 || seen[span.seq_id] ||
+                span.pos_begin != 0 || span.pos_end <= span.pos_begin ||
+                (uint32_t) span.pos_end > n_ctx_seq() || memory->seq_pos_max(span.seq_id) >= 0) {
+            return quote.status;
+        }
+        seen[span.seq_id] = true;
+    }
+    return reserve ? dsv4->reserve_admission(spans, n_spans, quote, id) :
+                     dsv4->quote_admission(spans, n_spans, quote);
+}
+
+llama_kv_admission_status llama_context::kv_admission_quote_ranges(
+        const llama_kv_admission_span * spans,
+        size_t n_spans,
+        llama_kv_admission_quote & quote) {
+    uint64_t unused_id = 0;
+    return kv_admission_prepare_ranges(spans, n_spans, quote, false, unused_id);
+}
+
+llama_kv_admission_status llama_context::kv_admission_reserve_ranges(
+        const llama_kv_admission_span * spans,
+        size_t n_spans,
+        llama_kv_admission_quote & quote,
+        uint64_t & id) {
+    return kv_admission_prepare_ranges(spans, n_spans, quote, true, id);
+}
+
+bool llama_context::kv_admission_arm(uint64_t id) {
+    auto * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
+    return dsv4 != nullptr && dsv4->arm_admission(id);
+}
+
+void llama_context::kv_admission_cancel(uint64_t id) {
+    auto * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
+    if (dsv4 != nullptr) {
+        dsv4->cancel_admission(id);
+    }
+}
+
 //
 // output
 //
@@ -4496,6 +4557,61 @@ bool llama_get_last_kv_pressure(
         return false;
     }
     return ctx->get_last_kv_pressure(*info);
+}
+
+struct llama_kv_admission_ticket {
+    llama_context * ctx = nullptr;
+    uint64_t id = 0;
+};
+
+llama_kv_admission_status llama_kv_admission_quote_ranges(
+        llama_context * ctx,
+        const llama_kv_admission_span * spans,
+        size_t n_spans,
+        llama_kv_admission_quote * quote) {
+    if (quote != nullptr) {
+        *quote = {};
+        quote->status = LLAMA_KV_ADMISSION_INVALID;
+    }
+    if (ctx == nullptr || quote == nullptr) {
+        return LLAMA_KV_ADMISSION_INVALID;
+    }
+    return ctx->kv_admission_quote_ranges(spans, n_spans, *quote);
+}
+
+llama_kv_admission_status llama_kv_admission_reserve_ranges(
+        llama_context * ctx,
+        const llama_kv_admission_span * spans,
+        size_t n_spans,
+        llama_kv_admission_quote * quote,
+        llama_kv_admission_ticket ** ticket) {
+    if (quote != nullptr) {
+        *quote = {};
+        quote->status = LLAMA_KV_ADMISSION_INVALID;
+    }
+    if (ticket != nullptr) {
+        *ticket = nullptr;
+    }
+    if (ctx == nullptr || quote == nullptr || ticket == nullptr) {
+        return LLAMA_KV_ADMISSION_INVALID;
+    }
+    uint64_t id = 0;
+    const auto status = ctx->kv_admission_reserve_ranges(spans, n_spans, *quote, id);
+    if (status == LLAMA_KV_ADMISSION_FEASIBLE) {
+        *ticket = new llama_kv_admission_ticket { ctx, id };
+    }
+    return status;
+}
+
+bool llama_kv_admission_arm(llama_kv_admission_ticket * ticket) {
+    return ticket != nullptr && ticket->ctx != nullptr && ticket->ctx->kv_admission_arm(ticket->id);
+}
+
+void llama_kv_admission_free(llama_kv_admission_ticket * ticket) {
+    if (ticket != nullptr && ticket->ctx != nullptr) {
+        ticket->ctx->kv_admission_cancel(ticket->id);
+    }
+    delete ticket;
 }
 
 //
