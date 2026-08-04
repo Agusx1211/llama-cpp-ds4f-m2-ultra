@@ -430,6 +430,94 @@ ggml_backend_dev_t verify_target_metal_device() {
     return target;
 }
 
+enum class placement_buft_kind {
+    target,
+    cpu,
+    unknown,
+};
+
+// llama_model_base::load_tensors() builds its CPU list from the canonical CPU
+// device returned by ggml_backend_dev_by_type(CPU).  The ordinary CPU and
+// CPU_Mapped buffer types intentionally have a null buft->device today, so a
+// device-only check would reject valid host-resident tensors.  Keep the
+// accepted null-device aliases narrow: canonical CPU/CPU_Mapped names (and
+// explicitly reported host types) are accepted; an arbitrary null-device
+// buffer remains unknown and fails closed.
+bool is_cpu_buft_alias(ggml_backend_buffer_type_t buft, ggml_backend_dev_t cpu_device,
+                       ggml_backend_dev_t target_device) {
+    if (buft == nullptr) {
+        return false;
+    }
+    if (buft == ggml_backend_cpu_buffer_type()) {
+        return true;
+    }
+    if (cpu_device == nullptr) {
+        return false;
+    }
+    if (buft == ggml_backend_dev_buffer_type(cpu_device)) {
+        return true;
+    }
+
+    // Extra CPU buffer types (for example CPU repack/AMX/HBM) are associated
+    // with the canonical CPU device by make_cpu_buft_list().
+    const ggml_backend_dev_t buft_device = ggml_backend_buft_get_device(buft);
+    if (buft_device == cpu_device) {
+        return true;
+    }
+    if (buft_device != nullptr) {
+        return false;
+    }
+
+    // CPU_Mapped is an internal type with no public constructor.  Its stable
+    // public identity is the host flag and name, which is what the CPU
+    // backend exposes through ggml_backend_dev_buffer_from_host_ptr().
+    const char * name = ggml_backend_buft_name(buft);
+    const bool canonical_null_host = ggml_backend_buft_is_host(buft) && name != nullptr &&
+                                     (std::strcmp(name, "CPU") == 0 || std::strcmp(name, "CPU_Mapped") == 0);
+    if (canonical_null_host) {
+        return true;
+    }
+
+    // Some backends expose a host buffer type with no owning device.  Treat
+    // only the host aliases selected by load_tensors() as CPU placement.
+    if (target_device != nullptr && buft == ggml_backend_dev_host_buffer_type(target_device)) {
+        return true;
+    }
+    return buft == ggml_backend_dev_host_buffer_type(cpu_device);
+}
+
+placement_buft_kind classify_placement_buft(ggml_backend_buffer_type_t buft, ggml_backend_dev_t target_device) {
+    if (buft == nullptr || target_device == nullptr) {
+        return placement_buft_kind::unknown;
+    }
+    const ggml_backend_dev_t cpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_device == nullptr) {
+        return placement_buft_kind::unknown;
+    }
+    const ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+    if (device == target_device) {
+        return placement_buft_kind::target;
+    }
+    if (is_cpu_buft_alias(buft, cpu_device, target_device)) {
+        return placement_buft_kind::cpu;
+    }
+    return placement_buft_kind::unknown;
+}
+
+void placement_buft_self_test() {
+    // Keep this helper runnable on hosts whose selected CPU dispatch library
+    // cannot execute the target build's optimized kernels.  The production
+    // placement path supplies the canonical CPU device after backend init;
+    // this focused check exercises the null-device classification itself.
+    const ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+    expect(is_cpu_buft_alias(cpu_buft, nullptr, nullptr),
+           "placement self-test rejected the canonical null-device CPU buffer type");
+    expect(!is_cpu_buft_alias(nullptr, nullptr, nullptr),
+           "placement self-test accepted an unknown null buffer type");
+    std::fprintf(stderr, "resident-model placement self-test canonical_cpu=%s unknown_null=rejected\n",
+                 ggml_backend_buft_name(cpu_buft));
+}
+
 void verify_model_placement(const llama_model * model, ggml_backend_dev_t target) {
     expect(llama_model_n_devices(model) == 1, "exact-model loaded model selected an unexpected device count");
     expect(llama_model_get_device(model, 0) == target,
@@ -441,22 +529,30 @@ void verify_model_placement(const llama_model * model, ggml_backend_dev_t target
     size_t cpu_tensors    = 0;
     uint64_t target_bytes = 0;
     uint64_t cpu_bytes    = 0;
+    std::map<std::string, std::pair<size_t, uint64_t>> cpu_buft_usage;
     for (const auto & item : tensors) {
         const ggml_tensor * tensor = item.second;
         expect(tensor != nullptr && tensor->buffer != nullptr,
                "exact-model loaded tensor has no backend buffer: " + item.first);
         const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
-        const ggml_backend_dev_t         device = buft != nullptr ? ggml_backend_buft_get_device(buft) : nullptr;
-        expect(device != nullptr, "exact-model loaded tensor has no backend device: " + item.first);
+        const ggml_backend_dev_t device = buft != nullptr ? ggml_backend_buft_get_device(buft) : nullptr;
         const uint64_t bytes = ggml_nbytes(tensor);
-        if (device == target) {
+        const placement_buft_kind kind = classify_placement_buft(buft, target);
+        if (kind == placement_buft_kind::target) {
             ++target_tensors;
             target_bytes += bytes;
-        } else {
-            expect(ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU,
-                   "exact-model loaded tensor is placed on an unexpected non-Metal device: " + item.first);
+        } else if (kind == placement_buft_kind::cpu) {
             ++cpu_tensors;
             cpu_bytes += bytes;
+            const char * buft_name = buft != nullptr ? ggml_backend_buft_name(buft) : nullptr;
+            auto & usage = cpu_buft_usage[buft_name != nullptr ? buft_name : "(unnamed CPU host)"];
+            ++usage.first;
+            usage.second += bytes;
+        } else {
+            const char * buft_name = buft != nullptr ? ggml_backend_buft_name(buft) : nullptr;
+            fail("exact-model loaded tensor is placed on an unexpected non-Metal device/buffer: " + item.first +
+                 " buft=" + (buft_name != nullptr ? buft_name : "(null)") +
+                 " device=" + (device != nullptr ? ggml_backend_dev_name(device) : "(null)"));
         }
     }
     expect(target_tensors > 0 && target_bytes > 0,
@@ -466,6 +562,10 @@ void verify_model_placement(const llama_model * model, ggml_backend_dev_t target
                  "cpu_tensors=%zu cpu_bytes=%llu\n",
                  ggml_backend_dev_name(target), ggml_backend_dev_description(target), target_tensors,
                  (unsigned long long) target_bytes, cpu_tensors, (unsigned long long) cpu_bytes);
+    for (const auto & [name, usage] : cpu_buft_usage) {
+        std::fprintf(stderr, "resident-model placement cpu-buft=%s tensors=%zu bytes=%llu\n", name.c_str(),
+                     usage.first, (unsigned long long) usage.second);
+    }
 }
 
 std::string model_meta(const llama_model * model, const char * key) {
@@ -1804,6 +1904,15 @@ bool parse_arguments(int argc, char ** argv, std::string & model_path, std::stri
 }  // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--placement-self-test") == 0) {
+        try {
+            placement_buft_self_test();
+            return 0;
+        } catch (const std::exception & error) {
+            std::fprintf(stderr, "resident-model placement self-test failure: %s\n", error.what());
+            return 1;
+        }
+    }
     std::string model_path;
     std::string manifest_path;
     bool        help = false;

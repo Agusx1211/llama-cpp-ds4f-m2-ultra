@@ -301,6 +301,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-dsv4-resident-model PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps)
+    # Host-only placement helper: exercises null-device CPU/CPU_Mapped
+    # classification without requiring the pinned model or an M2 Ultra.
+    llama_test(test-dsv4-resident-model
+        NAME test-dsv4-resident-placement-self-test
+        ARGS --placement-self-test)
     llama_build_and_test(test-kv-iswa-resident-metadata.cpp)
     target_include_directories(test-kv-iswa-resident-metadata PRIVATE
         ${PROJECT_SOURCE_DIR}/src)

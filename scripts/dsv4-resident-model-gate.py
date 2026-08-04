@@ -40,24 +40,70 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
+def process_group_exists(process: subprocess.Popen[bytes]) -> bool:
+    """Return whether the child session still has any process in its group."""
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # The group exists but is not probeable by policy.  Cleanup must stay
+        # conservative and escalate rather than assume it disappeared.
+        return True
+    return True
+
+
 def terminate_group(
     process: subprocess.Popen[bytes], signal_number: int = signal.SIGTERM, grace_seconds: float = 10.0
 ) -> None:
-    """Signal the child session, then reap the leader after bounded cleanup."""
+    """Signal and reap the entire child session with bounded escalation.
+
+    ``Popen.wait()`` only observes the leader.  A leader can exit while a
+    descendant keeps the process group alive, so probe the group explicitly
+    before returning and escalate that group to SIGKILL after the grace
+    period.  The short post-kill wait is bounded as well; this avoids hanging
+    the foreground queue job on a descendant that ignores SIGTERM.
+    """
+    grace_seconds = max(0.0, grace_seconds)
+
     try:
         os.killpg(process.pid, signal_number)
     except ProcessLookupError:
         pass
-    try:
-        process.wait(timeout=grace_seconds)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
+
+    deadline = time.monotonic() + grace_seconds
+    while process_group_exists(process) and time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        if process.poll() is None:
+            try:
+                process.wait(timeout=min(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                pass
+        elif remaining > 0:
+            time.sleep(min(0.05, remaining))
+
+    if process_group_exists(process):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    # Reap the leader without an unbounded wait.  SIGKILL should make this
+    # immediate; a timeout is an actionable runner failure rather than an
+    # opportunity to hang indefinitely.
+    if process.poll() is None:
+        try:
+            process.wait(timeout=max(1.0, grace_seconds))
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("child process did not exit after process-group SIGKILL") from error
+
+    # The leader may have exited before the initial signal.  Probe once more
+    # and issue a final SIGKILL to descendants that appeared during teardown.
+    if process_group_exists(process):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def forward_signal(signum: int, _frame: object) -> None:
@@ -67,7 +113,7 @@ def forward_signal(signum: int, _frame: object) -> None:
         return
     _FORWARDED_SIGNAL = signum
     process = _ACTIVE_PROCESS
-    if process is not None and process.poll() is None:
+    if process is not None:
         terminate_group(process, signal_number=signum)
 
 
@@ -100,8 +146,15 @@ def main(argv: list[str]) -> int:
 
     timed_out = False
     return_code: int
+    process: subprocess.Popen[bytes] | None = None
     previous_handlers: dict[int, signal.Handlers] = {}
     try:
+        # Install handlers before Popen so a signal delivered during process
+        # creation cannot leave an untracked child running.  The post-Popen
+        # forwarded-signal check closes the remaining assignment window.
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, forward_signal)
         with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
             process = subprocess.Popen(
                 command,
@@ -111,26 +164,39 @@ def main(argv: list[str]) -> int:
                 start_new_session=True,
             )
             _ACTIVE_PROCESS = process
-            for signum in (signal.SIGINT, signal.SIGTERM):
-                previous_handlers[signum] = signal.getsignal(signum)
-                signal.signal(signum, forward_signal)
             try:
-                return_code = process.wait(timeout=args.timeout_seconds)
+                if _FORWARDED_SIGNAL is not None:
+                    terminate_group(process, signal_number=_FORWARDED_SIGNAL)
+                    return_code = 128 + _FORWARDED_SIGNAL
+                else:
+                    return_code = process.wait(timeout=args.timeout_seconds)
+                    if process_group_exists(process):
+                        # A successful leader exit does not prove the child
+                        # session is empty.  Reap descendants left behind by
+                        # a fork/daemon-style child before returning pass.
+                        terminate_group(process)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 terminate_group(process)
                 return_code = 124
             finally:
                 if _FORWARDED_SIGNAL is not None:
-                    if process.poll() is None:
-                        terminate_group(process, signal_number=_FORWARDED_SIGNAL)
+                    terminate_group(process, signal_number=_FORWARDED_SIGNAL)
                     return_code = 128 + _FORWARDED_SIGNAL
                 _ACTIVE_PROCESS = None
-                for signum, handler in previous_handlers.items():
-                    signal.signal(signum, handler)
     except OSError as error:
         stderr_path.write_text(f"runner failed to start child: {error}\n", encoding="utf-8")
         return_code = 127
+    finally:
+        _ACTIVE_PROCESS = None
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+    # A signal can arrive in the narrow restoration window after child-group
+    # cleanup.  Preserve the interruption result even though the active
+    # handler no longer has a process to terminate.
+    if _FORWARDED_SIGNAL is not None and process is not None:
+        return_code = 128 + _FORWARDED_SIGNAL
 
     elapsed = time.monotonic() - start_monotonic
     record.update(
