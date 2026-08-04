@@ -121,6 +121,11 @@ class control {
             const std::string & remote_address,
             const std::map<std::string, std::string> & headers) const;
 
+    // Operator authorization is independent of benchmark trace collection.
+    bool authorize_operator(
+            const std::string & remote_address,
+            const std::map<std::string, std::string> & headers) const;
+
     void record(trace_event event);
     trace_snapshot snapshot() const;
 

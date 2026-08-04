@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-admin-dashboard.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -23,11 +24,13 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cinttypes>
 #include <cstdlib>
 #include <exception>
 #include <memory>
+#include <thread>
 #include <filesystem>
 #include <utility>
 #include <fstream>
@@ -5469,6 +5472,125 @@ void server_routes::init_routes() {
             { "overflow_events", snapshot.overflow_events },
             { "events", std::move(events) },
         });
+        return res;
+    };
+
+    const auto authorize_dashboard = [this](const server_http_req & req, server_res_generator & res) {
+        const auto authorization = server_admin_dashboard::authorize(
+                ctx_server.trusted_scheduling,
+                !params.api_keys.empty(),
+                req.remote_addr,
+                req.headers,
+                req.ambiguous_trusted_scheduling_headers || req.ambiguous_dashboard_security_headers,
+                req.ambiguous_last_event_id_header,
+                req.query_string);
+        if (authorization) {
+            return true;
+        }
+        res.error(format_error_response(authorization.message, ERROR_TYPE_PERMISSION));
+        return false;
+    };
+
+    this->get_admin_dashboard_snapshot = [this, authorize_dashboard](const server_http_req & req) {
+        auto res = create_response(true);
+        if (!authorize_dashboard(req, *res)) {
+            return res;
+        }
+
+        res->ok(server_admin_dashboard::make_snapshot(queue_tasks.request_state(), ggml_time_us()));
+        if (res->data.size() > server_admin_dashboard::maximum_snapshot_bytes) {
+            res->error(format_error_response(
+                    "read-only dashboard snapshot exceeds its bounded response budget",
+                    ERROR_TYPE_OVERLOADED));
+            return res;
+        }
+        res->headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
+        res->headers["Pragma"] = "no-cache";
+        res->headers["X-Content-Type-Options"] = "nosniff";
+        res->headers["Referrer-Policy"] = "no-referrer";
+        return res;
+    };
+
+    this->get_admin_dashboard_events = [this, authorize_dashboard](const server_http_req & req) {
+        auto res = create_response(true);
+        if (!authorize_dashboard(req, *res)) {
+            return res;
+        }
+
+        uint64_t cursor = 0;
+        if (!server_admin_dashboard::parse_last_event_id(req.headers, cursor)) {
+            res->error(format_error_response("invalid Last-Event-ID header", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const auto initial = server_admin_dashboard::make_resume_batch(
+                queue_tasks.request_state(), cursor, ggml_time_us());
+        if (initial.status == server_admin_dashboard::resume_status::future_cursor ||
+            initial.status == server_admin_dashboard::resume_status::gap) {
+            res->status = 409;
+            res->data = safe_json_to_str({
+                { "error", {
+                    { "message", "dashboard event cursor requires a fresh snapshot" },
+                    { "type", "resnapshot_required" },
+                    { "code", 409 },
+                    { "latest_sequence", initial.latest_sequence },
+                    { "oldest_available_sequence", initial.oldest_available_sequence },
+                } },
+            });
+            return res;
+        }
+        auto stream_lease = server_admin_dashboard::try_acquire_stream_lease();
+        if (!stream_lease) {
+            res->error(format_error_response(
+                    "too many live read-only dashboard streams",
+                    ERROR_TYPE_OVERLOADED));
+            return res;
+        }
+
+        res->status = 200;
+        res->data.clear();
+        res->content_type = "text/event-stream; charset=utf-8";
+        res->headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
+        res->headers["Pragma"] = "no-cache";
+        res->headers["X-Content-Type-Options"] = "nosniff";
+        res->headers["Referrer-Policy"] = "no-referrer";
+        const auto * should_stop = &req.should_stop;
+        server_queue * queue = &queue_tasks;
+        auto last_write = std::chrono::steady_clock::now();
+        res->next = [queue, should_stop, cursor, last_write, stream_lease](std::string & output) mutable {
+            (void) stream_lease;
+            while (!(*should_stop)()) {
+                const uint64_t now_us = ggml_time_us();
+                const auto batch = server_admin_dashboard::make_resume_batch(
+                        queue->request_state(), cursor, now_us);
+                if (batch.status == server_admin_dashboard::resume_status::events) {
+                    output.clear();
+                    for (const auto & frame : batch.frames) {
+                        output += frame;
+                    }
+                    cursor += batch.frames.size();
+                    last_write = std::chrono::steady_clock::now();
+                    return true;
+                }
+                if (batch.status == server_admin_dashboard::resume_status::gap ||
+                    batch.status == server_admin_dashboard::resume_status::future_cursor) {
+                    const uint64_t signal_sequence = std::max(cursor + 1, batch.latest_sequence);
+                    output = server_admin_dashboard::make_overflow_frame(
+                            signal_sequence, batch.oldest_available_sequence, now_us);
+                    return false;
+                }
+                if (std::chrono::steady_clock::now() - last_write >=
+                    std::chrono::milliseconds(server_admin_dashboard::heartbeat_milliseconds)) {
+                    output = ": keepalive\n\n";
+                    last_write = std::chrono::steady_clock::now();
+                    return true;
+                }
+                std::this_thread::sleep_for(
+                        std::chrono::milliseconds(server_admin_dashboard::poll_interval_milliseconds));
+            }
+            output.clear();
+            return false;
+        };
         return res;
     };
 

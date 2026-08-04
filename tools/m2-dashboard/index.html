@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' http://localhost:* http://127.0.0.1:* https://localhost:* https://127.0.0.1:*; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>M2 Ultra operations</title>
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -20,6 +20,32 @@
   </header>
 
   <main>
+    <section class="panel connection-panel" aria-labelledby="connection-title">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Read-only loopback connection</p>
+          <h2 id="connection-title">Live registry</h2>
+        </div>
+        <button id="fixture-button" type="button">Use fixture</button>
+      </div>
+      <form id="live-form" class="credential-form" autocomplete="off">
+        <label>
+          <span class="metric-label">Server URL</span>
+          <input id="server-url" name="server-url" type="url" value="http://127.0.0.1:8080" required spellcheck="false">
+        </label>
+        <label>
+          <span class="metric-label">API key</span>
+          <input id="api-key" name="api-key" type="password" required autocomplete="off" spellcheck="false">
+        </label>
+        <label>
+          <span class="metric-label">Operator token</span>
+          <input id="operator-token" name="operator-token" type="password" minlength="32" maxlength="256" required autocomplete="off" spellcheck="false">
+        </label>
+        <button type="submit">Connect live</button>
+      </form>
+      <p class="notice">Credentials are sent only as headers, retained only in this page's memory, and cleared on disconnect. Serve this page and llama-server from the same loopback hostname.</p>
+    </section>
+
     <section aria-label="system summary">
       <div id="health-strip" class="health-strip"></div>
     </section>
@@ -49,8 +75,8 @@
       <section class="panel" aria-labelledby="timeline-title">
         <div class="panel-heading">
           <div>
-            <p class="eyebrow">Committed boundaries</p>
-            <h2 id="timeline-title">Active timeline</h2>
+            <p class="eyebrow">Request registry</p>
+            <h2 id="timeline-title">Transition timeline</h2>
           </div>
         </div>
         <ol id="timeline" class="timeline"></ol>
@@ -126,9 +152,7 @@
     </div>
   </main>
 
-  <footer>
-    Fixture foundation only · content reveal disabled · no browser persistence
-  </footer>
+  <footer>Read-only dashboard · content reveal disabled · no browser persistence</footer>
 
   <script type="module" src="dashboard.js"></script>
 </body>

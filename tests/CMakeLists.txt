@@ -162,6 +162,14 @@ target_include_directories(test-server-trusted-scheduling PRIVATE
 target_link_libraries(test-server-trusted-scheduling PRIVATE server-context)
 target_compile_features(test-server-trusted-scheduling PRIVATE cxx_std_17)
 
+llama_build_and_test(test-server-admin-dashboard.cpp)
+target_include_directories(test-server-admin-dashboard PRIVATE
+    ${PROJECT_SOURCE_DIR}
+    ${PROJECT_SOURCE_DIR}/tools/mtmd
+    ${PROJECT_SOURCE_DIR}/tools/server)
+target_link_libraries(test-server-admin-dashboard PRIVATE server-context)
+target_compile_features(test-server-admin-dashboard PRIVATE cxx_std_17)
+
 llama_build_and_test(test-server-queue-runtime.cpp)
 target_include_directories(test-server-queue-runtime PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_link_libraries(test-server-queue-runtime PRIVATE server-context)

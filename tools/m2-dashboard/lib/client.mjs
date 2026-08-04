@@ -374,6 +374,14 @@ export class AdminStateClient {
             return;
         }
         this.closeStream();
+        if (error?.resnapshotRequired === true) {
+            this.state = requireResnapshot(this.state, "server_resume_rejected", {
+                message: errorMessage(error),
+            });
+            this.publish();
+            void this.resnapshot("server_resume_rejected");
+            return;
+        }
         if (retryIndex >= this.streamRetryDelaysMs.length) {
             this.state = setRecovery(this.state, {
                 status: "error",

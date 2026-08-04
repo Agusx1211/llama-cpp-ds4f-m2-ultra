@@ -46,6 +46,21 @@ test("duplicate reconnect delivery is ignored without altering snapshot", async 
     assert.equal(duplicate.snapshot, once.snapshot);
 });
 
+test("request events refresh authoritative registry counters", async () => {
+    const snapshot = await loadSnapshot();
+    const [fixture] = await loadEvents();
+    const event = clone(fixture);
+    event.payload.registry = {
+        ...snapshot.registry,
+        retained_events: snapshot.registry.retained_events + 1,
+        total_events: snapshot.registry.total_events + 1,
+    };
+
+    const state = reduceDashboardEvent(createDashboardState(snapshot), event);
+    assert.equal(state.snapshot.registry.total_events, snapshot.registry.total_events + 1);
+    assert.equal(state.snapshot.registry.retained_events, snapshot.registry.retained_events + 1);
+});
+
 test("a sequence gap forces a full resnapshot before applying later deltas", async () => {
     const snapshot = await loadSnapshot();
     const events = await loadEvents();

@@ -1,5 +1,6 @@
 import { AdminStateClient } from "./lib/client.mjs";
 import { ControlIntentBuffer, createControlIntent } from "./lib/controls.mjs";
+import { createLiveDashboardTransport } from "./lib/live.mjs";
 import {
     contentForDisplay,
     formatBytes,
@@ -12,6 +13,17 @@ const fixtureRoot = new URL("./fixtures/", import.meta.url);
 const intentBuffer = new ControlIntentBuffer(20);
 
 let selectedRequestId = null;
+let liveMode = false;
+let activeClient = null;
+let activeLiveTransport = null;
+
+function available(snapshot, field) {
+    return snapshot.availability?.[field] !== false;
+}
+
+function unavailable(target, label) {
+    target.replaceChildren(element("p", "unavailable", `${label} is unavailable in the registry-only live view.`));
+}
 
 function element(tag, className = "", text = null) {
     const node = document.createElement(tag);
@@ -43,18 +55,32 @@ function badge(value) {
 function renderHealth(snapshot, state) {
     const server = snapshot.server;
     const strip = document.querySelector("#health-strip");
-    const health = element("div", "metric");
-    health.append(element("span", "metric-label", "Health"), badge(server.health));
-    strip.replaceChildren(
-        health,
-        metric("Model", server.model),
-        metric("Build", server.build),
-        metric("RSS", formatBytes(server.rss_bytes)),
-        metric("Pressure", `${server.memory_pressure_percent.toFixed(0)}%`),
-        metric("Swap", formatBytes(server.swap_bytes)),
-        metric("Decode width", String(server.decode_width)),
-        metric("Aggregate", formatRate(server.aggregate_tokens_per_second, " tok/s")),
-    );
+    if (available(snapshot, "server_metrics")) {
+        const health = element("div", "metric");
+        health.append(element("span", "metric-label", "Health"), badge(server.health));
+        strip.replaceChildren(
+            health,
+            metric("Model", server.model),
+            metric("Build", server.build),
+            metric("RSS", formatBytes(server.rss_bytes)),
+            metric("Pressure", `${server.memory_pressure_percent.toFixed(0)}%`),
+            metric("Swap", formatBytes(server.swap_bytes)),
+            metric("Decode width", String(server.decode_width)),
+            metric("Aggregate", formatRate(server.aggregate_tokens_per_second, " tok/s")),
+        );
+    } else {
+        const registry = snapshot.registry;
+        strip.replaceChildren(
+            metric("Source", "request registry"),
+            metric("Requests", registry.active_requests.toLocaleString()),
+            metric("Occupied slots", registry.occupied_slots.toLocaleString()),
+            metric("Permits", registry.total_permits.toLocaleString()),
+            metric("Event sequence", registry.total_events.toLocaleString()),
+            metric("Retained events", `${registry.retained_events} / ${registry.event_capacity}`),
+            metric("Dropped events", registry.dropped_events.toLocaleString()),
+            metric("Process metrics", "unavailable"),
+        );
+    }
 
     const connection = document.querySelector("#connection-status");
     const recovery = state.recovery.lastError === null
@@ -96,9 +122,12 @@ function renderLanes(snapshot) {
         const heading = element("div", "request-title");
         heading.append(element("h3", "", lane.id), element("span", "muted", `${lane.queued} queued · ${lane.active} active`));
         const summary = element("div", "lane-summary");
+        const prediction = available(snapshot, "scheduler_predictions")
+            ? `start ${formatDuration(lane.predicted_start_ms[0])}–${formatDuration(lane.predicted_start_ms[1])}`
+            : `${lane.bound_permits ?? 0} bound / ${lane.claimed_permits ?? 0} claimed`;
         summary.append(
             element("span", "", `oldest ${formatDuration(lane.oldest_wait_ms)}`),
-            element("span", "", `start ${formatDuration(lane.predicted_start_ms[0])}–${formatDuration(lane.predicted_start_ms[1])}`),
+            element("span", "", prediction),
         );
         section.append(heading, summary);
 
@@ -151,34 +180,47 @@ function renderRequestDetail(snapshot) {
     const reasons = request.scheduler_reasons.length > 0
         ? request.scheduler_reasons.join(" · ")
         : "none";
-    const controls = element("div", "detail-block detail-block-wide");
-    controls.append(
-        element("span", "metric-label", "Local control intent preview"),
-        element("p", "notice", "No authenticated mutation adapter is attached."),
-    );
-    const controlRow = element("div", "control-row");
-    controlRow.append(
-        controlButton("Cancel", "request.cancel", request.id),
-        controlButton(request.state === "parked" ? "Resume" : "Pause", request.state === "parked" ? "request.resume" : "request.pause", request.id),
-        controlButton("Move to fast", "request.reprioritize", request.id, { lane: "fast" }),
-    );
-    controls.append(controlRow);
-
-    detail.replaceChildren(
+    const blocks = [
         valueBlock("Request", request.id),
         valueBlock("State", request.state),
         valueBlock("Lane", request.lane),
         valueBlock("Prompt", `${request.prompt_tokens.toLocaleString()} tokens`),
         valueBlock("Output", `${request.output_tokens.toLocaleString()} / ${request.requested_output_tokens ?? "∞"}`),
-        valueBlock("TTFT / TBT", `${formatDuration(request.ttft_ms)} / ${formatDuration(request.tbt_ms)}`),
-        valueBlock("KV", `${formatBytes(request.kv.unique_bytes)} unique / ${formatBytes(request.kv.logical_bytes)} logical`),
-        valueBlock("Lineage", request.kv.lineage),
-        valueBlock("Preemptions / DSpark", `${request.preemptions} / ${request.dspark_cycles}`),
         valueBlock("Scheduler reasons", reasons, true),
-        contentBlock("Prompt content", request.content.prompt),
-        contentBlock("Output content", request.content.output),
-        controls,
-    );
+    ];
+    if (available(snapshot, "request_latency")) {
+        blocks.push(valueBlock("TTFT / TBT", `${formatDuration(request.ttft_ms)} / ${formatDuration(request.tbt_ms)}`));
+    }
+    if (available(snapshot, "request_kv")) {
+        blocks.push(
+            valueBlock("KV", `${formatBytes(request.kv.unique_bytes)} unique / ${formatBytes(request.kv.logical_bytes)} logical`),
+            valueBlock("Lineage", request.kv.lineage),
+        );
+    }
+    if (available(snapshot, "request_preemption") || available(snapshot, "dspark")) {
+        blocks.push(valueBlock("Preemptions / DSpark", `${request.preemptions} / ${request.dspark_cycles}`));
+    }
+    if (available(snapshot, "content")) {
+        blocks.push(contentBlock("Prompt content", request.content.prompt), contentBlock("Output content", request.content.output));
+    } else {
+        blocks.push(valueBlock("Content", "not collected by this route", true));
+    }
+    if (!liveMode) {
+        const controls = element("div", "detail-block detail-block-wide");
+        controls.append(
+            element("span", "metric-label", "Local control intent preview"),
+            element("p", "notice", "No authenticated mutation adapter is attached."),
+        );
+        const controlRow = element("div", "control-row");
+        controlRow.append(
+            controlButton("Cancel", "request.cancel", request.id),
+            controlButton(request.state === "parked" ? "Resume" : "Pause", request.state === "parked" ? "request.resume" : "request.pause", request.id),
+            controlButton("Move to fast", "request.reprioritize", request.id, { lane: "fast" }),
+        );
+        controls.append(controlRow);
+        blocks.push(controls);
+    }
+    detail.replaceChildren(...blocks);
 }
 
 function progressCard(title, detail, used, capacity, footer) {
@@ -194,6 +236,10 @@ function progressCard(title, detail, used, capacity, footer) {
 
 function renderAllocator(snapshot) {
     const target = document.querySelector("#allocator-pools");
+    if (!available(snapshot, "allocator")) {
+        unavailable(target, "Allocator state");
+        return;
+    }
     const cards = snapshot.allocator.pools.map((pool) => progressCard(
         pool.id,
         `${pool.mapped_pages.toLocaleString()} / ${pool.capacity_pages.toLocaleString()} pages`,
@@ -206,6 +252,10 @@ function renderAllocator(snapshot) {
 
 function renderCache(snapshot) {
     const target = document.querySelector("#cache-objects");
+    if (!available(snapshot, "cache")) {
+        unavailable(target, "Cache state");
+        return;
+    }
     const cards = snapshot.cache.objects.map((object) => {
         const card = element("article", "stack-card");
         const heading = element("div", "row");
@@ -228,6 +278,10 @@ function renderCache(snapshot) {
 
 function renderDisks(snapshot) {
     const target = document.querySelector("#disk-list");
+    if (!available(snapshot, "disks")) {
+        unavailable(target, "Storage state");
+        return;
+    }
     const cards = snapshot.disks.map((disk) => {
         const health = disk.healthy ? "healthy" : "degraded";
         const card = progressCard(
@@ -245,6 +299,10 @@ function renderDisks(snapshot) {
 
 function renderAux(snapshot) {
     const target = document.querySelector("#aux-status");
+    if (!available(snapshot, "dspark") && !available(snapshot, "capture")) {
+        unavailable(target, "DSpark and capture state");
+        return;
+    }
     const dspark = element("article", "stack-card");
     const accepted = snapshot.dspark.proposals > 0
         ? snapshot.dspark.accepted / snapshot.dspark.proposals * 100
@@ -261,9 +319,11 @@ function renderAux(snapshot) {
         element("strong", "", `${snapshot.capture.mode} · ${snapshot.capture.healthy ? "healthy" : "degraded"}`),
         element("p", "muted", `${snapshot.capture.written_records.toLocaleString()} written · ${snapshot.capture.dropped_records.toLocaleString()} dropped · ${formatBytes(snapshot.capture.bytes_written)}`),
     );
-    const controls = element("div", "control-row");
-    controls.append(controlButton("Draft request exclusion", "capture.exclude", selectedRequestId ?? "none"));
-    capture.append(controls);
+    if (!liveMode) {
+        const controls = element("div", "control-row");
+        controls.append(controlButton("Draft request exclusion", "capture.exclude", selectedRequestId ?? "none"));
+        capture.append(controls);
+    }
     target.replaceChildren(dspark, capture);
 }
 
@@ -352,15 +412,33 @@ function fixtureTransport(events) {
     };
 }
 
-async function main() {
-    const [snapshot, events] = await Promise.all([
+async function loadFixtures() {
+    return Promise.all([
         loadJson(new URL("state.json", fixtureRoot)),
         loadJson(new URL("events.json", fixtureRoot)),
     ]);
+}
 
-    const client = new AdminStateClient({
-        getSnapshot: async () => snapshot,
-        openEvents: fixtureTransport(events),
+function stopActiveConnection() {
+    activeClient?.stop();
+    activeClient = null;
+    activeLiveTransport?.clear();
+    activeLiveTransport = null;
+}
+
+async function startClient(transport, mode) {
+    stopActiveConnection();
+    liveMode = mode === "live";
+    if (liveMode) {
+        activeLiveTransport = transport;
+    }
+    const badgeNode = document.querySelector("#mode-badge");
+    badgeNode.className = `badge badge-${liveMode ? "live" : "fixture"}`;
+    setSafeText(badgeNode, liveMode ? "live read-only" : "fixture data");
+
+    activeClient = new AdminStateClient({
+        getSnapshot: transport.getSnapshot,
+        openEvents: transport.openEvents,
         onState: (state) => {
             currentState = state;
             renderCurrentState();
@@ -368,12 +446,52 @@ async function main() {
         historyLimit: 32,
         pendingLimit: 16,
     });
-    await client.start();
-    globalThis.addEventListener("pagehide", () => client.stop(), { once: true });
+    await activeClient.start();
 }
 
-main().catch((error) => {
+async function connectFixture() {
+    const [snapshot, events] = await loadFixtures();
+    await startClient({
+        getSnapshot: async () => snapshot,
+        openEvents: fixtureTransport(events),
+    }, "fixture");
+}
+
+async function main() {
+    document.querySelector("#fixture-button").addEventListener("click", () => {
+        void connectFixture().catch(showConnectionError);
+    });
+    document.querySelector("#live-form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        const serverUrl = document.querySelector("#server-url").value;
+        const apiKeyInput = document.querySelector("#api-key");
+        const operatorInput = document.querySelector("#operator-token");
+        try {
+            const transport = createLiveDashboardTransport({
+                baseUrl: serverUrl,
+                apiKey: apiKeyInput.value,
+                operatorToken: operatorInput.value,
+            });
+            apiKeyInput.value = "";
+            operatorInput.value = "";
+            void startClient(transport, "live").catch((error) => {
+                transport.clear();
+                showConnectionError(error);
+            });
+        } catch (error) {
+            apiKeyInput.value = "";
+            operatorInput.value = "";
+            showConnectionError(error);
+        }
+    });
+    globalThis.addEventListener("pagehide", stopActiveConnection, { once: true });
+    await connectFixture();
+}
+
+function showConnectionError(error) {
     const status = document.querySelector("#connection-status");
-    setSafeText(status, `fixture error: ${error.message ?? error}`);
+    setSafeText(status, `connection error: ${error.message ?? error}`);
     status.className = "badge badge-failed";
-});
+}
+
+main().catch(showConnectionError);

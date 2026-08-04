@@ -1,9 +1,8 @@
 # M2 Ultra admin dashboard fixture foundation
 
-This directory is a dependency-free, static foundation for the adaptive
-server's future authenticated admin dashboard. It deliberately runs against
-deterministic fixtures by default because the admin snapshot, event, detail,
-and control routes do not exist yet.
+This directory is a dependency-free, static dashboard for the adaptive
+server. It runs against deterministic fixtures by default and can connect to
+the direct single-model server's narrow read-only request-registry routes.
 
 Implemented here:
 
@@ -20,12 +19,17 @@ Implemented here:
 - plain-text rendering and default prompt/output redaction;
 - local control-intent drafting without any network mutation; and
 - zero-dependency Node tests.
+- an opt-in live adapter using an API bearer and the loopback operator token;
+- bounded authenticated snapshot and resumable SSE request-registry views; and
+- explicit unavailable markers for metrics not supplied by this vertical.
 
 Not implemented or claimed:
 
-- server routes, authentication, authorization, CORS, or CSRF protection;
 - DNS, TLS, reverse-proxy configuration, or trusted lane headers;
 - POST/DELETE control transport;
+- request mutation/detail routes or content reveal;
+- allocator, cache, disk, DSpark, capture, model, or process telemetry in the
+  live registry-only view;
 - browser automation or browser-storage audits; or
 - dashboard/inference performance measurements.
 
@@ -48,11 +52,54 @@ cd tools/m2-dashboard
 python3 -m http.server 8080
 ```
 
-The page fetches `fixtures/state.json` and `fixtures/events.json`. It performs
-no state-changing requests. Control buttons only create a bounded local intent
-preview for a future authenticated adapter.
+The page initially fetches `fixtures/state.json` and `fixtures/events.json`.
+It performs no state-changing requests. Fixture control buttons only create a
+bounded local intent preview; the live view does not expose them.
 
-## Future integration contract
+## Live read-only view
+
+Configure the direct server with an API key, an operator token of 32-256 bytes,
+and localhost CORS. The operator token also controls trusted benchmark lanes,
+so keep it distinct from the API bearer and never expose it to ordinary
+clients:
+
+```sh
+export LLAMA_API_KEY='replace-with-api-key'
+export LLAMA_SERVER_TRUSTED_SCHEDULING_TOKEN='replace-with-32-or-more-random-bytes'
+
+llama-server ... \
+  --api-key "$LLAMA_API_KEY" \
+  --cors-origins localhost
+```
+
+Serve this directory from the same loopback hostname as llama-server. Ports
+may differ; hostnames must not. For example:
+
+```sh
+cd tools/m2-dashboard
+python3 -m http.server 8081 --bind 127.0.0.1
+```
+
+Open `http://127.0.0.1:8081/`, enter the llama-server URL, API key, and
+operator token, then choose **Connect live**. Credentials are sent only in
+headers with browser credentials omitted, stay only in JavaScript memory, are
+cleared from the form immediately, and are cleared from the adapter on
+disconnect/page exit. They are never placed in a URL or browser storage.
+
+The two live endpoints are:
+
+```text
+GET /internal/admin/dashboard/snapshot
+GET /internal/admin/dashboard/events  (Last-Event-ID header)
+```
+
+Both require normal API-key middleware plus the operator header, reject
+non-loopback and cross-site browser ingress, reject lane/tag headers and query
+parameters, and are disabled when the operator token is absent. Router mode
+does not proxy them. Snapshot/event payloads contain numeric registry facts,
+permit counts, lifecycle reasons, and redacted request identities only.
+
+## Client recovery contract
 
 `AdminStateClient` accepts two injected read-only functions:
 
@@ -61,13 +108,12 @@ getSnapshot() -> immutable versioned snapshot
 openEvents({ lastEventId, onEvent, onDisconnect }) -> close function
 ```
 
-The production event adapter must connect to an authenticated SSE route that
-honors `Last-Event-ID`. A reconnect resumes from the reducer's last accepted
-event ID. A gap, explicit server overflow, malformed event, schema mismatch, or
-local slow-consumer overflow discards queued deltas and fetches a fresh
-snapshot before reopening the stream. Snapshot and stream-open failures use
-finite retry schedules and expose the latest failure in client state; this
-fixture does not claim production availability behavior.
+The live event adapter connects to authenticated SSE and honors
+`Last-Event-ID`. A reconnect resumes from the reducer's last accepted event
+ID. A server cursor rejection, gap, explicit overflow, malformed event, schema
+mismatch, or local slow-consumer overflow discards queued deltas and fetches a
+fresh snapshot before reopening the stream. Snapshot and stream-open failures
+use finite retry schedules and expose the latest failure in client state.
 
 Control intent objects are intentionally transport-free. A later authenticated
 adapter must validate authorization and CSRF policy before translating an

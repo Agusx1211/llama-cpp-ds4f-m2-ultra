@@ -36,6 +36,21 @@ select {
   font: inherit;
 }
 
+input {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 0.45rem;
+  padding: 0.52rem 0.62rem;
+  color: var(--text);
+  background: #101314;
+}
+
+input:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
 button {
   border: 1px solid var(--line);
   border-radius: 0.45rem;
@@ -196,6 +211,29 @@ footer {
 
 .panel-heading p {
   margin-bottom: 0.2rem;
+}
+
+.connection-panel {
+  margin-bottom: 0.8rem;
+}
+
+.credential-form {
+  display: grid;
+  grid-template-columns: minmax(14rem, 1.4fr) minmax(10rem, 1fr) minmax(12rem, 1.2fr) auto;
+  align-items: end;
+  gap: 0.65rem;
+}
+
+.credential-form label {
+  min-width: 0;
+}
+
+.unavailable {
+  border: 1px dashed var(--line);
+  border-radius: 0.45rem;
+  padding: 0.75rem;
+  color: var(--muted);
+  font-size: 0.78rem;
 }
 
 .two-column {
@@ -389,6 +427,10 @@ footer {
   .health-strip {
     grid-template-columns: repeat(4, minmax(9rem, 1fr));
   }
+
+  .credential-form {
+    grid-template-columns: 1fr 1fr;
+  }
 }
 
 @media (max-width: 560px) {
@@ -407,5 +449,9 @@ footer {
 
   .detail-block-wide {
     grid-column: auto;
+  }
+
+  .credential-form {
+    grid-template-columns: 1fr;
   }
 }

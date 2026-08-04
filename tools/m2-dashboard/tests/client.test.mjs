@@ -114,6 +114,24 @@ test("server overflow forces snapshot replacement", async () => {
     client.stop();
 });
 
+test("HTTP resume rejection forces snapshot replacement instead of blind stream retry", async () => {
+    const snapshot = await loadSnapshot();
+    const replacement = snapshotAt(snapshot, 151);
+    const { client, openings, observed, snapshotCalls } = harness([snapshot, replacement]);
+
+    await client.start();
+    const error = new Error("SSE request failed: 409 Conflict");
+    error.resnapshotRequired = true;
+    openings[0].onDisconnect(error);
+    await client.idle();
+
+    assert.ok(observed.some((state) => state.synchronization.reason === "server_resume_rejected"));
+    assert.equal(snapshotCalls(), 2);
+    assert.equal(client.state.lastEventId, "151");
+    assert.equal(openings.at(-1).lastEventId, "151");
+    client.stop();
+});
+
 test("automatic resnapshot exposes rejection then recovers on a paced retry", async () => {
     const snapshot = await loadSnapshot();
     const events = await loadEvents();

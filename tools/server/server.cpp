@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-admin-dashboard.h"
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
@@ -231,6 +232,17 @@ int llama_server(common_params & params, int argc, char ** argv) {
             res->data = safe_json_to_str({{ "error", error }});
             return res;
         };
+        const auto router_admin_forbidden = [](const server_http_req &) {
+            auto res = std::make_unique<server_http_res>();
+            const auto error = format_error_response(
+                    "read-only dashboard routes are supported only by direct single-model llama-server",
+                    ERROR_TYPE_PERMISSION);
+            res->status = json_value(error, "code", 403);
+            res->data = safe_json_to_str({{ "error", error }});
+            return res;
+        };
+        routes.get_admin_dashboard_snapshot = router_admin_forbidden;
+        routes.get_admin_dashboard_events   = router_admin_forbidden;
 
         ctx_http.post("/models",               ex_wrapper(models_routes->post_router_models));
         ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
@@ -243,6 +255,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
     ctx_http.get ("/internal/benchmark/scheduler-trace", ex_wrapper(routes.get_benchmark_scheduler_trace));
+    ctx_http.get (server_admin_dashboard::snapshot_path, ex_wrapper(routes.get_admin_dashboard_snapshot));
+    ctx_http.get (server_admin_dashboard::events_path,   ex_wrapper(routes.get_admin_dashboard_events));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models)); // public endpoint (no API key check)

@@ -56,6 +56,8 @@ struct server_http_req {
     const std::function<bool()> & should_stop;
     std::string remote_addr; // numeric peer address; trusted ingress must still validate loopback
     bool ambiguous_trusted_scheduling_headers = false;
+    bool ambiguous_last_event_id_header = false;
+    bool ambiguous_dashboard_security_headers = false;
 
     std::string get_param(const std::string & key, const std::string & def = "") const {
         auto it = params.find(key);

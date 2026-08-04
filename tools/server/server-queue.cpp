@@ -1063,6 +1063,16 @@ server_request_runtime::dispatch_permit_snapshot server_queue::dispatch_permits(
     return request_runtime.permits();
 }
 
+server_queue_request_state server_queue::request_state() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    return {
+        request_runtime.snapshot(),
+        request_runtime.events(),
+        request_runtime.summary(),
+        request_runtime.permits(),
+    };
+}
+
 //
 // server_response
 //

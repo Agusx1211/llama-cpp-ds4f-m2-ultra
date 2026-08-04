@@ -104,6 +104,22 @@ function replaceById(values, replacement) {
     return values.map((value, current) => current === index ? replacement : value);
 }
 
+function requestAggregates(lanes, requests) {
+    return lanes.map((lane) => {
+        const matching = requests.filter((request) => request.lane === lane.id);
+        return {
+            ...lane,
+            queued: matching.filter((request) => request.state === "queued").length,
+            active: matching.filter((request) => ![
+                "queued",
+                "complete",
+                "cancelled",
+                "failed",
+            ].includes(request.state)).length,
+        };
+    });
+}
+
 function applyEvent(snapshot, event, timelineLimit) {
     const next = {
         ...snapshot,
@@ -114,9 +130,13 @@ function applyEvent(snapshot, event, timelineLimit) {
     switch (event.type) {
         case "request.upsert":
             next.requests = replaceById(snapshot.requests, event.payload.request);
+            next.lanes = event.payload.lanes ?? requestAggregates(snapshot.lanes, next.requests);
+            next.registry = event.payload.registry ?? snapshot.registry;
             break;
         case "request.remove":
             next.requests = snapshot.requests.filter((request) => request.id !== event.payload.request_id);
+            next.lanes = event.payload.lanes ?? requestAggregates(snapshot.lanes, next.requests);
+            next.registry = event.payload.registry ?? snapshot.registry;
             break;
         case "lane.replace":
             next.lanes = replaceById(snapshot.lanes, event.payload.lane);

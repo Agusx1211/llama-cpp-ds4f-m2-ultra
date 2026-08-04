@@ -554,6 +554,37 @@ static bool has_ambiguous_trusted_scheduling_headers(const httplib::Request & re
     return false;
 }
 
+static bool has_ambiguous_last_event_id_header(const httplib::Request & req) {
+    size_t count = 0;
+    for (const auto & header : req.headers) {
+        if (header_name_equals(header.first, "Last-Event-ID") && ++count > 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool has_ambiguous_dashboard_security_headers(const httplib::Request & req) {
+    size_t authorization_count = 0;
+    size_t api_key_count       = 0;
+    size_t origin_count        = 0;
+    size_t fetch_site_count    = 0;
+    for (const auto & header : req.headers) {
+        if (header_name_equals(header.first, "Authorization")) {
+            ++authorization_count;
+        } else if (header_name_equals(header.first, "X-Api-Key")) {
+            ++api_key_count;
+        } else if (header_name_equals(header.first, "Origin")) {
+            ++origin_count;
+        } else if (header_name_equals(header.first, "Sec-Fetch-Site")) {
+            ++fetch_site_count;
+        }
+    }
+    return authorization_count > 1 || api_key_count > 1 ||
+           (authorization_count != 0 && api_key_count != 0) ||
+           origin_count > 1 || fetch_site_count > 1;
+}
+
 static std::string build_query_string(const httplib::Request & req) {
     std::string qs;
     for (const auto & [key, value] : req.params) {
@@ -620,7 +651,9 @@ void server_http_context::get(const std::string & path, const server_http_contex
             {},
             req.is_connection_closed,
             req.remote_addr,
-            has_ambiguous_trusted_scheduling_headers(req)
+            has_ambiguous_trusted_scheduling_headers(req),
+            has_ambiguous_last_event_id_header(req),
+            has_ambiguous_dashboard_security_headers(req)
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -669,7 +702,9 @@ void server_http_context::post(const std::string & path, const server_http_conte
             std::move(files),
             req.is_connection_closed,
             req.remote_addr,
-            has_ambiguous_trusted_scheduling_headers(req)
+            has_ambiguous_trusted_scheduling_headers(req),
+            has_ambiguous_last_event_id_header(req),
+            has_ambiguous_dashboard_security_headers(req)
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -688,7 +723,9 @@ void server_http_context::del(const std::string & path, const server_http_contex
             {},
             req.is_connection_closed,
             req.remote_addr,
-            has_ambiguous_trusted_scheduling_headers(req)
+            has_ambiguous_trusted_scheduling_headers(req),
+            has_ambiguous_last_event_id_header(req),
+            has_ambiguous_dashboard_security_headers(req)
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -846,6 +883,8 @@ void server_http_context::register_gcp_compat() const {
                         req.should_stop,
                         req.remote_addr,
                         req.ambiguous_trusted_scheduling_headers,
+                        req.ambiguous_last_event_id_header,
+                        req.ambiguous_dashboard_security_headers,
                     };
 
                     server_http_res_ptr internal_res = handlers.at(dispatch_path)(internal_req);

@@ -62,9 +62,18 @@ test("snapshot validation rejects schema drift and incomplete lane sets", async 
     const duplicateLane = clone(snapshot);
     duplicateLane.lanes[2].id = "normal";
     assert.throws(() => validateSnapshot(duplicateLane), /duplicate lane normal/);
+
+    const missingAvailability = clone(snapshot);
+    delete missingAvailability.availability.dspark;
+    assert.throws(() => validateSnapshot(missingAvailability), /availability.dspark must be boolean/);
+
+    const malformedRegistry = clone(snapshot);
+    malformedRegistry.registry.claimed_permits.pop();
+    assert.throws(() => validateSnapshot(malformedRegistry), /one count per lane/);
 });
 
 test("event validation rejects mismatched SSE IDs and malformed typed payloads", async () => {
+    const snapshot = await loadSnapshot();
     const [fixture] = await loadEvents();
     const badId = clone(fixture);
     badId.id = "999";
@@ -81,6 +90,10 @@ test("event validation rejects mismatched SSE IDs and malformed typed payloads",
     const badLaneIdentity = clone(fixture);
     badLaneIdentity.lane = "normal";
     assert.throws(() => validateEvent(badLaneIdentity), /event.lane must equal.*request.lane/);
+
+    const incompleteLanes = clone(fixture);
+    incompleteLanes.payload.lanes = snapshot.lanes.slice(0, 2);
+    assert.throws(() => validateEvent(incompleteLanes), /payload.lanes is missing fast/);
 });
 
 test("event validation ties analogous envelope identities to typed payloads", async () => {

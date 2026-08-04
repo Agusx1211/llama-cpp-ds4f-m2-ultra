@@ -2,6 +2,30 @@
   "schema_version": 1,
   "sequence": 100,
   "generated_at": "2026-08-03T22:00:00.000Z",
+  "availability": {
+    "server_metrics": true,
+    "scheduler_predictions": true,
+    "request_latency": true,
+    "request_kv": true,
+    "request_preemption": true,
+    "content": true,
+    "allocator": true,
+    "cache": true,
+    "disks": true,
+    "dspark": true,
+    "capture": true
+  },
+  "registry": {
+    "active_requests": 6,
+    "occupied_slots": 5,
+    "retained_events": 100,
+    "event_capacity": 1024,
+    "total_events": 100,
+    "dropped_events": 0,
+    "claimed_permits": [2, 2, 2],
+    "bound_permits": [1, 2, 2],
+    "total_permits": 6
+  },
   "server": {
     "health": "degraded",
     "build": "0eaed1943-fixture",
@@ -22,7 +46,9 @@
       "oldest_wait_ms": 84000,
       "service_deficit": 3.5,
       "bypass_count": 2,
-      "predicted_start_ms": [12000, 26000]
+      "predicted_start_ms": [12000, 26000],
+      "claimed_permits": 2,
+      "bound_permits": 1
     },
     {
       "id": "normal",
@@ -31,7 +57,9 @@
       "oldest_wait_ms": 4800,
       "service_deficit": 0.8,
       "bypass_count": 0,
-      "predicted_start_ms": [900, 3100]
+      "predicted_start_ms": [900, 3100],
+      "claimed_permits": 2,
+      "bound_permits": 2
     },
     {
       "id": "fast",
@@ -40,7 +68,9 @@
       "oldest_wait_ms": 0,
       "service_deficit": 0,
       "bypass_count": 0,
-      "predicted_start_ms": [0, 450]
+      "predicted_start_ms": [0, 450],
+      "claimed_permits": 2,
+      "bound_permits": 2
     }
   ],
   "requests": [

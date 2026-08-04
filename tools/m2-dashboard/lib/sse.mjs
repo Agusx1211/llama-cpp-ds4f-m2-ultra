@@ -165,7 +165,11 @@ export function createFetchSseTransport(url, fetchImpl = globalThis.fetch, parse
                     signal: controller.signal,
                 });
                 if (!response.ok || response.body === null) {
-                    throw new Error(`SSE request failed: ${response.status} ${response.statusText}`);
+                    const error = new Error(`SSE request failed: ${response.status} ${response.statusText}`);
+                    if (response.status === 409) {
+                        error.resnapshotRequired = true;
+                    }
+                    throw error;
                 }
 
                 const parser = new SseParser(onEvent, parserOptions);

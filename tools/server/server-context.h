@@ -130,6 +130,8 @@ struct server_routes {
     server_http_context::handler_t get_health;
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_benchmark_scheduler_trace;
+    server_http_context::handler_t get_admin_dashboard_snapshot;
+    server_http_context::handler_t get_admin_dashboard_events;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
     server_http_context::handler_t get_props;

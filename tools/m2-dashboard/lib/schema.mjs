@@ -253,6 +253,7 @@ function validateLane(value, path, issues) {
     knownFields(lane, [
         "id", "queued", "active", "oldest_wait_ms", "service_deficit", "bypass_count",
         "predicted_start_ms",
+        "claimed_permits", "bound_permits",
     ], path, issues);
     enumeration(lane.id, LANES, `${path}.id`, issues);
     integer(lane.queued, `${path}.queued`, issues, { min: 0 });
@@ -261,6 +262,80 @@ function validateLane(value, path, issues) {
     finiteNumber(lane.service_deficit, `${path}.service_deficit`, issues, { min: 0 });
     integer(lane.bypass_count, `${path}.bypass_count`, issues, { min: 0 });
     range(lane.predicted_start_ms, `${path}.predicted_start_ms`, issues);
+    if (Object.hasOwn(lane, "claimed_permits")) {
+        integer(lane.claimed_permits, `${path}.claimed_permits`, issues, { min: 0 });
+    }
+    if (Object.hasOwn(lane, "bound_permits")) {
+        integer(lane.bound_permits, `${path}.bound_permits`, issues, { min: 0 });
+    }
+}
+
+function validateLanes(value, path, issues) {
+    const lanes = array(value, path, issues, { maxLength: LANES.length });
+    const laneIds = new Set();
+    for (const [index, lane] of lanes.entries()) {
+        validateLane(lane, `${path}[${index}]`, issues);
+        if (isRecord(lane) && typeof lane.id === "string") {
+            if (laneIds.has(lane.id)) {
+                issues.push(`${path} contains duplicate lane ${lane.id}`);
+            }
+            laneIds.add(lane.id);
+        }
+    }
+    for (const lane of LANES) {
+        if (!laneIds.has(lane)) {
+            issues.push(`${path} is missing ${lane}`);
+        }
+    }
+    return lanes;
+}
+
+const AVAILABILITY_FIELDS = Object.freeze([
+    "server_metrics",
+    "scheduler_predictions",
+    "request_latency",
+    "request_kv",
+    "request_preemption",
+    "content",
+    "allocator",
+    "cache",
+    "disks",
+    "dspark",
+    "capture",
+]);
+
+function validateAvailability(value, path, issues) {
+    const availability = record(value, path, issues);
+    knownFields(availability, AVAILABILITY_FIELDS, path, issues);
+    for (const field of AVAILABILITY_FIELDS) {
+        boolean(availability[field], `${path}.${field}`, issues);
+    }
+}
+
+function validateLanePermitCounts(value, path, issues) {
+    const counts = array(value, path, issues, { maxLength: LANES.length });
+    if (counts.length !== LANES.length) {
+        issues.push(`${path} must contain one count per lane`);
+    }
+    for (const [index, count] of counts.entries()) {
+        integer(count, `${path}[${index}]`, issues, { min: 0 });
+    }
+}
+
+function validateRegistry(value, path, issues) {
+    const registry = record(value, path, issues);
+    knownFields(registry, [
+        "active_requests", "occupied_slots", "retained_events", "event_capacity",
+        "total_events", "dropped_events", "claimed_permits", "bound_permits", "total_permits",
+    ], path, issues);
+    for (const field of [
+        "active_requests", "occupied_slots", "retained_events", "event_capacity",
+        "total_events", "dropped_events", "total_permits",
+    ]) {
+        integer(registry[field], `${path}.${field}`, issues, { min: 0 });
+    }
+    validateLanePermitCounts(registry.claimed_permits, `${path}.claimed_permits`, issues);
+    validateLanePermitCounts(registry.bound_permits, `${path}.bound_permits`, issues);
 }
 
 function validateRequest(value, path, issues) {
@@ -420,8 +495,8 @@ function validateTimelineItem(value, path, issues) {
 function validateSnapshotInto(snapshotValue, path, issues) {
     const snapshot = record(snapshotValue, path, issues);
     knownFields(snapshot, [
-        "schema_version", "sequence", "generated_at", "server", "lanes", "requests", "allocator",
-        "cache", "disks", "dspark", "capture", "timeline",
+        "schema_version", "sequence", "generated_at", "availability", "registry", "server", "lanes",
+        "requests", "allocator", "cache", "disks", "dspark", "capture", "timeline",
     ], path, issues);
     integer(snapshot.schema_version, `${path}.schema_version`, issues, { min: 1 });
     if (snapshot.schema_version !== SCHEMA_VERSION) {
@@ -429,24 +504,11 @@ function validateSnapshotInto(snapshotValue, path, issues) {
     }
     integer(snapshot.sequence, `${path}.sequence`, issues, { min: 0 });
     string(snapshot.generated_at, `${path}.generated_at`, issues);
+    validateAvailability(snapshot.availability, `${path}.availability`, issues);
+    validateRegistry(snapshot.registry, `${path}.registry`, issues);
     validateServer(snapshot.server, `${path}.server`, issues);
 
-    const lanes = array(snapshot.lanes, `${path}.lanes`, issues);
-    const laneIds = new Set();
-    for (const [index, lane] of lanes.entries()) {
-        validateLane(lane, `${path}.lanes[${index}]`, issues);
-        if (isRecord(lane) && typeof lane.id === "string") {
-            if (laneIds.has(lane.id)) {
-                issues.push(`${path}.lanes contains duplicate lane ${lane.id}`);
-            }
-            laneIds.add(lane.id);
-        }
-    }
-    for (const lane of LANES) {
-        if (!laneIds.has(lane)) {
-            issues.push(`${path}.lanes is missing ${lane}`);
-        }
-    }
+    const lanes = validateLanes(snapshot.lanes, `${path}.lanes`, issues);
 
     const requests = array(snapshot.requests, `${path}.requests`, issues);
     const requestIds = new Set();
@@ -507,8 +569,14 @@ function validateEventPayload(event, issues) {
     const payload = record(event.payload, "event.payload", issues);
     switch (event.type) {
         case "request.upsert":
-            knownFields(payload, ["request"], "event.payload", issues);
+            knownFields(payload, ["request", "lanes", "registry"], "event.payload", issues);
             validateRequest(payload.request, "event.payload.request", issues);
+            if (Object.hasOwn(payload, "lanes")) {
+                validateLanes(payload.lanes, "event.payload.lanes", issues);
+            }
+            if (Object.hasOwn(payload, "registry")) {
+                validateRegistry(payload.registry, "event.payload.registry", issues);
+            }
             if (isRecord(payload.request)) {
                 if (event.request_id !== payload.request.id) {
                     issues.push("event.request_id must equal event.payload.request.id");
@@ -519,8 +587,14 @@ function validateEventPayload(event, issues) {
             }
             break;
         case "request.remove":
-            knownFields(payload, ["request_id"], "event.payload", issues);
+            knownFields(payload, ["request_id", "lanes", "registry"], "event.payload", issues);
             string(payload.request_id, "event.payload.request_id", issues);
+            if (Object.hasOwn(payload, "lanes")) {
+                validateLanes(payload.lanes, "event.payload.lanes", issues);
+            }
+            if (Object.hasOwn(payload, "registry")) {
+                validateRegistry(payload.registry, "event.payload.registry", issues);
+            }
             if (event.request_id !== payload.request_id) {
                 issues.push("event.request_id must equal event.payload.request_id");
             }

@@ -212,7 +212,13 @@ classification control::classify(
 bool control::authorize_snapshot(
         const std::string & remote_address,
         const std::map<std::string, std::string> & headers) const {
-    return trace_enabled() && authorized(cfg, remote_address, headers);
+    return trace_enabled() && authorize_operator(remote_address, headers);
+}
+
+bool control::authorize_operator(
+        const std::string & remote_address,
+        const std::map<std::string, std::string> & headers) const {
+    return authorized(cfg, remote_address, headers);
 }
 
 void control::record(trace_event event) {

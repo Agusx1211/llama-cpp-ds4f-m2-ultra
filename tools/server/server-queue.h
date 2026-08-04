@@ -31,6 +31,15 @@ struct server_queue_expiration {
     server_request_runtime::deadline_kind kind    = server_request_runtime::deadline_kind::queue;
 };
 
+// One lock-consistent, detached view for read-only operational consumers.
+// The request registry remains the sole source of request and event facts.
+struct server_queue_request_state {
+    std::vector<server_request_registry::request_snapshot> requests;
+    server_request_registry::event_log_snapshot            events;
+    server_request_registry::registry_summary              summary;
+    server_request_runtime::dispatch_permit_snapshot       permits;
+};
+
 enum class server_queue_bind_code : uint8_t {
     bound = 0,
     expired,
@@ -161,6 +170,7 @@ public:
     server_request_registry::event_log_snapshot request_events();
     server_request_registry::registry_summary request_summary();
     server_request_runtime::dispatch_permit_snapshot dispatch_permits();
+    server_queue_request_state request_state();
 
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called
