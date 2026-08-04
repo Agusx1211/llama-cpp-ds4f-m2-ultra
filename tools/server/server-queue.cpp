@@ -38,6 +38,18 @@ server_queue_post_result rejected_post(const server_request_runtime::admission_r
              overload ? bounded_retry_after_seconds(admission.retry_after_seconds) : 0 };
 }
 
+server_scheduler::lane to_scheduler_lane(server_task::trusted_lane lane) {
+    switch (lane) {
+        case server_task::trusted_lane::low:
+            return server_scheduler::lane::low;
+        case server_task::trusted_lane::normal:
+            return server_scheduler::lane::normal;
+        case server_task::trusted_lane::fast:
+            return server_scheduler::lane::fast;
+    }
+    return server_scheduler::lane::count;
+}
+
 }  // namespace
 
 server_queue::server_queue() : server_queue(live_runtime_config(), {}) {}
@@ -69,8 +81,6 @@ uint64_t server_queue::now_us() const {
 }
 
 server_request_runtime::request_metadata server_queue::make_request_metadata(server_task & task, uint64_t at_us) {
-    using scheduler_lane = server_scheduler::lane;
-
     server_request_runtime::request_metadata result;
     result.id                 = runtime_id(task.id);
     result.arrival_us           = task.scheduling.arrival_us == 0 ? at_us : task.scheduling.arrival_us;
@@ -84,21 +94,31 @@ server_request_runtime::request_metadata server_queue::make_request_metadata(ser
     result.estimates.predicted_gpu_us        = task.scheduling.predicted_gpu_us;
     result.estimates.predicted_memory_bytes  = task.scheduling.predicted_memory_bytes;
     result.estimates.predicted_output_tokens = task.scheduling.predicted_output_tokens;
+    result.parent_id                         = task.id_parent >= 0 ? runtime_id(task.id_parent) : 0;
     result.queue_timeout_us                  = task.scheduling.queue_timeout_us;
     result.run_timeout_us                    = task.scheduling.run_timeout_us;
-    switch (task.scheduling.lane) {
-        case server_task::trusted_lane::low:
-            result.lane = scheduler_lane::low;
-            break;
-        case server_task::trusted_lane::normal:
-            result.lane = scheduler_lane::normal;
-            break;
-        case server_task::trusted_lane::fast:
-            result.lane = scheduler_lane::fast;
-            break;
-    }
+    result.lane = to_scheduler_lane(task.scheduling.lane);
     task.scheduling.arrival_us = result.arrival_us;
     return result;
+}
+
+server_request_runtime::admission_result server_queue::validate_user_family(const server_task & task) const {
+    std::array<size_t, server_scheduler::lane_count> demand = {};
+    const auto priority = to_scheduler_lane(task.scheduling.lane);
+    if (priority == server_scheduler::lane::count) {
+        return { server_request_runtime::result_code::invalid_request,
+                 server_scheduler::reason_code::reject_invalid_request };
+    }
+    ++demand[static_cast<size_t>(priority)];
+    for (const server_task & child : task.child_tasks) {
+        const auto child_lane = to_scheduler_lane(child.scheduling.lane);
+        if (child_lane == server_scheduler::lane::count) {
+            return { server_request_runtime::result_code::invalid_request,
+                     server_scheduler::reason_code::reject_invalid_request };
+        }
+        ++demand[static_cast<size_t>(child_lane)];
+    }
+    return request_runtime.validate_dispatch_family(priority, demand, physical_slot_capacity);
 }
 
 server_request_runtime::admission_result server_queue::enqueue_user_task(server_task && task, uint64_t at_us) {
@@ -124,6 +144,12 @@ server_queue_post_result server_queue::post(server_task && task, bool front) {
     const int task_id = task.id;
     QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
     if (is_user_task(task)) {
+        const auto family = validate_user_family(task);
+        if (!family) {
+            lock.unlock();
+            notify_expired(expired);
+            return rejected_post(family, task_id);
+        }
         const auto admitted = enqueue_user_task(std::move(task), at_us);
         if (!admitted) {
             lock.unlock();
@@ -152,6 +178,19 @@ server_queue_post_result server_queue::post(std::vector<server_task> && tasks, b
         if (task.id == -1) {
             task.id = id++;
         }
+    }
+    for (const auto & task : tasks) {
+        if (!is_user_task(task)) {
+            continue;
+        }
+        const auto family = validate_user_family(task);
+        if (!family) {
+            lock.unlock();
+            notify_expired(expired);
+            return rejected_post(family, task.id);
+        }
+    }
+    for (auto & task : tasks) {
         // if this is cancel task make sure to clean up pending tasks
         if (task.type == SERVER_TASK_TYPE_CANCEL) {
             cleanup_pending_task(task.id_target, at_us);
@@ -362,6 +401,12 @@ void server_queue::terminate() {
     condition_tasks.notify_all();
 }
 
+void server_queue::set_physical_slot_capacity(size_t capacity) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    GGML_ASSERT(!running && capacity > 0);
+    physical_slot_capacity = capacity;
+}
+
 void server_queue::start_loop(int64_t idle_sleep_ms) {
     running = true;
     time_last_task = ggml_time_ms();
@@ -400,7 +445,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 task = std::move(queue_tasks.front());
                 queue_tasks.pop_front();
             } else {
-                const auto decision = request_runtime.take_next(now_us());
+                const auto decision = request_runtime.take_next(now_us(), physical_slot_capacity);
                 if (!decision.selected) {
                     lock.unlock();
                     break;
@@ -577,6 +622,17 @@ bool server_queue::fail_task(int id_task) {
     const uint64_t               at_us   = now_us();
     auto                         expired = expire_requests_locked(at_us);
     const bool                   failed  = id_task >= 0 && request_runtime.fail(runtime_id(id_task), at_us);
+    if (failed) {
+        erase_pending_payload(id_task);
+        if (request_runtime.family_has_bindings(runtime_id(id_task))) {
+            server_task cancel(SERVER_TASK_TYPE_CANCEL);
+            cancel.id        = id++;
+            cancel.id_target = id_task;
+            queue_tasks.emplace_front(std::move(cancel));
+            time_last_task = ggml_time_ms();
+            condition_tasks.notify_one();
+        }
+    }
     lock.unlock();
     notify_expired(expired);
     return failed;
@@ -595,6 +651,11 @@ server_request_registry::event_log_snapshot server_queue::request_events() {
 server_request_registry::registry_summary server_queue::request_summary() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     return request_runtime.summary();
+}
+
+server_request_runtime::dispatch_permit_snapshot server_queue::dispatch_permits() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    return request_runtime.permits();
 }
 
 //

@@ -284,6 +284,20 @@ struct server_task {
     }
 };
 
+// Keep family matching shared by the live server and its bound-slot tests.
+// Releasing a parent must include every parallel child that names it.
+template <typename SlotRange>
+size_t release_server_task_family_slots(SlotRange & slots, int id_target) {
+    size_t released = 0;
+    for (auto & slot : slots) {
+        if (slot.task && (slot.task->id == id_target || slot.task->id_parent == id_target)) {
+            slot.release();
+            ++released;
+        }
+    }
+    return released;
+}
+
 struct result_timings {
     int32_t cache_n = -1;
 

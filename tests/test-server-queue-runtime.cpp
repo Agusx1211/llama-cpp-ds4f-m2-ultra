@@ -4,12 +4,16 @@
 
 #include "server-queue.h"
 
+#include <array>
+
 #include <condition_variable>
 #include <cstdio>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -57,6 +61,32 @@ server_task make_user(server_queue &              queue,
     return task;
 }
 
+server_task make_family(server_queue &              queue,
+                        server_task::trusted_lane lane,
+                        uint64_t                   arrival_us,
+                        size_t                     children = 2) {
+    server_task parent = make_user(queue, lane, arrival_us);
+    for (size_t i = 0; i < children; ++i) {
+        parent.add_child(parent.id, queue.get_new_id());
+    }
+    return parent;
+}
+
+struct bound_family_slot {
+    server_queue *                     queue = nullptr;
+    int                                slot  = -1;
+    std::unique_ptr<const server_task> task;
+
+    bound_family_slot(server_queue & queue, int slot, server_task && task) :
+        queue(&queue), slot(slot), task(std::make_unique<const server_task>(std::move(task))) {}
+
+    void release() {
+        const int task_id = task->id;
+        require(queue->release_slot(task_id, slot), "family release helper drains bound durable slot");
+        task.reset();
+    }
+};
+
 void bind_only(server_queue & queue, int task_id, int slot_id) {
     queue.on_new_task([&](server_task && selected) {
         require(selected.id == task_id, "dispatch expected publication task");
@@ -102,6 +132,28 @@ void require_timeout_only(server_response & responses, int task_id, const char *
     require(error != nullptr && error->err_type == ERROR_TYPE_TIMEOUT, message);
     require(responses.recv_with_timeout({ task_id }, 0) == nullptr,
             "terminal timeout leaves no queued success result");
+}
+
+void retire_bound_and_queued(server_queue &           queue,
+                             const std::vector<int> & all_ids,
+                             const std::vector<int> & bound_ids,
+                             const char *             message) {
+    for (size_t i = 0; i < bound_ids.size(); ++i) {
+        require(queue.release_slot(bound_ids[i], static_cast<int>(i)), "release fixture bound permit");
+    }
+
+    const std::unordered_set<int> bound_set(bound_ids.begin(), bound_ids.end());
+    std::vector<server_task>      cancellations;
+    for (int id : all_ids) {
+        if (bound_set.count(id) == 0) {
+            server_task cancel(SERVER_TASK_TYPE_CANCEL);
+            cancel.id_target = id;
+            cancellations.push_back(std::move(cancel));
+        }
+    }
+    require(queue.post(std::move(cancellations), true) && queue.request_summary().active_requests == 0 &&
+                queue.dispatch_permits().total == 0,
+            message);
 }
 
 void test_internal_and_three_lane_dispatch() {
@@ -406,7 +458,8 @@ void test_queue_and_deferred_deadlines() {
     });
     queue.start_loop();
     require(expirations.size() == 2 && expirations.back().task_id == replacement_id &&
-                queue.queue_tasks_deferred_size() == 0 && queue.request_summary().active_requests == 0,
+                queue.queue_tasks_deferred_size() == 0 && queue.request_summary().active_requests == 0 &&
+                queue.dispatch_permits().total == 0,
             "blocked deferred request expires, removes payload, and retires metadata");
 }
 
@@ -437,7 +490,7 @@ void test_selected_request_expires_before_bind() {
     require(queue.post(std::move(task)), "post pre-bind deadline request");
     queue.start_loop();
     require(bind_code == server_queue_bind_code::expired && expiration_callbacks == 1 &&
-                queue.request_summary().active_requests == 0,
+                queue.request_summary().active_requests == 0 && queue.dispatch_permits().total == 0,
             "selected payload crossing its deadline cannot bind or remain durable");
 }
 
@@ -497,6 +550,201 @@ void test_passive_child_cancellation() {
     queue.start_loop();
     require(cancellation_dispatches == 1 && queue.request_summary().active_requests == 0,
             "passive-child cancellation retires independently");
+}
+
+void test_parent_cancellation_retires_family() {
+    server_queue queue;
+    server_task  parent    = make_family(queue, server_task::trusted_lane::normal, 460);
+    const int    parent_id = parent.id;
+    std::vector<server_task> tasks;
+    tasks.push_back(std::move(parent));
+    require(queue.post(std::move(tasks)), "post family for parent cancellation");
+
+    server_task cancel(SERVER_TASK_TYPE_CANCEL);
+    cancel.id        = queue.get_new_id();
+    cancel.id_target = parent_id;
+    require(queue.post(std::move(cancel), true) && queue.request_summary().active_requests == 0 &&
+                queue.dispatch_permits().total == 0,
+            "parent cancellation retires every passive durable child");
+
+    int user_dispatches = 0;
+    queue.on_new_task([&](server_task && selected) {
+        user_dispatches += selected.type == SERVER_TASK_TYPE_COMPLETION;
+    });
+    queue.on_update_slots([&] { queue.terminate(); });
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+    require(user_dispatches == 0, "cancelled parent payload and children cannot reach slot launch");
+}
+
+void test_parent_failure_retires_queued_family() {
+    server_queue queue;
+    server_task  parent    = make_family(queue, server_task::trusted_lane::normal, 470);
+    const int    parent_id = parent.id;
+    std::vector<server_task> tasks;
+    tasks.push_back(std::move(parent));
+    require(queue.post(std::move(tasks)), "post family for parent failure");
+    require(queue.fail_task(parent_id) && queue.request_summary().active_requests == 0 &&
+                queue.dispatch_permits().total == 0,
+            "parent setup failure retires the queued family");
+
+    int user_dispatches = 0;
+    queue.on_new_task([&](server_task && selected) {
+        user_dispatches += selected.type == SERVER_TASK_TYPE_COMPLETION;
+    });
+    queue.on_update_slots([&] { queue.terminate(); });
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+    require(user_dispatches == 0, "failed parent payload and children cannot reach slot launch");
+}
+
+void test_partial_family_launch_failure_retires_permits() {
+    server_queue queue;
+    server_task  parent    = make_family(queue, server_task::trusted_lane::normal, 480);
+    const int    parent_id = parent.id;
+    std::vector<server_task> tasks;
+    tasks.push_back(std::move(parent));
+    require(queue.post(std::move(tasks)), "post family for partial launch failure");
+
+    queue.on_new_task([&](server_task && selected) {
+        require(selected.id == parent_id && selected.child_tasks.size() == 2,
+                "family dispatch preserves both child payloads");
+        const int launched_child = selected.child_tasks[0].id;
+        const int unbound_child  = selected.child_tasks[1].id;
+        require(queue.bind_slot(launched_child, 0), "simulate one launched child");
+        require(queue.fail_task(parent_id), "partial launch failure marks the complete family");
+        require(!queue.bind_slot(unbound_child, 1), "unlaunched child cannot bind after parent failure");
+        require(queue.release_slot(launched_child, 0), "release the one failed launched child");
+        require(queue.request_summary().active_requests == 0 && queue.dispatch_permits().total == 0,
+                "partial family launch failure retires all records and permits");
+        queue.terminate();
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+}
+
+void run_bound_parent_terminal_releases_family(bool fail_parent) {
+    server_queue queue;
+    server_task  parent    = make_family(queue, server_task::trusted_lane::normal, fail_parent ? 490 : 485);
+    const int    parent_id = parent.id;
+    std::vector<server_task> tasks;
+    tasks.push_back(std::move(parent));
+    require(queue.post(std::move(tasks)), "post family for bound parent terminal path");
+
+    std::vector<bound_family_slot> slots;
+    int                            cancel_controls = 0;
+    queue.on_new_task([&](server_task && selected) {
+        if (selected.type == SERVER_TASK_TYPE_CANCEL) {
+            ++cancel_controls;
+            require(selected.id_target == parent_id && release_server_task_family_slots(slots, parent_id) == 3,
+                    "server family control releases parent and every id_parent child");
+            require(queue.request_summary().active_requests == 0 && queue.dispatch_permits().total == 0,
+                    "server family control drains every bound durable permit");
+            queue.terminate();
+            return;
+        }
+
+        require(selected.id == parent_id && selected.child_tasks.size() == 2,
+                "bound terminal fixture dispatches complete family");
+        int slot = 0;
+        for (server_task & child : selected.child_tasks) {
+            const int child_id = child.id;
+            require(queue.bind_slot(child_id, slot), "bind child before parent terminal event");
+            slots.emplace_back(queue, slot++, std::move(child));
+        }
+        require(queue.bind_slot(parent_id, slot), "bind parent before terminal event");
+        slots.emplace_back(queue, slot, std::move(selected));
+
+        if (fail_parent) {
+            require(queue.fail_task(parent_id), "bound parent failure schedules family release control");
+        } else {
+            server_task cancel(SERVER_TASK_TYPE_CANCEL);
+            cancel.id        = queue.get_new_id();
+            cancel.id_target = parent_id;
+            require(queue.post(std::move(cancel), true), "bound parent cancellation posts family release control");
+        }
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+    require(cancel_controls == 1, "bound parent terminal event executes one family release control");
+}
+
+void test_bound_parent_cancellation_releases_family_slots() {
+    run_bound_parent_terminal_releases_family(false);
+}
+
+void test_bound_parent_failure_releases_family_slots() {
+    run_bound_parent_terminal_releases_family(true);
+}
+
+server_queue_post_result post_family(server_queue & queue, server_task::trusted_lane lane, size_t children) {
+    server_task parent = make_family(queue, lane, 500, children);
+    std::vector<server_task> tasks;
+    tasks.push_back(std::move(parent));
+    return queue.post(std::move(tasks));
+}
+
+void run_accepted_family_width(server_task::trusted_lane lane, size_t children, size_t expected_members) {
+    server_queue queue;
+    require(post_family(queue, lane, children), "accept family at exact cohort shape");
+    queue.on_new_task([&](server_task && selected) {
+        require(selected.child_tasks.size() + 1 == expected_members,
+                "accepted family retains every passive child payload");
+        int slot = 0;
+        for (const server_task & child : selected.child_tasks) {
+            require(queue.bind_slot(child.id, slot), "bind accepted boundary child");
+            ++slot;
+        }
+        require(queue.bind_slot(selected.id, slot), "bind accepted boundary parent");
+        slot = 0;
+        for (const server_task & child : selected.child_tasks) {
+            require(queue.release_slot(child.id, slot), "release accepted boundary child");
+            ++slot;
+        }
+        require(queue.release_slot(selected.id, slot), "release accepted boundary parent");
+        queue.terminate();
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+    require(queue.request_summary().active_requests == 0 && queue.dispatch_permits().total == 0,
+            "accepted family boundary drains without leaks");
+}
+
+void test_family_width_admission_is_atomic() {
+    for (const auto & rejected : std::vector<std::pair<server_task::trusted_lane, size_t>>({
+             { server_task::trusted_lane::normal, 8  },
+             { server_task::trusted_lane::fast,   2  },
+             { server_task::trusted_lane::low,    19 },
+         })) {
+        server_queue queue;
+        const auto result = post_family(queue, rejected.first, rejected.second);
+        require(!result && result.code == server_queue_post_code::unavailable &&
+                    queue.request_summary().active_requests == 0 && queue.dispatch_permits().total == 0,
+                "impossible family shape is rejected before durable insertion");
+    }
+
+    server_queue physical;
+    physical.set_physical_slot_capacity(2);
+    const auto physical_rejection = post_family(physical, server_task::trusted_lane::normal, 2);
+    require(!physical_rejection && physical_rejection.code == server_queue_post_code::unavailable &&
+                physical.request_summary().active_requests == 0,
+            "family wider than authoritative physical slots is rejected atomically");
+
+    server_queue atomic;
+    server_task valid   = make_user(atomic, server_task::trusted_lane::normal, 510);
+    server_task invalid = make_family(atomic, server_task::trusted_lane::fast, 511, 2);
+    std::vector<server_task> mixed;
+    mixed.push_back(std::move(valid));
+    mixed.push_back(std::move(invalid));
+    require(!atomic.post(std::move(mixed)) && atomic.request_summary().active_requests == 0,
+            "multi-post preflight rejects a later impossible family without admitting earlier work");
+
+    run_accepted_family_width(server_task::trusted_lane::normal, 7, 8);
+    run_accepted_family_width(server_task::trusted_lane::fast, 1, 2);
+    run_accepted_family_width(server_task::trusted_lane::low, 23, 24);
 }
 
 void test_final_result_publication_deadline_gate() {
@@ -712,7 +960,7 @@ void test_concurrent_update_publication_after_expiry() {
 
 void test_publication_gate_scales_without_global_sweep() {
     auto config = test_runtime_config();
-    config.scheduler.lanes[static_cast<size_t>(server_scheduler::lane::normal)].queue_cap = 128;
+    config.scheduler.lanes[static_cast<size_t>(server_scheduler::lane::low)].queue_cap = 128;
     config.registry.max_requests                                                        = 128;
     config.default_queue_timeout_us                                                     = 1000;
     config.default_run_timeout_us                                                       = 1000;
@@ -727,7 +975,7 @@ void test_publication_gate_scales_without_global_sweep() {
     int unrelated_due_id = -1;
     int release_probe_id = -1;
     for (int i = 0; i < 64; ++i) {
-        server_task task = make_user(queue, server_task::trusted_lane::normal, 0);
+        server_task task = make_user(queue, server_task::trusted_lane::low, 0);
         if (i == 0) {
             target_id                      = task.id;
             task.scheduling.run_timeout_us = 100;
@@ -755,7 +1003,7 @@ void test_publication_gate_scales_without_global_sweep() {
     queue.start_loop();
 
     for (int i = 0; i < 32; ++i) {
-        server_task task  = make_user(queue, server_task::trusted_lane::normal, 0);
+        server_task task  = make_user(queue, server_task::trusted_lane::low, 0);
         const int task_id = task.id;
         require_posted(queue.post(std::move(task)), task_id, "post scaled queued publication task");
         queued_ids.push_back(task_id);
@@ -798,6 +1046,346 @@ void test_publication_gate_scales_without_global_sweep() {
     }
     require(queue.post(std::move(cancellations), true) && queue.request_summary().active_requests == 0,
             "scale fixture cleanup retires all remaining durable requests");
+}
+
+void run_mixed_lane_isolation(bool include_fast,
+                              const std::array<size_t, server_scheduler::lane_count> & expected) {
+    server_queue queue;
+    queue.set_physical_slot_capacity(64);
+    std::vector<int> all_ids;
+    std::vector<std::pair<server_task::trusted_lane, size_t>> fixtures = {
+        { server_task::trusted_lane::low,    65 },
+        { server_task::trusted_lane::normal, 9  },
+    };
+    if (include_fast) {
+        fixtures.push_back({ server_task::trusted_lane::fast, 3 });
+    }
+    for (const auto & fixture : fixtures) {
+        for (size_t i = 0; i < fixture.second; ++i) {
+            server_task task = make_user(queue, fixture.first, i + 1);
+            all_ids.push_back(task.id);
+            require_posted(queue.post(std::move(task)), all_ids.back(), "post mixed permit task");
+        }
+    }
+
+    std::array<size_t, server_scheduler::lane_count> dispatched = {};
+    std::vector<int>                                 bound_ids;
+    queue.on_new_task([&](server_task && selected) {
+        const size_t lane_index = static_cast<size_t>(selected.scheduling.lane);
+        ++dispatched[lane_index];
+        const int slot = static_cast<int>(bound_ids.size());
+        require(queue.bind_slot(selected.id, slot), "mixed dispatch binds claimed permit");
+        bound_ids.push_back(selected.id);
+    });
+    queue.on_update_slots([&] {
+        const auto permits = queue.dispatch_permits();
+        require(dispatched == expected && permits.claimed == expected && permits.bound == expected &&
+                    permits.total == (include_fast ? 2 : 8),
+                "dominant live lane bounds the entire mixed cohort");
+        queue.terminate();
+    });
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+    retire_bound_and_queued(queue, all_ids, bound_ids, "mixed permit fixture retires without leaks");
+}
+
+void test_start_loop_enforces_live_lane_and_physical_permits() {
+    run_mixed_lane_isolation(true, { 0, 0, 2 });
+    run_mixed_lane_isolation(false, { 0, 8, 0 });
+}
+
+void run_exclusive_low_width(size_t ready, size_t expected) {
+    server_queue queue;
+    queue.set_physical_slot_capacity(64);
+    std::vector<int> all_ids;
+    std::vector<int> bound_ids;
+    for (size_t i = 0; i < ready; ++i) {
+        server_task task = make_user(queue, server_task::trusted_lane::low, i + 1);
+        all_ids.push_back(task.id);
+        require_posted(queue.post(std::move(task)), all_ids.back(), "post exclusive low task");
+    }
+    queue.on_new_task([&](server_task && selected) {
+        const int slot = static_cast<int>(bound_ids.size());
+        require(queue.bind_slot(selected.id, slot), "exclusive low selection binds permit");
+        bound_ids.push_back(selected.id);
+    });
+    queue.on_update_slots([&] {
+        require(bound_ids.size() == expected && queue.dispatch_permits().total == expected,
+                "start_loop stops at the profiled exclusive-low shape");
+        queue.terminate();
+    });
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+    retire_bound_and_queued(queue, all_ids, bound_ids, "exclusive low fixture cleanup");
+}
+
+void test_start_loop_uses_profiled_exclusive_low_shapes() {
+    run_exclusive_low_width(20, 8);
+    run_exclusive_low_width(24, 24);
+}
+
+void test_fast_arrival_bypasses_ready_low_backlog() {
+    server_queue queue;
+    queue.set_physical_slot_capacity(4);
+    std::vector<int> all_ids;
+    for (size_t i = 0; i < 20; ++i) {
+        server_task low = make_user(queue, server_task::trusted_lane::low, i + 1);
+        all_ids.push_back(low.id);
+        require_posted(queue.post(std::move(low)), all_ids.back(), "post fast-arrival low backlog");
+    }
+
+    std::vector<int>                       bound_ids;
+    std::vector<server_task::trusted_lane> order;
+    queue.on_new_task([&](server_task && selected) {
+        order.push_back(selected.scheduling.lane);
+        const int slot = static_cast<int>(bound_ids.size());
+        require(queue.bind_slot(selected.id, slot), "bind dynamic-arrival selection");
+        bound_ids.push_back(selected.id);
+        if (order.size() == 1) {
+            server_task fast = make_user(queue, server_task::trusted_lane::fast, 100);
+            all_ids.push_back(fast.id);
+            require_posted(queue.post(std::move(fast)), all_ids.back(), "post fast request during low dispatch");
+        }
+    });
+    queue.on_update_slots([&] {
+        require(order == std::vector<server_task::trusted_lane>(
+                             { server_task::trusted_lane::low, server_task::trusted_lane::fast }) &&
+                    queue.dispatch_permits().total == 2 && queue.request_summary().active_requests == 21,
+                "fast arrival stops widening and leaves the remaining low backlog untouched");
+        queue.terminate();
+    });
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+    require(order == std::vector<server_task::trusted_lane>(
+                         { server_task::trusted_lane::low, server_task::trusted_lane::fast }),
+            "new fast work is selected before and stops the remaining ready low backlog");
+    retire_bound_and_queued(queue, all_ids, bound_ids, "dynamic-arrival fixture cleanup");
+}
+
+void test_live_hdrr_under_sustained_mixed_queues() {
+    server_queue queue;
+    queue.set_physical_slot_capacity(1);
+    std::array<size_t, server_scheduler::lane_count> dispatches = {};
+    std::unordered_set<int>                          live_ids;
+    uint64_t                                         arrival = 1;
+
+    const auto post_lane = [&](server_task::trusted_lane lane) {
+        server_task task                 = make_user(queue, lane, arrival++);
+        task.scheduling.predicted_gpu_us = 1000;
+        const int task_id                = task.id;
+        live_ids.insert(task_id);
+        require_posted(queue.post(std::move(task)), task_id, "post sustained HDRR task");
+    };
+    for (int i = 0; i < 2; ++i) {
+        post_lane(server_task::trusted_lane::low);
+        post_lane(server_task::trusted_lane::normal);
+        post_lane(server_task::trusted_lane::fast);
+    }
+
+    size_t total = 0;
+    queue.on_new_task([&](server_task && selected) {
+        const auto lane = selected.scheduling.lane;
+        live_ids.erase(selected.id);
+        ++dispatches[static_cast<size_t>(lane)];
+        ++total;
+        require(queue.bind_slot(selected.id, 0) && queue.release_slot(selected.id, 0),
+                "sustained HDRR dispatch converts and releases one permit");
+        if (total == 2100) {
+            queue.terminate();
+        } else {
+            post_lane(lane);
+        }
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+    require(dispatches == std::array<size_t, server_scheduler::lane_count>({ 100, 400, 1600 }),
+            "live start_loop preserves the exact 1:4:16 HDRR share under sustained load");
+
+    std::vector<server_task> cancellations;
+    for (int id : live_ids) {
+        server_task cancel(SERVER_TASK_TYPE_CANCEL);
+        cancel.id_target = id;
+        cancellations.push_back(std::move(cancel));
+    }
+    require(queue.post(std::move(cancellations), true) && queue.request_summary().active_requests == 0,
+            "sustained HDRR fixture cleanup");
+}
+
+void test_live_hdrr_starts_sustained_wide_cohorts() {
+    server_queue queue;
+    queue.set_physical_slot_capacity(2);
+    std::array<size_t, server_scheduler::lane_count> cohort_starts = {};
+    std::unordered_set<int>                          live_ids;
+    std::vector<std::pair<int, server_task::trusted_lane>> cohort;
+    uint64_t                                         arrival = 1;
+
+    const auto post_lane = [&](server_task::trusted_lane lane) {
+        server_task task                 = make_user(queue, lane, arrival++);
+        task.scheduling.predicted_gpu_us = 1000;
+        const int task_id                = task.id;
+        live_ids.insert(task_id);
+        require_posted(queue.post(std::move(task)), task_id, "post sustained wide-cohort task");
+    };
+    for (int i = 0; i < 3; ++i) {
+        post_lane(server_task::trusted_lane::low);
+        post_lane(server_task::trusted_lane::normal);
+        post_lane(server_task::trusted_lane::fast);
+    }
+
+    size_t cohorts = 0;
+    queue.on_new_task([&](server_task && selected) {
+        const auto lane = selected.scheduling.lane;
+        live_ids.erase(selected.id);
+        const int slot = static_cast<int>(cohort.size());
+        require(slot < 2 && queue.bind_slot(selected.id, slot), "bind sustained wide-cohort request");
+        cohort.emplace_back(selected.id, lane);
+    });
+    queue.on_update_slots([&] {
+        require(cohort.size() == 2 && queue.dispatch_permits().total == 2,
+                "each sustained wide cohort fills the two physical slots");
+        const auto first  = static_cast<size_t>(cohort[0].second);
+        const auto second = static_cast<size_t>(cohort[1].second);
+        require(second >= first, "a live cohort stays on its starting lane or upgrades to a higher lane");
+        ++cohort_starts[first];
+        for (size_t slot = 0; slot < cohort.size(); ++slot) {
+            require(queue.release_slot(cohort[slot].first, static_cast<int>(slot)),
+                    "release sustained wide-cohort permit");
+        }
+
+        ++cohorts;
+        if (cohorts == 210) {
+            queue.terminate();
+        } else {
+            post_lane(cohort[0].second);
+            post_lane(cohort[1].second);
+        }
+        cohort.clear();
+    });
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+    require(cohort_starts[static_cast<size_t>(server_task::trusted_lane::low)] != 0 &&
+                cohort_starts[static_cast<size_t>(server_task::trusted_lane::normal)] != 0 &&
+                cohort_starts[static_cast<size_t>(server_task::trusted_lane::fast)] != 0,
+            "HDRR lets every lane begin a cohort under sustained two-slot load");
+
+    std::vector<server_task> cancellations;
+    for (int id : live_ids) {
+        server_task cancel(SERVER_TASK_TYPE_CANCEL);
+        cancel.id_target = id;
+        cancellations.push_back(std::move(cancel));
+    }
+    require(queue.post(std::move(cancellations), true) && queue.request_summary().active_requests == 0 &&
+                queue.dispatch_permits().total == 0,
+            "sustained wide-cohort fixture cleanup");
+}
+
+void test_staggered_cohorts_drain_before_same_lane_refill() {
+    struct active_slot {
+        int id;
+        int slot;
+        server_task::trusted_lane lane;
+    };
+
+    server_queue queue;
+    queue.set_physical_slot_capacity(2);
+    std::array<size_t, server_scheduler::lane_count> cohort_starts = {};
+    std::array<bool, 2>                              slot_busy = {};
+    std::vector<active_slot>                         active;
+    std::unordered_set<int>                          live_ids;
+    uint64_t                                         arrival = 1;
+    size_t                                           epochs = 0;
+    bool                                             stopping = false;
+
+    const auto post_lane = [&](server_task::trusted_lane lane) {
+        server_task task                 = make_user(queue, lane, arrival++);
+        task.scheduling.predicted_gpu_us = 1000;
+        const int task_id                = task.id;
+        live_ids.insert(task_id);
+        require_posted(queue.post(std::move(task)), task_id, "post staggered cohort task");
+    };
+    for (int i = 0; i < 3; ++i) {
+        post_lane(server_task::trusted_lane::low);
+        post_lane(server_task::trusted_lane::normal);
+        post_lane(server_task::trusted_lane::fast);
+    }
+
+    queue.on_new_task([&](server_task && selected) {
+        if (active.empty()) {
+            ++cohort_starts[static_cast<size_t>(selected.scheduling.lane)];
+            ++epochs;
+            if (epochs >= 210 && std::all_of(cohort_starts.begin(), cohort_starts.end(),
+                                              [](size_t starts) { return starts >= 5; })) {
+                stopping = true;
+            }
+            require(epochs <= 420, "staggered cohort fairness converges within a deterministic bound");
+        }
+        const auto free_slot = std::find(slot_busy.begin(), slot_busy.end(), false);
+        require(free_slot != slot_busy.end(), "staggered cohort never exceeds two physical slots");
+        const int slot = static_cast<int>(free_slot - slot_busy.begin());
+        slot_busy[slot] = true;
+        live_ids.erase(selected.id);
+        require(queue.bind_slot(selected.id, slot), "bind staggered cohort member");
+        active.push_back({ selected.id, slot, selected.scheduling.lane });
+    });
+    queue.on_update_slots([&] {
+        require(!active.empty() && active.size() <= 2, "staggered update owns a bounded live cohort");
+        const active_slot completed = active.front();
+        active.erase(active.begin());
+        require(queue.release_slot(completed.id, completed.slot), "release one staggered cohort member");
+        slot_busy[completed.slot] = false;
+
+        if (stopping) {
+            if (active.empty()) {
+                queue.terminate();
+            }
+        } else {
+            post_lane(completed.lane);
+        }
+    });
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+    require(std::all_of(cohort_starts.begin(), cohort_starts.end(), [](size_t starts) { return starts >= 5; }),
+            "every HDRR lane repeatedly begins cohorts under staggered continuous completion");
+
+    std::vector<server_task> cancellations;
+    for (int id : live_ids) {
+        server_task cancel(SERVER_TASK_TYPE_CANCEL);
+        cancel.id_target = id;
+        cancellations.push_back(std::move(cancel));
+    }
+    require(queue.post(std::move(cancellations), true) && queue.request_summary().active_requests == 0 &&
+                queue.dispatch_permits().total == 0,
+            "staggered cohort fixture drains and cancels without permit leaks");
+}
+
+void test_live_aging() {
+    uint64_t     now_us = 20001;
+    server_queue queue(test_runtime_config(), [&] { return now_us; });
+    queue.set_physical_slot_capacity(1);
+    server_task old                   = make_user(queue, server_task::trusted_lane::normal, 1);
+    old.scheduling.virtual_runtime_us = 4000;
+    const int old_id                  = old.id;
+    require_posted(queue.post(std::move(old)), old_id, "post aged request");
+    server_task fresh    = make_user(queue, server_task::trusted_lane::normal, 20000);
+    const int   fresh_id = fresh.id;
+    require_posted(queue.post(std::move(fresh)), fresh_id, "post fresh request");
+    int selected_id = -1;
+    queue.on_new_task([&](server_task && selected) {
+        selected_id = selected.id;
+        require(queue.bind_slot(selected.id, 0) && queue.release_slot(selected.id, 0),
+                "aged request completes its permit");
+        queue.terminate();
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+    require(selected_id == old_id, "bounded aging promotes the old request ahead of fresh work");
+    server_task cancel(SERVER_TASK_TYPE_CANCEL);
+    cancel.id        = queue.get_new_id();
+    cancel.id_target = fresh_id;
+    require(queue.post(std::move(cancel), true) && queue.request_summary().active_requests == 0,
+            "aging fixture cleanup");
 }
 
 void test_bound_stream_timeout_and_cancel_race() {
@@ -888,10 +1476,23 @@ int main() {
         { "selected pre-bind deadline",   test_selected_request_expires_before_bind     },
         { "passive child deadlines",      test_passive_child_deadline_order             },
         { "passive child cancellation",   test_passive_child_cancellation               },
+        { "parent family cancellation",   test_parent_cancellation_retires_family       },
+        { "parent family failure",        test_parent_failure_retires_queued_family     },
+        { "partial family launch failure", test_partial_family_launch_failure_retires_permits },
+        { "bound parent family cancellation", test_bound_parent_cancellation_releases_family_slots },
+        { "bound parent family failure",      test_bound_parent_failure_releases_family_slots      },
+        { "atomic family width",               test_family_width_admission_is_atomic                 },
         { "final publication gate",       test_final_result_publication_deadline_gate   },
         { "stream publication gate",      test_stream_result_publication_deadline_gate  },
         { "concurrent publication expiry", test_concurrent_update_publication_after_expiry },
         { "publication scale isolation",  test_publication_gate_scales_without_global_sweep },
+        { "live lane and physical permits", test_start_loop_enforces_live_lane_and_physical_permits },
+        { "profiled live low widths",       test_start_loop_uses_profiled_exclusive_low_shapes      },
+        { "fast arrival bypass",            test_fast_arrival_bypasses_ready_low_backlog            },
+        { "sustained live HDRR",            test_live_hdrr_under_sustained_mixed_queues             },
+        { "sustained wide HDRR cohorts",    test_live_hdrr_starts_sustained_wide_cohorts            },
+        { "staggered draining HDRR cohorts", test_staggered_cohorts_drain_before_same_lane_refill   },
+        { "live aging",                     test_live_aging                                         },
         { "bound stream timeout",         test_bound_stream_timeout_and_cancel_race     },
     };
 
