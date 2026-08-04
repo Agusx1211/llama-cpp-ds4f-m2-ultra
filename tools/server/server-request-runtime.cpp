@@ -62,6 +62,19 @@ uint64_t saturating_add(uint64_t lhs, uint64_t rhs) {
     return rhs > std::numeric_limits<uint64_t>::max() - lhs ? std::numeric_limits<uint64_t>::max() : lhs + rhs;
 }
 
+uint64_t proportional_cached_prefix_us(const request_metadata & request) {
+    const uint64_t prompt_tokens = request.counts.prompt_tokens;
+    if (prompt_tokens == 0) {
+        return 0;
+    }
+    const uint64_t cached_tokens = std::min(request.counts.cached_prompt_tokens, prompt_tokens);
+    // The ratio is bounded by predicted_prefill_us because cached_tokens <= prompt_tokens.
+    // Widening only the product preserves the exact floor without overflow.
+    using wide_uint              = __uint128_t;
+    return static_cast<uint64_t>(static_cast<wide_uint>(request.estimates.predicted_prefill_us) * cached_tokens /
+                                 prompt_tokens);
+}
+
 uint64_t deadline_from(uint64_t start_us, uint64_t timeout_us) {
     return timeout_us == 0 ? std::numeric_limits<uint64_t>::max() : saturating_add(start_us, timeout_us);
 }
@@ -287,8 +300,9 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
                 return result;
             }
             result.predicted_gpu_us = std::max<uint64_t>(1, it->second.metadata.estimates.predicted_gpu_us);
+            result.cached_prefix_us = proportional_cached_prefix_us(it->second.metadata);
             if (it->second.metadata.counts.cached_prompt_tokens != 0) {
-                result.cached_prefix_us = it->second.metadata.estimates.predicted_prefill_us;
+                result.restore_cost_us  = it->second.metadata.estimates.predicted_cache_restore_us;
             }
 
             const permit_demand demand = demand_for(request.id);

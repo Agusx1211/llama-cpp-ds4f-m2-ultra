@@ -5,6 +5,7 @@
 #include "server-request-runtime.h"
 
 #include <cstdio>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -32,6 +33,7 @@ request_metadata make_request(uint64_t id, lane priority, uint64_t arrival_us) {
     request.counts.cached_prompt_tokens       = 64;
     request.counts.requested_output_tokens    = 32;
     request.estimates.predicted_prefill_us    = 100;
+    request.estimates.predicted_cache_restore_us = 25;
     request.estimates.predicted_decode_us     = 200;
     request.estimates.predicted_gpu_us        = 300;
     request.estimates.predicted_memory_bytes  = 4096;
@@ -58,7 +60,7 @@ void test_live_ingress_and_dispatch() {
     require(fast.lane == trusted_lane::fast && fast.arrival_us == 102, "trusted ingress identity");
     require(fast.virtual_runtime_us == 10 && fast.debt_us == -3, "runtime and debt stamped");
     require(fast.counts.prompt_tokens == 128 && fast.counts.cached_prompt_tokens == 64, "token counts stamped");
-    require(fast.estimates.predicted_gpu_us == 300 &&
+    require(fast.estimates.predicted_gpu_us == 300 && fast.estimates.predicted_cache_restore_us == 25 &&
                 fast.last_reason == server_request_registry::reason_code::admission_ready,
             "estimates and reason stamped");
 
@@ -344,6 +346,61 @@ void test_zero_configuration_keeps_bounded_defaults() {
             "zero configuration cannot disable bounded run default");
 }
 
+void test_cache_affinity_scales_partial_hits_without_overflow() {
+    runtime_config config;
+    config.scheduler.context_tokens       = std::numeric_limits<uint64_t>::max();
+    config.scheduler.aging_credit_us      = 1;
+    config.scheduler.max_aging_credit_us  = 1;
+
+    {
+        request_runtime runtime(config);
+        request_metadata empty = make_request(71, lane::normal, 1);
+        empty.virtual_runtime_us                   = 500;
+        empty.counts.prompt_tokens                 = 0;
+        empty.counts.cached_prompt_tokens          = 0;
+        empty.counts.requested_output_tokens       = 0;
+        empty.estimates.predicted_prefill_us       = std::numeric_limits<uint64_t>::max();
+        empty.estimates.predicted_cache_restore_us = 0;
+
+        request_metadata miss = make_request(72, lane::normal, 1);
+        miss.virtual_runtime_us             = 500;
+        miss.counts.prompt_tokens           = 1;
+        miss.counts.cached_prompt_tokens    = 0;
+        miss.counts.requested_output_tokens = 0;
+        miss.estimates.predicted_prefill_us = 0;
+        require(runtime.admit(empty) && runtime.admit(miss), "admit zero-prompt cache-scaling fixture");
+        const dispatch_result selected = runtime.take_next(1, 1);
+        require(selected.selected && selected.request_id == 71,
+                "zero-prompt work has zero cache affinity and preserves FIFO");
+        require(runtime.cancel(71, 2) && runtime.cancel(72, 2), "zero-prompt fixture cleanup");
+    }
+
+    {
+        request_runtime runtime(config);
+        request_metadata miss = make_request(81, lane::normal, 1);
+        miss.virtual_runtime_us             = 500;
+        miss.counts.prompt_tokens           = 1;
+        miss.counts.cached_prompt_tokens    = 0;
+        miss.counts.requested_output_tokens = 0;
+        miss.estimates.predicted_prefill_us = 0;
+
+        request_metadata partial = make_request(82, lane::normal, 1);
+        partial.virtual_runtime_us                   = 501;
+        partial.counts.prompt_tokens                 = std::numeric_limits<uint64_t>::max() - 1;
+        partial.counts.cached_prompt_tokens          = 2;
+        partial.counts.requested_output_tokens       = 0;
+        partial.estimates.predicted_prefill_us       = std::numeric_limits<uint64_t>::max();
+        partial.estimates.predicted_cache_restore_us = 0;
+
+        require(runtime.admit(miss) && runtime.admit(partial), "admit overflow-safe cache-scaling fixture");
+        const dispatch_result selected = runtime.take_next(1, 1);
+        require(selected.selected && selected.request_id == 82 &&
+                    selected.request_reason == server_scheduler::reason_code::request_cache_affinity,
+                "overflow-safe proportional estimate preserves the exact two-microsecond cache benefit");
+        require(runtime.cancel(82, 2) && runtime.cancel(81, 2), "overflow-safe fixture cleanup");
+    }
+}
+
 event_log_snapshot replay() {
     request_runtime runtime;
     runtime.admit(make_request(1, lane::low, 1));
@@ -375,6 +432,7 @@ int main() {
         { "queue deadlines",            test_queue_deadlines_and_exact_capacity_reuse  },
         { "run deadline races",         test_run_deadline_and_first_terminal_wins      },
         { "zero timeout defaults",      test_zero_configuration_keeps_bounded_defaults },
+        { "proportional cache affinity", test_cache_affinity_scales_partial_hits_without_overflow },
         { "deterministic replay",       test_deterministic_replay              },
     };
 

@@ -31,6 +31,7 @@ request_registration make_request(request_id id, trusted_lane lane = trusted_lan
     request.counts.cached_prompt_tokens       = 64;
     request.counts.requested_output_tokens    = 32;
     request.estimates.predicted_prefill_us    = 100;
+    request.estimates.predicted_cache_restore_us = 25;
     request.estimates.predicted_decode_us     = 200;
     request.estimates.predicted_gpu_us        = 300;
     request.estimates.predicted_memory_bytes  = 4096;
@@ -90,6 +91,7 @@ void test_durable_state_outlives_bindings() {
     require(detached.counts.observed_output_tokens == 7, "observed count survives slot release");
     require(detached.estimates.predicted_gpu_us == active.estimates.predicted_gpu_us + 11,
             "estimates survive slot release");
+    require(detached.estimates.predicted_cache_restore_us == 25, "cache restore estimate survives slot release");
     require(detached.last_reason == reason_code::yielded, "last reason survives slot release");
 }
 
