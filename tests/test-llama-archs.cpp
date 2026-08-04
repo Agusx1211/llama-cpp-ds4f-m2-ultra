@@ -851,6 +851,54 @@ static bool dsv4_usage_snapshot_equal(
     return true;
 }
 
+static bool dsv4_sparse_footprint_equal(
+        const llama_dsv4_sparse_pool_usage & lhs,
+        const llama_dsv4_sparse_pool_usage & rhs) {
+    return lhs.pool_id               == rhs.pool_id &&
+           lhs.page_size             == rhs.page_size &&
+           lhs.virtual_pages         == rhs.virtual_pages &&
+           lhs.physical_pages        == rhs.physical_pages &&
+           lhs.free_pages            == rhs.free_pages &&
+           lhs.reserved_pages        == rhs.reserved_pages &&
+           lhs.mapped_mappings       == rhs.mapped_mappings &&
+           lhs.unique_physical_pages == rhs.unique_physical_pages &&
+           lhs.shared_physical_pages == rhs.shared_physical_pages &&
+           lhs.shared_mappings       == rhs.shared_mappings &&
+           lhs.refcount_sum          == rhs.refcount_sum &&
+           lhs.refcount_max          == rhs.refcount_max;
+}
+
+static bool dsv4_usage_footprint_equal(
+        const llama_dsv4_memory_usage_snapshot & lhs,
+        const llama_dsv4_memory_usage_snapshot & rhs) {
+    if (!dsv4_sparse_footprint_equal(lhs.sparse_total, rhs.sparse_total) ||
+            lhs.limiting_family != rhs.limiting_family ||
+            lhs.limiting_family_mask != rhs.limiting_family_mask ||
+            lhs.limiting_pool_id != rhs.limiting_pool_id ||
+            lhs.limiting_available_pages != rhs.limiting_available_pages) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.families.size(); ++i) {
+        const auto & lhs_family = lhs.families[i];
+        const auto & rhs_family = rhs.families[i];
+        if (lhs_family.family != rhs_family.family ||
+                lhs_family.placement_sparse != rhs_family.placement_sparse ||
+                lhs_family.logical_capacity_rows != rhs_family.logical_capacity_rows ||
+                lhs_family.logical_mapped_rows != rhs_family.logical_mapped_rows ||
+                lhs_family.sequence_mapped_rows != rhs_family.sequence_mapped_rows ||
+                lhs_family.pools.size() != rhs_family.pools.size() ||
+                !dsv4_sparse_footprint_equal(lhs_family.total, rhs_family.total)) {
+            return false;
+        }
+        for (size_t j = 0; j < lhs_family.pools.size(); ++j) {
+            if (!dsv4_sparse_footprint_equal(lhs_family.pools[j], rhs_family.pools[j])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 class dsv4_page_delta_audit_scope {
   public:
     dsv4_page_delta_audit_scope() {
@@ -1149,7 +1197,11 @@ static bool test_dsv4_admission_lifecycle(size_t seed, ggml_backend_dev_t dev) {
     GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(test.lctx.get()), 1) == 2);
 
     llama_memory_clear(llama_get_memory(test.lctx.get()), true);
-    GGML_ASSERT(dsv4_usage_snapshot_equal(baseline, memory->memory_usage_snapshot()) &&
+    // A committed mapping and its later unmap both advance the Metal pool's
+    // monotonic generation. COW totals are likewise lifetime counters. The
+    // cleanup invariant is that no live logical rows, mappings, references, or
+    // reservations remain above baseline, not that history was erased.
+    GGML_ASSERT(dsv4_usage_footprint_equal(baseline, memory->memory_usage_snapshot()) &&
             "consumed admission did not return to baseline after logical clear");
     return true;
 }
