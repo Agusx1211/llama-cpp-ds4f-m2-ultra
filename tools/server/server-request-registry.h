@@ -111,6 +111,7 @@ struct request_counts {
 
 struct request_estimates {
     uint64_t predicted_prefill_us    = 0;
+    uint64_t predicted_cache_restore_us = 0;
     uint64_t predicted_decode_us     = 0;
     uint64_t predicted_gpu_us        = 0;
     uint64_t predicted_memory_bytes  = 0;

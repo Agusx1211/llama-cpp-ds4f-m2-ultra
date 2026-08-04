@@ -72,6 +72,15 @@ server_task make_family(server_queue &              queue,
     return parent;
 }
 
+void set_cache_affinity(server_task & task, uint64_t saved_prefill_us, uint64_t restore_us = 0) {
+    if (task.tokens.empty()) {
+        task.tokens.push_back(1);
+    }
+    task.scheduling.cached_prompt_tokens       = 1;
+    task.scheduling.predicted_prefill_us       = saved_prefill_us;
+    task.scheduling.predicted_cache_restore_us = restore_us;
+}
+
 struct bound_family_slot {
     server_queue *                     queue = nullptr;
     int                                slot  = -1;
@@ -1162,6 +1171,213 @@ void test_fast_arrival_bypasses_ready_low_backlog() {
     retire_bound_and_queued(queue, all_ids, bound_ids, "dynamic-arrival fixture cleanup");
 }
 
+void test_live_cache_affinity_uses_trusted_costs() {
+    auto config = test_runtime_config();
+    config.scheduler.aging_credit_us     = 1;
+    config.scheduler.max_aging_credit_us = 1;
+    server_queue queue(config, [] { return 1; });
+    queue.set_physical_slot_capacity(1);
+
+    std::vector<int> all_ids;
+    server_task miss                   = make_user(queue, server_task::trusted_lane::normal, 1);
+    miss.scheduling.virtual_runtime_us = 500;
+    all_ids.push_back(miss.id);
+    require_posted(queue.post(std::move(miss)), all_ids.back(), "post cache miss");
+
+    server_task costly_restore                   = make_user(queue, server_task::trusted_lane::normal, 1);
+    costly_restore.scheduling.virtual_runtime_us = 500;
+    set_cache_affinity(costly_restore, 1000000, 1000000);
+    all_ids.push_back(costly_restore.id);
+    require_posted(queue.post(std::move(costly_restore)), all_ids.back(), "post costly cache restore");
+
+    server_task hit                   = make_user(queue, server_task::trusted_lane::normal, 1);
+    hit.scheduling.virtual_runtime_us = 500;
+    set_cache_affinity(hit, 1000000, 1);
+    const int hit_id = hit.id;
+    all_ids.push_back(hit_id);
+    require_posted(queue.post(std::move(hit)), hit_id, "post useful cache hit");
+
+    const auto snapshot = queue.request_snapshot();
+    require(std::any_of(snapshot.begin(), snapshot.end(), [](const auto & request) {
+                return request.counts.cached_prompt_tokens == 1 &&
+                       request.estimates.predicted_cache_restore_us == 1000000;
+            }),
+            "trusted cache count and restore estimate reach durable metadata");
+
+    int selected_id = -1;
+    queue.on_new_task([&](server_task && selected) {
+        selected_id = selected.id;
+        require(queue.bind_slot(selected.id, 0) && queue.release_slot(selected.id, 0),
+                "cache-affinity selection completes its permit");
+        queue.terminate();
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+
+    require(selected_id == hit_id, "net cache time saved reorders feasible work within one lane");
+    all_ids.erase(std::find(all_ids.begin(), all_ids.end(), selected_id));
+    retire_bound_and_queued(queue, all_ids, {}, "trusted cache cost fixture cleanup");
+}
+
+void test_live_cache_affinity_is_lane_and_cohort_bounded() {
+    server_queue queue;
+    queue.set_physical_slot_capacity(4);
+    std::vector<int> all_ids;
+    std::vector<int> fast_ids;
+    for (int i = 0; i < 2; ++i) {
+        server_task fast = make_user(queue, server_task::trusted_lane::fast, i + 1);
+        fast_ids.push_back(fast.id);
+        all_ids.push_back(fast.id);
+        require_posted(queue.post(std::move(fast)), all_ids.back(), "post fast cohort miss");
+    }
+    server_task normal_hit = make_user(queue, server_task::trusted_lane::normal, 3);
+    set_cache_affinity(normal_hit, 1000000);
+    all_ids.push_back(normal_hit.id);
+    require_posted(queue.post(std::move(normal_hit)), all_ids.back(), "post normal cache hit");
+
+    std::vector<int> bound_ids;
+    queue.on_new_task([&](server_task && selected) {
+        require(selected.scheduling.lane == server_task::trusted_lane::fast,
+                "cache affinity cannot cross the HDRR-selected lane");
+        const int slot = static_cast<int>(bound_ids.size());
+        require(queue.bind_slot(selected.id, slot), "bind cache-isolation cohort member");
+        bound_ids.push_back(selected.id);
+    });
+    queue.on_update_slots([&] {
+        require(bound_ids == fast_ids && queue.dispatch_permits().total == 2,
+                "cache affinity preserves the fast-lane durable cohort cap");
+        queue.terminate();
+    });
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+    retire_bound_and_queued(queue, all_ids, bound_ids, "cache lane-isolation fixture cleanup");
+}
+
+void test_live_cache_lookahead_and_bypass_bound() {
+    auto config = test_runtime_config();
+    config.scheduler.aging_credit_us     = 1;
+    config.scheduler.max_aging_credit_us = 1;
+
+    {
+        server_queue queue(config, [] { return 1; });
+        queue.set_physical_slot_capacity(1);
+        std::vector<int> all_ids;
+        for (int i = 0; i < 9; ++i) {
+            server_task task                   = make_user(queue, server_task::trusted_lane::low, 1);
+            task.scheduling.virtual_runtime_us = 500;
+            if (i == 8) {
+                set_cache_affinity(task, 1000000);
+            }
+            all_ids.push_back(task.id);
+            require_posted(queue.post(std::move(task)), all_ids.back(), "post cache-lookahead task");
+        }
+        int selected_id = -1;
+        queue.on_new_task([&](server_task && selected) {
+            selected_id = selected.id;
+            require(queue.bind_slot(selected.id, 0) && queue.release_slot(selected.id, 0),
+                    "lookahead selection completes its permit");
+            queue.terminate();
+        });
+        queue.on_update_slots([] {});
+        queue.on_sleeping_state([](bool) {});
+        queue.start_loop();
+        require(selected_id == all_ids.front(), "cache affinity cannot inspect beyond K=8 eligible requests");
+        all_ids.erase(std::find(all_ids.begin(), all_ids.end(), selected_id));
+        retire_bound_and_queued(queue, all_ids, {}, "cache lookahead fixture cleanup");
+    }
+
+    {
+        server_queue queue(config, [] { return 1; });
+        queue.set_physical_slot_capacity(1);
+        std::vector<int> all_ids;
+        server_task miss                   = make_user(queue, server_task::trusted_lane::normal, 1);
+        miss.scheduling.virtual_runtime_us = 500;
+        const int miss_id                  = miss.id;
+        all_ids.push_back(miss_id);
+        require_posted(queue.post(std::move(miss)), miss_id, "post bypass-protected miss");
+
+        const auto post_hit = [&] {
+            server_task hit                   = make_user(queue, server_task::trusted_lane::normal, 1);
+            hit.scheduling.virtual_runtime_us = 500;
+            set_cache_affinity(hit, 1000000);
+            all_ids.push_back(hit.id);
+            require_posted(queue.post(std::move(hit)), all_ids.back(), "post continuous cache hit");
+        };
+        post_hit();
+
+        std::vector<int> order;
+        queue.on_new_task([&](server_task && selected) {
+            order.push_back(selected.id);
+            require(queue.bind_slot(selected.id, 0) && queue.release_slot(selected.id, 0),
+                    "bypass-bound selection completes its permit");
+            if (selected.id == miss_id) {
+                queue.terminate();
+            } else {
+                post_hit();
+            }
+        });
+        queue.on_update_slots([] {});
+        queue.on_sleeping_state([](bool) {});
+        queue.start_loop();
+        require(order.size() == 4 && order.back() == miss_id,
+                "three cache bypasses protect an old feasible miss from starvation");
+        const std::unordered_set<int> completed(order.begin(), order.end());
+        all_ids.erase(std::remove_if(all_ids.begin(), all_ids.end(), [&](int id) { return completed.count(id) != 0; }),
+                      all_ids.end());
+        retire_bound_and_queued(queue, all_ids, {}, "cache bypass fixture cleanup");
+    }
+}
+
+void test_cache_affinity_preserves_atomic_families() {
+    auto config = test_runtime_config();
+    config.scheduler.aging_credit_us     = 1;
+    config.scheduler.max_aging_credit_us = 1;
+    server_queue queue(config, [] { return 1; });
+    queue.set_physical_slot_capacity(3);
+
+    server_task miss                   = make_user(queue, server_task::trusted_lane::normal, 1);
+    miss.scheduling.virtual_runtime_us = 500;
+    const int miss_id                  = miss.id;
+    miss.add_child(miss_id, queue.get_new_id());
+    miss.add_child(miss_id, queue.get_new_id());
+
+    server_task hit                   = make_user(queue, server_task::trusted_lane::normal, 1);
+    hit.scheduling.virtual_runtime_us = 500;
+    set_cache_affinity(hit, 1000000);
+    const int hit_id = hit.id;
+    hit.add_child(hit_id, queue.get_new_id());
+    hit.add_child(hit_id, queue.get_new_id());
+
+    std::vector<server_task> tasks;
+    tasks.push_back(std::move(miss));
+    tasks.push_back(std::move(hit));
+    require(queue.post(std::move(tasks)), "post cache-affinity families atomically");
+
+    queue.on_new_task([&](server_task && selected) {
+        require(selected.id == hit_id && selected.child_tasks.size() == 2,
+                "cache affinity selects the complete cached family");
+        require(std::all_of(selected.child_tasks.begin(), selected.child_tasks.end(), [](const server_task & child) {
+                    return child.scheduling.cached_prompt_tokens == 1 &&
+                           child.scheduling.predicted_prefill_us == 1000000;
+                }),
+                "trusted cache facts are copied to every passive child");
+        require(queue.dispatch_permits().total == 3, "family selection claims its complete atomic permit width");
+        require(queue.fail_task(selected.id) && queue.dispatch_permits().total == 0,
+                "family setup failure retires every cache-selected permit");
+        queue.terminate();
+    });
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([](bool) {});
+    queue.start_loop();
+
+    server_task cancel(SERVER_TASK_TYPE_CANCEL);
+    cancel.id        = queue.get_new_id();
+    cancel.id_target = miss_id;
+    require(queue.post(std::move(cancel), true) && queue.request_summary().active_requests == 0,
+            "atomic cache-family fixture cleanup");
+}
+
 void test_live_hdrr_under_sustained_mixed_queues() {
     server_queue queue;
     queue.set_physical_slot_capacity(1);
@@ -1172,6 +1388,9 @@ void test_live_hdrr_under_sustained_mixed_queues() {
     const auto post_lane = [&](server_task::trusted_lane lane) {
         server_task task                 = make_user(queue, lane, arrival++);
         task.scheduling.predicted_gpu_us = 1000;
+        if (lane == server_task::trusted_lane::low) {
+            set_cache_affinity(task, 1000000);
+        }
         const int task_id                = task.id;
         live_ids.insert(task_id);
         require_posted(queue.post(std::move(task)), task_id, "post sustained HDRR task");
@@ -1368,6 +1587,7 @@ void test_live_aging() {
     const int old_id                  = old.id;
     require_posted(queue.post(std::move(old)), old_id, "post aged request");
     server_task fresh    = make_user(queue, server_task::trusted_lane::normal, 20000);
+    set_cache_affinity(fresh, 1000000);
     const int   fresh_id = fresh.id;
     require_posted(queue.post(std::move(fresh)), fresh_id, "post fresh request");
     int selected_id = -1;
@@ -1489,6 +1709,10 @@ int main() {
         { "live lane and physical permits", test_start_loop_enforces_live_lane_and_physical_permits },
         { "profiled live low widths",       test_start_loop_uses_profiled_exclusive_low_shapes      },
         { "fast arrival bypass",            test_fast_arrival_bypasses_ready_low_backlog            },
+        { "trusted live cache costs",       test_live_cache_affinity_uses_trusted_costs              },
+        { "cache lane and cohort bounds",   test_live_cache_affinity_is_lane_and_cohort_bounded      },
+        { "cache lookahead and bypass",     test_live_cache_lookahead_and_bypass_bound               },
+        { "cache atomic families",          test_cache_affinity_preserves_atomic_families            },
         { "sustained live HDRR",            test_live_hdrr_under_sustained_mixed_queues             },
         { "sustained wide HDRR cohorts",    test_live_hdrr_starts_sustained_wide_cohorts            },
         { "staggered draining HDRR cohorts", test_staggered_cohorts_drain_before_same_lane_refill   },

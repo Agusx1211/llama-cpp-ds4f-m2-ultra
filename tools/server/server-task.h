@@ -147,7 +147,9 @@ struct server_task {
         uint64_t arrival_us = 0;  // zero asks server_queue to stamp its clock
         uint64_t virtual_runtime_us = 0;
         int64_t debt_us = 0;
+        uint64_t cached_prompt_tokens = 0;
         uint64_t predicted_prefill_us = 0;
+        uint64_t predicted_cache_restore_us = 0;
         uint64_t predicted_decode_us = 0;
         uint64_t predicted_gpu_us = 0;
         uint64_t predicted_memory_bytes = 0;

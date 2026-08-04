@@ -64,7 +64,9 @@ bool request_counts::operator==(const request_counts & other) const {
 }
 
 bool request_estimates::operator==(const request_estimates & other) const {
-    return predicted_prefill_us == other.predicted_prefill_us && predicted_decode_us == other.predicted_decode_us &&
+    return predicted_prefill_us == other.predicted_prefill_us &&
+           predicted_cache_restore_us == other.predicted_cache_restore_us &&
+           predicted_decode_us == other.predicted_decode_us &&
            predicted_gpu_us == other.predicted_gpu_us && predicted_memory_bytes == other.predicted_memory_bytes &&
            predicted_output_tokens == other.predicted_output_tokens;
 }

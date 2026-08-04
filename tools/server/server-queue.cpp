@@ -87,9 +87,11 @@ server_request_runtime::request_metadata server_queue::make_request_metadata(ser
     result.virtual_runtime_us = task.scheduling.virtual_runtime_us;
     result.debt_us            = task.scheduling.debt_us;
     result.counts.prompt_tokens = static_cast<uint64_t>(std::max<int32_t>(0, task.n_tokens()));
+    result.counts.cached_prompt_tokens = task.scheduling.cached_prompt_tokens;
     result.counts.requested_output_tokens = task.params.n_predict > 0 ?
                                                 static_cast<uint64_t>(task.params.n_predict) : 0;
     result.estimates.predicted_prefill_us    = task.scheduling.predicted_prefill_us;
+    result.estimates.predicted_cache_restore_us = task.scheduling.predicted_cache_restore_us;
     result.estimates.predicted_decode_us     = task.scheduling.predicted_decode_us;
     result.estimates.predicted_gpu_us        = task.scheduling.predicted_gpu_us;
     result.estimates.predicted_memory_bytes  = task.scheduling.predicted_memory_bytes;
