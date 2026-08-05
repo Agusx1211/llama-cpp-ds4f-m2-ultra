@@ -322,6 +322,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run-server-capture-store-tsan.sh)
         set_tests_properties(test-server-capture-store-tsan PROPERTIES LABELS sanitizer)
     endif()
+    llama_build_and_test(test-server-capture-resync-journal.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-capture-resync-journal.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-capture.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-capture-store.cpp)
+    target_include_directories(test-server-capture-resync-journal PRIVATE
+        ${PROJECT_SOURCE_DIR}/tools/server)
+    target_compile_features(test-server-capture-resync-journal PRIVATE cxx_std_17)
     llama_build_and_test(test-snapshot-metal-staging.cpp)
     target_include_directories(test-snapshot-metal-staging PRIVATE
         ${PROJECT_SOURCE_DIR}/src)

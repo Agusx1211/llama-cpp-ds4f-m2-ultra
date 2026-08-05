@@ -49,6 +49,8 @@ add_library(${TARGET} STATIC
     server-capture.h
     server-capture-store.cpp
     server-capture-store.h
+    server-capture-resync-journal.cpp
+    server-capture-resync-journal.h
 )
 
 if (BUILD_SHARED_LIBS)
