@@ -273,6 +273,10 @@ public:
     // excludes graph preparation plus every raw/SWA public mutation until the
     // composite reaches a terminal commit or rollback boundary.
     llama_kv_iswa_resident_transaction acquire_resident_transaction() const;
+    // True when the cache owns a resident aperture.  This distinguishes the
+    // unsupported (no-aperture) layout from a resident layout whose
+    // transaction is temporarily unavailable because it is not quiescent.
+    bool has_resident_aperture() const;
     bool has_resident_handles() const;
 
 private:

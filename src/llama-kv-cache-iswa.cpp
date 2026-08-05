@@ -500,6 +500,10 @@ llama_kv_iswa_resident_transaction llama_kv_cache_iswa::acquire_resident_transac
     return llama_kv_iswa_resident_transaction(resident->guard, std::move(resident_scope));
 }
 
+bool llama_kv_cache_iswa::has_resident_aperture() const {
+    return resident != nullptr;
+}
+
 bool llama_kv_cache_iswa::has_resident_handles() const {
     [[maybe_unused]] auto resident_scope = lock_resident();
     return resident && resident->guard->parked_handles != 0;

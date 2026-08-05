@@ -2253,6 +2253,26 @@ struct llama_dsv4_composite_resident::impl {
     uint64_t next_lease_generation = 1;
 };
 
+class llama_dsv4_composite_resident::aggregate_clear_transaction {
+public:
+    explicit aggregate_clear_transaction(impl & state) :
+        coordinator_lock(state.mutex),
+        raw_transaction(state.raw),
+        permitted(static_cast<bool>(raw_transaction) && state.handles.empty() &&
+                  !state.raw.has_resident_handles() &&
+                  state.compressed.memory_usage_snapshot().resident_handles == 0) {
+    }
+
+    explicit operator bool() const {
+        return permitted;
+    }
+
+private:
+    std::unique_lock<std::recursive_mutex> coordinator_lock;
+    dsv4_raw_transaction_scope             raw_transaction;
+    bool                                   permitted = false;
+};
+
 llama_dsv4_composite_resident::llama_dsv4_composite_resident(
         llama_kv_cache_iswa & raw,
         llama_dsv4_comp_pool & compressed,
@@ -2275,6 +2295,11 @@ llama_dsv4_composite_resident::~llama_dsv4_composite_resident() {
     if (pimpl && !pimpl->handles.empty()) {
         std::terminate();
     }
+}
+
+std::unique_ptr<llama_dsv4_composite_resident::aggregate_clear_transaction>
+llama_dsv4_composite_resident::acquire_aggregate_clear_transaction() {
+    return std::make_unique<aggregate_clear_transaction>(*pimpl);
 }
 
 llama_dsv4_resident_detach_quote llama_dsv4_composite_resident::quote_detach(
@@ -3354,13 +3379,43 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         return res;
     }
 
-    const bool res = kv_raw->seq_rm(seq_id, p0, p1);
+    const auto remove_and_clear = [&]() {
+        const bool res = kv_raw->seq_rm(seq_id, p0, p1);
 
-    if (res) {
-        clear_compressed(seq_id, true);
+        if (res) {
+            clear_compressed(seq_id, true);
+        }
+
+        return res;
+    };
+
+    if (seq_id < 0 && aggregate_compressed) {
+        if (composite_resident) {
+            auto aggregate_transaction = composite_resident->acquire_aggregate_clear_transaction();
+            if (!aggregate_transaction || !*aggregate_transaction) {
+                return false;
+            }
+            return remove_and_clear();
+        }
+
+        if (kv_raw->has_resident_aperture()) {
+            dsv4_raw_transaction_scope raw_transaction(*kv_raw);
+            if (!raw_transaction || kv_raw->has_resident_handles() ||
+                comp_pool->memory_usage_snapshot().resident_handles != 0) {
+                return false;
+            }
+            return remove_and_clear();
+        }
+
+        if (kv_raw->has_resident_handles() || comp_pool->memory_usage_snapshot().resident_handles != 0) {
+            // The raw-only resident mode has no composite coordinator to hold
+            // the resident transaction.  Reject before touching raw storage;
+            // callers can release the external resident lease and retry.
+            return false;
+        }
     }
 
-    return res;
+    return remove_and_clear();
 }
 
 void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -3855,15 +3910,21 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
             kv_lid->clear(true);
         }
         const auto usage = comp_pool->memory_usage_snapshot();
-        comp_pool = std::make_unique<llama_dsv4_comp_pool>(llama_dsv4_comp_pool_config {
+        llama_dsv4_comp_pool replacement(llama_dsv4_comp_pool_config {
                 usage.c4.capacity_segments - usage.c4.permanent_segments,
                 usage.hca.capacity_segments - usage.hca.permanent_segments,
         });
         for (uint32_t execution_id = 0; execution_id < n_seq_max; ++execution_id) {
-            const auto handle = comp_pool->create_handle();
+            const auto handle = replacement.create_handle();
             GGML_ASSERT(handle.status == llama_dsv4_comp_status::ok);
-            GGML_ASSERT(comp_pool->bind(execution_id, handle.handle) == llama_dsv4_comp_status::ok);
+            GGML_ASSERT(replacement.bind(execution_id, handle.handle) == llama_dsv4_comp_status::ok);
         }
+        // Keep the coordinator's compressed-pool reference valid.  Replacing
+        // the unique_ptr leaves a dangling reference even when no resident
+        // lease is outstanding; move assignment swaps the pool implementation
+        // in place after the transaction above has proved that no resident
+        // handles remain.
+        *comp_pool = std::move(replacement);
     } else if (aggregate_compressed) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
         llama_dsv4_comp_handle_id old_handle = 0;

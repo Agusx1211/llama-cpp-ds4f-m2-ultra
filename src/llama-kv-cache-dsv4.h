@@ -377,6 +377,16 @@ public:
     llama_dsv4_resident_usage usage() const;
 
 private:
+    friend class llama_kv_cache_dsv4;
+
+    class aggregate_clear_transaction;
+
+    // Retain the coordinator mutex and raw resident transaction while an
+    // aggregate whole-sequence clear performs its fail-before-mutation check
+    // and raw/compressed reset.  The scope is denied if any resident ownership
+    // remains in the composite, raw, or compressed component.
+    std::unique_ptr<aggregate_clear_transaction> acquire_aggregate_clear_transaction();
+
     struct impl;
     std::unique_ptr<impl> pimpl;
 };

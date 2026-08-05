@@ -1801,6 +1801,16 @@ void expect_resident_usage(const llama_dsv4_resident_usage & usage,
            std::string(phase) + " resident usage mismatch at boundary " + std::to_string(boundary));
 }
 
+void expect_resident_usage_equal(const llama_dsv4_resident_usage & expected,
+                                 const llama_dsv4_resident_usage & actual,
+                                 const char *                      phase,
+                                 uint32_t                          boundary) {
+    expect(expected.cache_id == actual.cache_id && expected.epoch == actual.epoch &&
+               expected.capacity == actual.capacity && expected.occupied_slots == actual.occupied_slots &&
+               expected.handles == actual.handles,
+           std::string(phase) + " resident identity/ownership changed at boundary " + std::to_string(boundary));
+}
+
 void expect_resident_transition(const llama_dsv4_resident_usage & before,
                                 const llama_dsv4_resident_usage & after,
                                 const char *                      phase,
@@ -2006,6 +2016,67 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary, bool
     expect_sparse_move(memory_before_detach, memory_after_detach, "detached", boundary);
     expect_logical_rows(memory_after_detach, { -1, (llama_pos) boundary, -1 }, "detached", boundary);
     validate_memory_snapshot(memory_after_detach, "detached", boundary);
+
+    // A whole-sequence public removal would replace the aggregate compressed
+    // pool.  A detached composite lease makes that replacement unsafe, so the
+    // operation must reject before touching raw storage, compressed mappings,
+    // recurrent state generations, or the coordinator identity.
+    const auto aggregate_reject_memory       = memory->memory_usage_snapshot();
+    const auto aggregate_reject_comp         = comp_pool->memory_usage_snapshot();
+    const auto aggregate_reject_resident     = memory->resident_usage();
+    const auto aggregate_reject_pool         = comp_pool;
+    const auto aggregate_reject_source_info  = comp_handle_info(comp_pool, initial_binding0, "aggregate reject");
+    const auto aggregate_reject_survivor_info =
+            comp_handle_info(comp_pool, survivor_binding_before_detach, "aggregate reject");
+    const auto aggregate_reject_binding0 = comp_binding(comp_pool, 0, "aggregate reject");
+    const auto aggregate_reject_binding1 = comp_binding(comp_pool, 1, "aggregate reject");
+    const auto aggregate_reject_binding2 = comp_binding(comp_pool, 2, "aggregate reject");
+    const auto aggregate_reject_csa_generation = memory->get_csa_state()->state_generation();
+    const auto aggregate_reject_hca_generation = memory->get_hca_state()->state_generation();
+    const auto aggregate_reject_lid_generation = memory->get_lid_state()->state_generation();
+    std::array<llama_pos, N_SEQ_MAX> aggregate_reject_positions = {};
+    for (uint32_t sequence = 0; sequence < N_SEQ_MAX; ++sequence) {
+        aggregate_reject_positions[sequence] =
+                llama_memory_seq_pos_max(llama_get_memory(candidate.get()), (llama_seq_id) sequence);
+    }
+    expect(!llama_memory_seq_rm(llama_get_memory(candidate.get()), -1, -1, -1),
+           "aggregate seq_rm with a detached composite handle was accepted");
+    expect(memory->get_comp_pool() == aggregate_reject_pool,
+           "rejected aggregate seq_rm replaced the compressed pool pointer");
+    compare_memory_baseline(aggregate_reject_memory, memory->memory_usage_snapshot(), "aggregate reject", boundary);
+    compare_comp_baseline(aggregate_reject_comp, comp_pool->memory_usage_snapshot(), "aggregate reject", boundary);
+    expect_resident_usage_equal(aggregate_reject_resident, memory->resident_usage(), "aggregate reject", boundary);
+    expect(comp_binding(comp_pool, 0, "aggregate reject") == aggregate_reject_binding0 &&
+               comp_binding(comp_pool, 1, "aggregate reject") == aggregate_reject_binding1 &&
+               comp_binding(comp_pool, 2, "aggregate reject") == aggregate_reject_binding2,
+           "rejected aggregate seq_rm changed compressed execution mappings");
+    expect_comp_handle_info_equal(aggregate_reject_source_info,
+                                  comp_handle_info(comp_pool, initial_binding0, "aggregate reject"),
+                                  "aggregate reject source handle");
+    expect_comp_handle_info_equal(aggregate_reject_survivor_info,
+                                  comp_handle_info(comp_pool, survivor_binding_before_detach, "aggregate reject"),
+                                  "aggregate reject survivor handle");
+    expect(memory->get_csa_state()->state_generation() == aggregate_reject_csa_generation &&
+               memory->get_hca_state()->state_generation() == aggregate_reject_hca_generation &&
+               memory->get_lid_state()->state_generation() == aggregate_reject_lid_generation,
+           "rejected aggregate seq_rm changed compressor-state generations");
+    for (uint32_t sequence = 0; sequence < N_SEQ_MAX; ++sequence) {
+        expect(llama_memory_seq_pos_max(llama_get_memory(candidate.get()), (llama_seq_id) sequence) ==
+                       aggregate_reject_positions[sequence],
+               "rejected aggregate seq_rm changed a sequence position ledger");
+    }
+    expect(memory->quote_resident_attach(detached.resident, 2).status == llama_dsv4_resident_status::ok,
+           "rejected aggregate seq_rm invalidated the detached composite handle");
+
+    // Per-sequence removal only replaces that execution root and remains safe
+    // while another sequence is parked in the composite resident aperture.
+    const auto per_sequence_pool = memory->get_comp_pool();
+    expect(llama_memory_seq_rm(llama_get_memory(candidate.get()), 2, -1, -1),
+           "per-sequence seq_rm control failed with a detached resident handle");
+    expect(memory->get_comp_pool() == per_sequence_pool,
+           "per-sequence seq_rm unexpectedly replaced the aggregate pool");
+    expect_resident_usage_equal(aggregate_reject_resident, memory->resident_usage(), "per-sequence control", boundary);
+    expect_rs_idx("per-sequence control");
 
     const uint64_t     candidate_before_parked      = counter.evaluations;
     const uint64_t     candidate_asks_before_parked = counter.asks;
@@ -2223,13 +2294,16 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary, bool
     expect(llama_memory_seq_pos_max(llama_get_memory(candidate.get()), 0) == 2,
            "replacement position ledger mismatch after release");
 
-    // clear(true) replaces the aggregate compressed pool.  The raw pointer
-    // captured before this boundary is intentionally not used again: handles
-    // and bindings are pool-instance scoped, so numeric IDs from the old pool
-    // must not be interpreted as identities in the replacement pool.
+    // After all resident leases have been attached or released, the public
+    // aggregate seq_rm path is safe.  It resets the compressed implementation
+    // in place so the composite coordinator's pool reference remains valid.
+    expect(llama_memory_seq_rm(llama_get_memory(candidate.get()), -1, -1, -1),
+           "aggregate seq_rm after resident release failed");
+    // Keep the ordinary public clear coverage as well: after the guarded
+    // seq_rm has completed, the regular coordinator reset must remain valid.
     llama_memory_clear(llama_get_memory(candidate.get()), true);
     auto * final_comp_pool = memory->get_comp_pool();
-    expect(final_comp_pool != nullptr, "final clear did not recreate compressed pool");
+    expect(final_comp_pool != nullptr, "final aggregate seq_rm lost the compressed pool");
     const auto final_comp   = final_comp_pool->memory_usage_snapshot();
     const auto final_memory = memory->memory_usage_snapshot();
     expect_sparse_counters_monotonic(memory_baseline, final_memory, "final", boundary);
