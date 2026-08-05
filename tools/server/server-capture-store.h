@@ -104,6 +104,26 @@ struct capture_store_faults {
     bool preserve_failed_files = false;
     bool slow_worker           = false;
 
+    // Deterministic test seam: force OS CSPRNG admission failure. There is no
+    // clock/address/pid fallback for a generated identity salt.
+    bool fail_csprng = false;
+
+    // Deterministic producer-lifecycle barrier, called after an admission
+    // lifetime token is claimed and before accepting is checked. The callback
+    // must not throw; try_enqueue remains noexcept.
+    std::function<void()> before_enqueue_accept;
+
+    // Deterministic filesystem fault seams. Each enabled point fails every
+    // matching operation with EIO so tests can prove terminal ordering and
+    // orphan/tombstone recovery without relying on host filesystem failures.
+    bool fail_file_fsync      = false;
+    bool fail_tombstone_fsync = false;
+    bool fail_directory_fsync = false;
+    bool fail_shard_rename    = false;
+    bool fail_manifest_rename = false;
+    bool fail_fstat           = false;
+    bool fail_unlink          = false;
+
     // Optional deterministic worker barrier. It is called immediately before
     // the worker waits for the next wake token, and exceptions fail the store.
     std::function<void()> before_worker_wait;
@@ -172,14 +192,15 @@ struct capture_store_result {
 
 struct capture_store_stats {
     ring_stats ring;
-    uint64_t   committed_shards   = 0;
-    uint64_t   committed_records  = 0;
-    uint64_t   committed_bytes    = 0;
-    uint64_t   failed_writes      = 0;
-    uint64_t   cancelled_writes   = 0;
-    uint64_t   dropped_after_stop = 0;
-    bool       worker_running     = false;
-    bool       worker_failed      = false;
+    uint64_t   committed_shards    = 0;
+    uint64_t   committed_records   = 0;
+    uint64_t   committed_bytes     = 0;
+    uint64_t   failed_writes       = 0;
+    uint64_t   cancelled_writes    = 0;
+    uint64_t   dropped_after_stop  = 0;
+    uint64_t   dropped_on_shutdown = 0;
+    bool       worker_running      = false;
+    bool       worker_failed       = false;
 };
 
 // The store owns one background consumer.  Construction performs crash

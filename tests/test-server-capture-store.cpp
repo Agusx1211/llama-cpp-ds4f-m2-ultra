@@ -16,6 +16,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -547,6 +548,15 @@ void test_bounds_off_mode_and_private_permissions() {
     expect(!off.try_enqueue(make_observation(1)), "off mode accepted observation");
     expect_status(off.shutdown().status, capture_store_status::disabled, "off mode shutdown");
 
+    temporary_directory  csprng_temp;
+    capture_store_config csprng_config = make_config(csprng_temp.path() / "not-created");
+    csprng_config.identity_salt        = {};
+    csprng_config.faults.fail_csprng   = true;
+    capture_store csprng_failed(csprng_config);
+    expect(csprng_failed.stats().worker_failed, "CSPRNG failure did not fail closed");
+    expect_status(csprng_failed.shutdown(false).status, capture_store_status::io_error, "CSPRNG failure status");
+    expect(!fs::exists(csprng_temp.path() / "not-created"), "CSPRNG failure created a capture root");
+
     capture_store store(base);
     expect(store.try_enqueue(make_observation(1)), "private mode enqueue");
     expect_status(store.flush().status, capture_store_status::ok, "private mode flush");
@@ -732,6 +742,196 @@ void test_concurrent_flush_shutdown() {
            "concurrent shutdown returned unexpected status");
 }
 
+void test_admission_linearization_and_high_count_shutdown() {
+    temporary_directory     barrier_temp;
+    capture_store_config    barrier_config = make_config(barrier_temp.path());
+    std::mutex              barrier_mutex;
+    std::condition_variable barrier_cv;
+    bool                    entered             = false;
+    bool                    release             = false;
+    barrier_config.faults.before_enqueue_accept = [&]() {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        entered = true;
+        barrier_cv.notify_all();
+        barrier_cv.wait(lock, [&]() { return release; });
+    };
+    auto              store = std::make_unique<capture_store>(barrier_config);
+    capture_store *   raw   = store.get();
+    std::atomic<bool> accepted{ true };
+    std::thread producer([&]() { accepted.store(raw->try_enqueue(make_observation(1)), std::memory_order_release); });
+    {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        expect(barrier_cv.wait_for(lock, std::chrono::seconds(2), [&]() { return entered; }),
+               "producer did not claim admission before destructor");
+    }
+    std::atomic<bool> destroyed{ false };
+    std::thread       destroyer([&]() {
+        store.reset();
+        destroyed.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    expect(!destroyed.load(std::memory_order_acquire), "destructor ignored live producer claim");
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex);
+        release = true;
+    }
+    barrier_cv.notify_all();
+    producer.join();
+    destroyer.join();
+    expect(!accepted.load(std::memory_order_acquire), "producer accepted after admission closed by destructor");
+
+    for (const bool drain : { true, false }) {
+        temporary_directory  temp;
+        capture_store_config config = make_config(temp.path());
+        config.ring_capacity        = 128;
+        config.max_shard_records    = 64;
+        config.max_shard_bytes      = 16384;
+        config.max_retained_shards  = 10000;
+        config.max_retained_records = 100000;
+        config.max_retained_bytes   = 64U * 1024U * 1024U;
+        config.max_manifest_bytes   = CAPTURE_MAX_MANIFEST_BYTES;
+        config.faults.slow_worker   = true;
+        capture_store         store_counted(config);
+        std::atomic<uint64_t> accepted_count{ 0 };
+        std::atomic<uint64_t> rejected_count{ 0 };
+        std::atomic<bool>     start{ false };
+        std::thread           producer_counted([&]() {
+            start.store(true, std::memory_order_release);
+            for (uint32_t sequence = 0; sequence < 100000; ++sequence) {
+                if (store_counted.try_enqueue(make_observation(sequence))) {
+                    accepted_count.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    rejected_count.fetch_add(1, std::memory_order_relaxed);
+                }
+                if ((sequence & 63U) == 0) {
+                    std::this_thread::yield();
+                }
+            }
+        });
+        for (unsigned attempt = 0; attempt < 200 && !start.load(std::memory_order_acquire); ++attempt) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        const capture_store_status shutdown_status = store_counted.shutdown(drain).status;
+        producer_counted.join();
+        expect(shutdown_status == capture_store_status::ok || shutdown_status == capture_store_status::stopped,
+               "counted shutdown failed");
+        const capture_store_stats stats = store_counted.stats();
+        capture_manifest          manifest;
+        expect_status(store_counted.inspect(manifest).status, capture_store_status::ok, "counted inspect");
+        const uint64_t accepted_total = accepted_count.load(std::memory_order_relaxed);
+        const uint64_t rejected_total = rejected_count.load(std::memory_order_relaxed);
+        expect(stats.ring.pushed == accepted_total, "producer true result disagrees with ring pushes");
+        expect(stats.ring.dropped + stats.dropped_after_stop == rejected_total,
+               "producer false result disagrees with ring/closed drops");
+        if (drain) {
+            expect(manifest.total_records == accepted_total, "draining shutdown lost an accepted producer record");
+            expect(stats.dropped_on_shutdown == 0, "draining shutdown discarded a queued record");
+        } else {
+            expect(manifest.total_records + stats.dropped_on_shutdown == accepted_total,
+                   "non-draining shutdown accounting disagrees with accepted records");
+        }
+    }
+}
+
+void test_filesystem_fault_seams_and_flush_ordering() {
+    struct fault_case {
+        const char * name;
+        void (*configure)(capture_store_config &);
+    };
+
+    const std::array<fault_case, 5> cases = {
+        {
+         { "file-fsync", [](capture_store_config & config) { config.faults.fail_file_fsync           = true; } },
+         { "directory-fsync", [](capture_store_config & config) { config.faults.fail_directory_fsync = true; } },
+         { "shard-rename", [](capture_store_config & config) { config.faults.fail_shard_rename = true; } },
+         { "manifest-rename", [](capture_store_config & config) { config.faults.fail_manifest_rename = true; } },
+         { "fstat", [](capture_store_config & config) { config.faults.fail_fstat = true; } },
+         }
+    };
+    for (const fault_case & current : cases) {
+        temporary_directory  temp;
+        capture_store_config config = make_config(temp.path());
+        current.configure(config);
+        capture_store store(config);
+        expect(store.try_enqueue(make_observation(1)), std::string(current.name) + " enqueue");
+        expect_status(store.flush().status, capture_store_status::io_error, std::string(current.name) + " flush");
+        expect_status(store.shutdown(false).status, capture_store_status::io_error,
+                      std::string(current.name) + " shutdown");
+    }
+
+    // A directory-fsync failure occurs after the shard rename but before the
+    // manifest is published.  Recovery must treat that shard as uncommitted,
+    // remove it with bounded authority, and leave a clean no-manifest state.
+    temporary_directory directory_fsync_temp;
+    {
+        capture_store_config config        = make_config(directory_fsync_temp.path());
+        config.faults.fail_directory_fsync = true;
+        capture_store store(config);
+        expect(store.try_enqueue(make_observation(1)), "directory-fsync orphan enqueue");
+        expect_status(store.flush().status, capture_store_status::io_error, "directory-fsync orphan flush");
+        expect_status(store.shutdown(false).status, capture_store_status::io_error, "directory-fsync orphan shutdown");
+    }
+    capture_store    recovered_directory_fsync(make_config(directory_fsync_temp.path()));
+    capture_manifest recovered_directory_manifest;
+    expect_status(recovered_directory_fsync.inspect(recovered_directory_manifest).status,
+                  capture_store_status::no_manifest, "directory-fsync orphan recovery manifest");
+    for (const fs::directory_entry & entry : fs::directory_iterator(directory_fsync_temp.path())) {
+        expect(entry.path().extension() != ".cap", "directory-fsync orphan shard survived recovery");
+    }
+    expect_status(recovered_directory_fsync.shutdown().status, capture_store_status::ok,
+                  "directory-fsync orphan recovery shutdown");
+
+    temporary_directory  tombstone_temp;
+    capture_store_config tombstone_config        = make_config(tombstone_temp.path());
+    tombstone_config.max_shard_records           = 1;
+    tombstone_config.max_retained_shards         = 1;
+    tombstone_config.max_retained_records        = 1;
+    tombstone_config.max_retained_bytes          = 4096;
+    tombstone_config.faults.fail_tombstone_fsync = true;
+    capture_store tombstone_store(tombstone_config);
+    expect(tombstone_store.try_enqueue(make_observation(1)), "tombstone fsync first enqueue");
+    expect_status(tombstone_store.flush().status, capture_store_status::ok, "tombstone fsync first flush");
+    expect(tombstone_store.try_enqueue(make_observation(2)), "tombstone fsync second enqueue");
+    expect_status(tombstone_store.flush().status, capture_store_status::deletion_failed, "tombstone fsync flush");
+    expect_status(tombstone_store.shutdown(false).status, capture_store_status::deletion_failed,
+                  "tombstone fsync shutdown");
+    capture_store_config recovered_config = make_config(tombstone_temp.path());
+    recovered_config.max_shard_records    = 1;
+    recovered_config.max_retained_shards  = 1;
+    recovered_config.max_retained_records = 1;
+    recovered_config.max_retained_bytes   = 4096;
+    capture_store    recovered(recovered_config);
+    capture_manifest recovered_manifest;
+    expect_status(recovered.inspect(recovered_manifest).status, capture_store_status::ok,
+                  "tombstone fsync recovery inspect");
+    expect(recovered_manifest.shards.size() == 1 && recovered_manifest.shards.front().sequence == 2,
+           "tombstone fsync recovery did not retain published manifest");
+    expect_status(recovered.shutdown().status, capture_store_status::ok, "tombstone fsync recovery shutdown");
+
+    temporary_directory  orphan_temp;
+    capture_store_config orphan_config = make_config(orphan_temp.path());
+    write_private_file(orphan_temp.path() / ".shard-00000000000000000001.tmp", { 1, 2, 3 });
+    orphan_config.faults.fail_unlink = true;
+    capture_store orphan(orphan_config);
+    expect(orphan.stats().worker_failed, "orphan unlink fault did not fail recovery");
+    expect_status(orphan.shutdown(false).status, capture_store_status::deletion_failed, "orphan unlink fault status");
+
+    temporary_directory  ordering_temp;
+    capture_store_config ordering_config   = make_config(ordering_temp.path());
+    ordering_config.faults.fail_file_fsync = true;
+    capture_store ordering(ordering_config);
+    expect(ordering.try_enqueue(make_observation(1)), "ordering enqueue");
+    std::array<capture_store_result, 2> flush_results = {};
+    std::thread                         first([&]() { flush_results[0] = ordering.flush(); });
+    std::thread                         second([&]() { flush_results[1] = ordering.flush(); });
+    first.join();
+    second.join();
+    expect_status(flush_results[0].status, capture_store_status::io_error, "first failure flush ordering");
+    expect_status(flush_results[1].status, capture_store_status::io_error, "second failure flush ordering");
+    expect_status(ordering.shutdown(false).status, capture_store_status::io_error, "failure ordering shutdown");
+}
+
 }  // namespace
 
 int main() {
@@ -749,6 +949,8 @@ int main() {
         test_root_file_and_tombstone_security();
         test_random_salt_and_post_publication_retention();
         test_concurrent_flush_shutdown();
+        test_admission_linearization_and_high_count_shutdown();
+        test_filesystem_fault_seams_and_flush_ordering();
     } catch (const std::exception & error) {
         std::fprintf(stderr, "test-server-capture-store: %s\n", error.what());
         return 1;

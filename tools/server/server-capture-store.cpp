@@ -16,7 +16,6 @@
 #include <limits>
 #include <mutex>
 #include <new>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -39,6 +38,8 @@ constexpr uint32_t MANIFEST_FLAG_REDACTED_IDENTITY = 1U;
 constexpr mode_t   PRIVATE_FILE_MODE               = S_IRUSR | S_IWUSR;
 constexpr mode_t   PRIVATE_DIRECTORY_MODE          = S_IRWXU;
 constexpr uint64_t CAPTURE_MAX_RETAINED_RECORDS    = 1ULL << 32;
+constexpr uint64_t ADMISSION_CLOSED                = UINT64_C(1) << 63;
+constexpr uint64_t ADMISSION_COUNT_MASK            = ADMISSION_CLOSED - 1;
 
 struct sha256_context {
     uint32_t state[8]      = {};
@@ -397,7 +398,10 @@ capture_store_result open_private_root(const fs::path & root, bool require_priva
     return result(capture_store_status::ok);
 }
 
-capture_store_result safe_remove_file_at(int root_fd, const std::string & name) {
+capture_store_result safe_remove_file_at(int root_fd, const std::string & name, bool fail_unlink = false) {
+    if (fail_unlink) {
+        return result(capture_store_status::deletion_failed, EIO);
+    }
     struct stat status = {};
     if (::fstatat(root_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) {
         return errno == ENOENT ? result(capture_store_status::ok) : result(capture_store_status::path_security, errno);
@@ -535,23 +539,24 @@ capture_store_result write_file_at(int                          root_fd,
                                                      errno_result(errno);
     }
     struct stat file_status = {};
-    if (::fstat(descriptor, &file_status) != 0 || !S_ISREG(file_status.st_mode) || file_status.st_uid != ::geteuid() ||
-        (file_status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+    if (faults.fail_fstat || ::fstat(descriptor, &file_status) != 0 || !S_ISREG(file_status.st_mode) ||
+        file_status.st_uid != ::geteuid() || (file_status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
         const int error = errno == 0 ? EACCES : errno;
         ::close(descriptor);
-        return result(capture_store_status::path_security, error);
+        return faults.fail_fstat ? result(capture_store_status::io_error, EIO) :
+                                   result(capture_store_status::path_security, error);
     }
     uint64_t             written      = 0;
     capture_store_result write_status = write_all(descriptor, bytes.data(), bytes.size(), faults, written);
-    if (write_status.status == capture_store_status::ok && ::fsync(descriptor) != 0) {
-        write_status = errno_result(errno);
+    if (write_status.status == capture_store_status::ok && (faults.fail_file_fsync || ::fsync(descriptor) != 0)) {
+        write_status = faults.fail_file_fsync ? result(capture_store_status::io_error, EIO) : errno_result(errno);
     }
     const int close_error = ::close(descriptor) == 0 ? 0 : errno;
     if (write_status.status == capture_store_status::ok && close_error != 0) {
         write_status = errno_result(close_error);
     }
     if (write_status.status != capture_store_status::ok && !preserve_on_failure) {
-        (void) safe_remove_file_at(root_fd, name);
+        (void) safe_remove_file_at(root_fd, name, faults.fail_unlink);
     }
     return write_status;
 }
@@ -561,17 +566,18 @@ capture_store_result read_file_at(int                    root_fd,
                                   uint64_t               max_bytes,
                                   std::vector<uint8_t> & bytes,
                                   capture_store_status   missing_status,
-                                  capture_store_status   too_large_status) {
+                                  capture_store_status   too_large_status,
+                                  bool                   fail_fstat = false) {
     const int descriptor = ::openat(root_fd, name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (descriptor < 0) {
         return errno == ELOOP ? result(capture_store_status::path_security, errno) :
                                 result(errno == ENOENT ? missing_status : capture_store_status::io_error, errno);
     }
     struct stat file_status = {};
-    if (::fstat(descriptor, &file_status) != 0) {
+    if (fail_fstat || ::fstat(descriptor, &file_status) != 0) {
         const int error = errno;
         ::close(descriptor);
-        return result(capture_store_status::io_error, error);
+        return result(capture_store_status::io_error, fail_fstat ? EIO : error);
     }
     if (!S_ISREG(file_status.st_mode) || file_status.st_size < 0 || file_status.st_uid != ::geteuid() ||
         (file_status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
@@ -623,19 +629,23 @@ capture_store_result read_file_at(int                    root_fd,
     return result(capture_store_status::ok);
 }
 
-bool fsync_directory_fd(int descriptor, int & error, bool require_private) {
+bool fsync_directory_fd(int   descriptor,
+                        int & error,
+                        bool  require_private,
+                        bool  fail_fsync = false,
+                        bool  fail_fstat = false) {
     if (descriptor < 0) {
         error = EBADF;
         return false;
     }
     struct stat status = {};
-    if (::fstat(descriptor, &status) != 0 || !S_ISDIR(status.st_mode) || status.st_uid != ::geteuid() ||
+    if (fail_fstat || ::fstat(descriptor, &status) != 0 || !S_ISDIR(status.st_mode) || status.st_uid != ::geteuid() ||
         (require_private && (status.st_mode & (S_IRWXG | S_IRWXO)) != 0)) {
-        error = errno == 0 ? EACCES : errno;
+        error = fail_fstat ? EIO : (errno == 0 ? EACCES : errno);
         return false;
     }
-    const bool success = ::fsync(descriptor) == 0;
-    error              = success ? 0 : errno;
+    const bool success = !fail_fsync && ::fsync(descriptor) == 0;
+    error              = success ? 0 : (fail_fsync ? EIO : errno);
     return success;
 }
 
@@ -1085,32 +1095,17 @@ struct capture_store::impl {
         wakeup = std::make_unique<capture_wakeup>();
         salt   = cfg.identity_salt;
         if (salt_zero(salt)) {
-            bool random_salt = true;
-            try {
-                std::random_device random;
-                for (size_t index = 0; index < salt.size(); ++index) {
-                    salt[index] = static_cast<uint8_t>(random() & 0xffU);
-                }
-            } catch (...) {
-                random_salt = false;
+            int  random_error  = EIO;
+            bool random_failed = cfg.faults.fail_csprng;
+            if (!random_failed && ::getentropy(salt.data(), salt.size()) != 0) {
+                random_failed = true;
+                random_error  = errno == 0 ? EIO : errno;
             }
-            random_salt = random_salt && !salt_zero(salt);
-            if (random_salt) {
-                // random_device is preferred; the deterministic fallback
-                // below keeps construction available on restricted hosts.
-            } else {
-                std::array<uint8_t, 32> entropy       = {};
-                const auto              now           = std::chrono::steady_clock::now().time_since_epoch().count();
-                const uint64_t          clock_value   = static_cast<uint64_t>(now);
-                const uint64_t          address_value = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(this));
-                const uint64_t          pid_value     = static_cast<uint64_t>(::getpid());
-                for (unsigned shift = 0; shift < 64; shift += 8) {
-                    entropy[shift / 8]      = static_cast<uint8_t>(clock_value >> shift);
-                    entropy[8 + shift / 8]  = static_cast<uint8_t>(address_value >> shift);
-                    entropy[16 + shift / 8] = static_cast<uint8_t>(pid_value >> shift);
-                }
-                const capture_digest generated = sha256(entropy.data(), entropy.size());
-                std::copy_n(generated.begin(), salt.size(), salt.begin());
+            if (random_failed || salt_zero(salt)) {
+                startup = result(capture_store_status::io_error, random_error);
+                accepting.store(false, std::memory_order_release);
+                failed.store(true, std::memory_order_release);
+                return;
             }
         }
         manifest.capture_mode   = cfg.capture_mode;
@@ -1129,6 +1124,9 @@ struct capture_store::impl {
     ~impl() {
         if (worker.joinable()) {
             (void) shutdown(true);
+        } else {
+            accepting.store(false, std::memory_order_release);
+            close_admission_and_wait();
         }
         if (root_fd >= 0) {
             (void) ::close(root_fd);
@@ -1146,7 +1144,7 @@ struct capture_store::impl {
         std::vector<uint8_t>       bytes;
         const capture_store_result read =
             read_file_at(root_fd, "capture.manifest", cfg.max_manifest_bytes, bytes, capture_store_status::no_manifest,
-                         capture_store_status::manifest_too_large);
+                         capture_store_status::manifest_too_large, cfg.faults.fail_fstat);
         if (read.status == capture_store_status::no_manifest) {
             manifest                = {};
             manifest.capture_mode   = cfg.capture_mode;
@@ -1192,6 +1190,9 @@ struct capture_store::impl {
         for (const std::string & name : entries) {
             struct stat entry_status = {};
             if (::fstatat(root_fd, name.c_str(), &entry_status, AT_SYMLINK_NOFOLLOW) != 0) {
+                if (errno == ENOENT) {
+                    continue;
+                }
                 return result(capture_store_status::path_security, errno);
             }
             const bool capture_prefix = name == ".capture.manifest.tmp" || name.rfind(".capture.", 0) == 0 ||
@@ -1215,11 +1216,13 @@ struct capture_store::impl {
                 if (found != manifest.shards.end()) {
                     return result(capture_store_status::path_security, EINVAL);
                 }
-                const capture_store_result remove_shard = safe_remove_file_at(root_fd, shard_name(sequence, false));
+                const capture_store_result remove_shard =
+                    safe_remove_file_at(root_fd, shard_name(sequence, false), cfg.faults.fail_unlink);
                 if (remove_shard.status != capture_store_status::ok) {
                     return remove_shard;
                 }
-                const capture_store_result remove_tombstone = safe_remove_file_at(root_fd, name);
+                const capture_store_result remove_tombstone =
+                    safe_remove_file_at(root_fd, name, cfg.faults.fail_unlink);
                 if (remove_tombstone.status != capture_store_status::ok) {
                     return result(capture_store_status::deletion_failed, remove_tombstone.os_error);
                 }
@@ -1228,7 +1231,7 @@ struct capture_store::impl {
             uint64_t shard_sequence = 0;
             bool     temporary      = false;
             if (name == ".capture.manifest.tmp") {
-                const capture_store_result removed = safe_remove_file_at(root_fd, name);
+                const capture_store_result removed = safe_remove_file_at(root_fd, name, cfg.faults.fail_unlink);
                 if (removed.status != capture_store_status::ok) {
                     return removed;
                 }
@@ -1241,7 +1244,7 @@ struct capture_store::impl {
                 manifest.shards.begin(), manifest.shards.end(),
                 [shard_sequence](const capture_shard_info & shard) { return shard.sequence == shard_sequence; });
             if (temporary || found == manifest.shards.end()) {
-                const capture_store_result removed = safe_remove_file_at(root_fd, name);
+                const capture_store_result removed = safe_remove_file_at(root_fd, name, cfg.faults.fail_unlink);
                 if (removed.status != capture_store_status::ok) {
                     return removed;
                 }
@@ -1258,9 +1261,9 @@ struct capture_store::impl {
         }
         for (const capture_shard_info & shard : candidate.shards) {
             std::vector<uint8_t>       bytes;
-            const capture_store_result read =
-                read_file_at(root_fd, shard_name(shard.sequence, false), cfg.max_shard_bytes, bytes,
-                             capture_store_status::shard_missing, capture_store_status::shard_too_large);
+            const capture_store_result read = read_file_at(
+                root_fd, shard_name(shard.sequence, false), cfg.max_shard_bytes, bytes,
+                capture_store_status::shard_missing, capture_store_status::shard_too_large, cfg.faults.fail_fstat);
             if (read.status != capture_store_status::ok) {
                 return read;
             }
@@ -1278,9 +1281,10 @@ struct capture_store::impl {
         if (preserve) {
             return result(capture_store_status::commit_uncertain);
         }
-        const capture_store_result remove_temporary = safe_remove_file_at(root_fd, temporary);
-        const capture_store_result remove_final     = safe_remove_file_at(root_fd, final);
-        const capture_store_result remove_manifest  = safe_remove_file_at(root_fd, ".capture.manifest.tmp");
+        const capture_store_result remove_temporary = safe_remove_file_at(root_fd, temporary, cfg.faults.fail_unlink);
+        const capture_store_result remove_final     = safe_remove_file_at(root_fd, final, cfg.faults.fail_unlink);
+        const capture_store_result remove_manifest =
+            safe_remove_file_at(root_fd, ".capture.manifest.tmp", cfg.faults.fail_unlink);
         if (remove_temporary.status != capture_store_status::ok || remove_final.status != capture_store_status::ok ||
             remove_manifest.status != capture_store_status::ok) {
             const capture_store_result & failure =
@@ -1315,41 +1319,49 @@ struct capture_store::impl {
                               errno);
             }
             struct stat tombstone_status = {};
-            if (::fstat(descriptor, &tombstone_status) != 0 || !S_ISREG(tombstone_status.st_mode) ||
-                tombstone_status.st_uid != ::geteuid() || (tombstone_status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+            if (cfg.faults.fail_fstat || ::fstat(descriptor, &tombstone_status) != 0 ||
+                !S_ISREG(tombstone_status.st_mode) || tombstone_status.st_uid != ::geteuid() ||
+                (tombstone_status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
                 const int error = errno == 0 ? EACCES : errno;
                 ::close(descriptor);
-                return result(capture_store_status::path_security, error);
+                return cfg.faults.fail_fstat ? result(capture_store_status::io_error, EIO) :
+                                               result(capture_store_status::path_security, error);
             }
             const uint8_t marker  = 1;
             ssize_t       written = 0;
             do {
                 written = ::write(descriptor, &marker, sizeof(marker));
             } while (written < 0 && errno == EINTR);
-            const int write_error = written == 1 ? 0 : (written < 0 ? errno : EIO);
-            const int sync_error  = write_error == 0 && ::fsync(descriptor) != 0 ? errno : 0;
-            const int close_error = ::close(descriptor) != 0 ? errno : 0;
+            const int  write_error         = written == 1 ? 0 : (written < 0 ? errno : EIO);
+            const bool fail_tombstone_sync = cfg.faults.fail_file_fsync || cfg.faults.fail_tombstone_fsync;
+            const int  sync_error          = write_error == 0 && (fail_tombstone_sync || ::fsync(descriptor) != 0) ?
+                                                 (fail_tombstone_sync ? EIO : errno) :
+                                                 0;
+            const int  close_error         = ::close(descriptor) != 0 ? errno : 0;
             if (write_error != 0 || sync_error != 0 || close_error != 0) {
                 const int error = write_error != 0 ? write_error : (sync_error != 0 ? sync_error : close_error);
                 return result(capture_store_status::deletion_failed, error);
             }
             int directory_error = 0;
-            if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root)) {
+            if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root, cfg.faults.fail_directory_fsync,
+                                    cfg.faults.fail_fstat)) {
                 return result(capture_store_status::deletion_failed, directory_error);
             }
-            const capture_store_result remove_final = safe_remove_file_at(root_fd, final);
+            const capture_store_result remove_final = safe_remove_file_at(root_fd, final, cfg.faults.fail_unlink);
             if (remove_final.status != capture_store_status::ok) {
                 return remove_final.status == capture_store_status::path_security ?
                            remove_final :
                            result(capture_store_status::deletion_failed, remove_final.os_error);
             }
-            const capture_store_result remove_tombstone = safe_remove_file_at(root_fd, tombstone);
+            const capture_store_result remove_tombstone =
+                safe_remove_file_at(root_fd, tombstone, cfg.faults.fail_unlink);
             if (remove_tombstone.status != capture_store_status::ok) {
                 return remove_tombstone.status == capture_store_status::path_security ?
                            remove_tombstone :
                            result(capture_store_status::deletion_failed, remove_tombstone.os_error);
             }
-            if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root)) {
+            if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root, cfg.faults.fail_directory_fsync,
+                                    cfg.faults.fail_fstat)) {
                 return result(capture_store_status::deletion_failed, directory_error);
             }
         }
@@ -1389,7 +1401,7 @@ struct capture_store::impl {
             if (cfg.faults.preserve_failed_files) {
                 return write;
             }
-            const capture_store_result removed = safe_remove_file_at(root_fd, temporary);
+            const capture_store_result removed = safe_remove_file_at(root_fd, temporary, cfg.faults.fail_unlink);
             if (removed.status != capture_store_status::ok) {
                 return result(capture_store_status::deletion_failed, removed.os_error);
             }
@@ -1418,7 +1430,10 @@ struct capture_store::impl {
         if (errno != ENOENT) {
             return result(capture_store_status::path_security, errno);
         }
-        if (::renameat(root_fd, temporary.c_str(), root_fd, final.c_str()) != 0) {
+        if (cfg.faults.fail_shard_rename || ::renameat(root_fd, temporary.c_str(), root_fd, final.c_str()) != 0) {
+            if (cfg.faults.fail_shard_rename) {
+                errno = EIO;
+            }
             const int                  error   = errno;
             const capture_store_result cleanup = cleanup_after_failure(temporary, final, false);
             return cleanup.status == capture_store_status::deletion_failed ? cleanup : errno_result(error);
@@ -1430,7 +1445,8 @@ struct capture_store::impl {
             return cleanup_after_failure(temporary, final, false);
         }
         int directory_error = 0;
-        if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root)) {
+        if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root, cfg.faults.fail_directory_fsync,
+                                cfg.faults.fail_fstat)) {
             return errno_result(directory_error);
         }
 
@@ -1446,7 +1462,7 @@ struct capture_store::impl {
         candidate.shards.push_back(info);
         if (candidate.total_records > UINT64_MAX - info.record_count ||
             candidate.total_bytes > UINT64_MAX - info.byte_count) {
-            const capture_store_result removed = safe_remove_file_at(root_fd, final);
+            const capture_store_result removed = safe_remove_file_at(root_fd, final, cfg.faults.fail_unlink);
             if (removed.status != capture_store_status::ok) {
                 return result(capture_store_status::deletion_failed, removed.os_error);
             }
@@ -1471,7 +1487,7 @@ struct capture_store::impl {
             retired.push_back(old);
         }
         if (candidate.shards.empty()) {
-            const capture_store_result removed = safe_remove_file_at(root_fd, final);
+            const capture_store_result removed = safe_remove_file_at(root_fd, final, cfg.faults.fail_unlink);
             if (removed.status != capture_store_status::ok) {
                 return result(capture_store_status::deletion_failed, removed.os_error);
             }
@@ -1479,7 +1495,7 @@ struct capture_store::impl {
         }
         const std::vector<uint8_t> manifest_bytes = serialize_manifest(candidate, salt);
         if (manifest_bytes.size() > cfg.max_manifest_bytes) {
-            const capture_store_result removed = safe_remove_file_at(root_fd, final);
+            const capture_store_result removed = safe_remove_file_at(root_fd, final, cfg.faults.fail_unlink);
             if (removed.status != capture_store_status::ok) {
                 return result(capture_store_status::deletion_failed, removed.os_error);
             }
@@ -1492,8 +1508,9 @@ struct capture_store::impl {
                                                                   cfg.faults, cfg.faults.preserve_failed_files);
         if (manifest_write.status != capture_store_status::ok) {
             if (!cfg.faults.preserve_failed_files) {
-                const capture_store_result remove_final    = safe_remove_file_at(root_fd, final);
-                const capture_store_result remove_manifest = safe_remove_file_at(root_fd, ".capture.manifest.tmp");
+                const capture_store_result remove_final = safe_remove_file_at(root_fd, final, cfg.faults.fail_unlink);
+                const capture_store_result remove_manifest =
+                    safe_remove_file_at(root_fd, ".capture.manifest.tmp", cfg.faults.fail_unlink);
                 if (remove_final.status != capture_store_status::ok ||
                     remove_manifest.status != capture_store_status::ok) {
                     const capture_store_result & failure =
@@ -1520,7 +1537,11 @@ struct capture_store::impl {
                                                                    manifest_tmp_status.os_error :
                                                                    manifest_status.os_error);
         }
-        if (::renameat(root_fd, ".capture.manifest.tmp", root_fd, "capture.manifest") != 0) {
+        if (cfg.faults.fail_manifest_rename ||
+            ::renameat(root_fd, ".capture.manifest.tmp", root_fd, "capture.manifest") != 0) {
+            if (cfg.faults.fail_manifest_rename) {
+                errno = EIO;
+            }
             const int                  error   = errno;
             const capture_store_result cleanup = cleanup_after_failure(".capture.manifest.tmp", final, false);
             return cleanup.status == capture_store_status::deletion_failed ? cleanup : errno_result(error);
@@ -1535,7 +1556,8 @@ struct capture_store::impl {
         // Cancellation after publication is too late to revoke a durable
         // commit; returning success is the only truthful outcome.
         (void) phase_cancelled(cfg, capture_store_phase::after_manifest_rename);
-        if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root)) {
+        if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root, cfg.faults.fail_directory_fsync,
+                                cfg.faults.fail_fstat)) {
             return result(capture_store_status::commit_uncertain, directory_error, true);
         }
         // Cancellation after publication cannot revoke the manifest.  Invoke
@@ -1640,8 +1662,9 @@ struct capture_store::impl {
                 }
                 if (should_stop && !should_drain) {
                     while (ring->try_pop(observation)) {
-                        ++dropped_after_stop;
+                        ++dropped_on_shutdown;
                     }
+                    dropped_on_shutdown += current_records;
                     reset_current();
                 }
                 if (ring->stats().size_approx != 0) {
@@ -1738,6 +1761,8 @@ struct capture_store::impl {
 
     capture_store_result shutdown(bool drain) {
         if (cfg.capture_mode == mode::off) {
+            accepting.store(false, std::memory_order_release);
+            close_admission_and_wait();
             return result(capture_store_status::disabled);
         }
         std::unique_lock<std::mutex> guard(mutex);
@@ -1747,6 +1772,7 @@ struct capture_store::impl {
         }
         shutdown_started = true;
         if (!worker_started.load(std::memory_order_acquire)) {
+            close_admission_and_wait();
             stopped = true;
             return terminal.status == capture_store_status::invalid_argument ? startup : terminal;
         }
@@ -1757,9 +1783,7 @@ struct capture_store::impl {
             stop_requested.store(true, std::memory_order_release);
             accepting.store(false, std::memory_order_release);
         }
-        while (active_producers.load(std::memory_order_acquire) != 0) {
-            std::this_thread::yield();
-        }
+        close_admission_and_wait();
         (void) wakeup->post();
         worker.join();
         worker_started.store(false, std::memory_order_release);
@@ -1790,7 +1814,7 @@ struct capture_store::impl {
     std::atomic<bool>               failed{ false };
     std::atomic<bool>               worker_running{ false };
     std::atomic<bool>               worker_started{ false };
-    std::atomic<uint64_t>           active_producers{ 0 };
+    std::atomic<uint64_t>           admission_state{ 0 };
     bool                            shutdown_started = false;
     uint64_t                        flush_requested  = 0;
     uint64_t                        flush_completed  = 0;
@@ -1801,6 +1825,29 @@ struct capture_store::impl {
     uint64_t                        current_last_ns  = 0;
     uint64_t                        failed_writes    = 0;
     std::atomic<uint64_t>           dropped_after_stop{ 0 };
+    std::atomic<uint64_t>           dropped_on_shutdown{ 0 };
+
+    bool claim_producer() noexcept {
+        uint64_t observed = admission_state.load(std::memory_order_acquire);
+        for (;;) {
+            if ((observed & ADMISSION_CLOSED) != 0 || (observed & ADMISSION_COUNT_MASK) == ADMISSION_COUNT_MASK) {
+                return false;
+            }
+            if (admission_state.compare_exchange_weak(observed, observed + 1, std::memory_order_acq_rel,
+                                                      std::memory_order_acquire)) {
+                return true;
+            }
+        }
+    }
+
+    void release_producer() noexcept { admission_state.fetch_sub(1, std::memory_order_release); }
+
+    void close_admission_and_wait() noexcept {
+        admission_state.fetch_or(ADMISSION_CLOSED, std::memory_order_acq_rel);
+        while ((admission_state.load(std::memory_order_acquire) & ADMISSION_COUNT_MASK) != 0) {
+            std::this_thread::yield();
+        }
+    }
 };
 
 capture_store::capture_store(capture_store_config config) : data(std::make_unique<impl>(std::move(config))) {}
@@ -1808,14 +1855,22 @@ capture_store::capture_store(capture_store_config config) : data(std::make_uniqu
 capture_store::~capture_store() = default;
 
 bool capture_store::try_enqueue(const cycle_observation & observation) noexcept {
-    if (data->ring == nullptr || !data->accepting.load(std::memory_order_acquire)) {
+    if (!data->claim_producer()) {
         data->dropped_after_stop.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    data->active_producers.fetch_add(1, std::memory_order_acq_rel);
-    if (!data->accepting.load(std::memory_order_acquire)) {
-        data->active_producers.fetch_sub(1, std::memory_order_acq_rel);
+    if (data->cfg.faults.before_enqueue_accept) {
+        try {
+            data->cfg.faults.before_enqueue_accept();
+        } catch (...) {
+            data->dropped_after_stop.fetch_add(1, std::memory_order_relaxed);
+            data->release_producer();
+            return false;
+        }
+    }
+    if (data->ring == nullptr || !data->accepting.load(std::memory_order_acquire)) {
         data->dropped_after_stop.fetch_add(1, std::memory_order_relaxed);
+        data->release_producer();
         return false;
     }
     const bool pushed = data->ring->try_push(observation);
@@ -1824,12 +1879,7 @@ bool capture_store::try_enqueue(const cycle_observation & observation) noexcept 
             data->failed.store(true, std::memory_order_release);
         }
     }
-    if (pushed && !data->accepting.load(std::memory_order_acquire)) {
-        data->dropped_after_stop.fetch_add(1, std::memory_order_relaxed);
-        data->active_producers.fetch_sub(1, std::memory_order_acq_rel);
-        return false;
-    }
-    data->active_producers.fetch_sub(1, std::memory_order_acq_rel);
+    data->release_producer();
     return pushed;
 }
 
@@ -1849,9 +1899,9 @@ capture_store_result capture_store::inspect(capture_manifest & output) const {
         return data->startup;
     }
     std::vector<uint8_t>       bytes;
-    const capture_store_result read =
-        read_file_at(data->root_fd, "capture.manifest", data->cfg.max_manifest_bytes, bytes,
-                     capture_store_status::no_manifest, capture_store_status::manifest_too_large);
+    const capture_store_result read = read_file_at(
+        data->root_fd, "capture.manifest", data->cfg.max_manifest_bytes, bytes, capture_store_status::no_manifest,
+        capture_store_status::manifest_too_large, data->cfg.faults.fail_fstat);
     if (read.status != capture_store_status::ok) {
         return read;
     }
@@ -1868,10 +1918,11 @@ capture_store_result capture_store::validate(const capture_manifest & manifest) 
 
 capture_store_stats capture_store::stats() const noexcept {
     capture_store_stats output;
-    output.ring               = data->ring == nullptr ? ring_stats{} : data->ring->stats();
-    output.worker_running     = data->worker_running.load(std::memory_order_acquire);
-    output.worker_failed      = data->failed.load(std::memory_order_acquire);
-    output.dropped_after_stop = data->dropped_after_stop.load(std::memory_order_relaxed);
+    output.ring                = data->ring == nullptr ? ring_stats{} : data->ring->stats();
+    output.worker_running      = data->worker_running.load(std::memory_order_acquire);
+    output.worker_failed       = data->failed.load(std::memory_order_acquire);
+    output.dropped_after_stop  = data->dropped_after_stop.load(std::memory_order_relaxed);
+    output.dropped_on_shutdown = data->dropped_on_shutdown.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(data->mutex);
     output.committed_shards  = static_cast<uint64_t>(data->manifest.shards.size());
     output.committed_records = data->manifest.total_records;
