@@ -1,7 +1,9 @@
 #include "server-capture-store.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -34,6 +36,9 @@ constexpr std::array<uint8_t, 8> SHARD_MAGIC = {
 constexpr size_t   MANIFEST_ENTRY_BYTES            = 72;
 constexpr uint32_t RICH_RECORD_FLAG                = 1U;
 constexpr uint32_t MANIFEST_FLAG_REDACTED_IDENTITY = 1U;
+constexpr mode_t   PRIVATE_FILE_MODE               = S_IRUSR | S_IWUSR;
+constexpr mode_t   PRIVATE_DIRECTORY_MODE          = S_IRWXU;
+constexpr uint64_t CAPTURE_MAX_RETAINED_RECORDS    = 1ULL << 32;
 
 struct sha256_context {
     uint32_t state[8]      = {};
@@ -286,9 +291,10 @@ bool parse_shard_sequence(const std::string & name, uint64_t & sequence, bool & 
     if (prefix.empty()) {
         return false;
     }
-    temporary                  = prefix[0] == '.';
-    const size_t suffix_length = temporary ? 4 : 4;
-    if (name.size() <= prefix.size() + suffix_length || name.substr(name.size() - 4) != (temporary ? ".tmp" : ".cap")) {
+    temporary                        = prefix[0] == '.';
+    constexpr size_t sequence_digits = 20;
+    if (name.size() != prefix.size() + sequence_digits + 4 ||
+        name.substr(name.size() - 4) != (temporary ? ".tmp" : ".cap")) {
         return false;
     }
     const size_t begin  = prefix.size();
@@ -305,6 +311,9 @@ bool parse_shard_sequence(const std::string & name, uint64_t & sequence, bool & 
         }
         parsed = parsed * 10U + digit;
     }
+    if (parsed == 0) {
+        return false;
+    }
     sequence = parsed;
     return true;
 }
@@ -316,6 +325,164 @@ capture_store_result result(capture_store_status status, int os_error = 0, bool 
 capture_store_result errno_result(int error) {
     return result(error == ENOSPC ? capture_store_status::no_space : capture_store_status::io_error, error);
 }
+
+bool valid_capture_mode_value(uint32_t value) noexcept {
+    return value == static_cast<uint32_t>(mode::metrics_only) || value == static_cast<uint32_t>(mode::compact) ||
+           value == static_cast<uint32_t>(mode::sampled_rich);
+}
+
+bool path_has_traversal(const fs::path & path) {
+    if (!path.is_absolute()) {
+        return true;
+    }
+    for (const fs::path & component : path) {
+        if (component == "." || component == "..") {
+            return true;
+        }
+    }
+    return false;
+}
+
+capture_store_result open_private_root(const fs::path & root, bool require_private, int & descriptor) {
+    descriptor = -1;
+    if (path_has_traversal(root) || root == root.root_path()) {
+        return result(capture_store_status::path_security, EINVAL);
+    }
+    int current = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (current < 0) {
+        return errno_result(errno);
+    }
+    for (const fs::path & component : root) {
+        if (component == root.root_path()) {
+            continue;
+        }
+        const std::string name = component.string();
+        int               next = ::openat(current, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next < 0 && errno == ENOENT) {
+            if (::mkdirat(current, name.c_str(), PRIVATE_DIRECTORY_MODE) != 0 && errno != EEXIST) {
+                const int error = errno;
+                ::close(current);
+                return errno_result(error);
+            }
+            next = ::openat(current, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        }
+        if (next < 0) {
+            const int error = errno;
+            ::close(current);
+            return result(capture_store_status::path_security, error);
+        }
+        struct stat status = {};
+        if (::fstat(next, &status) != 0 || !S_ISDIR(status.st_mode)) {
+            const int error = errno == 0 ? ENOTDIR : errno;
+            ::close(next);
+            ::close(current);
+            return result(capture_store_status::path_security, error);
+        }
+        ::close(current);
+        current = next;
+    }
+    struct stat status = {};
+    if (::fstat(current, &status) != 0 || !S_ISDIR(status.st_mode) || status.st_uid != ::geteuid()) {
+        const int error = errno == 0 ? EACCES : errno;
+        ::close(current);
+        return result(capture_store_status::path_security, error);
+    }
+    if (require_private && (::fchmod(current, PRIVATE_DIRECTORY_MODE) != 0 || ::fstat(current, &status) != 0 ||
+                            (status.st_mode & (S_IRWXG | S_IRWXO)) != 0)) {
+        const int error = errno == 0 ? EACCES : errno;
+        ::close(current);
+        return result(capture_store_status::path_security, error);
+    }
+    descriptor = current;
+    return result(capture_store_status::ok);
+}
+
+capture_store_result safe_remove_file_at(int root_fd, const std::string & name) {
+    struct stat status = {};
+    if (::fstatat(root_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) {
+        return errno == ENOENT ? result(capture_store_status::ok) : result(capture_store_status::path_security, errno);
+    }
+    if (S_ISLNK(status.st_mode) || !S_ISREG(status.st_mode) || status.st_uid != ::geteuid() ||
+        (status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        return result(capture_store_status::path_security, EACCES);
+    }
+    return ::unlinkat(root_fd, name.c_str(), 0) == 0 ? result(capture_store_status::ok) :
+                                                       result(capture_store_status::deletion_failed, errno);
+}
+
+capture_store_result validate_private_file_at(int root_fd, const std::string & name, bool allow_missing = false) {
+    struct stat status = {};
+    if (::fstatat(root_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (allow_missing && errno == ENOENT) {
+            return result(capture_store_status::ok);
+        }
+        return result(capture_store_status::path_security, errno);
+    }
+    if (S_ISLNK(status.st_mode) || !S_ISREG(status.st_mode) || status.st_uid != ::geteuid() ||
+        (status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        return result(capture_store_status::path_security, EACCES);
+    }
+    return result(capture_store_status::ok);
+}
+
+bool parse_tombstone_sequence(const std::string & name, uint64_t & sequence) noexcept {
+    constexpr size_t PREFIX = 8;  // .delete-
+    constexpr size_t DIGITS = 20;
+    constexpr size_t SUFFIX = 5;  // .tomb
+    if (name.size() != PREFIX + DIGITS + SUFFIX || name.rfind(".delete-", 0) != 0 ||
+        name.substr(PREFIX + DIGITS) != ".tomb") {
+        return false;
+    }
+    uint64_t parsed = 0;
+    for (size_t index = PREFIX; index < PREFIX + DIGITS; ++index) {
+        const char character = name[index];
+        if (character < '0' || character > '9') {
+            return false;
+        }
+        const uint64_t digit = static_cast<uint64_t>(character - '0');
+        if (parsed > (std::numeric_limits<uint64_t>::max() - digit) / 10U) {
+            return false;
+        }
+        parsed = parsed * 10U + digit;
+    }
+    if (parsed == 0) {
+        return false;
+    }
+    sequence = parsed;
+    return true;
+}
+
+class capture_wakeup {
+  public:
+    capture_wakeup() = default;
+
+    capture_wakeup(const capture_wakeup &)             = delete;
+    capture_wakeup & operator=(const capture_wakeup &) = delete;
+
+    bool post() noexcept {
+        epoch.fetch_add(1, std::memory_order_release);
+        condition.notify_one();
+        return true;
+    }
+
+    uint64_t snapshot() const noexcept { return epoch.load(std::memory_order_acquire); }
+
+    void wait(uint64_t & observed) {
+        std::unique_lock<std::mutex> lock(mutex);
+        // C++17 has no atomic_wait, and condition_variable notification can
+        // race the worker's unlock/register transition because producers must
+        // remain lock-free. A bounded timeout closes that final lost-wake
+        // window while the epoch predicate handles ordinary notifications.
+        (void) condition.wait_for(lock, std::chrono::milliseconds(1),
+                                  [this, observed]() { return epoch.load(std::memory_order_acquire) != observed; });
+        observed = epoch.load(std::memory_order_acquire);
+    }
+
+  private:
+    std::atomic<uint64_t>   epoch{ 0 };
+    mutable std::mutex      mutex;
+    std::condition_variable condition;
+};
 
 capture_store_result write_all(int                          descriptor,
                                const uint8_t *              data,
@@ -356,38 +523,49 @@ capture_store_result write_all(int                          descriptor,
     return result(capture_store_status::ok);
 }
 
-capture_store_result write_file(const fs::path &             path,
-                                const std::vector<uint8_t> & bytes,
-                                const capture_store_faults & faults,
-                                bool                         preserve_on_failure) {
-    const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+capture_store_result write_file_at(int                          root_fd,
+                                   const std::string &          name,
+                                   const std::vector<uint8_t> & bytes,
+                                   const capture_store_faults & faults,
+                                   bool                         preserve_on_failure) {
+    const int descriptor =
+        ::openat(root_fd, name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, PRIVATE_FILE_MODE);
     if (descriptor < 0) {
-        return errno_result(errno);
+        return (errno == ELOOP || errno == EEXIST) ? result(capture_store_status::path_security, errno) :
+                                                     errno_result(errno);
     }
-    uint64_t             written = 0;
-    capture_store_result status  = write_all(descriptor, bytes.data(), bytes.size(), faults, written);
-    if (status.status == capture_store_status::ok && ::fsync(descriptor) != 0) {
-        status = errno_result(errno);
+    struct stat file_status = {};
+    if (::fstat(descriptor, &file_status) != 0 || !S_ISREG(file_status.st_mode) || file_status.st_uid != ::geteuid() ||
+        (file_status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        const int error = errno == 0 ? EACCES : errno;
+        ::close(descriptor);
+        return result(capture_store_status::path_security, error);
+    }
+    uint64_t             written      = 0;
+    capture_store_result write_status = write_all(descriptor, bytes.data(), bytes.size(), faults, written);
+    if (write_status.status == capture_store_status::ok && ::fsync(descriptor) != 0) {
+        write_status = errno_result(errno);
     }
     const int close_error = ::close(descriptor) == 0 ? 0 : errno;
-    if (status.status == capture_store_status::ok && close_error != 0) {
-        status = errno_result(close_error);
+    if (write_status.status == capture_store_status::ok && close_error != 0) {
+        write_status = errno_result(close_error);
     }
-    if (status.status != capture_store_status::ok && !preserve_on_failure) {
-        std::error_code ignored;
-        fs::remove(path, ignored);
+    if (write_status.status != capture_store_status::ok && !preserve_on_failure) {
+        (void) safe_remove_file_at(root_fd, name);
     }
-    return status;
+    return write_status;
 }
 
-capture_store_result read_file(const fs::path &       path,
-                               uint64_t               max_bytes,
-                               std::vector<uint8_t> & bytes,
-                               capture_store_status   missing_status,
-                               capture_store_status   too_large_status) {
-    const int descriptor = ::open(path.c_str(), O_RDONLY);
+capture_store_result read_file_at(int                    root_fd,
+                                  const std::string &    name,
+                                  uint64_t               max_bytes,
+                                  std::vector<uint8_t> & bytes,
+                                  capture_store_status   missing_status,
+                                  capture_store_status   too_large_status) {
+    const int descriptor = ::openat(root_fd, name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (descriptor < 0) {
-        return result(errno == ENOENT ? missing_status : capture_store_status::io_error, errno);
+        return errno == ELOOP ? result(capture_store_status::path_security, errno) :
+                                result(errno == ENOENT ? missing_status : capture_store_status::io_error, errno);
     }
     struct stat file_status = {};
     if (::fstat(descriptor, &file_status) != 0) {
@@ -395,9 +573,10 @@ capture_store_result read_file(const fs::path &       path,
         ::close(descriptor);
         return result(capture_store_status::io_error, error);
     }
-    if (!S_ISREG(file_status.st_mode) || file_status.st_size < 0) {
+    if (!S_ISREG(file_status.st_mode) || file_status.st_size < 0 || file_status.st_uid != ::geteuid() ||
+        (file_status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
         ::close(descriptor);
-        return result(capture_store_status::malformed_manifest);
+        return result(capture_store_status::path_security, EACCES);
     }
     const uint64_t size = static_cast<uint64_t>(file_status.st_size);
     if (size > max_bytes || size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
@@ -427,24 +606,36 @@ capture_store_result read_file(const fs::path &       path,
         }
         offset += static_cast<size_t>(count);
     }
+    struct stat final_status = {};
+    if (::fstat(descriptor, &final_status) != 0) {
+        const int error = errno;
+        ::close(descriptor);
+        return result(capture_store_status::io_error, error);
+    }
+    if (final_status.st_size < 0 || static_cast<uint64_t>(final_status.st_size) != size) {
+        ::close(descriptor);
+        return static_cast<uint64_t>(final_status.st_size) > size ? result(capture_store_status::trailing_data) :
+                                                                    result(capture_store_status::truncated);
+    }
     if (::close(descriptor) != 0) {
         return errno_result(errno);
     }
     return result(capture_store_status::ok);
 }
 
-bool fsync_directory(const fs::path & path, int & error) {
-    const int descriptor = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
+bool fsync_directory_fd(int descriptor, int & error, bool require_private) {
     if (descriptor < 0) {
-        error = errno;
+        error = EBADF;
+        return false;
+    }
+    struct stat status = {};
+    if (::fstat(descriptor, &status) != 0 || !S_ISDIR(status.st_mode) || status.st_uid != ::geteuid() ||
+        (require_private && (status.st_mode & (S_IRWXG | S_IRWXO)) != 0)) {
+        error = errno == 0 ? EACCES : errno;
         return false;
     }
     const bool success = ::fsync(descriptor) == 0;
     error              = success ? 0 : errno;
-    if (::close(descriptor) != 0 && success) {
-        error = errno;
-        return false;
-    }
     return success;
 }
 
@@ -531,8 +722,8 @@ capture_store_result parse_manifest(const std::vector<uint8_t> & bytes,
         !read_u32(bytes, cursor, reserved) || !read_salt(bytes, cursor, salt)) {
         return result(capture_store_status::malformed_manifest);
     }
-    if (reserved != 0 || flags != MANIFEST_FLAG_REDACTED_IDENTITY || generation == 0 ||
-        shard_count > config.max_retained_shards || mode_value > static_cast<uint32_t>(mode::sampled_rich) ||
+    if (reserved != 0 || flags != MANIFEST_FLAG_REDACTED_IDENTITY || generation == 0 || shard_count == 0 ||
+        shard_count > config.max_retained_shards || !valid_capture_mode_value(mode_value) ||
         static_cast<mode>(mode_value) != config.capture_mode) {
         return result(capture_store_status::malformed_manifest);
     }
@@ -638,9 +829,9 @@ capture_store_result validate_shard_bytes(const std::vector<uint8_t> & bytes,
         !read_u64(bytes, cursor, payload_size) || !read_u64(bytes, cursor, first_ns) ||
         !read_u64(bytes, cursor, last_ns) || !read_u64(bytes, cursor, reserved) ||
         version != CAPTURE_SHARD_FORMAT_VERSION || header_bytes != CAPTURE_SHARD_HEADER_BYTES || reserved != 0 ||
-        mode_value != static_cast<uint32_t>(capture_mode) || sequence != expected.sequence ||
-        record_count != expected.record_count || first_ns != expected.first_monotonic_ns ||
-        last_ns != expected.last_monotonic_ns) {
+        !valid_capture_mode_value(mode_value) || mode_value != static_cast<uint32_t>(capture_mode) ||
+        sequence != expected.sequence || record_count != expected.record_count ||
+        first_ns != expected.first_monotonic_ns || last_ns != expected.last_monotonic_ns) {
         return result(capture_store_status::shard_corrupt);
     }
     if (declared_size > bytes.size()) {
@@ -682,6 +873,7 @@ capture_store_result validate_shard_bytes(const std::vector<uint8_t> & bytes,
             (record_flags & ~RICH_RECORD_FLAG) != 0 ||
             record_bytes !=
                 ((record_flags & RICH_RECORD_FLAG) != 0 ? CAPTURE_RICH_RECORD_BYTES : CAPTURE_COMPACT_RECORD_BYTES) ||
+            ((record_flags & RICH_RECORD_FLAG) != 0 && capture_mode != mode::sampled_rich) ||
             record_bytes > payload_end - payload_cursor) {
             return result(capture_store_status::shard_corrupt);
         }
@@ -779,8 +971,21 @@ bool valid_config(const capture_store_config & config) {
         config.max_retained_shards == 0 || config.max_retained_records == 0 || config.max_retained_bytes == 0 ||
         config.max_manifest_bytes <
             CAPTURE_MANIFEST_HEADER_BYTES + MANIFEST_ENTRY_BYTES + CAPTURE_MANIFEST_FOOTER_BYTES ||
-        config.max_manifest_bytes > 64U * 1024U * 1024U || config.max_shard_records > UINT32_MAX ||
-        config.rich_sample_every == 0) {
+        config.max_manifest_bytes > CAPTURE_MAX_MANIFEST_BYTES || config.max_shard_records > UINT32_MAX ||
+        config.rich_sample_every == 0 || !valid_capture_mode_value(static_cast<uint32_t>(config.capture_mode))) {
+        return false;
+    }
+    if (config.ring_capacity > CAPTURE_MAX_RING_CAPACITY || config.max_shard_bytes > CAPTURE_MAX_SHARD_BYTES ||
+        config.max_retained_bytes > CAPTURE_MAX_SHARD_BYTES * 64U ||
+        config.max_shard_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        config.max_manifest_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        return false;
+    }
+    const uint64_t max_manifest_entries =
+        (config.max_manifest_bytes - CAPTURE_MANIFEST_HEADER_BYTES - CAPTURE_MANIFEST_FOOTER_BYTES) /
+        MANIFEST_ENTRY_BYTES;
+    if (config.max_retained_shards > max_manifest_entries ||
+        config.max_retained_records > CAPTURE_MAX_RETAINED_RECORDS) {
         return false;
     }
     if (config.capture_mode == mode::sampled_rich && !config.allow_sampled_rich) {
@@ -803,6 +1008,16 @@ bool valid_config(const capture_store_config & config) {
         (config.max_shard_bytes - CAPTURE_SHARD_HEADER_BYTES - CAPTURE_SHARD_FOOTER_BYTES) /
         (CAPTURE_RECORD_HEADER_BYTES + record_bytes);
     return max_records_by_bytes != 0 && max_records_for_mode != 0 && config.max_shard_records <= max_records_for_mode;
+}
+
+size_t checked_ring_capacity(const capture_store_config & config) {
+    if (config.capture_mode == mode::off) {
+        return 0;
+    }
+    if (!valid_config(config)) {
+        throw std::invalid_argument("invalid capture store configuration");
+    }
+    return config.ring_capacity;
 }
 
 }  // namespace
@@ -851,16 +1066,24 @@ const char * capture_store_status_name(capture_store_status status) noexcept {
             return "cancelled";
         case capture_store_status::deletion_failed:
             return "deletion_failed";
+        case capture_store_status::path_security:
+            return "path_security";
     }
     return "unknown";
 }
 
 struct capture_store::impl {
-    explicit impl(capture_store_config config) : cfg(std::move(config)), ring(cfg.ring_capacity) {
+    explicit impl(capture_store_config config) : cfg(std::move(config)) {
+        if (cfg.capture_mode == mode::off) {
+            startup = result(capture_store_status::disabled);
+            return;
+        }
         if (!valid_config(cfg)) {
             throw std::invalid_argument("invalid capture store configuration");
         }
-        salt = cfg.identity_salt;
+        ring   = std::make_unique<spsc_ring>(checked_ring_capacity(cfg));
+        wakeup = std::make_unique<capture_wakeup>();
+        salt   = cfg.identity_salt;
         if (salt_zero(salt)) {
             bool random_salt = true;
             try {
@@ -871,6 +1094,7 @@ struct capture_store::impl {
             } catch (...) {
                 random_salt = false;
             }
+            random_salt = random_salt && !salt_zero(salt);
             if (random_salt) {
                 // random_device is preferred; the deterministic fallback
                 // below keeps construction available on restricted hosts.
@@ -892,41 +1116,37 @@ struct capture_store::impl {
         manifest.capture_mode   = cfg.capture_mode;
         manifest.format_version = CAPTURE_STORE_FORMAT_VERSION;
         startup                 = recover();
-        if (startup.status != capture_store_status::ok || cfg.capture_mode == mode::off) {
+        if (startup.status != capture_store_status::ok) {
             accepting.store(false, std::memory_order_release);
             failed.store(startup.status != capture_store_status::ok, std::memory_order_release);
             return;
         }
         accepting.store(true, std::memory_order_release);
         worker = std::thread(&impl::run, this);
+        worker_started.store(true, std::memory_order_release);
     }
 
     ~impl() {
         if (worker.joinable()) {
             (void) shutdown(true);
         }
+        if (root_fd >= 0) {
+            (void) ::close(root_fd);
+            root_fd = -1;
+        }
     }
 
     fs::path root() const { return fs::path(cfg.root_path); }
 
-    fs::path manifest_path() const { return root() / "capture.manifest"; }
-
-    fs::path manifest_tmp_path() const { return root() / ".capture.manifest.tmp"; }
-
     capture_store_result recover() {
-        std::error_code error;
-        if (!fs::exists(root(), error)) {
-            if (!fs::create_directories(root(), error) && error) {
-                return errno_result(error.value());
-            }
-        }
-        if (error || !fs::is_directory(root(), error) || error) {
-            return result(capture_store_status::io_error, error ? error.value() : ENOTDIR);
+        const capture_store_result root_status = open_private_root(root(), cfg.require_private_root, root_fd);
+        if (root_status.status != capture_store_status::ok) {
+            return root_status;
         }
         std::vector<uint8_t>       bytes;
         const capture_store_result read =
-            read_file(manifest_path(), cfg.max_manifest_bytes, bytes, capture_store_status::no_manifest,
-                      capture_store_status::manifest_too_large);
+            read_file_at(root_fd, "capture.manifest", cfg.max_manifest_bytes, bytes, capture_store_status::no_manifest,
+                         capture_store_status::manifest_too_large);
         if (read.status == capture_store_status::no_manifest) {
             manifest                = {};
             manifest.capture_mode   = cfg.capture_mode;
@@ -947,58 +1167,84 @@ struct capture_store::impl {
         // A manifest is the commit record.  Remove only unreferenced temp and
         // final shard names; malformed manifests never reach this point, so
         // recovery remains fail-closed.
-        std::vector<uint64_t> tombstones;
-        for (const fs::directory_entry & entry : fs::directory_iterator(root(), error)) {
-            if (error) {
-                return errno_result(error.value());
-            }
-            const std::string name = entry.path().filename().string();
-            if (name.rfind(".delete-", 0) == 0 && name.size() > 12 && name.substr(name.size() - 5) == ".tomb") {
-                uint64_t sequence = 0;
-                for (size_t index = 8; index + 5 < name.size(); ++index) {
-                    if (name[index] < '0' || name[index] > '9') {
-                        sequence = 0;
-                        break;
-                    }
-                    sequence = sequence * 10U + static_cast<uint64_t>(name[index] - '0');
-                }
-                if (sequence != 0) {
-                    tombstones.push_back(sequence);
-                }
-            }
+        const int scan_descriptor = ::dup(root_fd);
+        if (scan_descriptor < 0) {
+            return errno_result(errno);
         }
-        for (const uint64_t sequence : tombstones) {
-            std::error_code remove_error;
-            fs::remove(root() / shard_name(sequence, false), remove_error);
-            if (remove_error) {
-                return result(capture_store_status::deletion_failed, remove_error.value());
-            }
-            fs::remove(root() / tombstone_name(sequence), remove_error);
-            if (remove_error) {
-                return result(capture_store_status::deletion_failed, remove_error.value());
-            }
+        DIR * directory = ::fdopendir(scan_descriptor);
+        if (directory == nullptr) {
+            const int error = errno;
+            ::close(scan_descriptor);
+            return errno_result(error);
         }
-        for (const fs::directory_entry & entry : fs::directory_iterator(root(), error)) {
-            if (error) {
-                return errno_result(error.value());
+        std::vector<std::string> entries;
+        errno = 0;
+        for (dirent * entry = ::readdir(directory); entry != nullptr; entry = ::readdir(directory)) {
+            entries.emplace_back(entry->d_name);
+        }
+        const int scan_error = errno;
+        if (::closedir(directory) != 0 && scan_error == 0) {
+            return errno_result(errno);
+        }
+        if (scan_error != 0) {
+            return errno_result(scan_error);
+        }
+        for (const std::string & name : entries) {
+            struct stat entry_status = {};
+            if (::fstatat(root_fd, name.c_str(), &entry_status, AT_SYMLINK_NOFOLLOW) != 0) {
+                return result(capture_store_status::path_security, errno);
             }
-            const std::string name      = entry.path().filename().string();
-            uint64_t          sequence  = 0;
-            bool              temporary = false;
-            if (name == ".capture.manifest.tmp" || (parse_shard_sequence(name, sequence, temporary) && temporary)) {
-                std::error_code ignored;
-                fs::remove(entry.path(), ignored);
+            const bool capture_prefix = name == ".capture.manifest.tmp" || name.rfind(".capture.", 0) == 0 ||
+                                        name.rfind(".shard-", 0) == 0 || name.rfind("shard-", 0) == 0 ||
+                                        name.rfind(".delete-", 0) == 0;
+            if (!capture_prefix) {
                 continue;
             }
-            if (!parse_shard_sequence(name, sequence, temporary) || temporary) {
+            if (S_ISLNK(entry_status.st_mode) || !S_ISREG(entry_status.st_mode) || entry_status.st_uid != ::geteuid() ||
+                (entry_status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+                return result(capture_store_status::path_security, EACCES);
+            }
+            uint64_t sequence = 0;
+            if (name.rfind(".delete-", 0) == 0) {
+                if (!parse_tombstone_sequence(name, sequence)) {
+                    return result(capture_store_status::path_security, EINVAL);
+                }
+                const auto found =
+                    std::find_if(manifest.shards.begin(), manifest.shards.end(),
+                                 [sequence](const capture_shard_info & shard) { return shard.sequence == sequence; });
+                if (found != manifest.shards.end()) {
+                    return result(capture_store_status::path_security, EINVAL);
+                }
+                const capture_store_result remove_shard = safe_remove_file_at(root_fd, shard_name(sequence, false));
+                if (remove_shard.status != capture_store_status::ok) {
+                    return remove_shard;
+                }
+                const capture_store_result remove_tombstone = safe_remove_file_at(root_fd, name);
+                if (remove_tombstone.status != capture_store_status::ok) {
+                    return result(capture_store_status::deletion_failed, remove_tombstone.os_error);
+                }
                 continue;
             }
-            const auto found =
-                std::find_if(manifest.shards.begin(), manifest.shards.end(),
-                             [sequence](const capture_shard_info & shard) { return shard.sequence == sequence; });
-            if (found == manifest.shards.end()) {
-                std::error_code ignored;
-                fs::remove(entry.path(), ignored);
+            uint64_t shard_sequence = 0;
+            bool     temporary      = false;
+            if (name == ".capture.manifest.tmp") {
+                const capture_store_result removed = safe_remove_file_at(root_fd, name);
+                if (removed.status != capture_store_status::ok) {
+                    return removed;
+                }
+                continue;
+            }
+            if (!parse_shard_sequence(name, shard_sequence, temporary)) {
+                return result(capture_store_status::path_security, EINVAL);
+            }
+            const auto found = std::find_if(
+                manifest.shards.begin(), manifest.shards.end(),
+                [shard_sequence](const capture_shard_info & shard) { return shard.sequence == shard_sequence; });
+            if (temporary || found == manifest.shards.end()) {
+                const capture_store_result removed = safe_remove_file_at(root_fd, name);
+                if (removed.status != capture_store_status::ok) {
+                    return removed;
+                }
             }
         }
         return result(capture_store_status::ok);
@@ -1013,8 +1259,8 @@ struct capture_store::impl {
         for (const capture_shard_info & shard : candidate.shards) {
             std::vector<uint8_t>       bytes;
             const capture_store_result read =
-                read_file(root() / shard_name(shard.sequence, false), cfg.max_shard_bytes, bytes,
-                          capture_store_status::shard_missing, capture_store_status::shard_too_large);
+                read_file_at(root_fd, shard_name(shard.sequence, false), cfg.max_shard_bytes, bytes,
+                             capture_store_status::shard_missing, capture_store_status::shard_too_large);
             if (read.status != capture_store_status::ok) {
                 return read;
             }
@@ -1026,51 +1272,86 @@ struct capture_store::impl {
         return result(capture_store_status::ok);
     }
 
-    uint64_t next_sequence() const {
-        return manifest.shards.empty() ?
-                   1 :
-                   (manifest.shards.back().sequence == UINT64_MAX ? 0 : manifest.shards.back().sequence + 1);
-    }
-
-    capture_store_result cleanup_after_failure(const fs::path & temporary, const fs::path & final, bool preserve) {
+    capture_store_result cleanup_after_failure(const std::string & temporary,
+                                               const std::string & final,
+                                               bool                preserve) {
         if (preserve) {
             return result(capture_store_status::commit_uncertain);
         }
-        std::error_code ignored;
-        fs::remove(temporary, ignored);
-        fs::remove(final, ignored);
-        fs::remove(manifest_tmp_path(), ignored);
+        const capture_store_result remove_temporary = safe_remove_file_at(root_fd, temporary);
+        const capture_store_result remove_final     = safe_remove_file_at(root_fd, final);
+        const capture_store_result remove_manifest  = safe_remove_file_at(root_fd, ".capture.manifest.tmp");
+        if (remove_temporary.status != capture_store_status::ok || remove_final.status != capture_store_status::ok ||
+            remove_manifest.status != capture_store_status::ok) {
+            const capture_store_result & failure =
+                remove_temporary.status != capture_store_status::ok ?
+                    remove_temporary :
+                    (remove_final.status != capture_store_status::ok ? remove_final : remove_manifest);
+            return result(capture_store_status::deletion_failed, failure.os_error);
+        }
         return result(capture_store_status::cancelled);
     }
 
     capture_store_result delete_retired(const std::vector<capture_shard_info> & retired) {
         for (const capture_shard_info & shard : retired) {
-            const fs::path tombstone  = root() / tombstone_name(shard.sequence);
-            const fs::path final      = root() / shard_name(shard.sequence, false);
-            const int      descriptor = ::open(tombstone.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-            if (descriptor < 0) {
-                return result(capture_store_status::deletion_failed, errno);
+            const std::string tombstone        = tombstone_name(shard.sequence);
+            const std::string final            = shard_name(shard.sequence, false);
+            bool              still_referenced = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                still_referenced = std::find_if(manifest.shards.begin(), manifest.shards.end(),
+                                                [sequence = shard.sequence](const capture_shard_info & current) {
+                                                    return current.sequence == sequence;
+                                                }) != manifest.shards.end();
             }
-            const uint8_t marker = 1;
-            if (::write(descriptor, &marker, sizeof(marker)) != static_cast<ssize_t>(sizeof(marker)) ||
-                ::fsync(descriptor) != 0 || ::close(descriptor) != 0) {
-                const int error = errno;
+            if (still_referenced) {
+                return result(capture_store_status::path_security, EINVAL);
+            }
+            const int descriptor = ::openat(root_fd, tombstone.c_str(),
+                                            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, PRIVATE_FILE_MODE);
+            if (descriptor < 0) {
+                return result((errno == ELOOP || errno == EEXIST) ? capture_store_status::path_security :
+                                                                    capture_store_status::deletion_failed,
+                              errno);
+            }
+            struct stat tombstone_status = {};
+            if (::fstat(descriptor, &tombstone_status) != 0 || !S_ISREG(tombstone_status.st_mode) ||
+                tombstone_status.st_uid != ::geteuid() || (tombstone_status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+                const int error = errno == 0 ? EACCES : errno;
                 ::close(descriptor);
+                return result(capture_store_status::path_security, error);
+            }
+            const uint8_t marker  = 1;
+            ssize_t       written = 0;
+            do {
+                written = ::write(descriptor, &marker, sizeof(marker));
+            } while (written < 0 && errno == EINTR);
+            const int write_error = written == 1 ? 0 : (written < 0 ? errno : EIO);
+            const int sync_error  = write_error == 0 && ::fsync(descriptor) != 0 ? errno : 0;
+            const int close_error = ::close(descriptor) != 0 ? errno : 0;
+            if (write_error != 0 || sync_error != 0 || close_error != 0) {
+                const int error = write_error != 0 ? write_error : (sync_error != 0 ? sync_error : close_error);
                 return result(capture_store_status::deletion_failed, error);
             }
-            std::error_code remove_error;
-            fs::remove(final, remove_error);
-            if (remove_error) {
-                return result(capture_store_status::deletion_failed, remove_error.value());
+            int directory_error = 0;
+            if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root)) {
+                return result(capture_store_status::deletion_failed, directory_error);
             }
-            fs::remove(tombstone, remove_error);
-            if (remove_error) {
-                return result(capture_store_status::deletion_failed, remove_error.value());
+            const capture_store_result remove_final = safe_remove_file_at(root_fd, final);
+            if (remove_final.status != capture_store_status::ok) {
+                return remove_final.status == capture_store_status::path_security ?
+                           remove_final :
+                           result(capture_store_status::deletion_failed, remove_final.os_error);
             }
-        }
-        int error = 0;
-        if (!fsync_directory(root(), error)) {
-            return errno_result(error);
+            const capture_store_result remove_tombstone = safe_remove_file_at(root_fd, tombstone);
+            if (remove_tombstone.status != capture_store_status::ok) {
+                return remove_tombstone.status == capture_store_status::path_security ?
+                           remove_tombstone :
+                           result(capture_store_status::deletion_failed, remove_tombstone.os_error);
+            }
+            if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root)) {
+                return result(capture_store_status::deletion_failed, directory_error);
+            }
         }
         return result(capture_store_status::ok);
     }
@@ -1079,7 +1360,15 @@ struct capture_store::impl {
         if (current_records == 0) {
             return result(capture_store_status::ok, 0, true);
         }
-        const uint64_t sequence = next_sequence();
+        capture_manifest candidate;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            candidate = manifest;
+        }
+        const uint64_t sequence =
+            candidate.shards.empty() ?
+                1 :
+                (candidate.shards.back().sequence == UINT64_MAX ? 0 : candidate.shards.back().sequence + 1);
         if (sequence == 0) {
             return result(capture_store_status::too_many_shards);
         }
@@ -1089,19 +1378,21 @@ struct capture_store::impl {
         if (shard_bytes.size() > cfg.max_shard_bytes) {
             return result(capture_store_status::shard_too_large);
         }
-        const fs::path temporary = root() / shard_name(sequence, true);
-        const fs::path final     = root() / shard_name(sequence, false);
+        const std::string temporary = shard_name(sequence, true);
+        const std::string final     = shard_name(sequence, false);
         if (phase_cancelled(cfg, capture_store_phase::before_shard_write)) {
             return cleanup_after_failure(temporary, final, false);
         }
         const capture_store_result write =
-            write_file(temporary, shard_bytes, cfg.faults, cfg.faults.preserve_failed_files);
+            write_file_at(root_fd, temporary, shard_bytes, cfg.faults, cfg.faults.preserve_failed_files);
         if (write.status != capture_store_status::ok) {
             if (cfg.faults.preserve_failed_files) {
                 return write;
             }
-            std::error_code ignored;
-            fs::remove(temporary, ignored);
+            const capture_store_result removed = safe_remove_file_at(root_fd, temporary);
+            if (removed.status != capture_store_status::ok) {
+                return result(capture_store_status::deletion_failed, removed.os_error);
+            }
             return write;
         }
         if (phase_cancelled(cfg, capture_store_phase::after_shard_write)) {
@@ -1113,8 +1404,24 @@ struct capture_store::impl {
         if (phase_cancelled(cfg, capture_store_phase::before_shard_rename)) {
             return cleanup_after_failure(temporary, final, false);
         }
-        if (::rename(temporary.c_str(), final.c_str()) != 0) {
-            return errno_result(errno);
+        const capture_store_result temporary_status = validate_private_file_at(root_fd, temporary);
+        const capture_store_result final_status     = validate_private_file_at(root_fd, final, true);
+        if (temporary_status.status != capture_store_status::ok || final_status.status != capture_store_status::ok) {
+            return result(capture_store_status::path_security, temporary_status.status != capture_store_status::ok ?
+                                                                   temporary_status.os_error :
+                                                                   final_status.os_error);
+        }
+        struct stat final_check = {};
+        if (::fstatat(root_fd, final.c_str(), &final_check, AT_SYMLINK_NOFOLLOW) == 0) {
+            return result(capture_store_status::path_security, EEXIST);
+        }
+        if (errno != ENOENT) {
+            return result(capture_store_status::path_security, errno);
+        }
+        if (::renameat(root_fd, temporary.c_str(), root_fd, final.c_str()) != 0) {
+            const int                  error   = errno;
+            const capture_store_result cleanup = cleanup_after_failure(temporary, final, false);
+            return cleanup.status == capture_store_status::deletion_failed ? cleanup : errno_result(error);
         }
         if (cfg.faults.crash_after_shard_rename) {
             return result(capture_store_status::commit_uncertain);
@@ -1123,13 +1430,12 @@ struct capture_store::impl {
             return cleanup_after_failure(temporary, final, false);
         }
         int directory_error = 0;
-        if (!fsync_directory(root(), directory_error)) {
+        if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root)) {
             return errno_result(directory_error);
         }
 
-        capture_manifest candidate = manifest;
-        candidate.generation       = manifest.generation == UINT64_MAX ? 1 : manifest.generation + 1;
-        candidate.capture_mode     = cfg.capture_mode;
+        candidate.generation   = candidate.generation == UINT64_MAX ? 1 : candidate.generation + 1;
+        candidate.capture_mode = cfg.capture_mode;
         capture_shard_info info;
         info.sequence           = sequence;
         info.first_monotonic_ns = current_first_ns;
@@ -1140,8 +1446,10 @@ struct capture_store::impl {
         candidate.shards.push_back(info);
         if (candidate.total_records > UINT64_MAX - info.record_count ||
             candidate.total_bytes > UINT64_MAX - info.byte_count) {
-            std::error_code ignored;
-            fs::remove(final, ignored);
+            const capture_store_result removed = safe_remove_file_at(root_fd, final);
+            if (removed.status != capture_store_status::ok) {
+                return result(capture_store_status::deletion_failed, removed.os_error);
+            }
             return result(capture_store_status::too_many_records);
         }
         candidate.total_records += info.record_count;
@@ -1163,40 +1471,59 @@ struct capture_store::impl {
             retired.push_back(old);
         }
         if (candidate.shards.empty()) {
-            std::error_code ignored;
-            fs::remove(final, ignored);
+            const capture_store_result removed = safe_remove_file_at(root_fd, final);
+            if (removed.status != capture_store_status::ok) {
+                return result(capture_store_status::deletion_failed, removed.os_error);
+            }
             return result(capture_store_status::invalid_argument);
         }
         const std::vector<uint8_t> manifest_bytes = serialize_manifest(candidate, salt);
         if (manifest_bytes.size() > cfg.max_manifest_bytes) {
-            std::error_code ignored;
-            fs::remove(final, ignored);
+            const capture_store_result removed = safe_remove_file_at(root_fd, final);
+            if (removed.status != capture_store_status::ok) {
+                return result(capture_store_status::deletion_failed, removed.os_error);
+            }
             return result(capture_store_status::manifest_too_large);
         }
         if (phase_cancelled(cfg, capture_store_phase::before_manifest_write)) {
             return cleanup_after_failure(temporary, final, false);
         }
-        const capture_store_result manifest_write =
-            write_file(manifest_tmp_path(), manifest_bytes, cfg.faults, cfg.faults.preserve_failed_files);
+        const capture_store_result manifest_write = write_file_at(root_fd, ".capture.manifest.tmp", manifest_bytes,
+                                                                  cfg.faults, cfg.faults.preserve_failed_files);
         if (manifest_write.status != capture_store_status::ok) {
             if (!cfg.faults.preserve_failed_files) {
-                std::error_code ignored;
-                fs::remove(final, ignored);
-                fs::remove(manifest_tmp_path(), ignored);
+                const capture_store_result remove_final    = safe_remove_file_at(root_fd, final);
+                const capture_store_result remove_manifest = safe_remove_file_at(root_fd, ".capture.manifest.tmp");
+                if (remove_final.status != capture_store_status::ok ||
+                    remove_manifest.status != capture_store_status::ok) {
+                    const capture_store_result & failure =
+                        remove_final.status != capture_store_status::ok ? remove_final : remove_manifest;
+                    return result(capture_store_status::deletion_failed, failure.os_error);
+                }
             }
             return manifest_write;
         }
         if (phase_cancelled(cfg, capture_store_phase::after_manifest_write)) {
-            return cleanup_after_failure(manifest_tmp_path(), final, false);
+            return cleanup_after_failure(".capture.manifest.tmp", final, false);
         }
         if (cfg.faults.crash_before_manifest_rename) {
-            return cleanup_after_failure(manifest_tmp_path(), final, true);
+            return cleanup_after_failure(".capture.manifest.tmp", final, true);
         }
         if (phase_cancelled(cfg, capture_store_phase::before_manifest_rename)) {
-            return cleanup_after_failure(manifest_tmp_path(), final, false);
+            return cleanup_after_failure(".capture.manifest.tmp", final, false);
         }
-        if (::rename(manifest_tmp_path().c_str(), manifest_path().c_str()) != 0) {
-            return errno_result(errno);
+        const capture_store_result manifest_tmp_status = validate_private_file_at(root_fd, ".capture.manifest.tmp");
+        const capture_store_result manifest_status     = validate_private_file_at(root_fd, "capture.manifest", true);
+        if (manifest_tmp_status.status != capture_store_status::ok ||
+            manifest_status.status != capture_store_status::ok) {
+            return result(capture_store_status::path_security, manifest_tmp_status.status != capture_store_status::ok ?
+                                                                   manifest_tmp_status.os_error :
+                                                                   manifest_status.os_error);
+        }
+        if (::renameat(root_fd, ".capture.manifest.tmp", root_fd, "capture.manifest") != 0) {
+            const int                  error   = errno;
+            const capture_store_result cleanup = cleanup_after_failure(".capture.manifest.tmp", final, false);
+            return cleanup.status == capture_store_status::deletion_failed ? cleanup : errno_result(error);
         }
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -1208,12 +1535,13 @@ struct capture_store::impl {
         // Cancellation after publication is too late to revoke a durable
         // commit; returning success is the only truthful outcome.
         (void) phase_cancelled(cfg, capture_store_phase::after_manifest_rename);
-        if (!fsync_directory(root(), directory_error)) {
+        if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root)) {
             return result(capture_store_status::commit_uncertain, directory_error, true);
         }
-        if (phase_cancelled(cfg, capture_store_phase::before_retention_delete)) {
-            return result(capture_store_status::ok, 0, true);
-        }
+        // Cancellation after publication cannot revoke the manifest.  Invoke
+        // the seam for observability, then finish deletion so cleanup authority
+        // is durable and no retired shard leaks until restart.
+        (void) phase_cancelled(cfg, capture_store_phase::before_retention_delete);
         const capture_store_result deleted = delete_retired(retired);
         if (deleted.status != capture_store_status::ok) {
             return deleted;
@@ -1229,119 +1557,158 @@ struct capture_store::impl {
         current_last_ns  = 0;
     }
 
-    void mark_failure(capture_store_result failure) {
+    void mark_failure(capture_store_result failure) noexcept {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            terminal        = failure;
+            flush_result    = failure;
+            flush_completed = flush_requested;
+            ++failed_writes;
+        }
         failed.store(true, std::memory_order_release);
         accepting.store(false, std::memory_order_release);
-        std::lock_guard<std::mutex> lock(mutex);
-        terminal = failure;
-        ++failed_writes;
-        flush_result    = failure;
-        flush_completed = flush_requested;
+        stop_requested.store(true, std::memory_order_release);
+        if (wakeup != nullptr) {
+            (void) wakeup->post();
+        }
         cv.notify_all();
     }
 
-    void run() {
+    capture_store_result consume_observation(const cycle_observation & observation) {
+        const bool rich = cfg.capture_mode == mode::sampled_rich && cfg.allow_sampled_rich &&
+                          observation.cycle_sequence % cfg.rich_sample_every == 0;
+        const size_t before = current_payload.size();
+        const size_t add =
+            CAPTURE_RECORD_HEADER_BYTES + (rich ? CAPTURE_RICH_RECORD_BYTES : CAPTURE_COMPACT_RECORD_BYTES);
+        const size_t payload_limit =
+            static_cast<size_t>(cfg.max_shard_bytes) - CAPTURE_SHARD_HEADER_BYTES - CAPTURE_SHARD_FOOTER_BYTES;
+        if (before > payload_limit || add > payload_limit - before) {
+            if (current_records != 0) {
+                const capture_store_result committed = commit_payload();
+                if (committed.status != capture_store_status::ok) {
+                    return committed;
+                }
+                reset_current();
+            }
+        }
+        if (current_records == 0) {
+            current_first_ns = observation.monotonic_ns;
+        }
+        current_last_ns = observation.monotonic_ns;
+        append_record(observation, salt, rich, cfg.capture_mode == mode::metrics_only, current_payload);
+        ++current_records;
+        if (current_records >= cfg.max_shard_records ||
+            current_payload.size() + CAPTURE_SHARD_HEADER_BYTES + CAPTURE_SHARD_FOOTER_BYTES >= cfg.max_shard_bytes) {
+            const capture_store_result committed = commit_payload();
+            if (committed.status != capture_store_status::ok) {
+                return committed;
+            }
+            reset_current();
+        }
+        return result(capture_store_status::ok);
+    }
+
+    void run() noexcept {
         worker_running.store(true, std::memory_order_release);
-        current_payload.reserve(static_cast<size_t>(cfg.max_shard_bytes));
-        for (;;) {
-            cycle_observation observation;
-            bool              popped = false;
-            {
-                std::unique_lock<std::mutex> lock(mutex);
-                cv.wait(lock, [this]() {
-                    return stop_requested.load(std::memory_order_acquire) || flush_requested != flush_completed ||
-                           ring.stats().size_approx != 0;
-                });
-                const bool should_drain = drain_requested.load(std::memory_order_acquire);
-                if (!should_drain && stop_requested.load(std::memory_order_acquire)) {
-                    while (ring.try_pop(observation)) {
+        try {
+            current_payload.reserve(static_cast<size_t>(cfg.max_shard_bytes));
+            bool exit = false;
+            while (!exit) {
+                cycle_observation observation;
+                while (ring->try_pop(observation)) {
+                    const capture_store_result consumed = consume_observation(observation);
+                    if (consumed.status != capture_store_status::ok) {
+                        mark_failure(consumed);
+                        exit = true;
+                        break;
+                    }
+                    if (cfg.faults.slow_worker) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                }
+                if (exit) {
+                    break;
+                }
+                bool should_stop  = false;
+                bool should_flush = false;
+                bool should_drain = true;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    should_stop  = stop_requested.load(std::memory_order_acquire);
+                    should_flush = flush_requested != flush_completed;
+                    should_drain = drain_requested.load(std::memory_order_acquire);
+                }
+                if (should_stop && !should_drain) {
+                    while (ring->try_pop(observation)) {
                         ++dropped_after_stop;
                     }
-                } else {
-                    popped = ring.try_pop(observation);
-                }
-            }
-            if (popped) {
-                try {
-                    const bool rich = cfg.capture_mode == mode::sampled_rich && cfg.allow_sampled_rich &&
-                                      observation.cycle_sequence % cfg.rich_sample_every == 0;
-                    const size_t before = current_payload.size();
-                    const size_t add =
-                        CAPTURE_RECORD_HEADER_BYTES + (rich ? CAPTURE_RICH_RECORD_BYTES : CAPTURE_COMPACT_RECORD_BYTES);
-                    if (before > cfg.max_shard_bytes - CAPTURE_SHARD_HEADER_BYTES - CAPTURE_SHARD_FOOTER_BYTES ||
-                        add > cfg.max_shard_bytes - CAPTURE_SHARD_HEADER_BYTES - CAPTURE_SHARD_FOOTER_BYTES - before) {
-                        if (current_records != 0) {
-                            const capture_store_result committed = commit_payload();
-                            if (committed.status != capture_store_status::ok) {
-                                mark_failure(committed);
-                                break;
-                            }
-                            reset_current();
-                        }
-                    }
-                    if (current_records == 0) {
-                        current_first_ns = observation.monotonic_ns;
-                    }
-                    current_last_ns = observation.monotonic_ns;
-                    append_record(observation, salt, rich, cfg.capture_mode == mode::metrics_only, current_payload);
-                    ++current_records;
-                    if (current_records >= cfg.max_shard_records ||
-                        current_payload.size() + CAPTURE_SHARD_HEADER_BYTES + CAPTURE_SHARD_FOOTER_BYTES >=
-                            cfg.max_shard_bytes) {
-                        const capture_store_result committed = commit_payload();
-                        if (committed.status != capture_store_status::ok) {
-                            mark_failure(committed);
-                            break;
-                        }
-                        reset_current();
-                    }
-                } catch (const std::bad_alloc &) {
-                    mark_failure(result(capture_store_status::io_error, ENOMEM));
-                    break;
-                }
-                if (cfg.faults.slow_worker) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                }
-                continue;
-            }
-
-            bool should_stop  = false;
-            bool should_flush = false;
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                should_stop  = stop_requested.load(std::memory_order_acquire);
-                should_flush = flush_requested != flush_completed;
-            }
-            if (should_flush || should_stop) {
-                capture_store_result committed = result(capture_store_status::ok, 0, true);
-                if (current_records != 0 && (drain_requested.load(std::memory_order_acquire) || should_flush)) {
-                    committed = commit_payload();
                     reset_current();
                 }
-                if (committed.status != capture_store_status::ok) {
-                    mark_failure(committed);
-                    break;
+                if (ring->stats().size_approx != 0) {
+                    continue;
                 }
-                std::lock_guard<std::mutex> lock(mutex);
-                if (should_flush) {
-                    flush_result    = committed;
-                    flush_completed = flush_requested;
+                if (should_flush || should_stop) {
+                    capture_store_result committed = result(capture_store_status::ok, 0, true);
+                    if (current_records != 0 && (should_drain || should_flush)) {
+                        committed = commit_payload();
+                        reset_current();
+                    }
+                    if (committed.status != capture_store_status::ok) {
+                        mark_failure(committed);
+                        exit = true;
+                        break;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        if (should_flush) {
+                            flush_result    = committed;
+                            flush_completed = flush_requested;
+                        }
+                        if (should_stop) {
+                            accepting.store(false, std::memory_order_release);
+                            stopped  = true;
+                            terminal = committed;
+                        }
+                    }
+                    cv.notify_all();
+                    if (should_stop) {
+                        exit = true;
+                        break;
+                    }
+                    continue;
                 }
-                if (should_stop) {
-                    accepting.store(false, std::memory_order_release);
-                    stopped  = true;
-                    terminal = committed;
+
+                // Snapshot the wake epoch before the second queue/control check.
+                // A producer that races either check increments the epoch after
+                // this snapshot, so wait() cannot lose its notification.
+                uint64_t observed = wakeup->snapshot();
+                if (ring->stats().size_approx != 0) {
+                    continue;
                 }
-                cv.notify_all();
-                if (should_stop) {
-                    break;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (stop_requested.load(std::memory_order_acquire) || flush_requested != flush_completed) {
+                        continue;
+                    }
                 }
+                if (cfg.faults.before_worker_wait) {
+                    cfg.faults.before_worker_wait();
+                }
+                wakeup->wait(observed);
             }
+        } catch (const std::bad_alloc &) {
+            mark_failure(result(capture_store_status::io_error, ENOMEM));
+        } catch (const std::exception &) {
+            mark_failure(result(capture_store_status::io_error, EFAULT));
+        } catch (...) {
+            mark_failure(result(capture_store_status::io_error, EFAULT));
         }
         worker_running.store(false, std::memory_order_release);
         accepting.store(false, std::memory_order_release);
-        std::lock_guard<std::mutex> lock(mutex);
-        stopped = true;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopped = true;
+        }
         cv.notify_all();
     }
 
@@ -1349,16 +1716,20 @@ struct capture_store::impl {
         if (cfg.capture_mode == mode::off) {
             return result(capture_store_status::disabled);
         }
-        if (!worker.joinable()) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!worker_started.load(std::memory_order_acquire)) {
             return terminal.status == capture_store_status::invalid_argument ? startup : terminal;
         }
-        std::unique_lock<std::mutex> lock(mutex);
+        if (shutdown_started) {
+            cv.wait(lock, [this]() { return stopped; });
+            return terminal.status == capture_store_status::invalid_argument ? startup : terminal;
+        }
         if (stopped || failed.load(std::memory_order_acquire)) {
             return terminal.status == capture_store_status::invalid_argument ? startup : terminal;
         }
         ++flush_requested;
         const uint64_t request = flush_requested;
-        cv.notify_one();
+        (void) wakeup->post();
         cv.wait(lock, [this, request]() {
             return flush_completed >= request || stopped || failed.load(std::memory_order_acquire);
         });
@@ -1369,48 +1740,67 @@ struct capture_store::impl {
         if (cfg.capture_mode == mode::off) {
             return result(capture_store_status::disabled);
         }
-        if (!worker.joinable()) {
+        std::unique_lock<std::mutex> guard(mutex);
+        if (shutdown_started) {
+            cv.wait(guard, [this]() { return stopped; });
             return terminal.status == capture_store_status::invalid_argument ? startup : terminal;
         }
+        shutdown_started = true;
+        if (!worker_started.load(std::memory_order_acquire)) {
+            stopped = true;
+            return terminal.status == capture_store_status::invalid_argument ? startup : terminal;
+        }
+        guard.unlock();
         {
             std::lock_guard<std::mutex> lock(mutex);
             drain_requested.store(drain, std::memory_order_release);
             stop_requested.store(true, std::memory_order_release);
             accepting.store(false, std::memory_order_release);
-            cv.notify_one();
         }
+        while (active_producers.load(std::memory_order_acquire) != 0) {
+            std::this_thread::yield();
+        }
+        (void) wakeup->post();
         worker.join();
+        worker_started.store(false, std::memory_order_release);
         std::lock_guard<std::mutex> lock(mutex);
         if (terminal.status == capture_store_status::invalid_argument) {
             terminal = result(capture_store_status::stopped);
         }
+        stopped = true;
+        cv.notify_all();
         return terminal;
     }
 
-    capture_store_config    cfg;
-    spsc_ring               ring;
-    std::array<uint8_t, 16> salt = {};
-    capture_manifest        manifest;
-    capture_store_result    startup      = result(capture_store_status::invalid_argument);
-    capture_store_result    terminal     = result(capture_store_status::invalid_argument);
-    capture_store_result    flush_result = result(capture_store_status::invalid_argument);
-    std::thread             worker;
-    mutable std::mutex      mutex;
-    std::condition_variable cv;
-    std::atomic<bool>       accepting{ false };
-    std::atomic<bool>       stop_requested{ false };
-    std::atomic<bool>       drain_requested{ true };
-    std::atomic<bool>       failed{ false };
-    std::atomic<bool>       worker_running{ false };
-    uint64_t                flush_requested = 0;
-    uint64_t                flush_completed = 0;
-    bool                    stopped         = false;
-    std::vector<uint8_t>    current_payload;
-    uint32_t                current_records  = 0;
-    uint64_t                current_first_ns = 0;
-    uint64_t                current_last_ns  = 0;
-    uint64_t                failed_writes    = 0;
-    std::atomic<uint64_t>   dropped_after_stop{ 0 };
+    capture_store_config            cfg;
+    std::unique_ptr<spsc_ring>      ring;
+    std::unique_ptr<capture_wakeup> wakeup;
+    int                             root_fd = -1;
+    std::array<uint8_t, 16>         salt    = {};
+    capture_manifest                manifest;
+    capture_store_result            startup      = result(capture_store_status::invalid_argument);
+    capture_store_result            terminal     = result(capture_store_status::invalid_argument);
+    capture_store_result            flush_result = result(capture_store_status::invalid_argument);
+    std::thread                     worker;
+    mutable std::mutex              mutex;
+    std::condition_variable         cv;
+    std::atomic<bool>               accepting{ false };
+    std::atomic<bool>               stop_requested{ false };
+    std::atomic<bool>               drain_requested{ true };
+    std::atomic<bool>               failed{ false };
+    std::atomic<bool>               worker_running{ false };
+    std::atomic<bool>               worker_started{ false };
+    std::atomic<uint64_t>           active_producers{ 0 };
+    bool                            shutdown_started = false;
+    uint64_t                        flush_requested  = 0;
+    uint64_t                        flush_completed  = 0;
+    bool                            stopped          = false;
+    std::vector<uint8_t>            current_payload;
+    uint32_t                        current_records  = 0;
+    uint64_t                        current_first_ns = 0;
+    uint64_t                        current_last_ns  = 0;
+    uint64_t                        failed_writes    = 0;
+    std::atomic<uint64_t>           dropped_after_stop{ 0 };
 };
 
 capture_store::capture_store(capture_store_config config) : data(std::make_unique<impl>(std::move(config))) {}
@@ -1418,14 +1808,28 @@ capture_store::capture_store(capture_store_config config) : data(std::make_uniqu
 capture_store::~capture_store() = default;
 
 bool capture_store::try_enqueue(const cycle_observation & observation) noexcept {
-    if (!data->accepting.load(std::memory_order_acquire)) {
+    if (data->ring == nullptr || !data->accepting.load(std::memory_order_acquire)) {
         data->dropped_after_stop.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    const bool pushed = data->ring.try_push(observation);
-    if (pushed) {
-        data->cv.notify_one();
+    data->active_producers.fetch_add(1, std::memory_order_acq_rel);
+    if (!data->accepting.load(std::memory_order_acquire)) {
+        data->active_producers.fetch_sub(1, std::memory_order_acq_rel);
+        data->dropped_after_stop.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
+    const bool pushed = data->ring->try_push(observation);
+    if (pushed) {
+        if (data->wakeup == nullptr || !data->wakeup->post()) {
+            data->failed.store(true, std::memory_order_release);
+        }
+    }
+    if (pushed && !data->accepting.load(std::memory_order_acquire)) {
+        data->dropped_after_stop.fetch_add(1, std::memory_order_relaxed);
+        data->active_producers.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
+    }
+    data->active_producers.fetch_sub(1, std::memory_order_acq_rel);
     return pushed;
 }
 
@@ -1441,10 +1845,13 @@ capture_store_result capture_store::inspect(capture_manifest & output) const {
     if (data->cfg.capture_mode == mode::off) {
         return result(capture_store_status::disabled);
     }
+    if (data->root_fd < 0) {
+        return data->startup;
+    }
     std::vector<uint8_t>       bytes;
     const capture_store_result read =
-        read_file(data->manifest_path(), data->cfg.max_manifest_bytes, bytes, capture_store_status::no_manifest,
-                  capture_store_status::manifest_too_large);
+        read_file_at(data->root_fd, "capture.manifest", data->cfg.max_manifest_bytes, bytes,
+                     capture_store_status::no_manifest, capture_store_status::manifest_too_large);
     if (read.status != capture_store_status::ok) {
         return read;
     }
@@ -1453,12 +1860,15 @@ capture_store_result capture_store::inspect(capture_manifest & output) const {
 }
 
 capture_store_result capture_store::validate(const capture_manifest & manifest) const {
+    if (data->root_fd < 0) {
+        return data->startup;
+    }
     return data->validate(manifest);
 }
 
 capture_store_stats capture_store::stats() const noexcept {
     capture_store_stats output;
-    output.ring               = data->ring.stats();
+    output.ring               = data->ring == nullptr ? ring_stats{} : data->ring->stats();
     output.worker_running     = data->worker_running.load(std::memory_order_acquire);
     output.worker_failed      = data->failed.load(std::memory_order_acquire);
     output.dropped_after_stop = data->dropped_after_stop.load(std::memory_order_relaxed);

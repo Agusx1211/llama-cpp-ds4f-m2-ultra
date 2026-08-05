@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -14,9 +16,11 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -135,6 +139,28 @@ void mutate_byte(const fs::path & path, uint64_t offset) {
 
 void truncate_file(const fs::path & path, uint64_t bytes) {
     expect(::truncate(path.c_str(), static_cast<off_t>(bytes)) == 0, "truncate fixture");
+}
+
+void write_private_file(const fs::path & path, const std::vector<uint8_t> & bytes) {
+    const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+    expect(descriptor >= 0, "open private fixture");
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+        const ssize_t count = ::write(descriptor, bytes.data() + offset, bytes.size() - offset);
+        expect(count > 0, "write private fixture");
+        offset += static_cast<size_t>(count);
+    }
+    expect(::fsync(descriptor) == 0 && ::close(descriptor) == 0, "close private fixture");
+}
+
+void expect_invalid_config(capture_store_config config, const std::string & message) {
+    bool threw = false;
+    try {
+        capture_store invalid(std::move(config));
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    expect(threw, message);
 }
 
 void test_compact_round_trip_and_privacy() {
@@ -430,6 +456,282 @@ void test_full_ring_progress_and_slow_worker() {
            "slow worker non-draining shutdown");
 }
 
+void test_wakeup_barrier_and_worker_exception() {
+    temporary_directory  temp;
+    capture_store_config config = make_config(temp.path());
+    config.max_shard_records    = 1;
+    std::mutex              barrier_mutex;
+    std::condition_variable barrier_cv;
+    bool                    entered  = false;
+    bool                    release  = false;
+    bool                    first    = true;
+    config.faults.before_worker_wait = [&]() {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        if (!first) {
+            return;
+        }
+        first   = false;
+        entered = true;
+        barrier_cv.notify_all();
+        barrier_cv.wait(lock, [&]() { return release; });
+    };
+    capture_store store(config);
+    {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        expect(barrier_cv.wait_for(lock, std::chrono::seconds(2), [&]() { return entered; }),
+               "worker did not reach wake barrier");
+    }
+    expect(store.try_enqueue(make_observation(1)), "barrier enqueue");
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex);
+        release = true;
+    }
+    barrier_cv.notify_all();
+    bool committed = false;
+    for (unsigned attempt = 0; attempt < 200; ++attempt) {
+        if (store.stats().committed_records == 1) {
+            committed = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    expect(committed, "semaphore wake was lost across worker wait barrier");
+    expect_status(store.shutdown().status, capture_store_status::ok, "barrier shutdown");
+
+    temporary_directory  throwing_temp;
+    capture_store_config throwing      = make_config(throwing_temp.path());
+    throwing.faults.before_worker_wait = []() {
+        throw std::runtime_error("worker barrier failure");
+    };
+    capture_store failed(throwing);
+    for (unsigned attempt = 0; attempt < 200 && !failed.stats().worker_failed; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    expect(failed.stats().worker_failed, "worker callback exception did not fail store");
+    expect_status(failed.shutdown(false).status, capture_store_status::io_error, "worker callback failure status");
+}
+
+void test_bounds_off_mode_and_private_permissions() {
+    temporary_directory        temp;
+    const capture_store_config base    = make_config(temp.path());
+    capture_store_config       invalid = base;
+    invalid.ring_capacity              = CAPTURE_MAX_RING_CAPACITY + 1;
+    expect_invalid_config(invalid, "ring hard bound accepted");
+    invalid                 = base;
+    invalid.max_shard_bytes = CAPTURE_MAX_SHARD_BYTES + 1;
+    expect_invalid_config(invalid, "shard hard bound accepted");
+    invalid                    = base;
+    invalid.max_manifest_bytes = CAPTURE_MAX_MANIFEST_BYTES + 1;
+    expect_invalid_config(invalid, "manifest hard bound accepted");
+    invalid                     = base;
+    invalid.max_retained_shards = UINT32_MAX;
+    expect_invalid_config(invalid, "retained shard hard bound accepted");
+    invalid                      = base;
+    invalid.max_retained_records = UINT64_MAX;
+    expect_invalid_config(invalid, "retained record hard bound accepted");
+    invalid              = base;
+    invalid.capture_mode = static_cast<mode>(99);
+    expect_invalid_config(invalid, "invalid capture mode accepted");
+    capture_store_config traversal = base;
+    traversal.root_path            = (temp.path() / ".." / "escape").string();
+    capture_store traversal_store(traversal);
+    expect(traversal_store.stats().worker_failed, "traversal root accepted");
+    expect_status(traversal_store.shutdown(false).status, capture_store_status::path_security, "traversal root status");
+
+    temporary_directory  off_temp;
+    const fs::path       off_root   = off_temp.path() / "not-created";
+    capture_store_config off_config = make_config(off_root);
+    off_config.capture_mode         = mode::off;
+    capture_store off(off_config);
+    expect(!fs::exists(off_root), "off mode created capture root");
+    expect(!off.try_enqueue(make_observation(1)), "off mode accepted observation");
+    expect_status(off.shutdown().status, capture_store_status::disabled, "off mode shutdown");
+
+    capture_store store(base);
+    expect(store.try_enqueue(make_observation(1)), "private mode enqueue");
+    expect_status(store.flush().status, capture_store_status::ok, "private mode flush");
+    struct stat root_status = {};
+    expect(::stat(temp.path().c_str(), &root_status) == 0, "private root stat");
+    expect((root_status.st_mode & (S_IRWXG | S_IRWXO)) == 0, "capture root is not private");
+    struct stat    manifest_status = {};
+    const fs::path manifest_path   = temp.path() / "capture.manifest";
+    expect(::stat(manifest_path.c_str(), &manifest_status) == 0, "private manifest stat");
+    expect((manifest_status.st_mode & (S_IRWXG | S_IRWXO)) == 0, "manifest is not private");
+    const fs::path shard        = only_shard(temp.path());
+    struct stat    shard_status = {};
+    expect(::stat(shard.c_str(), &shard_status) == 0, "private shard stat");
+    expect((shard_status.st_mode & (S_IRWXG | S_IRWXO)) == 0, "shard is not private");
+    expect_status(store.shutdown().status, capture_store_status::ok, "private mode shutdown");
+}
+
+void test_root_file_and_tombstone_security() {
+    temporary_directory symlink_temp;
+    const fs::path      target = symlink_temp.path() / "target";
+    fs::create_directory(target);
+    const fs::path root_link = symlink_temp.path() / "root-link";
+    expect(::symlink(target.c_str(), root_link.c_str()) == 0, "create root symlink");
+    capture_store_config linked = make_config(root_link);
+    capture_store        linked_store(linked);
+    expect(linked_store.stats().worker_failed, "root symlink was accepted");
+    expect_status(linked_store.shutdown(false).status, capture_store_status::path_security, "root symlink status");
+
+    temporary_directory  manifest_temp;
+    capture_store_config normal_config = make_config(manifest_temp.path());
+    {
+        capture_store normal(normal_config);
+        expect(normal.try_enqueue(make_observation(1)), "manifest symlink fixture enqueue");
+        expect_status(normal.flush().status, capture_store_status::ok, "manifest symlink fixture flush");
+        expect_status(normal.shutdown().status, capture_store_status::ok, "manifest symlink fixture shutdown");
+    }
+    const fs::path external = manifest_temp.path() / "external";
+    write_private_file(external, { 1, 2, 3 });
+    const fs::path manifest        = manifest_temp.path() / "capture.manifest";
+    const fs::path manifest_backup = manifest_temp.path() / "manifest.backup";
+    expect(::rename(manifest.c_str(), manifest_backup.c_str()) == 0, "move manifest fixture");
+    expect(::symlink(external.c_str(), manifest.c_str()) == 0, "create manifest symlink");
+    capture_store manifest_store(normal_config);
+    expect(manifest_store.stats().worker_failed, "manifest symlink was accepted");
+    expect_status(manifest_store.shutdown(false).status, capture_store_status::path_security,
+                  "manifest symlink status");
+
+    temporary_directory  shard_temp;
+    capture_store_config shard_config = make_config(shard_temp.path());
+    {
+        capture_store normal(shard_config);
+        expect(normal.try_enqueue(make_observation(1)), "shard symlink fixture enqueue");
+        expect_status(normal.flush().status, capture_store_status::ok, "shard symlink fixture flush");
+        expect_status(normal.shutdown().status, capture_store_status::ok, "shard symlink fixture shutdown");
+    }
+    const fs::path shard_path   = only_shard(shard_temp.path());
+    const fs::path shard_backup = shard_temp.path() / "shard.backup";
+    expect(::rename(shard_path.c_str(), shard_backup.c_str()) == 0, "move shard fixture");
+    expect(::symlink(external.c_str(), shard_path.c_str()) == 0, "create shard symlink");
+    capture_store shard_store(shard_config);
+    expect(shard_store.stats().worker_failed, "shard symlink was accepted");
+    expect_status(shard_store.shutdown(false).status, capture_store_status::path_security, "shard symlink status");
+
+    temporary_directory  temporary_temp;
+    capture_store_config temporary_config = make_config(temporary_temp.path());
+    const fs::path       temporary_link   = temporary_temp.path() / ".shard-00000000000000000001.tmp";
+    expect(::symlink(external.c_str(), temporary_link.c_str()) == 0, "create temporary symlink");
+    capture_store temporary_store(temporary_config);
+    expect(temporary_store.stats().worker_failed, "temporary symlink was accepted");
+    expect_status(temporary_store.shutdown(false).status, capture_store_status::path_security,
+                  "temporary symlink status");
+
+    temporary_directory  tombstone_temp;
+    capture_store_config tombstone_config = make_config(tombstone_temp.path());
+    write_private_file(tombstone_temp.path() / ".delete-18446744073709551616.tomb", { 1 });
+    capture_store tombstone_store(tombstone_config);
+    expect(tombstone_store.stats().worker_failed, "overflow tombstone was accepted");
+    expect_status(tombstone_store.shutdown(false).status, capture_store_status::path_security,
+                  "overflow tombstone status");
+
+    temporary_directory  referenced_tombstone_temp;
+    capture_store_config referenced_config = make_config(referenced_tombstone_temp.path());
+    {
+        capture_store normal(referenced_config);
+        expect(normal.try_enqueue(make_observation(1)), "referenced tombstone fixture enqueue");
+        expect_status(normal.flush().status, capture_store_status::ok, "referenced tombstone fixture flush");
+        expect_status(normal.shutdown().status, capture_store_status::ok, "referenced tombstone fixture shutdown");
+    }
+    write_private_file(referenced_tombstone_temp.path() / ".delete-00000000000000000001.tomb", { 1 });
+    capture_store referenced_tombstone(referenced_config);
+    expect(referenced_tombstone.stats().worker_failed, "referenced tombstone was accepted");
+    expect_status(referenced_tombstone.shutdown(false).status, capture_store_status::path_security,
+                  "referenced tombstone status");
+}
+
+void test_random_salt_and_post_publication_retention() {
+    temporary_directory  temp;
+    capture_store_config config = make_config(temp.path());
+    config.max_shard_records    = 1;
+    config.max_retained_shards  = 1;
+    config.max_retained_records = 1;
+    config.max_retained_bytes   = 4096;
+    config.identity_salt        = {};
+    capture_store store(config);
+    expect(store.try_enqueue(make_observation(1)), "random salt first enqueue");
+    expect_status(store.flush().status, capture_store_status::ok, "random salt first flush");
+    capture_manifest first;
+    expect_status(store.inspect(first).status, capture_store_status::ok, "random salt inspect");
+    expect(
+        std::any_of(first.identity_salt.begin(), first.identity_salt.end(), [](uint8_t value) { return value != 0; }),
+        "random salt remained zero");
+    const auto persisted_salt = first.identity_salt;
+    expect_status(store.shutdown().status, capture_store_status::ok, "random salt shutdown");
+    capture_store    restarted(config);
+    capture_manifest recovered;
+    expect_status(restarted.inspect(recovered).status, capture_store_status::ok, "random salt restart inspect");
+    expect(recovered.identity_salt == persisted_salt, "random salt did not persist");
+    expect_status(restarted.shutdown().status, capture_store_status::ok, "random salt restart shutdown");
+
+    for (const capture_store_phase cancellation_phase :
+         { capture_store_phase::before_retention_delete, capture_store_phase::after_retention_delete }) {
+        temporary_directory  retention_temp;
+        capture_store_config retention = make_config(retention_temp.path());
+        retention.max_shard_records    = 1;
+        retention.max_retained_shards  = 1;
+        retention.max_retained_records = 1;
+        retention.max_retained_bytes   = 4096;
+        retention.cancel_check         = [cancellation_phase](capture_store_phase phase) {
+            return phase == cancellation_phase;
+        };
+        capture_store retention_store(retention);
+        expect(retention_store.try_enqueue(make_observation(1)), "post-publication cancellation first enqueue");
+        expect_status(retention_store.flush().status, capture_store_status::ok,
+                      "post-publication cancellation first flush");
+        expect(retention_store.try_enqueue(make_observation(2)), "post-publication cancellation second enqueue");
+        expect_status(retention_store.flush().status, capture_store_status::ok,
+                      "post-publication cancellation second flush");
+        capture_manifest retained;
+        expect_status(retention_store.inspect(retained).status, capture_store_status::ok,
+                      "post-publication cancellation inspect");
+        expect(retained.shards.size() == 1 && retained.shards.front().sequence == 2,
+               "post-publication cancellation leaked retired shard");
+        expect_status(retention_store.shutdown().status, capture_store_status::ok,
+                      "post-publication cancellation shutdown");
+        capture_store    retention_restart(retention);
+        capture_manifest restarted_manifest;
+        expect_status(retention_restart.inspect(restarted_manifest).status, capture_store_status::ok,
+                      "post-publication cancellation restart inspect");
+        expect_status(retention_restart.validate(restarted_manifest).status, capture_store_status::ok,
+                      "post-publication cancellation restart validate");
+        expect_status(retention_restart.shutdown().status, capture_store_status::ok,
+                      "post-publication cancellation restart shutdown");
+    }
+}
+
+void test_concurrent_flush_shutdown() {
+    temporary_directory  temp;
+    capture_store_config config = make_config(temp.path());
+    config.max_shard_records    = 1;
+    config.faults.slow_worker   = true;
+    capture_store store(config);
+    expect(store.try_enqueue(make_observation(1)), "concurrent lifecycle enqueue");
+    std::atomic<bool>        start{ false };
+    std::vector<std::thread> flushers;
+    for (unsigned index = 0; index < 4; ++index) {
+        flushers.emplace_back([&]() {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (unsigned attempt = 0; attempt < 20; ++attempt) {
+                const capture_store_status status = store.flush().status;
+                expect(status == capture_store_status::ok || status == capture_store_status::stopped,
+                       "concurrent flush returned unexpected status");
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+    const capture_store_status shutdown_status = store.shutdown().status;
+    for (std::thread & flusher : flushers) {
+        flusher.join();
+    }
+    expect(shutdown_status == capture_store_status::ok || shutdown_status == capture_store_status::stopped,
+           "concurrent shutdown returned unexpected status");
+}
+
 }  // namespace
 
 int main() {
@@ -442,6 +744,11 @@ int main() {
         test_faults_corruption_and_recovery();
         test_crash_seams_and_cancellation();
         test_full_ring_progress_and_slow_worker();
+        test_wakeup_barrier_and_worker_exception();
+        test_bounds_off_mode_and_private_permissions();
+        test_root_file_and_tombstone_security();
+        test_random_salt_and_post_publication_retention();
+        test_concurrent_flush_shutdown();
     } catch (const std::exception & error) {
         std::fprintf(stderr, "test-server-capture-store: %s\n", error.what());
         return 1;

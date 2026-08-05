@@ -28,6 +28,9 @@ constexpr size_t CAPTURE_MANIFEST_FOOTER_BYTES   = sizeof(capture_digest);
 constexpr size_t CAPTURE_RECORD_HEADER_BYTES     = 16;
 constexpr size_t CAPTURE_COMPACT_RECORD_BYTES    = 128;
 constexpr size_t CAPTURE_RICH_RECORD_BYTES       = 156;
+constexpr size_t CAPTURE_MAX_RING_CAPACITY       = 1U << 20;
+constexpr size_t CAPTURE_MAX_SHARD_BYTES         = 64U * 1024U * 1024U;
+constexpr size_t CAPTURE_MAX_MANIFEST_BYTES      = 16U * 1024U * 1024U;
 
 enum class capture_store_status : uint8_t {
     ok = 0,
@@ -51,6 +54,7 @@ enum class capture_store_status : uint8_t {
     commit_uncertain,
     cancelled,
     deletion_failed,
+    path_security,
 };
 
 const char * capture_store_status_name(capture_store_status status) noexcept;
@@ -99,11 +103,16 @@ struct capture_store_faults {
 
     bool preserve_failed_files = false;
     bool slow_worker           = false;
+
+    // Optional deterministic worker barrier. It is called immediately before
+    // the worker waits for the next wake token, and exceptions fail the store.
+    std::function<void()> before_worker_wait;
 };
 
 struct capture_store_config {
     std::string root_path;
-    mode        capture_mode = mode::compact;
+    mode        capture_mode         = mode::compact;
+    bool        require_private_root = true;
 
     // The ring is allocated once.  It is the only object touched by the
     // producer after construction; a full ring drops the newest observation.
