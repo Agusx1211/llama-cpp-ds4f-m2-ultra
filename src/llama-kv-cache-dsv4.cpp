@@ -3154,6 +3154,18 @@ bool llama_kv_cache_dsv4::arm_admission(uint64_t id) {
         return false;
     }
     found->second.armed = true;
+    // Commit the sparse reservation now, while the ticket generation is current.
+    // Deferring the commit to consume_admission (init_batch) lets the pool
+    // generation advance via concurrent slot + speculative decodes between reserve
+    // and the first prefill, so the Metal sparse commit rejects the ticket as
+    // stale (result=stale reason=ticket-current; e.g. ticket_generation=6 vs
+    // current_generation=27) and the memory preflight fails with ret=-2 -- the
+    // transient HTTP 500 "Compute error". commit_ranges() is idempotent (a no-op
+    // once the ticket is freed), so consume_admission's later call is harmless.
+    if (found->second.reservation->commit_ranges() != GGML_METAL_SPARSE_RESERVATION_OK) {
+        admission_state->entries.erase(found);
+        return false;
+    }
     return true;
 }
 
