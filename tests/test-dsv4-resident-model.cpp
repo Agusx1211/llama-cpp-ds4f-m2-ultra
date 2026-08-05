@@ -2093,21 +2093,27 @@ bool silent_progress(float /* progress */, void * /* user_data */) {
 }
 
 bool parse_arguments(int argc, char ** argv, std::string & model_path, std::string & manifest_path, bool & help,
-                     bool & diagnostic_only, bool & diagnostic_skip_shard_digests) {
+                     bool & diagnostic_only, bool & diagnostic_all_boundaries, bool & diagnostic_skip_shard_digests) {
     help = argc == 2 && (std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0);
     if (help) {
         std::printf("usage: %s --model <first-shard.gguf> --manifest <pinned.manifest>\n"
                     "       %s --model <first-shard.gguf> --manifest <pinned.manifest> --diagnostic-only\n"
-                    "          [--diagnostic-skip-shard-digests]\n",
+                    "          [--diagnostic-all-boundaries] [--diagnostic-skip-shard-digests]\n",
                     argv[0], argv[0]);
         return false;
     }
     diagnostic_only = false;
+    diagnostic_all_boundaries = false;
     diagnostic_skip_shard_digests = false;
     for (int index = 1; index < argc;) {
         const char * option = argv[index];
         if (std::strcmp(option, "--diagnostic-only") == 0) {
             diagnostic_only = true;
+            ++index;
+            continue;
+        }
+        if (std::strcmp(option, "--diagnostic-all-boundaries") == 0) {
+            diagnostic_all_boundaries = true;
             ++index;
             continue;
         }
@@ -2139,6 +2145,10 @@ bool parse_arguments(int argc, char ** argv, std::string & model_path, std::stri
         }
         index += 2;
     }
+    if (diagnostic_all_boundaries && !diagnostic_only) {
+        std::fprintf(stderr, "--diagnostic-all-boundaries requires --diagnostic-only\n");
+        return false;
+    }
     if (diagnostic_skip_shard_digests && !diagnostic_only) {
         std::fprintf(stderr, "--diagnostic-skip-shard-digests requires --diagnostic-only\n");
         return false;
@@ -2166,9 +2176,10 @@ int main(int argc, char ** argv) {
     std::string manifest_path;
     bool        help = false;
     bool        diagnostic_only = false;
+    bool        diagnostic_all_boundaries = false;
     bool        diagnostic_skip_shard_digests = false;
     if (!parse_arguments(argc, argv, model_path, manifest_path, help, diagnostic_only,
-                         diagnostic_skip_shard_digests)) {
+                         diagnostic_all_boundaries, diagnostic_skip_shard_digests)) {
         return help ? 0 : 2;
     }
     if (!env_is_one("LLAMA_DSV4_COMPOSITE_RESIDENT_ENABLE") || !env_is_one("LLAMA_DSV4_AGGREGATE_POOL_FORCE") ||
@@ -2183,7 +2194,9 @@ int main(int argc, char ** argv) {
         const model_manifest manifest = read_model_manifest(manifest_path);
         if (diagnostic_only) {
             std::fprintf(stderr,
-                         "resident-model diagnostic-only enabled; shard digests=%s; result is forced nonzero\n",
+                         "resident-model diagnostic-only enabled; all-boundaries=%s; shard digests=%s; "
+                         "result is forced nonzero\n",
+                         diagnostic_all_boundaries ? "enabled" : "disabled",
                          diagnostic_skip_shard_digests ? "skipped" : "verified");
         }
         // Validate the supplied path before the platform gate so wrong-model
@@ -2212,12 +2225,24 @@ int main(int argc, char ** argv) {
                      N_CTX, N_BATCH, N_UBATCH, N_SEQ_MAX, N_RS_SEQ, N_OUTPUTS, BOUNDARIES.size());
         for (uint32_t boundary : BOUNDARIES) {
             run_boundary(model.get(), n_vocab, boundary, diagnostic_only && boundary == BOUNDARIES.front());
-            if (diagnostic_only) {
+            if (diagnostic_only && !diagnostic_all_boundaries) {
                 std::fprintf(stderr,
                              "resident-model diagnostic-only stopped after boundary=%u; forced nonzero result\n",
                              boundary);
                 return 3;
             }
+            if (diagnostic_only) {
+                std::fprintf(stderr,
+                             "resident-model diagnostic-all-boundaries completed boundary=%u/%zu; "
+                             "result remains forced nonzero\n",
+                             boundary, BOUNDARIES.size());
+            }
+        }
+        if (diagnostic_only) {
+            std::fprintf(stderr,
+                         "resident-model diagnostic-all-boundaries complete boundaries=%zu; forced nonzero result\n",
+                         BOUNDARIES.size());
+            return 3;
         }
         std::fprintf(stderr, "resident-model complete boundaries=%zu\n", BOUNDARIES.size());
         return 0;
