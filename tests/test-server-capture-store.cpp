@@ -557,6 +557,16 @@ void test_bounds_off_mode_and_private_permissions() {
     expect_status(csprng_failed.shutdown(false).status, capture_store_status::io_error, "CSPRNG failure status");
     expect(!fs::exists(csprng_temp.path() / "not-created"), "CSPRNG failure created a capture root");
 
+    temporary_directory  zero_csprng_temp;
+    capture_store_config zero_csprng_config       = make_config(zero_csprng_temp.path() / "not-created");
+    zero_csprng_config.identity_salt              = {};
+    zero_csprng_config.faults.csprng_returns_zero = true;
+    capture_store zero_csprng_failed(zero_csprng_config);
+    expect(zero_csprng_failed.stats().worker_failed, "all-zero CSPRNG did not fail closed");
+    expect_status(zero_csprng_failed.shutdown(false).status, capture_store_status::io_error,
+                  "all-zero CSPRNG failure status");
+    expect(!fs::exists(zero_csprng_temp.path() / "not-created"), "all-zero CSPRNG created a capture root");
+
     capture_store store(base);
     expect(store.try_enqueue(make_observation(1)), "private mode enqueue");
     expect_status(store.flush().status, capture_store_status::ok, "private mode flush");
@@ -778,7 +788,105 @@ void test_admission_linearization_and_high_count_shutdown() {
     barrier_cv.notify_all();
     producer.join();
     destroyer.join();
-    expect(!accepted.load(std::memory_order_acquire), "producer accepted after admission closed by destructor");
+    expect(accepted.load(std::memory_order_acquire), "destructor stranded a pre-close producer observation");
+
+    for (const bool drain : { true, false }) {
+        temporary_directory     barrier_shutdown_temp;
+        capture_store_config    barrier_shutdown_config = make_config(barrier_shutdown_temp.path());
+        std::mutex              push_mutex;
+        std::condition_variable push_cv;
+        bool                    push_entered               = false;
+        bool                    push_release               = false;
+        barrier_shutdown_config.faults.before_enqueue_push = [&]() {
+            std::unique_lock<std::mutex> lock(push_mutex);
+            push_entered = true;
+            push_cv.notify_all();
+            push_cv.wait(lock, [&]() { return push_release; });
+        };
+        capture_store     barrier_shutdown_store(barrier_shutdown_config);
+        std::atomic<bool> push_result{ false };
+        std::thread       barrier_producer([&]() {
+            push_result.store(barrier_shutdown_store.try_enqueue(make_observation(1)), std::memory_order_release);
+        });
+        {
+            std::unique_lock<std::mutex> lock(push_mutex);
+            expect(push_cv.wait_for(lock, std::chrono::seconds(2), [&]() { return push_entered; }),
+                   "producer did not reach pre-push barrier");
+        }
+        std::atomic<bool>    shutdown_done{ false };
+        capture_store_result barrier_shutdown_result;
+        std::thread          barrier_shutdown([&]() {
+            barrier_shutdown_result = barrier_shutdown_store.shutdown(drain);
+            shutdown_done.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        expect(!shutdown_done.load(std::memory_order_acquire), "shutdown did not wait for pre-push producer");
+        {
+            std::lock_guard<std::mutex> lock(push_mutex);
+            push_release = true;
+        }
+        push_cv.notify_all();
+        barrier_producer.join();
+        barrier_shutdown.join();
+        expect(push_result.load(std::memory_order_acquire), "pre-push producer lost an accepted observation");
+        expect_status(barrier_shutdown_result.status, capture_store_status::ok, "pre-push barrier shutdown status");
+        const capture_store_stats barrier_stats = barrier_shutdown_store.stats();
+        expect(barrier_stats.ring.size_approx == 0, "shutdown left a pre-push observation in the ring");
+        capture_manifest           barrier_manifest;
+        const capture_store_result barrier_inspect = barrier_shutdown_store.inspect(barrier_manifest);
+        if (drain) {
+            expect_status(barrier_inspect.status, capture_store_status::ok, "draining pre-push inspect");
+            expect(barrier_manifest.total_records == 1, "draining pre-push shutdown lost accepted observation");
+            expect(barrier_stats.dropped_on_shutdown == 0, "draining pre-push shutdown dropped observation");
+        } else {
+            expect_status(barrier_inspect.status, capture_store_status::no_manifest, "non-draining pre-push inspect");
+            expect(barrier_stats.dropped_on_shutdown == 1,
+                   "non-draining pre-push shutdown did not account accepted observation");
+        }
+    }
+
+    temporary_directory     failure_temp;
+    capture_store_config    failure_config = make_config(failure_temp.path());
+    std::mutex              failure_mutex;
+    std::condition_variable failure_cv;
+    bool                    failure_producer_entered = false;
+    bool                    failure_producer_release = false;
+    bool                    failure_triggered        = false;
+    failure_config.faults.before_enqueue_push        = [&]() {
+        std::unique_lock<std::mutex> lock(failure_mutex);
+        failure_producer_entered = true;
+        failure_cv.notify_all();
+        failure_cv.wait(lock, [&]() { return failure_producer_release; });
+    };
+    failure_config.faults.before_worker_wait = [&]() {
+        std::unique_lock<std::mutex> lock(failure_mutex);
+        failure_cv.wait(lock, [&]() { return failure_producer_entered; });
+        failure_triggered = true;
+        failure_cv.notify_all();
+        throw std::runtime_error("deterministic mark_failure seam");
+    };
+    capture_store     failure_store(failure_config);
+    std::atomic<bool> failure_push_result{ false };
+    std::thread       failure_producer([&]() {
+        failure_push_result.store(failure_store.try_enqueue(make_observation(1)), std::memory_order_release);
+    });
+    {
+        std::unique_lock<std::mutex> lock(failure_mutex);
+        expect(failure_cv.wait_for(lock, std::chrono::seconds(2), [&]() { return failure_producer_entered; }),
+               "mark_failure producer did not reach pre-push barrier");
+        expect(failure_cv.wait_for(lock, std::chrono::seconds(2), [&]() { return failure_triggered; }),
+               "mark_failure worker did not trigger");
+        failure_producer_release = true;
+    }
+    failure_cv.notify_all();
+    failure_producer.join();
+    expect(failure_push_result.load(std::memory_order_acquire),
+           "mark_failure rejected a producer that passed accepting before failure");
+    expect_status(failure_store.shutdown(false).status, capture_store_status::io_error, "mark_failure shutdown status");
+    const capture_store_stats failure_stats = failure_store.stats();
+    expect(failure_stats.worker_failed, "mark_failure did not set worker failure state");
+    expect(failure_stats.ring.size_approx == 0, "mark_failure left an accepted observation in the ring");
+    expect(failure_stats.dropped_on_shutdown == 1, "mark_failure did not account an accepted ring observation");
 
     for (const bool drain : { true, false }) {
         temporary_directory  temp;
@@ -824,6 +932,7 @@ void test_admission_linearization_and_high_count_shutdown() {
         expect(stats.ring.pushed == accepted_total, "producer true result disagrees with ring pushes");
         expect(stats.ring.dropped + stats.dropped_after_stop == rejected_total,
                "producer false result disagrees with ring/closed drops");
+        expect(stats.ring.size_approx == 0, "shutdown left an accepted observation in the ring");
         if (drain) {
             expect(manifest.total_records == accepted_total, "draining shutdown lost an accepted producer record");
             expect(stats.dropped_on_shutdown == 0, "draining shutdown discarded a queued record");
@@ -908,6 +1017,116 @@ void test_filesystem_fault_seams_and_flush_ordering() {
     expect(recovered_manifest.shards.size() == 1 && recovered_manifest.shards.front().sequence == 2,
            "tombstone fsync recovery did not retain published manifest");
     expect_status(recovered.shutdown().status, capture_store_status::ok, "tombstone fsync recovery shutdown");
+
+    auto configure_one_retained = [](capture_store_config & config) {
+        config.max_shard_records    = 2;
+        config.max_retained_shards  = 1;
+        config.max_retained_records = 2;
+        config.max_retained_bytes   = 4096;
+    };
+
+    temporary_directory post_fsync_temp;
+    {
+        capture_store_config config = make_config(post_fsync_temp.path());
+        configure_one_retained(config);
+        capture_store store(config);
+        expect(store.try_enqueue(make_observation(1)), "post-publication fsync first enqueue");
+        expect_status(store.flush().status, capture_store_status::ok, "post-publication fsync first flush");
+        expect_status(store.shutdown().status, capture_store_status::ok, "post-publication fsync first shutdown");
+    }
+    {
+        capture_store_config config = make_config(post_fsync_temp.path());
+        configure_one_retained(config);
+        config.faults.fail_post_publication_directory_fsync = true;
+        capture_store store(config);
+        expect(store.try_enqueue(make_observation(2)), "post-publication fsync second enqueue");
+        expect_status(store.flush().status, capture_store_status::commit_uncertain,
+                      "post-publication fsync second flush");
+        expect_status(store.shutdown(false).status, capture_store_status::commit_uncertain,
+                      "post-publication fsync second shutdown");
+    }
+    capture_store    post_fsync_recovered(make_config(post_fsync_temp.path()));
+    capture_manifest post_fsync_manifest;
+    expect_status(post_fsync_recovered.inspect(post_fsync_manifest).status, capture_store_status::ok,
+                  "post-publication fsync recovery inspect");
+    expect(post_fsync_manifest.shards.size() == 1 && post_fsync_manifest.shards.front().sequence == 2,
+           "post-publication fsync recovery lost durable manifest");
+    expect_status(post_fsync_recovered.validate(post_fsync_manifest).status, capture_store_status::ok,
+                  "post-publication fsync recovery validate");
+    expect_status(post_fsync_recovered.shutdown().status, capture_store_status::ok,
+                  "post-publication fsync recovery shutdown");
+    size_t post_fsync_shards = 0;
+    for (const fs::directory_entry & entry : fs::directory_iterator(post_fsync_temp.path())) {
+        post_fsync_shards += entry.path().extension() == ".cap" ? 1 : 0;
+    }
+    expect(post_fsync_shards == 1, "post-publication fsync recovery left an unreferenced shard");
+
+    temporary_directory post_rename_temp;
+    {
+        capture_store_config config = make_config(post_rename_temp.path());
+        configure_one_retained(config);
+        capture_store store(config);
+        expect(store.try_enqueue(make_observation(1)), "post-publication rename first enqueue");
+        expect_status(store.flush().status, capture_store_status::ok, "post-publication rename first flush");
+        expect_status(store.shutdown().status, capture_store_status::ok, "post-publication rename first shutdown");
+    }
+    {
+        capture_store_config config = make_config(post_rename_temp.path());
+        configure_one_retained(config);
+        config.faults.fail_manifest_rename = true;
+        capture_store store(config);
+        expect(store.try_enqueue(make_observation(2)), "post-publication rename second enqueue");
+        expect_status(store.flush().status, capture_store_status::io_error, "post-publication rename second flush");
+        expect_status(store.shutdown(false).status, capture_store_status::io_error,
+                      "post-publication rename second shutdown");
+    }
+    capture_store    post_rename_recovered(make_config(post_rename_temp.path()));
+    capture_manifest post_rename_manifest;
+    expect_status(post_rename_recovered.inspect(post_rename_manifest).status, capture_store_status::ok,
+                  "post-publication rename recovery inspect");
+    expect(post_rename_manifest.shards.size() == 1 && post_rename_manifest.shards.front().sequence == 1,
+           "post-publication rename recovery replaced the prior manifest");
+    expect_status(post_rename_recovered.shutdown().status, capture_store_status::ok,
+                  "post-publication rename recovery shutdown");
+    size_t post_rename_shards = 0;
+    for (const fs::directory_entry & entry : fs::directory_iterator(post_rename_temp.path())) {
+        post_rename_shards += entry.path().extension() == ".cap" ? 1 : 0;
+    }
+    expect(post_rename_shards == 1, "post-publication rename recovery left an unreferenced shard");
+
+    temporary_directory post_unlink_temp;
+    {
+        capture_store_config config = make_config(post_unlink_temp.path());
+        configure_one_retained(config);
+        capture_store store(config);
+        expect(store.try_enqueue(make_observation(1)), "post-publication unlink first enqueue");
+        expect_status(store.flush().status, capture_store_status::ok, "post-publication unlink first flush");
+        expect_status(store.shutdown().status, capture_store_status::ok, "post-publication unlink first shutdown");
+    }
+    {
+        capture_store_config config = make_config(post_unlink_temp.path());
+        configure_one_retained(config);
+        config.faults.fail_unlink = true;
+        capture_store store(config);
+        expect(store.try_enqueue(make_observation(2)), "post-publication unlink second enqueue");
+        expect_status(store.flush().status, capture_store_status::deletion_failed,
+                      "post-publication unlink second flush");
+        expect_status(store.shutdown(false).status, capture_store_status::deletion_failed,
+                      "post-publication unlink second shutdown");
+    }
+    capture_store    post_unlink_recovered(make_config(post_unlink_temp.path()));
+    capture_manifest post_unlink_manifest;
+    expect_status(post_unlink_recovered.inspect(post_unlink_manifest).status, capture_store_status::ok,
+                  "post-publication unlink recovery inspect");
+    expect(post_unlink_manifest.shards.size() == 1 && post_unlink_manifest.shards.front().sequence == 2,
+           "post-publication unlink recovery lost durable manifest");
+    expect_status(post_unlink_recovered.shutdown().status, capture_store_status::ok,
+                  "post-publication unlink recovery shutdown");
+    size_t post_unlink_shards = 0;
+    for (const fs::directory_entry & entry : fs::directory_iterator(post_unlink_temp.path())) {
+        post_unlink_shards += entry.path().extension() == ".cap" ? 1 : 0;
+    }
+    expect(post_unlink_shards == 1, "post-publication unlink recovery left an unreferenced shard");
 
     temporary_directory  orphan_temp;
     capture_store_config orphan_config = make_config(orphan_temp.path());

@@ -1097,7 +1097,9 @@ struct capture_store::impl {
         if (salt_zero(salt)) {
             int  random_error  = EIO;
             bool random_failed = cfg.faults.fail_csprng;
-            if (!random_failed && ::getentropy(salt.data(), salt.size()) != 0) {
+            if (cfg.faults.csprng_returns_zero) {
+                random_failed = false;
+            } else if (!random_failed && ::getentropy(salt.data(), salt.size()) != 0) {
                 random_failed = true;
                 random_error  = errno == 0 ? EIO : errno;
             }
@@ -1556,7 +1558,8 @@ struct capture_store::impl {
         // Cancellation after publication is too late to revoke a durable
         // commit; returning success is the only truthful outcome.
         (void) phase_cancelled(cfg, capture_store_phase::after_manifest_rename);
-        if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root, cfg.faults.fail_directory_fsync,
+        if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root,
+                                cfg.faults.fail_directory_fsync || cfg.faults.fail_post_publication_directory_fsync,
                                 cfg.faults.fail_fstat)) {
             return result(capture_store_status::commit_uncertain, directory_error, true);
         }
@@ -1566,7 +1569,7 @@ struct capture_store::impl {
         (void) phase_cancelled(cfg, capture_store_phase::before_retention_delete);
         const capture_store_result deleted = delete_retired(retired);
         if (deleted.status != capture_store_status::ok) {
-            return deleted;
+            return result(deleted.status, deleted.os_error, true);
         }
         (void) phase_cancelled(cfg, capture_store_phase::after_retention_delete);
         return result(capture_store_status::ok, 0, true);
@@ -1579,17 +1582,51 @@ struct capture_store::impl {
         current_last_ns  = 0;
     }
 
+    // Called only by the worker after producer admission is closed and all
+    // claimed producer tokens have returned.  No producer can append after
+    // this drain begins, so every pre-close successful push is accounted.
+    void discard_pending(bool current_persisted = false) noexcept {
+        if (worker_observation_in_flight && !worker_observation_recorded) {
+            // The worker popped this observation but failed before appending
+            // it to the current shard.  Count it alongside queued records so
+            // a terminal worker failure cannot strand a successful push.
+            dropped_on_shutdown.fetch_add(1, std::memory_order_relaxed);
+        }
+        worker_observation_in_flight = false;
+        worker_observation_recorded  = false;
+        if (ring != nullptr) {
+            cycle_observation observation;
+            while (ring->try_pop(observation)) {
+                dropped_on_shutdown.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (!current_persisted) {
+            dropped_on_shutdown.fetch_add(current_records, std::memory_order_relaxed);
+        }
+        reset_current();
+    }
+
     void mark_failure(capture_store_result failure) noexcept {
         {
             std::lock_guard<std::mutex> lock(mutex);
-            terminal        = failure;
-            flush_result    = failure;
-            flush_completed = flush_requested;
+            terminal     = failure;
+            flush_result = failure;
             ++failed_writes;
         }
+        // The worker remains alive while admission closes and waits.  This is
+        // deliberately outside mutex: a producer callback may need another
+        // lifecycle thread to release it, and waiting while holding mutex
+        // would deadlock flush/shutdown coordination.
+        close_admission_and_wait();
         failed.store(true, std::memory_order_release);
         accepting.store(false, std::memory_order_release);
         stop_requested.store(true, std::memory_order_release);
+        discard_pending(failure.committed);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            flush_result    = failure;
+            flush_completed = flush_requested;
+        }
         if (wakeup != nullptr) {
             (void) wakeup->post();
         }
@@ -1619,6 +1656,7 @@ struct capture_store::impl {
         current_last_ns = observation.monotonic_ns;
         append_record(observation, salt, rich, cfg.capture_mode == mode::metrics_only, current_payload);
         ++current_records;
+        worker_observation_recorded = true;
         if (current_records >= cfg.max_shard_records ||
             current_payload.size() + CAPTURE_SHARD_HEADER_BYTES + CAPTURE_SHARD_FOOTER_BYTES >= cfg.max_shard_bytes) {
             const capture_store_result committed = commit_payload();
@@ -1638,12 +1676,15 @@ struct capture_store::impl {
             while (!exit) {
                 cycle_observation observation;
                 while (ring->try_pop(observation)) {
+                    worker_observation_in_flight        = true;
+                    worker_observation_recorded         = false;
                     const capture_store_result consumed = consume_observation(observation);
                     if (consumed.status != capture_store_status::ok) {
                         mark_failure(consumed);
                         exit = true;
                         break;
                     }
+                    worker_observation_in_flight = false;
                     if (cfg.faults.slow_worker) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     }
@@ -1661,11 +1702,7 @@ struct capture_store::impl {
                     should_drain = drain_requested.load(std::memory_order_acquire);
                 }
                 if (should_stop && !should_drain) {
-                    while (ring->try_pop(observation)) {
-                        ++dropped_on_shutdown;
-                    }
-                    dropped_on_shutdown += current_records;
-                    reset_current();
+                    discard_pending();
                 }
                 if (ring->stats().size_approx != 0) {
                     continue;
@@ -1777,13 +1814,17 @@ struct capture_store::impl {
             return terminal.status == capture_store_status::invalid_argument ? startup : terminal;
         }
         guard.unlock();
+        // Seal admission while the worker remains alive.  Only after every
+        // pre-close producer has returned may stop/drain state be published;
+        // this guarantees that a successful push cannot be stranded behind
+        // the worker's final queue check.
+        close_admission_and_wait();
         {
             std::lock_guard<std::mutex> lock(mutex);
             drain_requested.store(drain, std::memory_order_release);
             stop_requested.store(true, std::memory_order_release);
             accepting.store(false, std::memory_order_release);
         }
-        close_admission_and_wait();
         (void) wakeup->post();
         worker.join();
         worker_started.store(false, std::memory_order_release);
@@ -1820,10 +1861,12 @@ struct capture_store::impl {
     uint64_t                        flush_completed  = 0;
     bool                            stopped          = false;
     std::vector<uint8_t>            current_payload;
-    uint32_t                        current_records  = 0;
-    uint64_t                        current_first_ns = 0;
-    uint64_t                        current_last_ns  = 0;
-    uint64_t                        failed_writes    = 0;
+    uint32_t                        current_records              = 0;
+    uint64_t                        current_first_ns             = 0;
+    uint64_t                        current_last_ns              = 0;
+    uint64_t                        failed_writes                = 0;
+    bool                            worker_observation_in_flight = false;
+    bool                            worker_observation_recorded  = false;
     std::atomic<uint64_t>           dropped_after_stop{ 0 };
     std::atomic<uint64_t>           dropped_on_shutdown{ 0 };
 
@@ -1872,6 +1915,15 @@ bool capture_store::try_enqueue(const cycle_observation & observation) noexcept 
         data->dropped_after_stop.fetch_add(1, std::memory_order_relaxed);
         data->release_producer();
         return false;
+    }
+    if (data->cfg.faults.before_enqueue_push) {
+        try {
+            data->cfg.faults.before_enqueue_push();
+        } catch (...) {
+            data->dropped_after_stop.fetch_add(1, std::memory_order_relaxed);
+            data->release_producer();
+            return false;
+        }
     }
     const bool pushed = data->ring->try_push(observation);
     if (pushed) {
