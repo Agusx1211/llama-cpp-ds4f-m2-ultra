@@ -51,8 +51,13 @@ The root walk uses the same absolute, no-follow, owner, and private-mode
 invariants as `server-capture-store` (that helper is currently translation-unit
 private, so the invariants are mirrored until a shared authority can be
 extracted without changing the capture ABI).  Symlinked or group/world-writable
-roots and journal files fail closed.  The journal object must outlive all
-concurrent calls; destruction requires external call quiescence.
+roots and journal files fail closed.  Final and temporary images are opened
+with no-follow semantics and authorized from the descriptor that is actually
+read or written; the publication source identity is compared again immediately
+before `renameat`.  A pre-existing owner lock must already be a regular,
+owner-owned 0600 file and is never chmod'd on rejection.  The journal object
+must outlive all concurrent calls; destruction requires external call
+quiescence.
 
 ## Crash and corruption behavior
 

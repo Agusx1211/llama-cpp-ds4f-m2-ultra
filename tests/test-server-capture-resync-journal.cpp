@@ -138,6 +138,30 @@ bool contains_bytes(const std::vector<uint8_t> & bytes, const std::array<uint8_t
     return std::search(bytes.begin(), bytes.end(), needle.begin(), needle.end()) != bytes.end();
 }
 
+std::atomic<int> read_replacement_calls{ 0 };
+std::atomic<int> read_replacement_error{ 0 };
+std::atomic<int> publish_replacement_calls{ 0 };
+std::atomic<int> publish_replacement_error{ 0 };
+
+void replace_journal_after_open(int root_fd, int) noexcept {
+    if (::renameat(root_fd, ".replacement", root_fd, "resync.journal") != 0) {
+        read_replacement_error.store(errno, std::memory_order_release);
+    }
+    read_replacement_calls.fetch_add(1, std::memory_order_release);
+}
+
+void replace_temp_before_rename(int root_fd, int) noexcept {
+    bool failed = false;
+    if (::renameat(root_fd, ".resync.journal.tmp", root_fd, ".displaced.tmp") != 0) {
+        publish_replacement_error.store(errno, std::memory_order_release);
+        failed = true;
+    }
+    if (!failed && ::renameat(root_fd, ".replacement", root_fd, ".resync.journal.tmp") != 0) {
+        publish_replacement_error.store(errno, std::memory_order_release);
+    }
+    publish_replacement_calls.fetch_add(1, std::memory_order_release);
+}
+
 std::vector<uint8_t> read_file(const fs::path & path) {
     std::ifstream input(path, std::ios::binary);
     expect(input.good(), "open journal file");
@@ -463,9 +487,92 @@ void test_temp_file_security() {
     }
 }
 
-void make_persisted_fixture(const fs::path & root) {
+void test_owner_lock_path_security() {
+    for (const mode_t unsafe_mode : { static_cast<mode_t>(0640), static_cast<mode_t>(0666) }) {
+        temporary_directory temp;
+        const fs::path root = temp.path() / "unsafe-lock-mode";
+        expect(fs::create_directory(root), "create unsafe lock root");
+        expect(::chmod(root.c_str(), S_IRWXU) == 0, "chmod unsafe lock root");
+        const fs::path lock = root / ".resync.journal.lock";
+        const std::vector<uint8_t> before = { 0x51, 0x52, 0x53 };
+        write_file(lock, before);
+        expect(::chmod(lock.c_str(), unsafe_mode) == 0, "chmod unsafe lock fixture");
+        bool threw = false;
+        try {
+            resync_journal rejected(persistent_config(root));
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        expect(threw, "pre-existing unsafe lock rejected");
+        struct stat status = {};
+        expect(::stat(lock.c_str(), &status) == 0 && (status.st_mode & 07777) == unsafe_mode,
+               "unsafe lock mode remains unchanged");
+        expect(read_file(lock) == before, "unsafe lock bytes remain unchanged");
+    }
+    {
+        temporary_directory temp;
+        const fs::path root = temp.path() / "symlink-lock";
+        expect(fs::create_directory(root), "create symlink lock root");
+        expect(::chmod(root.c_str(), S_IRWXU) == 0, "chmod symlink lock root");
+        const fs::path target = temp.path() / "lock-target";
+        const std::vector<uint8_t> before = { 0x61, 0x62, 0x63 };
+        write_file(target, before);
+        expect(::symlink(target.c_str(), (root / ".resync.journal.lock").c_str()) == 0,
+               "create lock symlink");
+        bool threw = false;
+        try {
+            resync_journal rejected(persistent_config(root));
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        expect(threw, "symlink lock rejected");
+        expect(fs::is_symlink(root / ".resync.journal.lock") && read_file(target) == before,
+               "symlink lock and target remain unchanged");
+    }
+    {
+        temporary_directory temp;
+        const fs::path root = temp.path() / "fifo-lock";
+        expect(fs::create_directory(root), "create fifo lock root");
+        expect(::chmod(root.c_str(), S_IRWXU) == 0, "chmod fifo lock root");
+        const fs::path lock = root / ".resync.journal.lock";
+        expect(::mkfifo(lock.c_str(), S_IRUSR | S_IWUSR) == 0, "create fifo lock");
+        bool threw = false;
+        try {
+            resync_journal rejected(persistent_config(root));
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        struct stat status = {};
+        expect(threw && ::lstat(lock.c_str(), &status) == 0 && S_ISFIFO(status.st_mode),
+               "nonregular lock rejected unchanged");
+    }
+    if (::geteuid() == 0) {
+        temporary_directory temp;
+        const fs::path root = temp.path() / "wrong-owner-lock";
+        expect(fs::create_directory(root), "create wrong-owner lock root");
+        expect(::chmod(root.c_str(), S_IRWXU) == 0, "chmod wrong-owner lock root");
+        const fs::path lock = root / ".resync.journal.lock";
+        const std::vector<uint8_t> before = { 0x71, 0x72, 0x73 };
+        write_file(lock, before);
+        expect(::chmod(lock.c_str(), S_IRUSR | S_IWUSR) == 0 && ::chown(lock.c_str(), 65534, 65534) == 0,
+               "create wrong-owner lock fixture");
+        bool threw = false;
+        try {
+            resync_journal rejected(persistent_config(root));
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        struct stat status = {};
+        expect(threw && ::stat(lock.c_str(), &status) == 0 && status.st_uid == 65534 &&
+                   (status.st_mode & 07777) == (S_IRUSR | S_IWUSR) && read_file(lock) == before,
+               "wrong-owner lock rejected unchanged");
+    }
+}
+
+void make_persisted_fixture(const fs::path & root, uint32_t record = 1, int32_t accepted_token = 12345,
+                            int32_t rejected_token = 54321) {
     resync_journal journal(persistent_config(root));
-    expect_status(append(journal, make_commit(1), { accepted(0, 12345), rejected(1, 54321) }).status,
+    expect_status(append(journal, make_commit(record), { accepted(0, accepted_token), rejected(1, rejected_token) }).status,
                   resync_journal_status::ok, "persist fixture append");
 }
 
@@ -507,6 +614,66 @@ void test_sha256_vectors_and_journal_footer() {
            "journal footer matches shared SHA-256 parser");
 }
 
+void test_descriptor_authority_under_same_size_replacement() {
+    temporary_directory temp;
+    const fs::path original_root = temp.path() / "descriptor-original";
+    const fs::path replacement_root = temp.path() / "descriptor-replacement";
+    make_persisted_fixture(original_root, 1, 12345, 54321);
+    make_persisted_fixture(replacement_root, 2, 22345, 64321);
+
+    const fs::path original_path = original_root / "resync.journal";
+    const fs::path replacement_path = replacement_root / "resync.journal";
+    expect(fs::file_size(original_path) == fs::file_size(replacement_path), "same-size replacement fixture");
+    std::error_code copy_error;
+    fs::copy_file(replacement_path, original_root / ".replacement", fs::copy_options::overwrite_existing, copy_error);
+    expect(!copy_error, "copy same-size replacement fixture");
+
+    read_replacement_calls.store(0, std::memory_order_release);
+    read_replacement_error.store(0, std::memory_order_release);
+    resync_journal_config config = persistent_config(original_root);
+    config.faults.after_read_open = replace_journal_after_open;
+    resync_journal restarted(config);
+    resync_journal_snapshot snapshot;
+    expect_status(restarted.inspect(snapshot).status, resync_journal_status::ok,
+                  "descriptor-authority restart");
+    expect(read_replacement_calls.load(std::memory_order_acquire) == 1 &&
+               read_replacement_error.load(std::memory_order_acquire) == 0,
+           "same-size replacement hook ran");
+    expect(snapshot.last_commit.record_index == 1 && snapshot.events[0].token_id == 12345,
+           "opened descriptor remains the recovery source after pathname replacement");
+    expect(read_file(original_path) == read_file(replacement_path),
+           "replacement pathname published independently of opened descriptor");
+}
+
+void test_publication_source_identity() {
+    temporary_directory temp;
+    const fs::path root = temp.path() / "publication-source";
+    const fs::path replacement_root = temp.path() / "publication-replacement";
+    make_persisted_fixture(root, 1, 12345, 54321);
+    make_persisted_fixture(replacement_root, 9, 92345, 96321);
+    const fs::path journal_path = root / "resync.journal";
+    const std::vector<uint8_t> before = read_file(journal_path);
+    std::error_code copy_error;
+    fs::copy_file(replacement_root / "resync.journal", root / ".replacement",
+                  fs::copy_options::overwrite_existing, copy_error);
+    expect(!copy_error, "copy publication replacement fixture");
+
+    publish_replacement_calls.store(0, std::memory_order_release);
+    publish_replacement_error.store(0, std::memory_order_release);
+    resync_journal_config config = persistent_config(root);
+    config.faults.before_rename = replace_temp_before_rename;
+    resync_journal journal(config);
+    const resync_journal_result append_result = append(journal, make_commit(2), { accepted(1, 22222) });
+    expect_status(append_result.status, resync_journal_status::path_security,
+                  "replaced publication source rejected");
+    expect(publish_replacement_calls.load(std::memory_order_acquire) == 1 &&
+               publish_replacement_error.load(std::memory_order_acquire) == 0,
+           "publication source replacement hook ran");
+    expect(read_file(journal_path) == before && fs::exists(root / ".displaced.tmp") &&
+               fs::exists(root / ".resync.journal.tmp"),
+           "replaced publication source was not published");
+}
+
 void test_restart_and_privacy() {
     temporary_directory temp;
     const fs::path root = temp.path() / "journal-root";
@@ -520,6 +687,10 @@ void test_restart_and_privacy() {
     struct stat root_status = {};
     expect(::stat(root.c_str(), &root_status) == 0 && (root_status.st_mode & 07777) == S_IRWXU,
            "journal root exact private mode");
+    struct stat lock_status = {};
+    expect(::stat((root / ".resync.journal.lock").c_str(), &lock_status) == 0 &&
+               (lock_status.st_mode & 07777) == (S_IRUSR | S_IWUSR),
+           "owner lock exact private mode");
     const std::vector<uint8_t> bytes = read_file(path);
     const std::array<uint8_t, 4> token_bytes = { 0x39, 0x30, 0, 0 };
     expect(std::search(bytes.begin(), bytes.end(), token_bytes.begin(), token_bytes.end()) != bytes.end(),
@@ -1012,7 +1183,10 @@ int main() {
         test_overflow_and_invalid_commits();
         test_persistence_opt_in();
         test_sha256_vectors_and_journal_footer();
+        test_descriptor_authority_under_same_size_replacement();
+        test_publication_source_identity();
         test_temp_file_security();
+        test_owner_lock_path_security();
         test_restart_and_privacy();
         test_reject_only_restart();
         test_corruption_fail_closed();

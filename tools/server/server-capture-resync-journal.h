@@ -117,6 +117,13 @@ struct resync_journal_snapshot {
     std::array<resync_journal_event, RESYNC_JOURNAL_MAX_EVENTS> replay_tokens = {};
 };
 
+// Test-only publication seam. Production callers leave this null; focused
+// persistence tests use it to replace the directory name after the journal
+// descriptor has been opened, proving that parsing remains tied to the
+// validated descriptor rather than a raced pathname.
+using resync_journal_read_test_hook = void (*)(int root_fd, int journal_fd) noexcept;
+using resync_journal_publish_test_hook = void (*)(int root_fd, int temp_fd) noexcept;
+
 struct resync_journal_config {
     // Persistence is opt-in.  With persist=false the same bounded semantics
     // apply in memory and no filesystem path is required.
@@ -136,6 +143,8 @@ struct resync_journal_config {
         bool fail_directory_fsync = false;
         bool crash_before_rename  = false;
         bool crash_after_rename   = false;
+        resync_journal_read_test_hook after_read_open = nullptr;
+        resync_journal_publish_test_hook before_rename = nullptr;
     } faults;
 
     // Per-stream token positions normally start at zero.  Tests and callers

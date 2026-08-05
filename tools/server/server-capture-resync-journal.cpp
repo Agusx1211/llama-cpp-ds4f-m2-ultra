@@ -183,17 +183,41 @@ resync_journal_status open_private_root(const fs::path & root, bool require_priv
 resync_journal_status acquire_owner_lock(int root_fd, int & descriptor, int & os_error) {
     descriptor = -1;
     os_error  = 0;
-    const int lock = ::openat(root_fd, LOCK_NAME, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, PRIVATE_FILE_MODE);
+    int lock = ::openat(root_fd, LOCK_NAME,
+                        O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, PRIVATE_FILE_MODE);
+    const bool created = lock >= 0;
+    if (lock < 0 && errno == EEXIST) {
+        // An existing lock is an authority-bearing object. Never chmod or
+        // otherwise mutate it before validating its owner, type, and exact
+        // private mode.
+        lock = ::openat(root_fd, LOCK_NAME, O_RDWR | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    }
     if (lock < 0) {
         os_error = errno;
-        return errno == EACCES || errno == ELOOP ? resync_journal_status::path_security :
-                                                   resync_journal_status::io_error;
+        return errno == EACCES || errno == ELOOP || errno == EISDIR ? resync_journal_status::path_security :
+                                                                      resync_journal_status::io_error;
     }
     struct stat status = {};
-    if (::fstat(lock, &status) != 0 || !S_ISREG(status.st_mode) || status.st_uid != ::geteuid() ||
-        ::fchmod(lock, PRIVATE_FILE_MODE) != 0 || ::fstat(lock, &status) != 0 ||
-        (status.st_mode & 07777) != PRIVATE_FILE_MODE) {
-        os_error = errno == 0 ? EACCES : errno;
+    const int  stat_result = ::fstat(lock, &status);
+    const bool valid_type = stat_result == 0 && S_ISREG(status.st_mode) && status.st_uid == ::geteuid();
+    if (stat_result != 0 || !valid_type) {
+        os_error = stat_result != 0 ? errno : EACCES;
+        ::close(lock);
+        if (created) {
+            ::unlinkat(root_fd, LOCK_NAME, 0);
+        }
+        return resync_journal_status::path_security;
+    }
+    if (created) {
+        if (::fchmod(lock, PRIVATE_FILE_MODE) != 0 || ::fstat(lock, &status) != 0 ||
+            (status.st_mode & 07777) != PRIVATE_FILE_MODE) {
+            os_error = errno == 0 ? EACCES : errno;
+            ::close(lock);
+            ::unlinkat(root_fd, LOCK_NAME, 0);
+            return resync_journal_status::path_security;
+        }
+    } else if ((status.st_mode & 07777) != PRIVATE_FILE_MODE) {
+        os_error = EACCES;
         ::close(lock);
         return resync_journal_status::path_security;
     }
@@ -213,6 +237,15 @@ resync_journal_status acquire_owner_lock(int root_fd, int & descriptor, int & os
 
 resync_journal_result result(resync_journal_status status, int os_error = 0, bool committed = false) {
     return { status, os_error, committed };
+}
+
+bool private_regular_file(const struct stat & status) noexcept {
+    return S_ISREG(status.st_mode) && status.st_uid == ::geteuid() &&
+           (status.st_mode & 07777) == PRIVATE_FILE_MODE;
+}
+
+bool same_file_identity(const struct stat & left, const struct stat & right) noexcept {
+    return left.st_dev == right.st_dev && left.st_ino == right.st_ino;
 }
 
 bool equal_commit(const resync_capture_commit & left, const resync_capture_commit & right) noexcept {
@@ -568,28 +601,41 @@ resync_journal_result parse_state(const std::vector<uint8_t> & bytes, journal_st
     return result(resync_journal_status::ok, 0, true);
 }
 
-resync_journal_result read_private_file(int root_fd, std::vector<uint8_t> & bytes) {
-    struct stat status = {};
-    if (::fstatat(root_fd, JOURNAL_NAME, &status, AT_SYMLINK_NOFOLLOW) != 0) {
+resync_journal_result read_private_file(int root_fd, std::vector<uint8_t> & bytes,
+                                        resync_journal_read_test_hook after_open) {
+    // Open first and authorize the descriptor we will actually read. A
+    // pathname stat followed by open permits a same-owner process to swap a
+    // same-sized valid image between those operations.
+    const int descriptor = ::openat(root_fd, JOURNAL_NAME, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (descriptor < 0) {
         if (errno == ENOENT) {
             bytes.clear();
             return result(resync_journal_status::ok, 0, true);
         }
-        return result(resync_journal_status::path_security, errno);
+        return result(errno == EACCES || errno == ELOOP || errno == EISDIR ? resync_journal_status::path_security :
+                                                                                 resync_journal_status::io_error,
+                      errno);
     }
-    if (S_ISLNK(status.st_mode) || !S_ISREG(status.st_mode) || status.st_uid != ::geteuid() ||
-        (status.st_mode & 07777) != PRIVATE_FILE_MODE) {
+    struct stat status = {};
+    if (::fstat(descriptor, &status) != 0) {
+        const int error = errno;
+        ::close(descriptor);
+        return result(resync_journal_status::path_security, error);
+    }
+    if (!private_regular_file(status)) {
+        ::close(descriptor);
         return result(resync_journal_status::path_security, EACCES);
     }
     if (status.st_size <= 0) {
+        ::close(descriptor);
         return result(resync_journal_status::truncated);
     }
     if (static_cast<uint64_t>(status.st_size) > RESYNC_JOURNAL_MAX_FILE_BYTES) {
+        ::close(descriptor);
         return result(resync_journal_status::trailing_data, EFBIG);
     }
-    const int descriptor = ::openat(root_fd, JOURNAL_NAME, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (descriptor < 0) {
-        return result(resync_journal_status::io_error, errno);
+    if (after_open != nullptr) {
+        after_open(root_fd, descriptor);
     }
     bytes.assign(static_cast<size_t>(status.st_size), 0);
     size_t offset = 0;
@@ -612,18 +658,31 @@ resync_journal_result read_private_file(int root_fd, std::vector<uint8_t> & byte
 }
 
 resync_journal_result validate_private_file_at(int root_fd, bool allow_missing) {
-    struct stat status = {};
-    if (::fstatat(root_fd, JOURNAL_NAME, &status, AT_SYMLINK_NOFOLLOW) != 0) {
+    const int descriptor = ::openat(root_fd, JOURNAL_NAME, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (descriptor < 0) {
         if (allow_missing && errno == ENOENT) {
             return result(resync_journal_status::ok, 0, true);
         }
-        return result(resync_journal_status::path_security, errno);
+        return result(errno == EACCES || errno == ELOOP || errno == EISDIR ? resync_journal_status::path_security :
+                                                                                 resync_journal_status::io_error,
+                      errno);
     }
-    if (S_ISLNK(status.st_mode) || !S_ISREG(status.st_mode) || status.st_uid != ::geteuid() ||
-        (status.st_mode & 07777) != PRIVATE_FILE_MODE) {
-        return result(resync_journal_status::path_security, EACCES);
+    struct stat status = {};
+    const int  stat_result = ::fstat(descriptor, &status);
+    const bool valid = stat_result == 0 && private_regular_file(status);
+    const int  error = stat_result != 0 ? errno : (valid ? 0 : EACCES);
+    if (::close(descriptor) != 0 && valid) {
+        return result(resync_journal_status::io_error, errno);
     }
-    return result(resync_journal_status::ok, 0, true);
+    return valid ? result(resync_journal_status::ok, 0, true) : result(resync_journal_status::path_security, error);
+}
+
+void unlink_temp_if_same(int root_fd, const struct stat & expected) noexcept {
+    struct stat path_status = {};
+    if (::fstatat(root_fd, TEMP_NAME, &path_status, AT_SYMLINK_NOFOLLOW) == 0 &&
+        private_regular_file(path_status) && same_file_identity(path_status, expected)) {
+        (void) ::unlinkat(root_fd, TEMP_NAME, 0);
+    }
 }
 
 resync_journal_result write_private_file(int root_fd, const std::vector<uint8_t> & bytes,
@@ -632,10 +691,10 @@ resync_journal_result write_private_file(int root_fd, const std::vector<uint8_t>
     if (final_status.status != resync_journal_status::ok) {
         return final_status;
     }
-    int  descriptor = ::openat(root_fd, TEMP_NAME,
-                               O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,
-                               PRIVATE_FILE_MODE);
-    bool created_temp = descriptor >= 0;
+    int descriptor = ::openat(root_fd, TEMP_NAME,
+                              O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,
+                              PRIVATE_FILE_MODE);
+    const bool created_temp = descriptor >= 0;
     if (descriptor < 0 && errno == EEXIST) {
         descriptor = ::openat(root_fd, TEMP_NAME, O_WRONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     }
@@ -647,10 +706,12 @@ resync_journal_result write_private_file(int root_fd, const std::vector<uint8_t>
                       error);
     }
     struct stat temporary_status = {};
-    if (::fstat(descriptor, &temporary_status) != 0 || !S_ISREG(temporary_status.st_mode) ||
-        temporary_status.st_uid != ::geteuid() ||
-        (!created_temp && (temporary_status.st_mode & 07777) != PRIVATE_FILE_MODE)) {
-        const int error = errno == 0 ? EACCES : errno;
+    const int  stat_result = ::fstat(descriptor, &temporary_status);
+    const bool valid_type = stat_result == 0 && S_ISREG(temporary_status.st_mode) &&
+                            temporary_status.st_uid == ::geteuid();
+    const bool valid_mode = created_temp || (stat_result == 0 && (temporary_status.st_mode & 07777) == PRIVATE_FILE_MODE);
+    if (stat_result != 0 || !valid_type || !valid_mode) {
+        const int error = stat_result != 0 ? errno : EACCES;
         ::close(descriptor);
         if (created_temp) {
             ::unlinkat(root_fd, TEMP_NAME, 0);
@@ -658,9 +719,15 @@ resync_journal_result write_private_file(int root_fd, const std::vector<uint8_t>
         return result(resync_journal_status::path_security, error);
     }
     if (created_temp) {
-        if (::fchmod(descriptor, PRIVATE_FILE_MODE) != 0 || ::fstat(descriptor, &temporary_status) != 0 ||
-            (temporary_status.st_mode & 07777) != PRIVATE_FILE_MODE) {
-            const int error = errno == 0 ? EACCES : errno;
+        int error = 0;
+        if (::fchmod(descriptor, PRIVATE_FILE_MODE) != 0) {
+            error = errno;
+        } else if (::fstat(descriptor, &temporary_status) != 0) {
+            error = errno;
+        } else if ((temporary_status.st_mode & 07777) != PRIVATE_FILE_MODE) {
+            error = EACCES;
+        }
+        if (error != 0) {
             ::close(descriptor);
             ::unlinkat(root_fd, TEMP_NAME, 0);
             return result(resync_journal_status::io_error, error);
@@ -669,9 +736,7 @@ resync_journal_result write_private_file(int root_fd, const std::vector<uint8_t>
     if (::ftruncate(descriptor, 0) != 0) {
         const int error = errno;
         ::close(descriptor);
-        if (created_temp) {
-            ::unlinkat(root_fd, TEMP_NAME, 0);
-        }
+        unlink_temp_if_same(root_fd, temporary_status);
         return result(error == ENOSPC ? resync_journal_status::no_space : resync_journal_status::io_error, error);
     }
     size_t offset = 0;
@@ -683,7 +748,7 @@ resync_journal_result write_private_file(int root_fd, const std::vector<uint8_t>
         if (count <= 0) {
             const int error = count == 0 ? EIO : errno;
             ::close(descriptor);
-            ::unlinkat(root_fd, TEMP_NAME, 0);
+            unlink_temp_if_same(root_fd, temporary_status);
             return result(count == 0 ? resync_journal_status::short_write
                                      : (error == ENOSPC ? resync_journal_status::no_space
                                                         : resync_journal_status::io_error),
@@ -694,26 +759,45 @@ resync_journal_result write_private_file(int root_fd, const std::vector<uint8_t>
     if (faults.fail_file_fsync || ::fsync(descriptor) != 0) {
         const int error = faults.fail_file_fsync ? EIO : errno;
         ::close(descriptor);
-        ::unlinkat(root_fd, TEMP_NAME, 0);
-        return result(resync_journal_status::io_error, error);
-    }
-    if (::close(descriptor) != 0) {
-        const int error = errno;
-        ::unlinkat(root_fd, TEMP_NAME, 0);
+        unlink_temp_if_same(root_fd, temporary_status);
         return result(resync_journal_status::io_error, error);
     }
     if (faults.crash_before_rename) {
+        (void) ::close(descriptor);
         return result(resync_journal_status::commit_uncertain, 0, false);
     }
     const resync_journal_result final_before_rename = validate_private_file_at(root_fd, true);
     if (final_before_rename.status != resync_journal_status::ok) {
-        ::unlinkat(root_fd, TEMP_NAME, 0);
+        (void) ::close(descriptor);
+        unlink_temp_if_same(root_fd, temporary_status);
         return final_before_rename;
+    }
+    if (faults.before_rename != nullptr) {
+        faults.before_rename(root_fd, descriptor);
+    }
+    const int temporary_stat_result = ::fstat(descriptor, &temporary_status);
+    if (temporary_stat_result != 0 || !private_regular_file(temporary_status)) {
+        const int error = temporary_stat_result != 0 ? errno : EACCES;
+        (void) ::close(descriptor);
+        return result(resync_journal_status::path_security, error);
+    }
+    struct stat temporary_path_status = {};
+    const int temporary_path_stat_result =
+            ::fstatat(root_fd, TEMP_NAME, &temporary_path_status, AT_SYMLINK_NOFOLLOW);
+    if (temporary_path_stat_result != 0 || !private_regular_file(temporary_path_status) ||
+        !same_file_identity(temporary_status, temporary_path_status)) {
+        const int error = temporary_path_stat_result != 0 ? errno : EACCES;
+        (void) ::close(descriptor);
+        return result(resync_journal_status::path_security, error);
     }
     if (::renameat(root_fd, TEMP_NAME, root_fd, JOURNAL_NAME) != 0) {
         const int error = errno;
-        ::unlinkat(root_fd, TEMP_NAME, 0);
+        (void) ::close(descriptor);
+        unlink_temp_if_same(root_fd, temporary_status);
         return result(error == ENOSPC ? resync_journal_status::no_space : resync_journal_status::io_error, error);
+    }
+    if (::close(descriptor) != 0) {
+        return result(resync_journal_status::commit_uncertain, errno, true);
     }
     // A successful rename publishes a complete checksum-verified snapshot. If
     // this directory fence fails, the new file is visible but durability is
@@ -907,7 +991,7 @@ struct resync_journal::impl {
                                         std::string(resync_journal_status_name(lock_status)));
         }
         std::vector<uint8_t> bytes;
-        const resync_journal_result read_result = read_private_file(root_fd, bytes);
+        const resync_journal_result read_result = read_private_file(root_fd, bytes, config.faults.after_read_open);
         if (read_result.status != resync_journal_status::ok) {
             startup_status = read_result.status;
             startup_error  = read_result.os_error;
