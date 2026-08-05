@@ -3349,12 +3349,18 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
                 }
             }
 
-            if (!candidate_is_staging && !dest_empty) {
+            // In-place restore (no staging) is safe when the destination is
+            // empty OR when it is the only sequence (n_seq_max <= 1): the
+            // transactional staging sequence exists to avoid disturbing other
+            // decoding survivors, and with a single sequence there are none to
+            // disturb. This keeps prompt-cache restore working at -np 1.
+            const bool in_place_safe = dest_empty || cparams.n_seq_max <= 1;
+            if (!candidate_is_staging && !in_place_safe) {
                 throw std::runtime_error(
                         "transactional DSV4 restore requires an unused sequence staging slot");
             }
 
-            candidate_owned = candidate_is_staging || dest_empty;
+            candidate_owned = candidate_is_staging || in_place_safe;
             if (candidate_is_staging) {
                 if (!dsv4->seq_rm(candidate_seq_id, -1, -1)) {
                     throw std::runtime_error("failed to clear DSV4 restore staging sequence");
