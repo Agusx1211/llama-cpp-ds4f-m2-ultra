@@ -32,6 +32,7 @@ extern "C" {
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <tuple>
 #include <utility>
 #include <vector>
 #include <unistd.h>
@@ -111,9 +112,36 @@ using model_file_snapshots = std::array<model_file_snapshot, MODEL_SHARD_COUNT>;
 using model_ptr   = std::unique_ptr<llama_model, decltype(&llama_model_free)>;
 using context_ptr = std::unique_ptr<llama_context, decltype(&llama_free)>;
 
-struct graph_counter {
+struct graph_trace_key {
+    uint64_t    split   = 0;
+    std::string node;
+    std::string op;
+    std::string backend;
+
+    bool operator<(const graph_trace_key & other) const {
+        return std::tie(split, node, op, backend) < std::tie(other.split, other.node, other.op, other.backend);
+    }
+};
+
+struct graph_trace_bucket {
+    uint64_t asks        = 0;
+    uint64_t evaluations = 0;
+};
+
+struct graph_trace {
     uint64_t evaluations = 0;
     uint64_t asks        = 0;
+    uint64_t splits      = 0;
+    std::map<graph_trace_key, graph_trace_bucket> histogram;
+};
+
+struct graph_counter {
+    uint64_t   evaluations = 0;
+    uint64_t   asks        = 0;
+    bool       trace       = false;
+    bool       trace_split_open = false;
+    uint64_t   trace_next_split = 0;
+    graph_trace trace_data;
 };
 
 struct phase_evaluations {
@@ -127,14 +155,79 @@ struct phase_evaluations {
     uint64_t post_asks           = 0;
 };
 
-bool count_graph_evaluations(ggml_tensor * /* tensor */, bool ask, void * user_data) {
+std::string graph_trace_node_name(const ggml_tensor * tensor) {
+    const char * name = tensor != nullptr ? ggml_get_name(tensor) : nullptr;
+    return name != nullptr && name[0] != '\0' ? name : "(unnamed)";
+}
+
+std::string graph_trace_op_name(const ggml_tensor * tensor) {
+    return tensor != nullptr ? ggml_op_name(tensor->op) : "(unknown)";
+}
+
+std::string graph_trace_backend_name(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        return "(unbound)";
+    }
+    const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+    const ggml_backend_dev_t device = buft != nullptr ? ggml_backend_buft_get_device(buft) : nullptr;
+    if (device != nullptr) {
+        const char * name = ggml_backend_dev_name(device);
+        if (name != nullptr && name[0] != '\0') {
+            return name;
+        }
+    }
+    const char * name = buft != nullptr ? ggml_backend_buft_name(buft) : nullptr;
+    return name != nullptr && name[0] != '\0' ? name : "(unknown)";
+}
+
+void reset_graph_trace(graph_counter & counter, bool enabled) {
+    counter.trace = enabled;
+    counter.trace_split_open = false;
+    counter.trace_next_split = 0;
+    counter.trace_data = {};
+}
+
+bool count_graph_evaluations(ggml_tensor * tensor, bool ask, void * user_data) {
     auto * counter = static_cast<graph_counter *>(user_data);
     if (ask) {
         ++counter->asks;
     } else {
         ++counter->evaluations;
     }
+    if (counter->trace) {
+        if (ask && !counter->trace_split_open) {
+            counter->trace_split_open = true;
+            ++counter->trace_next_split;
+        }
+        const uint64_t split = counter->trace_next_split > 0 ? counter->trace_next_split - 1 : 0;
+        auto & bucket = counter->trace_data.histogram[{ split, graph_trace_node_name(tensor), graph_trace_op_name(tensor),
+                                                          graph_trace_backend_name(tensor) }];
+        if (ask) {
+            ++counter->trace_data.asks;
+            ++bucket.asks;
+        } else {
+            ++counter->trace_data.evaluations;
+            ++bucket.evaluations;
+            counter->trace_split_open = false;
+        }
+        counter->trace_data.splits = counter->trace_next_split;
+    }
     return true;
+}
+
+void print_graph_trace(uint32_t boundary, const char * phase, const char * side, const graph_trace & trace) {
+    std::fprintf(stderr,
+                 "resident-model diagnostic graph-count boundary=%u phase=%s side=%s evaluations=%llu asks=%llu "
+                 "callback_splits=%llu histogram_entries=%zu\n",
+                 boundary, phase, side, (unsigned long long) trace.evaluations, (unsigned long long) trace.asks,
+                 (unsigned long long) trace.splits, trace.histogram.size());
+    for (const auto & [key, bucket] : trace.histogram) {
+        std::fprintf(stderr,
+                     "resident-model diagnostic graph-hist boundary=%u phase=%s side=%s split=%llu node=%s op=%s "
+                     "backend=%s asks=%llu evaluations=%llu\n",
+                     boundary, phase, side, (unsigned long long) key.split, key.node.c_str(), key.op.c_str(),
+                     key.backend.c_str(), (unsigned long long) bucket.asks, (unsigned long long) bucket.evaluations);
+    }
 }
 
 [[noreturn]] void fail(const std::string & message) {
@@ -369,7 +462,8 @@ std::string sha256_descriptor(int fd, uint64_t expected_bytes, const std::filesy
 model_file_snapshots verify_model_files(const std::string &                 model_path,
                                         const model_manifest &               manifest,
                                         const model_file_snapshots *          expected_snapshots = nullptr,
-                                        const char *                          stage = "pre-load") {
+                                        const char *                          stage = "pre-load",
+                                        bool                                   skip_digests = false) {
     const std::filesystem::path first = std::filesystem::path(model_path);
     expect(first.filename() == manifest.shards[0].filename,
            "exact-model gate requires the pinned canonical first shard filename");
@@ -383,18 +477,23 @@ model_file_snapshots verify_model_files(const std::string &                 mode
         descriptor_guard guard           = open_model_shard(path);
         const file_identity descriptor_before = descriptor_identity(guard.fd, path);
         expect(path_before == descriptor_before,
-               std::string(stage) + " model shard path changed before hashing: " + path.string());
+               std::string(stage) + " model shard path changed before validation: " + path.string());
         expect(descriptor_before.size == shard.bytes, "pinned model shard byte size mismatch: " + path.string());
-        const std::string digest = sha256_descriptor(guard.fd, shard.bytes, path);
+        const std::string digest = skip_digests ? std::string() : sha256_descriptor(guard.fd, shard.bytes, path);
         const file_identity descriptor_after = descriptor_identity(guard.fd, path);
         const file_identity path_after       = path_identity(path);
         expect(descriptor_after == descriptor_before && path_after == descriptor_before,
-               std::string(stage) + " model shard changed while hashing: " + path.string());
-        expect(digest == shard.sha256, "pinned model shard SHA-256 mismatch: " + path.string());
+               std::string(stage) + " model shard changed while validating: " + path.string());
+        if (!skip_digests) {
+            expect(digest == shard.sha256, "pinned model shard SHA-256 mismatch: " + path.string());
+        }
         if (expected_snapshots != nullptr) {
-            expect(descriptor_after == (*expected_snapshots)[index].identity &&
-                       digest == (*expected_snapshots)[index].sha256,
+            expect(descriptor_after == (*expected_snapshots)[index].identity,
                    std::string(stage) + " model shard identity changed after load: " + path.string());
+            if (!skip_digests) {
+                expect(digest == (*expected_snapshots)[index].sha256,
+                       std::string(stage) + " model shard digest changed after load: " + path.string());
+            }
         }
         snapshots[index] = { descriptor_after, digest };
         std::fprintf(stderr,
@@ -402,7 +501,8 @@ model_file_snapshots verify_model_files(const std::string &                 mode
                      "mtime=%lld.%09lld sha256=%s\n",
                      stage, shard.index, shard.filename.c_str(), (unsigned long long) descriptor_after.device,
                      (unsigned long long) descriptor_after.inode, (unsigned long long) descriptor_after.size,
-                     (long long) descriptor_after.mtime_sec, (long long) descriptor_after.mtime_nsec, digest.c_str());
+                     (long long) descriptor_after.mtime_sec, (long long) descriptor_after.mtime_nsec,
+                     skip_digests ? "(skipped)" : digest.c_str());
         total_bytes += descriptor_after.size;
     }
     expect(total_bytes == MODEL_TOTAL_FILE_BYTES, "pinned model total file size mismatch");
@@ -1474,13 +1574,14 @@ void expect_context_empty(llama_context *                          context,
     expect_resident_usage(memory->resident_usage(), 0, 0, "empty", boundary);
 }
 
-void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary) {
+void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary, bool diagnostic_trace) {
     const model_plan                 plan = make_model_plan(n_vocab);
     phase_logits                     oracle_prompt;
     phase_logits                     oracle_parked;
     phase_logits                     oracle_resumed;
     phase_logits                     oracle_post;
     phase_evaluations                oracle_evaluations;
+    graph_trace                      oracle_prompt_trace;
     llama_dsv4_memory_usage_snapshot oracle_before_release_memory;
     llama_dsv4_memory_usage_snapshot oracle_release_memory;
 
@@ -1499,7 +1600,10 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary) {
         submission_ledger oracle_prompt_ledger;
         const uint64_t oracle_before_prompt      = counter.evaluations;
         const uint64_t oracle_asks_before_prompt = counter.asks;
+        reset_graph_trace(counter, diagnostic_trace);
         oracle_prompt = decode_history(oracle.get(), plan, boundary, 2, 1, &oracle_prompt_ledger);
+        oracle_prompt_trace = counter.trace_data;
+        reset_graph_trace(counter, false);
         oracle_evaluations.prompt_evaluations = counter.evaluations - oracle_before_prompt;
         oracle_evaluations.prompt_asks        = counter.asks - oracle_asks_before_prompt;
         expect_prompt_ledger(oracle_prompt_ledger, 2, 1, boundary);
@@ -1563,7 +1667,21 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary) {
     submission_ledger prompt_ledger;
     const uint64_t     candidate_before_prompt      = counter.evaluations;
     const uint64_t     candidate_asks_before_prompt = counter.asks;
+    reset_graph_trace(counter, diagnostic_trace);
     const phase_logits candidate_prompt = decode_history(candidate.get(), plan, boundary, 0, 1, &prompt_ledger);
+    const graph_trace candidate_prompt_trace = counter.trace_data;
+    reset_graph_trace(counter, false);
+    if (diagnostic_trace) {
+        print_graph_trace(boundary, "prompt", "oracle", oracle_prompt_trace);
+        print_graph_trace(boundary, "prompt", "candidate", candidate_prompt_trace);
+        std::fprintf(stderr,
+                     "resident-model diagnostic prompt-delta boundary=%u oracle_evaluations=%llu "
+                     "candidate_evaluations=%llu oracle_asks=%llu candidate_asks=%llu\n",
+                     boundary, (unsigned long long) oracle_evaluations.prompt_evaluations,
+                     (unsigned long long) (counter.evaluations - candidate_before_prompt),
+                     (unsigned long long) oracle_evaluations.prompt_asks,
+                     (unsigned long long) (counter.asks - candidate_asks_before_prompt));
+    }
     expect(counter.evaluations - candidate_before_prompt == oracle_evaluations.prompt_evaluations &&
                counter.asks - candidate_asks_before_prompt == oracle_evaluations.prompt_asks,
            "candidate prompt graph-evaluation count differs from oracle");
@@ -1870,19 +1988,35 @@ bool silent_progress(float /* progress */, void * /* user_data */) {
     return true;
 }
 
-bool parse_arguments(int argc, char ** argv, std::string & model_path, std::string & manifest_path, bool & help) {
+bool parse_arguments(int argc, char ** argv, std::string & model_path, std::string & manifest_path, bool & help,
+                     bool & diagnostic_only, bool & diagnostic_skip_shard_digests) {
     help = argc == 2 && (std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0);
     if (help) {
-        std::printf("usage: %s --model <first-shard.gguf> --manifest <pinned.manifest>\n", argv[0]);
+        std::printf("usage: %s --model <first-shard.gguf> --manifest <pinned.manifest>\n"
+                    "       %s --model <first-shard.gguf> --manifest <pinned.manifest> --diagnostic-only\n"
+                    "          [--diagnostic-skip-shard-digests]\n",
+                    argv[0], argv[0]);
         return false;
     }
-    if (argc != 5) {
-        std::fprintf(stderr, "usage: %s --model <first-shard.gguf> --manifest <pinned.manifest>\n", argv[0]);
-        return false;
-    }
-    for (int index = 1; index < argc; index += 2) {
+    diagnostic_only = false;
+    diagnostic_skip_shard_digests = false;
+    for (int index = 1; index < argc;) {
         const char * option = argv[index];
-        const char * value  = argv[index + 1];
+        if (std::strcmp(option, "--diagnostic-only") == 0) {
+            diagnostic_only = true;
+            ++index;
+            continue;
+        }
+        if (std::strcmp(option, "--diagnostic-skip-shard-digests") == 0) {
+            diagnostic_skip_shard_digests = true;
+            ++index;
+            continue;
+        }
+        if (index + 1 >= argc) {
+            std::fprintf(stderr, "resident-model option requires a value: %s\n", option);
+            return false;
+        }
+        const char * value = argv[index + 1];
         if (std::strcmp(option, "--model") == 0 || std::strcmp(option, "-m") == 0) {
             if (!model_path.empty()) {
                 std::fprintf(stderr, "duplicate --model argument\n");
@@ -1899,6 +2033,11 @@ bool parse_arguments(int argc, char ** argv, std::string & model_path, std::stri
             std::fprintf(stderr, "unknown resident-model argument: %s\n", option);
             return false;
         }
+        index += 2;
+    }
+    if (diagnostic_skip_shard_digests && !diagnostic_only) {
+        std::fprintf(stderr, "--diagnostic-skip-shard-digests requires --diagnostic-only\n");
+        return false;
     }
     if (model_path.empty() || manifest_path.empty()) {
         std::fprintf(stderr, "resident-model requires both --model and --manifest\n");
@@ -1922,7 +2061,10 @@ int main(int argc, char ** argv) {
     std::string model_path;
     std::string manifest_path;
     bool        help = false;
-    if (!parse_arguments(argc, argv, model_path, manifest_path, help)) {
+    bool        diagnostic_only = false;
+    bool        diagnostic_skip_shard_digests = false;
+    if (!parse_arguments(argc, argv, model_path, manifest_path, help, diagnostic_only,
+                         diagnostic_skip_shard_digests)) {
         return help ? 0 : 2;
     }
     if (!env_is_one("LLAMA_DSV4_COMPOSITE_RESIDENT_ENABLE") || !env_is_one("LLAMA_DSV4_AGGREGATE_POOL_FORCE") ||
@@ -1935,10 +2077,16 @@ int main(int argc, char ** argv) {
 
     try {
         const model_manifest manifest = read_model_manifest(manifest_path);
+        if (diagnostic_only) {
+            std::fprintf(stderr,
+                         "resident-model diagnostic-only enabled; shard digests=%s; result is forced nonzero\n",
+                         diagnostic_skip_shard_digests ? "skipped" : "verified");
+        }
         // Validate the supplied path before the platform gate so wrong-model
         // failure paths are deterministic even on a non-Metal host. Hashing
         // only proceeds after the canonical five-shard layout is present.
-        const model_file_snapshots model_snapshots = verify_model_files(model_path, manifest);
+        const model_file_snapshots model_snapshots = verify_model_files(model_path, manifest, nullptr, "pre-load",
+                                                                         diagnostic_skip_shard_digests);
         backend_scope backend;
         const ggml_backend_dev_t target_device = verify_target_metal_device();
         std::array<ggml_backend_dev_t, 2> model_devices = { target_device, nullptr };
@@ -1949,7 +2097,7 @@ int main(int argc, char ** argv) {
         model_params.progress_callback  = silent_progress;
         model_ptr model(llama_model_load_from_file(model_path.c_str(), model_params), llama_model_free);
         expect(model != nullptr, "failed to load exact DeepSeek V4 Flash model");
-        (void) verify_model_files(model_path, manifest, &model_snapshots, "post-load");
+        (void) verify_model_files(model_path, manifest, &model_snapshots, "post-load", diagnostic_skip_shard_digests);
         verify_model_placement(model.get(), target_device);
         verify_model_metadata(model.get(), manifest);
         const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
@@ -1959,7 +2107,13 @@ int main(int argc, char ** argv) {
                      "n_outputs_max=%u flash_attn=1 boundaries=%zu\n",
                      N_CTX, N_BATCH, N_UBATCH, N_SEQ_MAX, N_RS_SEQ, N_OUTPUTS, BOUNDARIES.size());
         for (uint32_t boundary : BOUNDARIES) {
-            run_boundary(model.get(), n_vocab, boundary);
+            run_boundary(model.get(), n_vocab, boundary, diagnostic_only && boundary == BOUNDARIES.front());
+            if (diagnostic_only) {
+                std::fprintf(stderr,
+                             "resident-model diagnostic-only stopped after boundary=%u; forced nonzero result\n",
+                             boundary);
+                return 3;
+            }
         }
         std::fprintf(stderr, "resident-model complete boundaries=%zu\n", BOUNDARIES.size());
         return 0;
