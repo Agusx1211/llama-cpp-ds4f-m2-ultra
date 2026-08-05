@@ -3021,11 +3021,19 @@ bool llama_kv_cache_dsv4::collect_admission_ranges(
                 kv_raw->get_base()->get_n_stream(), span.seq_id, kv_raw->get_base()->get_size());
         const int64_t raw_swa_offset = dsv4_stream_offset(
                 kv_raw->get_swa()->get_n_stream(), span.seq_id, kv_raw->get_swa()->get_size());
+        // SWA is a sliding-window ring buffer of size_swa cells per stream (see
+        // llama_kv_cache find_slot ring wrap). Reserving the full linear prompt
+        // range [pos_begin, pos_end) here overflows size_swa for any prompt
+        // larger than the window and turns a feasible request into 503. Reserve
+        // the whole per-stream window instead: it is a safe superset of every
+        // ring cell the window can touch and always fits (n_rows_total =
+        // size_swa * n_stream).
+        const int64_t raw_swa_size = kv_raw->get_swa()->get_size();
         if (!dsv4_sparse_append_k_row_run(
                     kv_raw->get_base(), raw_base_offset + span.pos_begin, raw_base_offset + span.pos_end,
                     LLAMA_DSV4_MEMORY_RAW, ranges) ||
                 !dsv4_sparse_append_k_row_run(
-                    kv_raw->get_swa(), raw_swa_offset + span.pos_begin, raw_swa_offset + span.pos_end,
+                    kv_raw->get_swa(), raw_swa_offset, raw_swa_offset + raw_swa_size,
                     LLAMA_DSV4_MEMORY_RAW, ranges)) {
             return false;
         }
