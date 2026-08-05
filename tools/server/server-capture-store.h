@@ -106,8 +106,9 @@ struct capture_store_faults {
 
     // Deterministic test seams for OS CSPRNG admission. There is no
     // clock/address/pid fallback for a generated identity salt.
-    bool fail_csprng         = false;
-    bool csprng_returns_zero = false;
+    bool fail_csprng              = false;
+    bool csprng_returns_zero      = false;
+    bool force_zero_manifest_salt = false;
 
     // Deterministic producer-lifecycle barrier, called after an admission
     // lifetime token is claimed and before accepting is checked. The callback
@@ -118,6 +119,10 @@ struct capture_store_faults {
     // observed true and immediately before the SPSC push. The callback must
     // not throw; try_enqueue remains noexcept.
     std::function<void()> before_enqueue_push;
+
+    // Deterministic flush lifecycle seam, called after a flush request is
+    // registered and before its wake is posted. The callback must not throw.
+    std::function<void()> after_flush_registration;
 
     // Deterministic filesystem fault seams. Each enabled point fails every
     // matching operation with EIO so tests can prove terminal ordering and

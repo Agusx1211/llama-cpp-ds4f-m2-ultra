@@ -349,6 +349,9 @@ capture_store_result open_private_root(const fs::path & root, bool require_priva
     if (path_has_traversal(root) || root == root.root_path()) {
         return result(capture_store_status::path_security, EINVAL);
     }
+    // Intermediate parent directories are no-follow walked but are not made
+    // private here; deployment policy must trust that containing path. Only
+    // the capture root itself is enforced as private when requested.
     int current = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (current < 0) {
         return errno_result(errno);
@@ -730,6 +733,9 @@ capture_store_result parse_manifest(const std::vector<uint8_t> & bytes,
         !read_u32(bytes, cursor, flags) || !read_u64(bytes, cursor, total_records) ||
         !read_u64(bytes, cursor, total_bytes) || !read_u32(bytes, cursor, shard_count) ||
         !read_u32(bytes, cursor, reserved) || !read_salt(bytes, cursor, salt)) {
+        return result(capture_store_status::malformed_manifest);
+    }
+    if (salt_zero(salt)) {
         return result(capture_store_status::malformed_manifest);
     }
     if (reserved != 0 || flags != MANIFEST_FLAG_REDACTED_IDENTITY || generation == 0 || shard_count == 0 ||
@@ -1495,7 +1501,9 @@ struct capture_store::impl {
             }
             return result(capture_store_status::invalid_argument);
         }
-        const std::vector<uint8_t> manifest_bytes = serialize_manifest(candidate, salt);
+        const std::array<uint8_t, 16> manifest_salt =
+            cfg.faults.force_zero_manifest_salt ? std::array<uint8_t, 16>{} : salt;
+        const std::vector<uint8_t> manifest_bytes = serialize_manifest(candidate, manifest_salt);
         if (manifest_bytes.size() > cfg.max_manifest_bytes) {
             const capture_store_result removed = safe_remove_file_at(root_fd, final, cfg.faults.fail_unlink);
             if (removed.status != capture_store_status::ok) {
@@ -1548,31 +1556,41 @@ struct capture_store::impl {
             const capture_store_result cleanup = cleanup_after_failure(".capture.manifest.tmp", final, false);
             return cleanup.status == capture_store_status::deletion_failed ? cleanup : errno_result(error);
         }
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            manifest = candidate;
+        // Manifest rename is the durable publication boundary. Every
+        // operation after it is wrapped so callback/allocation/unknown
+        // failures remain non-ok and committed=true; the worker must not
+        // discard records that are already represented by this manifest.
+        try {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                manifest = std::move(candidate);
+            }
+            if (cfg.faults.crash_after_manifest_rename) {
+                return result(capture_store_status::commit_uncertain, 0, true);
+            }
+            // Cancellation after publication is too late to revoke a durable
+            // commit; returning success is the only truthful outcome.
+            (void) phase_cancelled(cfg, capture_store_phase::after_manifest_rename);
+            if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root,
+                                    cfg.faults.fail_directory_fsync || cfg.faults.fail_post_publication_directory_fsync,
+                                    cfg.faults.fail_fstat)) {
+                return result(capture_store_status::commit_uncertain, directory_error, true);
+            }
+            // Cancellation after publication cannot revoke the manifest. Invoke
+            // the seam for observability, then finish deletion so cleanup
+            // authority is durable and no retired shard leaks until restart.
+            (void) phase_cancelled(cfg, capture_store_phase::before_retention_delete);
+            const capture_store_result deleted = delete_retired(retired);
+            if (deleted.status != capture_store_status::ok) {
+                return result(deleted.status, deleted.os_error, true);
+            }
+            (void) phase_cancelled(cfg, capture_store_phase::after_retention_delete);
+            return result(capture_store_status::ok, 0, true);
+        } catch (const std::bad_alloc &) {
+            return result(capture_store_status::commit_uncertain, ENOMEM, true);
+        } catch (...) {
+            return result(capture_store_status::commit_uncertain, EFAULT, true);
         }
-        if (cfg.faults.crash_after_manifest_rename) {
-            return result(capture_store_status::commit_uncertain, 0, true);
-        }
-        // Cancellation after publication is too late to revoke a durable
-        // commit; returning success is the only truthful outcome.
-        (void) phase_cancelled(cfg, capture_store_phase::after_manifest_rename);
-        if (!fsync_directory_fd(root_fd, directory_error, cfg.require_private_root,
-                                cfg.faults.fail_directory_fsync || cfg.faults.fail_post_publication_directory_fsync,
-                                cfg.faults.fail_fstat)) {
-            return result(capture_store_status::commit_uncertain, directory_error, true);
-        }
-        // Cancellation after publication cannot revoke the manifest.  Invoke
-        // the seam for observability, then finish deletion so cleanup authority
-        // is durable and no retired shard leaks until restart.
-        (void) phase_cancelled(cfg, capture_store_phase::before_retention_delete);
-        const capture_store_result deleted = delete_retired(retired);
-        if (deleted.status != capture_store_status::ok) {
-            return result(deleted.status, deleted.os_error, true);
-        }
-        (void) phase_cancelled(cfg, capture_store_phase::after_retention_delete);
-        return result(capture_store_status::ok, 0, true);
     }
 
     void reset_current() {
@@ -1703,6 +1721,19 @@ struct capture_store::impl {
                 }
                 if (should_stop && !should_drain) {
                     discard_pending();
+                    const capture_store_result stopped_result = result(capture_store_status::stopped);
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        if (should_flush) {
+                            flush_result    = stopped_result;
+                            flush_completed = flush_requested;
+                        }
+                        stopped  = true;
+                        terminal = stopped_result;
+                    }
+                    cv.notify_all();
+                    exit = true;
+                    break;
                 }
                 if (ring->stats().size_approx != 0) {
                     continue;
@@ -1789,7 +1820,12 @@ struct capture_store::impl {
         }
         ++flush_requested;
         const uint64_t request = flush_requested;
+        lock.unlock();
+        if (cfg.faults.after_flush_registration) {
+            cfg.faults.after_flush_registration();
+        }
         (void) wakeup->post();
+        lock.lock();
         cv.wait(lock, [this, request]() {
             return flush_completed >= request || stopped || failed.load(std::memory_order_acquire);
         });

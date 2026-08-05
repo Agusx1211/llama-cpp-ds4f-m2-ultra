@@ -567,6 +567,20 @@ void test_bounds_off_mode_and_private_permissions() {
                   "all-zero CSPRNG failure status");
     expect(!fs::exists(zero_csprng_temp.path() / "not-created"), "all-zero CSPRNG created a capture root");
 
+    temporary_directory persisted_zero_temp;
+    {
+        capture_store_config config            = make_config(persisted_zero_temp.path());
+        config.faults.force_zero_manifest_salt = true;
+        capture_store store(config);
+        expect(store.try_enqueue(make_observation(1)), "zero-salt manifest enqueue");
+        expect_status(store.flush().status, capture_store_status::ok, "zero-salt manifest flush");
+        expect_status(store.shutdown().status, capture_store_status::ok, "zero-salt manifest shutdown");
+    }
+    capture_store persisted_zero_recovered(make_config(persisted_zero_temp.path()));
+    expect(persisted_zero_recovered.stats().worker_failed, "persisted all-zero identity salt was accepted");
+    expect_status(persisted_zero_recovered.shutdown(false).status, capture_store_status::malformed_manifest,
+                  "persisted all-zero identity salt status");
+
     capture_store store(base);
     expect(store.try_enqueue(make_observation(1)), "private mode enqueue");
     expect_status(store.flush().status, capture_store_status::ok, "private mode flush");
@@ -829,7 +843,9 @@ void test_admission_linearization_and_high_count_shutdown() {
         barrier_producer.join();
         barrier_shutdown.join();
         expect(push_result.load(std::memory_order_acquire), "pre-push producer lost an accepted observation");
-        expect_status(barrier_shutdown_result.status, capture_store_status::ok, "pre-push barrier shutdown status");
+        expect(barrier_shutdown_result.status == capture_store_status::ok ||
+                   (!drain && barrier_shutdown_result.status == capture_store_status::stopped),
+               "pre-push barrier shutdown status");
         const capture_store_stats barrier_stats = barrier_shutdown_store.stats();
         expect(barrier_stats.ring.size_approx == 0, "shutdown left a pre-push observation in the ring");
         capture_manifest           barrier_manifest;
@@ -1151,6 +1167,144 @@ void test_filesystem_fault_seams_and_flush_ordering() {
     expect_status(ordering.shutdown(false).status, capture_store_status::io_error, "failure ordering shutdown");
 }
 
+void test_post_publication_callbacks_and_pending_flush() {
+    temporary_directory  after_manifest_temp;
+    capture_store_config after_manifest_config = make_config(after_manifest_temp.path());
+    after_manifest_config.cancel_check         = [](capture_store_phase phase) {
+        if (phase == capture_store_phase::after_manifest_rename) {
+            throw std::runtime_error("after-manifest publication callback");
+        }
+        return false;
+    };
+    {
+        capture_store store(after_manifest_config);
+        expect(store.try_enqueue(make_observation(1)), "after-manifest callback enqueue");
+        const capture_store_result flushed = store.flush();
+        expect(flushed.status == capture_store_status::commit_uncertain && flushed.committed,
+               "after-manifest callback lost committed uncertainty");
+        const capture_store_result stopped = store.shutdown(false);
+        expect(stopped.status == capture_store_status::commit_uncertain && stopped.committed,
+               "after-manifest callback shutdown status");
+        capture_manifest manifest;
+        expect_status(store.inspect(manifest).status, capture_store_status::ok, "after-manifest callback inspect");
+        expect_status(store.validate(manifest).status, capture_store_status::ok, "after-manifest callback validate");
+        expect(manifest.shards.size() == 1 && manifest.shards.front().sequence == 1,
+               "after-manifest callback lost published shard");
+        expect(store.stats().dropped_on_shutdown == 0, "after-manifest callback double-counted durable records");
+    }
+    capture_store    after_manifest_recovered(make_config(after_manifest_temp.path()));
+    capture_manifest after_manifest_manifest;
+    expect_status(after_manifest_recovered.inspect(after_manifest_manifest).status, capture_store_status::ok,
+                  "after-manifest callback restart inspect");
+    expect_status(after_manifest_recovered.validate(after_manifest_manifest).status, capture_store_status::ok,
+                  "after-manifest callback restart validate");
+    expect_status(after_manifest_recovered.shutdown().status, capture_store_status::ok,
+                  "after-manifest callback restart shutdown");
+
+    temporary_directory  before_retention_temp;
+    capture_store_config before_retention_config = make_config(before_retention_temp.path());
+    before_retention_config.max_retained_shards  = 1;
+    before_retention_config.max_retained_records = 2;
+    before_retention_config.max_retained_bytes   = 4096;
+    std::atomic<unsigned> before_retention_calls{ 0 };
+    before_retention_config.cancel_check = [&](capture_store_phase phase) {
+        if (phase == capture_store_phase::before_retention_delete &&
+            before_retention_calls.fetch_add(1, std::memory_order_relaxed) != 0) {
+            throw std::runtime_error("before-retention publication callback");
+        }
+        return false;
+    };
+    {
+        capture_store store(before_retention_config);
+        expect(store.try_enqueue(make_observation(1)), "before-retention first enqueue");
+        expect_status(store.flush().status, capture_store_status::ok, "before-retention first flush");
+        expect(store.try_enqueue(make_observation(2)), "before-retention second enqueue");
+        const capture_store_result flushed = store.flush();
+        expect(flushed.status == capture_store_status::commit_uncertain && flushed.committed,
+               "before-retention callback lost committed uncertainty");
+        const capture_store_result stopped = store.shutdown(false);
+        expect(stopped.status == capture_store_status::commit_uncertain && stopped.committed,
+               "before-retention callback shutdown status");
+        capture_manifest manifest;
+        expect_status(store.inspect(manifest).status, capture_store_status::ok, "before-retention callback inspect");
+        expect_status(store.validate(manifest).status, capture_store_status::ok, "before-retention callback validate");
+        expect(manifest.shards.size() == 1 && manifest.shards.front().sequence == 2,
+               "before-retention callback lost published shard");
+        expect(store.stats().dropped_on_shutdown == 0, "before-retention callback double-counted durable records");
+    }
+    capture_store    before_retention_recovered(make_config(before_retention_temp.path()));
+    capture_manifest before_retention_manifest;
+    expect_status(before_retention_recovered.inspect(before_retention_manifest).status, capture_store_status::ok,
+                  "before-retention callback restart inspect");
+    expect_status(before_retention_recovered.validate(before_retention_manifest).status, capture_store_status::ok,
+                  "before-retention callback restart validate");
+    expect(before_retention_manifest.shards.size() == 1 && before_retention_manifest.shards.front().sequence == 2,
+           "before-retention callback restart manifest");
+    expect_status(before_retention_recovered.shutdown().status, capture_store_status::ok,
+                  "before-retention callback restart shutdown");
+
+    temporary_directory     pending_flush_temp;
+    capture_store_config    pending_flush_config = make_config(pending_flush_temp.path());
+    std::mutex              pending_mutex;
+    std::condition_variable pending_cv;
+    bool                    worker_wait_entered    = false;
+    bool                    worker_wait_release    = false;
+    bool                    flush_registered       = false;
+    bool                    flush_release          = false;
+    pending_flush_config.faults.before_worker_wait = [&]() {
+        std::unique_lock<std::mutex> lock(pending_mutex);
+        worker_wait_entered = true;
+        pending_cv.notify_all();
+        pending_cv.wait(lock, [&]() { return worker_wait_release; });
+    };
+    pending_flush_config.faults.after_flush_registration = [&]() {
+        std::unique_lock<std::mutex> lock(pending_mutex);
+        flush_registered = true;
+        pending_cv.notify_all();
+        pending_cv.wait(lock, [&]() { return flush_release; });
+    };
+    capture_store pending_flush_store(pending_flush_config);
+    {
+        std::unique_lock<std::mutex> lock(pending_mutex);
+        expect(pending_cv.wait_for(lock, std::chrono::seconds(2), [&]() { return worker_wait_entered; }),
+               "pending-flush worker barrier did not enter");
+    }
+    expect(pending_flush_store.try_enqueue(make_observation(1)), "pending-flush enqueue");
+    capture_store_result pending_flush_result;
+    std::thread          flusher([&]() { pending_flush_result = pending_flush_store.flush(); });
+    {
+        std::unique_lock<std::mutex> lock(pending_mutex);
+        expect(pending_cv.wait_for(lock, std::chrono::seconds(2), [&]() { return flush_registered; }),
+               "pending flush did not register before shutdown");
+    }
+    std::atomic<bool>    pending_shutdown_done{ false };
+    capture_store_result pending_shutdown_result;
+    std::thread          pending_shutdown([&]() {
+        pending_shutdown_result = pending_flush_store.shutdown(false);
+        pending_shutdown_done.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    expect(!pending_shutdown_done.load(std::memory_order_acquire), "pending shutdown skipped worker barrier");
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex);
+        flush_release       = true;
+        worker_wait_release = true;
+    }
+    pending_cv.notify_all();
+    flusher.join();
+    pending_shutdown.join();
+    expect(pending_flush_result.status == capture_store_status::stopped ||
+               pending_flush_result.status == capture_store_status::cancelled,
+           "pending non-drain flush status");
+    expect(pending_shutdown_result.status == capture_store_status::stopped, "pending non-drain shutdown status");
+    capture_manifest pending_manifest;
+    expect_status(pending_flush_store.inspect(pending_manifest).status, capture_store_status::no_manifest,
+                  "pending non-drain manifest");
+    const capture_store_stats pending_stats = pending_flush_store.stats();
+    expect(pending_stats.dropped_on_shutdown == 1, "pending non-drain dropped count");
+    expect(pending_stats.ring.size_approx == 0, "pending non-drain ring not empty");
+}
+
 }  // namespace
 
 int main() {
@@ -1170,6 +1324,7 @@ int main() {
         test_concurrent_flush_shutdown();
         test_admission_linearization_and_high_count_shutdown();
         test_filesystem_fault_seams_and_flush_ordering();
+        test_post_publication_callbacks_and_pending_flush();
     } catch (const std::exception & error) {
         std::fprintf(stderr, "test-server-capture-store: %s\n", error.what());
         return 1;
