@@ -327,6 +327,9 @@ static bool dsv4_sparse_append_k_row_run(
     }
     const int64_t n_rows_total = (int64_t) kv->get_size()*kv->get_n_stream();
     if (row_begin < 0 || row_end <= row_begin || row_end > n_rows_total) {
+        fprintf(stderr, "DSV4RECLAIM append_k_row_run FAIL row=[%lld,%lld) n_rows_total=%lld size=%d n_stream=%d\n",
+                (long long) row_begin, (long long) row_end, (long long) n_rows_total,
+                kv->get_size(), kv->get_n_stream());
         return false;
     }
     ranges.reserve(ranges.size() + kv->get_layer_ids().size());
@@ -3008,6 +3011,8 @@ bool llama_kv_cache_dsv4::collect_admission_ranges(
         std::vector<dsv4_sparse_range> & ranges,
         llama_dsv4_batch_quote & quote) const {
     if (aggregate_compressed || spans == nullptr || n_spans == 0 || n_spans > 2) {
+        fprintf(stderr, "DSV4RECLAIM collect reject aggregate=%d n_spans=%zu\n",
+                (int) aggregate_compressed, n_spans);
         return false;
     }
 
