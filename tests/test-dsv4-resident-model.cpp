@@ -230,6 +230,103 @@ void print_graph_trace(uint32_t boundary, const char * phase, const char * side,
     }
 }
 
+const char * dsv4_memory_family_name(llama_dsv4_memory_family family) {
+    switch (family) {
+        case LLAMA_DSV4_MEMORY_RAW: return "raw";
+        case LLAMA_DSV4_MEMORY_CSA: return "csa";
+        case LLAMA_DSV4_MEMORY_HCA: return "hca";
+        case LLAMA_DSV4_MEMORY_LID: return "lid";
+        case LLAMA_DSV4_MEMORY_FAMILY_COUNT: break;
+    }
+    return "unknown";
+}
+
+void print_sparse_pool_usage(
+        uint32_t boundary,
+        const char * label,
+        const char * family,
+        size_t pool_index,
+        const llama_dsv4_sparse_pool_usage & usage,
+        const llama_dsv4_sparse_pool_usage * before = nullptr) {
+    const auto delta = [&](uint64_t value, uint64_t prior) -> int64_t {
+        return value >= prior ? (int64_t) (value - prior) : -(int64_t) (prior - value);
+    };
+    std::fprintf(stderr,
+                 "resident-model diagnostic sparse-pool boundary=%u label=%s family=%s index=%zu "
+                 "pool=%llu page=%llu virtual=%llu physical=%llu free=%llu reserved=%llu mapped=%llu "
+                 "unique=%llu shared_physical=%llu shared_mappings=%llu refsum=%llu refmax=%u "
+                 "generation=%llu cow_alloc=%llu cow_pages=%llu",
+                 boundary, label, family, pool_index,
+                 (unsigned long long) usage.pool_id,
+                 (unsigned long long) usage.page_size,
+                 (unsigned long long) usage.virtual_pages,
+                 (unsigned long long) usage.physical_pages,
+                 (unsigned long long) usage.free_pages,
+                 (unsigned long long) usage.reserved_pages,
+                 (unsigned long long) usage.mapped_mappings,
+                 (unsigned long long) usage.unique_physical_pages,
+                 (unsigned long long) usage.shared_physical_pages,
+                 (unsigned long long) usage.shared_mappings,
+                 (unsigned long long) usage.refcount_sum,
+                 usage.refcount_max,
+                 (unsigned long long) usage.generation,
+                 (unsigned long long) usage.cow_allocations,
+                 (unsigned long long) usage.cow_pages);
+    if (before != nullptr) {
+        std::fprintf(stderr,
+                     " delta_free=%lld delta_reserved=%lld delta_mapped=%lld delta_unique=%lld "
+                     "delta_shared_physical=%lld delta_shared_mappings=%lld delta_refsum=%lld "
+                     "delta_generation=%lld delta_cow_alloc=%lld delta_cow_pages=%lld",
+                     (long long) delta(usage.free_pages, before->free_pages),
+                     (long long) delta(usage.reserved_pages, before->reserved_pages),
+                     (long long) delta(usage.mapped_mappings, before->mapped_mappings),
+                     (long long) delta(usage.unique_physical_pages, before->unique_physical_pages),
+                     (long long) delta(usage.shared_physical_pages, before->shared_physical_pages),
+                     (long long) delta(usage.shared_mappings, before->shared_mappings),
+                     (long long) delta(usage.refcount_sum, before->refcount_sum),
+                     (long long) delta(usage.generation, before->generation),
+                     (long long) delta(usage.cow_allocations, before->cow_allocations),
+                     (long long) delta(usage.cow_pages, before->cow_pages));
+    }
+    std::fprintf(stderr, "\n");
+}
+
+void print_sparse_snapshot(
+        uint32_t boundary,
+        const char * label,
+        const llama_dsv4_memory_usage_snapshot & snapshot,
+        const llama_dsv4_memory_usage_snapshot * before = nullptr) {
+    std::fprintf(stderr,
+                 "resident-model diagnostic sparse-snapshot boundary=%u label=%s "
+                 "limiting_family=%s limiting_mask=%u limiting_pool=%llu limiting_available=%llu\n",
+                 boundary, label, dsv4_memory_family_name(snapshot.limiting_family),
+                 snapshot.limiting_family_mask,
+                 (unsigned long long) snapshot.limiting_pool_id,
+                 (unsigned long long) snapshot.limiting_available_pages);
+    for (size_t i = 0; i < snapshot.families.size(); ++i) {
+        const auto & family = snapshot.families[i];
+        const llama_dsv4_family_usage * before_family =
+                before != nullptr ? &before->families[i] : nullptr;
+        for (size_t p = 0; p < family.pools.size(); ++p) {
+            const llama_dsv4_sparse_pool_usage * prior = nullptr;
+            if (before_family != nullptr && p < before_family->pools.size() &&
+                    before_family->pools[p].pool_id == family.pools[p].pool_id) {
+                prior = &before_family->pools[p];
+            }
+            print_sparse_pool_usage(boundary, label, dsv4_memory_family_name(family.family), p,
+                                    family.pools[p], prior);
+        }
+        if (!family.pools.empty()) {
+            const llama_dsv4_sparse_pool_usage * prior =
+                    before_family != nullptr ? &before_family->total : nullptr;
+            print_sparse_pool_usage(boundary, label, dsv4_memory_family_name(family.family), SIZE_MAX,
+                                    family.total, prior);
+        }
+    }
+    print_sparse_pool_usage(boundary, label, "all", SIZE_MAX, snapshot.sparse_total,
+                            before != nullptr ? &before->sparse_total : nullptr);
+}
+
 [[noreturn]] void fail(const std::string & message) {
     throw std::runtime_error(message);
 }
@@ -1287,6 +1384,26 @@ void expect_sparse_release_delta(const llama_dsv4_memory_usage_snapshot & expect
             expect(actual_rhs.generation > actual_lhs.generation,
                    "boundary " + std::to_string(boundary) + " " + phase + " sparse release generation did not advance");
         } else {
+            if (actual_rhs.generation != actual_lhs.generation) {
+                std::fprintf(stderr,
+                             "resident-model debug sparse-release-untouched boundary=%u phase=%s "
+                             "pool=%llu expected(before free=%llu mapped=%llu gen=%llu; after free=%llu mapped=%llu gen=%llu) "
+                             "actual(before free=%llu mapped=%llu gen=%llu; after free=%llu mapped=%llu gen=%llu)\n",
+                             boundary, phase,
+                             (unsigned long long) actual_lhs.pool_id,
+                             (unsigned long long) expected_lhs.free_pages,
+                             (unsigned long long) expected_lhs.mapped_mappings,
+                             (unsigned long long) expected_lhs.generation,
+                             (unsigned long long) expected_rhs.free_pages,
+                             (unsigned long long) expected_rhs.mapped_mappings,
+                             (unsigned long long) expected_rhs.generation,
+                             (unsigned long long) actual_lhs.free_pages,
+                             (unsigned long long) actual_lhs.mapped_mappings,
+                             (unsigned long long) actual_lhs.generation,
+                             (unsigned long long) actual_rhs.free_pages,
+                             (unsigned long long) actual_rhs.mapped_mappings,
+                             (unsigned long long) actual_rhs.generation);
+            }
             expect(actual_rhs.generation == actual_lhs.generation,
                    std::string(phase) + " untouched sparse release generation changed");
         }
@@ -1726,8 +1843,19 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary, bool
                                  std::vector<llama_pos>{ (llama_pos) boundary + 1 } },
                                "oracle resumed");
         oracle_before_release_memory = memory->memory_usage_snapshot();
+        if (diagnostic_trace) {
+            std::fprintf(stderr,
+                         "resident-model diagnostic oracle-seq-rm boundary=%u seq=2 p0=-1 p1=-1 "
+                         "operation=raw-seq-rm-plus-aggregate-compressed-reset\n",
+                         boundary);
+            print_sparse_snapshot(boundary, "oracle-before-release", oracle_before_release_memory);
+        }
         expect(llama_memory_seq_rm(llama_get_memory(oracle.get()), 2, -1, -1), "oracle source release failed");
         oracle_release_memory = memory->memory_usage_snapshot();
+        if (diagnostic_trace) {
+            print_sparse_snapshot(boundary, "oracle-after-release", oracle_release_memory,
+                                  &oracle_before_release_memory);
+        }
         expect(llama_memory_seq_pos_max(llama_get_memory(oracle.get()), 2) == -1,
                "oracle released source position ledger mismatch");
         const uint64_t oracle_before_post      = counter.evaluations;
@@ -1976,6 +2104,9 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary, bool
     compare_comp_family(comp_before_second_detach.hca, comp_after_second_detach.hca, "second detached", boundary);
     expect_sparse_move(memory_after_resumed, memory_after_second_detach, "second detached", boundary);
     expect_logical_rows(memory_after_second_detach, { 1, (llama_pos) boundary + 2, -1 }, "second detached", boundary);
+    if (diagnostic_trace) {
+        print_sparse_snapshot(boundary, "candidate-before-release", memory_after_second_detach);
+    }
     const auto release_status = memory->release_resident(second_detached.resident);
     if (release_status == llama_dsv4_resident_status::ok) {
         cleanup.disarm();
@@ -2026,6 +2157,10 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary, bool
         comp_after_second_detach, comp_after_release, released_source_info_before_release,
         { replacement_info_before_release, survivor_info_before_second_detach, destination_info_before_release },
         "released", boundary);
+    if (diagnostic_trace) {
+        print_sparse_snapshot(boundary, "candidate-after-release", memory_after_release,
+                              &memory_after_second_detach);
+    }
     expect_sparse_release_delta(oracle_before_release_memory, oracle_release_memory, memory_after_second_detach,
                                 memory_after_release, "released", boundary);
     expect_sparse_counters_monotonic(memory_after_second_detach, memory_after_release, "released", boundary);

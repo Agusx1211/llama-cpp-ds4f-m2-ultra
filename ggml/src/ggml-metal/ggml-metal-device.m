@@ -10,6 +10,8 @@
 
 #include <stdatomic.h>
 #include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define GGML_METAL_PROFILE_UNLIKELY(x) __builtin_expect(!!(x), 0)
 
@@ -2523,6 +2525,11 @@ struct ggml_metal_sparse_move {
     bool consumed;
 };
 
+static bool ggml_metal_sparse_move_trace_enabled(void) {
+    const char * value = getenv("LLAMA_DSV4_RESIDENT_SPARSE_MOVE_TRACE");
+    return value != NULL && (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
+}
+
 static int ggml_metal_sparse_buffer_move_compare(const void * lhs, const void * rhs) {
     const struct ggml_metal_sparse_buffer_move * l = lhs;
     const struct ggml_metal_sparse_buffer_move * r = rhs;
@@ -3111,6 +3118,7 @@ enum ggml_metal_sparse_reservation_result ggml_metal_sparse_move_commit(
         }
         ggml_metal_sparse_move_lock(move);
         enum ggml_metal_sparse_reservation_result status = GGML_METAL_SPARSE_RESERVATION_OK;
+        const bool trace = ggml_metal_sparse_move_trace_enabled();
         for (size_t i = 0; i < move->n_entries; ++i) {
             struct ggml_metal_sparse_move_entry * entry = &move->entries[i];
             ggml_metal_buffer_t buf = entry->buffer;
@@ -3120,6 +3128,18 @@ enum ggml_metal_sparse_reservation_result ggml_metal_sparse_move_commit(
                         buf->sparse_v2p, buf->sparse_p_ref,
                         entry->moves, entry->n_moves, entry->source_physical,
                         entry->selected) != GGML_METAL_SPARSE_PLAN_OK) {
+                if (trace) {
+                    const size_t source_first = entry->n_moves > 0 ? entry->moves[0].source : SIZE_MAX;
+                    const size_t source_last = entry->n_moves > 0 ? entry->moves[entry->n_moves - 1].source : SIZE_MAX;
+                    fprintf(stderr,
+                            "resident-model diagnostic sparse-move phase=commit status=stale "
+                            "entry=%zu pool=%llu generation_before=%llu generation_current=%llu "
+                            "moves=%zu source_first=%zu source_last=%zu\n",
+                            i, (unsigned long long) (uintptr_t) buf,
+                            (unsigned long long) entry->generation,
+                            (unsigned long long) buf->sparse_generation,
+                            entry->n_moves, source_first, source_last);
+                }
                 status = GGML_METAL_SPARSE_RESERVATION_STALE;
                 break;
             }
@@ -3161,6 +3181,36 @@ enum ggml_metal_sparse_reservation_result ggml_metal_sparse_move_commit(
             }
             GGML_ASSERT(io <= 3*entry->n_moves);
             entry->n_operations = io;
+            if (trace) {
+                size_t mapped_sources = 0;
+                size_t destination_pages = 0;
+                size_t destination_first = SIZE_MAX;
+                size_t destination_last = SIZE_MAX;
+                for (size_t j = 0; j < entry->n_moves; ++j) {
+                    if (entry->source_physical[j] != UINT32_MAX) {
+                        ++mapped_sources;
+                    }
+                    if (entry->moves[j].destination != SIZE_MAX) {
+                        if (destination_first == SIZE_MAX) {
+                            destination_first = entry->moves[j].destination;
+                        }
+                        destination_last = entry->moves[j].destination;
+                        ++destination_pages;
+                    }
+                }
+                const size_t source_first = entry->n_moves > 0 ? entry->moves[0].source : SIZE_MAX;
+                const size_t source_last = entry->n_moves > 0 ? entry->moves[entry->n_moves - 1].source : SIZE_MAX;
+                fprintf(stderr,
+                        "resident-model diagnostic sparse-move phase=commit status=quoted "
+                        "entry=%zu pool=%llu generation_before=%llu moves=%zu mapped_sources=%zu "
+                        "source_first=%zu source_last=%zu destination_pages=%zu destination_first=%zu "
+                        "destination_last=%zu mapping_operations=%zu\n",
+                        i, (unsigned long long) (uintptr_t) buf,
+                        (unsigned long long) entry->generation,
+                        entry->n_moves, mapped_sources,
+                        source_first, source_last,
+                        destination_pages, destination_first, destination_last, entry->n_operations);
+            }
         }
 
         if (status == GGML_METAL_SPARSE_RESERVATION_OK) {
@@ -3183,6 +3233,14 @@ enum ggml_metal_sparse_reservation_result ggml_metal_sparse_move_commit(
                         entry->buffer, entry->operations, entry->n_operations,
                         NULL, 0);
                 ++entry->buffer->sparse_generation;
+                if (trace) {
+                    fprintf(stderr,
+                            "resident-model diagnostic sparse-move phase=commit status=committed "
+                            "entry=%zu pool=%llu generation_after=%llu mapping_operations=%zu\n",
+                            i, (unsigned long long) (uintptr_t) entry->buffer,
+                            (unsigned long long) entry->buffer->sparse_generation,
+                            entry->n_operations);
+                }
             }
             move->consumed = true;
         }
