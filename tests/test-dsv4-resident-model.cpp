@@ -592,6 +592,8 @@ bool is_cpu_buft_alias(ggml_backend_buffer_type_t buft, ggml_backend_dev_t cpu_d
     return buft == ggml_backend_dev_host_buffer_type(cpu_device);
 }
 
+void prompt_batch_geometry_self_test();
+
 placement_buft_kind classify_placement_buft(ggml_backend_buffer_type_t buft, ggml_backend_dev_t target_device) {
     if (buft == nullptr || target_device == nullptr) {
         return placement_buft_kind::unknown;
@@ -620,6 +622,7 @@ void placement_buft_self_test() {
            "placement self-test rejected the canonical null-device CPU buffer type");
     expect(!is_cpu_buft_alias(nullptr, nullptr, nullptr),
            "placement self-test accepted an unknown null buffer type");
+    prompt_batch_geometry_self_test();
     std::fprintf(stderr, "resident-model placement self-test canonical_cpu=%s unknown_null=rejected\n",
                  ggml_backend_buft_name(cpu_buft));
 }
@@ -751,6 +754,83 @@ struct row_input {
     bool         output   = false;
 };
 
+bool prompt_batch_one_split_eligible(const std::vector<row_input> & rows,
+                                     llama_seq_id                    source_sequence,
+                                     llama_seq_id                    survivor_sequence,
+                                     uint32_t                        boundary) {
+    if (source_sequence < 0 || survivor_sequence < 0 || source_sequence >= (llama_seq_id) N_SEQ_MAX ||
+        survivor_sequence >= (llama_seq_id) N_SEQ_MAX || source_sequence == survivor_sequence ||
+        rows.size() != 2u * (boundary + 1u)) {
+        return false;
+    }
+
+    const llama_seq_id first_sequence = std::min(source_sequence, survivor_sequence);
+    const llama_seq_id last_sequence  = std::max(source_sequence, survivor_sequence);
+    if (last_sequence != first_sequence + 1) {
+        return false;
+    }
+
+    std::array<uint32_t, N_SEQ_MAX> next_position = {};
+    std::vector<llama_seq_id>        sequence_order;
+    sequence_order.reserve(2);
+    for (const auto & row : rows) {
+        if (row.sequence != source_sequence && row.sequence != survivor_sequence) {
+            return false;
+        }
+        if (sequence_order.empty() || sequence_order.back() != row.sequence) {
+            if (!sequence_order.empty() && row.sequence != sequence_order.back() + 1) {
+                return false;
+            }
+            sequence_order.push_back(row.sequence);
+        }
+        const uint32_t expected_role = row.sequence == source_sequence ? 0u : 1u;
+        if (row.role != expected_role || row.position != (llama_pos) next_position[(size_t) row.sequence] ||
+            row.position > (llama_pos) boundary) {
+            return false;
+        }
+        ++next_position[(size_t) row.sequence];
+    }
+
+    return sequence_order.size() == 2 && sequence_order[0] == first_sequence && sequence_order[1] == last_sequence &&
+           next_position[(size_t) source_sequence] == boundary + 1 &&
+           next_position[(size_t) survivor_sequence] == boundary + 1;
+}
+
+struct model_plan;
+
+std::vector<row_input> make_prompt_rows(const model_plan & plan,
+                                        uint32_t            boundary,
+                                        llama_seq_id        source_sequence,
+                                        llama_seq_id        survivor_sequence);
+
+void prompt_batch_geometry_self_test() {
+    constexpr uint32_t boundary = 3;
+    const auto make_unsorted_rows = [boundary](llama_seq_id source_sequence, llama_seq_id survivor_sequence) {
+        std::vector<row_input> rows;
+        for (uint32_t position = 0; position <= boundary; ++position) {
+            rows.push_back({ 0, source_sequence, (llama_pos) position, 0, position == boundary });
+        }
+        for (uint32_t position = 0; position <= boundary; ++position) {
+            rows.push_back({ 1, survivor_sequence, (llama_pos) position, 0, position == boundary });
+        }
+        return rows;
+    };
+
+    auto descending = make_unsorted_rows(2, 1);
+    expect(!prompt_batch_one_split_eligible(descending, 2, 1, boundary),
+           "descending source=2/survivor=1 rows unexpectedly passed one-split check");
+    std::stable_sort(descending.begin(), descending.end(),
+                     [](const row_input & lhs, const row_input & rhs) { return lhs.sequence < rhs.sequence; });
+    expect(prompt_batch_one_split_eligible(descending, 2, 1, boundary),
+           "sorted source=2/survivor=1 rows failed one-split check");
+    const auto ascending = make_unsorted_rows(0, 1);
+    expect(prompt_batch_one_split_eligible(ascending, 0, 1, boundary),
+           "ascending source=0/survivor=1 rows failed one-split check");
+    std::fprintf(stderr,
+                 "resident-model prompt-geometry-self-test descending=2,1 raw=two-splits sorted=1,2 "
+                 "expected_one_split=1 ascending=0,1 expected_one_split=1\n");
+}
+
 struct phase_logits {
     std::array<std::vector<float>, 3> values;
 };
@@ -804,6 +884,35 @@ model_plan make_model_plan(uint32_t n_vocab) {
         }
     }
     return plan;
+}
+
+std::vector<row_input> make_prompt_rows(const model_plan & plan,
+                                        uint32_t            boundary,
+                                        llama_seq_id        source_sequence,
+                                        llama_seq_id        survivor_sequence) {
+    std::vector<row_input> rows;
+    rows.reserve(2 * (boundary + 1));
+    const auto append_role = [&](uint32_t role, llama_seq_id sequence) {
+        for (uint32_t position = 0; position <= boundary; ++position) {
+            rows.push_back({ role, sequence, (llama_pos) position, plan.token(role, position), position == boundary });
+        }
+    };
+
+    // llama_kv_cache_dsv4 uses split_equal(..., sequential=true) for its
+    // per-sequence state. Emit the two roles in ascending adjacent sequence
+    // order so both oracle and candidate prompts are eligible for one ubatch,
+    // while retaining each context's source/survivor IDs for later lifecycle
+    // assertions.
+    if (source_sequence < survivor_sequence) {
+        append_role(0, source_sequence);
+        append_role(1, survivor_sequence);
+    } else {
+        append_role(1, survivor_sequence);
+        append_role(0, source_sequence);
+    }
+    expect(prompt_batch_one_split_eligible(rows, source_sequence, survivor_sequence, boundary),
+           "prompt rows are not sorted into one adjacent sequence split");
+    return rows;
 }
 
 context_ptr make_context(llama_model * model, graph_counter & counter) {
@@ -897,14 +1006,7 @@ phase_logits decode_history(llama_context *    context,
                             llama_seq_id       source_sequence,
                             llama_seq_id       survivor_sequence,
                             submission_ledger * ledger = nullptr) {
-    std::vector<row_input> rows;
-    rows.reserve(2 * (boundary + 1));
-    for (uint32_t position = 0; position <= boundary; ++position) {
-        rows.push_back({ 0, source_sequence, (llama_pos) position, plan.token(0, position), position == boundary });
-    }
-    for (uint32_t position = 0; position <= boundary; ++position) {
-        rows.push_back({ 1, survivor_sequence, (llama_pos) position, plan.token(1, position), position == boundary });
-    }
+    const std::vector<row_input> rows = make_prompt_rows(plan, boundary, source_sequence, survivor_sequence);
     return decode_rows(context, rows, plan.n_vocab, ledger);
 }
 
