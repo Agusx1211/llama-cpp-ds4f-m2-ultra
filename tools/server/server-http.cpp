@@ -2,6 +2,7 @@
 #include "http.h"
 #include "server-http.h"
 #include "server-common.h"
+#include "server-trusted-scheduling.h"
 #include "ui.h"
 
 #include <cpp-httplib/httplib.h>
@@ -94,6 +95,11 @@ bool server_http_context::init(const common_params & params) {
     port = params.port;
     hostname = params.hostname;
 
+    trust_lan = [] {
+        const char * v = std::getenv("LLAMA_SERVER_TRUST_LAN");
+        return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+    }();
+
     if (gcp.enabled) {
         SRV_TRC("Google Cloud Platform compat: health route = %s, predict route = %s, port = %d\n", gcp.path_health.c_str(), gcp.path_predict.c_str(), gcp.port);
 
@@ -126,6 +132,16 @@ bool server_http_context::init(const common_params & params) {
 #endif
 
     srv->set_default_headers({{"Server", "llama.cpp"}});
+    if (trust_lan) {
+        const char * dash_dir = std::getenv("LLAMA_SERVER_DASHBOARD_DIR");
+        if (dash_dir != nullptr && dash_dir[0] != '\0') {
+            if (srv->set_mount_point("/m2-dashboard", dash_dir)) {
+                SRV_INF("trusted-LAN: serving dashboard at /m2-dashboard from %s\n", dash_dir);
+            } else {
+                SRV_WRN("trusted-LAN: failed to mount dashboard directory %s\n", dash_dir);
+            }
+        }
+    }
     // srv->set_logger(log_server_request); // TODO @ngxson : this is too spamy, no very useful; improve it in the future
     srv->set_exception_handler([](const httplib::Request &, httplib::Response & res, const std::exception_ptr & ep) {
         // this is fail-safe; exceptions should already handled by `ex_wrapper`
@@ -651,7 +667,7 @@ static void process_handler_response(server_http_req_ptr && request, server_http
 
 void server_http_context::get(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    pimpl->srv->Get(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
+    auto serve = [handler, path, prefix = path_prefix](const httplib::Request & req, httplib::Response & res, const std::string & lane) {
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -665,14 +681,24 @@ void server_http_context::get(const std::string & path, const server_http_contex
             has_ambiguous_last_event_id_header(req),
             has_ambiguous_dashboard_security_headers(req)
         });
+        if (!lane.empty()) {
+            request->headers[server_trusted_scheduling::lane_header] = lane;
+            request->path = prefix + path;
+        }
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
-    });
+    };
+    pimpl->srv->Get(path_prefix + path, [serve](const httplib::Request & req, httplib::Response & res) { serve(req, res, ""); });
+    if (trust_lan) {
+        for (const char * lane : {"low", "normal", "fast"}) {
+            pimpl->srv->Get(path_prefix + "/" + lane + path, [serve, lane](const httplib::Request & req, httplib::Response & res) { serve(req, res, lane); });
+        }
+    }
 }
 
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    pimpl->srv->Post(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
+    auto serve = [handler, path, prefix = path_prefix](const httplib::Request & req, httplib::Response & res, const std::string & lane) {
         std::string body = req.body;
         std::map<std::string, uploaded_file> files;
 
@@ -716,14 +742,24 @@ void server_http_context::post(const std::string & path, const server_http_conte
             has_ambiguous_last_event_id_header(req),
             has_ambiguous_dashboard_security_headers(req)
         });
+        if (!lane.empty()) {
+            request->headers[server_trusted_scheduling::lane_header] = lane;
+            request->path = prefix + path;
+        }
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
-    });
+    };
+    pimpl->srv->Post(path_prefix + path, [serve](const httplib::Request & req, httplib::Response & res) { serve(req, res, ""); });
+    if (trust_lan) {
+        for (const char * lane : {"low", "normal", "fast"}) {
+            pimpl->srv->Post(path_prefix + "/" + lane + path, [serve, lane](const httplib::Request & req, httplib::Response & res) { serve(req, res, lane); });
+        }
+    }
 }
 
 void server_http_context::del(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    pimpl->srv->Delete(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
+    auto serve = [handler, path, prefix = path_prefix](const httplib::Request & req, httplib::Response & res, const std::string & lane) {
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -737,9 +773,19 @@ void server_http_context::del(const std::string & path, const server_http_contex
             has_ambiguous_last_event_id_header(req),
             has_ambiguous_dashboard_security_headers(req)
         });
+        if (!lane.empty()) {
+            request->headers[server_trusted_scheduling::lane_header] = lane;
+            request->path = prefix + path;
+        }
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
-    });
+    };
+    pimpl->srv->Delete(path_prefix + path, [serve](const httplib::Request & req, httplib::Response & res) { serve(req, res, ""); });
+    if (trust_lan) {
+        for (const char * lane : {"low", "normal", "fast"}) {
+            pimpl->srv->Delete(path_prefix + "/" + lane + path, [serve, lane](const httplib::Request & req, httplib::Response & res) { serve(req, res, lane); });
+        }
+    }
 }
 
 //

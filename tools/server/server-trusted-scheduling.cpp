@@ -144,6 +144,8 @@ const char * to_string(release_reason value) {
 
 config config_from_environment() {
     config result;
+    const char * trust_lan = std::getenv(trust_lan_environment);
+    result.trust_lan = trust_lan != nullptr && trust_lan[0] != '\0' && std::string(trust_lan) != "0";
     const char * token = std::getenv(token_environment);
     result.token = token == nullptr ? "" : token;
     if (result.token.empty()) {
@@ -186,6 +188,21 @@ classification control::classify(
     }
     if (requested_lane.ambiguous) {
         return { classification_status::rejected, lane::normal, {}, "ambiguous trusted scheduling lane header" };
+    }
+    // Trusted-LAN bypass: a single-operator LAN/Tailscale deployment that sets
+    // LLAMA_SERVER_TRUST_LAN does not require loopback ingress or the operator
+    // secret.  Lane selection still flows through the request lane header
+    // (injected by the path-prefix routes in server-http when trust_lan is on).
+    if (cfg.trust_lan) {
+        lane priority;
+        if (!parse_lane(requested_lane.value, priority)) {
+            return { classification_status::rejected, lane::normal, {}, "invalid trusted scheduling lane" };
+        }
+        const auto tag = find_header(headers, tag_header);
+        if (tag.ambiguous || (tag.present && !valid_tag(tag.value))) {
+            return { classification_status::rejected, lane::normal, {}, "invalid trusted scheduling benchmark tag" };
+        }
+        return { classification_status::trusted, priority, tag.present ? tag.value : std::string(), {} };
     }
     if (!enabled()) {
         return { classification_status::rejected, lane::normal, {}, "trusted scheduling lanes are disabled" };

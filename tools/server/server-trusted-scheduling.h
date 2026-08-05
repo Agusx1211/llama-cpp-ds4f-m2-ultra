@@ -15,6 +15,7 @@ constexpr size_t maximum_tag_bytes      = 64;
 
 constexpr const char * token_environment = "LLAMA_SERVER_TRUSTED_SCHEDULING_TOKEN";
 constexpr const char * trace_capacity_environment = "LLAMA_SERVER_BENCH_TRACE_CAPACITY";
+constexpr const char * trust_lan_environment       = "LLAMA_SERVER_TRUST_LAN";
 constexpr const char * token_header = "X-Llama-Trusted-Scheduling-Token";
 constexpr const char * lane_header  = "X-Llama-Trusted-Lane";
 constexpr const char * tag_header   = "X-Llama-Benchmark-Tag";
@@ -32,6 +33,11 @@ struct config {
     // must contain at least 32 and at most 256 bytes.
     std::string token;
     size_t      trace_capacity = default_trace_capacity;
+    // Opt-in: trust the local network.  When set, lane selection and the
+    // dashboard accept non-loopback clients without the operator secret.
+    // Intended for a single-operator LAN/Tailscale deployment behind no
+    // gateway; the default (unset) keeps the loopback + token boundary.
+    bool        trust_lan = false;
 };
 
 config config_from_environment();
@@ -112,6 +118,7 @@ class control {
 
     bool enabled() const { return !cfg.token.empty(); }
     bool trace_enabled() const { return enabled() && cfg.trace_capacity != 0; }
+    bool trust_lan() const { return cfg.trust_lan; }
 
     classification classify(
             const std::string & remote_address,

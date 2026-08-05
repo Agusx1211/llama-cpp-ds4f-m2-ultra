@@ -428,6 +428,9 @@ authorization_result authorize(
         bool                                       ambiguous_operator_header,
         bool                                       ambiguous_last_event_id,
         const std::string &                        query_string) {
+    if (operator_control.trust_lan()) {
+        return { authorization_status::allowed, "allowed (trusted LAN)" };
+    }
     if (!operator_control.enabled()) {
         return { authorization_status::disabled, "dashboard admin routes are disabled" };
     }
@@ -480,6 +483,9 @@ authorization_result authorize_post(
             query_string);
     if (!base) {
         return base;
+    }
+    if (operator_control.trust_lan()) {
+        return { authorization_status::allowed, "allowed (trusted LAN)" };
     }
     if (!find_header(headers, "Origin")) {
         return { authorization_status::missing_origin,
