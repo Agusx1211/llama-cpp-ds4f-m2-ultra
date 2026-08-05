@@ -809,23 +809,27 @@ void test_admission_linearization_and_high_count_shutdown() {
     {
         std::unique_lock<std::mutex> lock(barrier_mutex);
         expect(barrier_cv.wait_for(lock, std::chrono::seconds(2), [&]() { return entered; }),
-               "producer did not claim admission before destructor");
+               "producer did not claim admission before shutdown");
     }
-    std::atomic<bool> destroyed{ false };
-    std::thread       destroyer([&]() {
-        store.reset();
-        destroyed.store(true, std::memory_order_release);
+    std::atomic<bool>        shutdown_done{ false };
+    capture_store_result     shutdown_result;
+    std::thread              shutdowner([&]() {
+        shutdown_result = raw->shutdown();
+        shutdown_done.store(true, std::memory_order_release);
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    expect(!destroyed.load(std::memory_order_acquire), "destructor ignored live producer claim");
+    expect(!shutdown_done.load(std::memory_order_acquire), "shutdown ignored live producer claim");
     {
         std::lock_guard<std::mutex> lock(barrier_mutex);
         release = true;
     }
     barrier_cv.notify_all();
     producer.join();
-    destroyer.join();
-    expect(accepted.load(std::memory_order_acquire), "destructor stranded a pre-close producer observation");
+    shutdowner.join();
+    expect(accepted.load(std::memory_order_acquire), "shutdown stranded a pre-close producer observation");
+    expect(shutdown_result.status == capture_store_status::ok || shutdown_result.status == capture_store_status::stopped,
+           "concurrent admission shutdown returned unexpected status");
+    store.reset();
 
     for (const bool drain : { true, false }) {
         temporary_directory     barrier_shutdown_temp;

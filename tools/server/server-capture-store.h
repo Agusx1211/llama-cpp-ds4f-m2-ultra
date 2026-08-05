@@ -217,9 +217,11 @@ struct capture_store_stats {
 
 // The store owns one background consumer.  Construction performs crash
 // recovery before starting the worker; destruction is equivalent to
-// shutdown(true).  try_enqueue() is the inference-facing operation and is
-// noexcept, non-blocking, allocation-free after construction, and safe to
-// call until shutdown begins.
+// shutdown(true).  The owning capture_store object must outlive every method
+// call: shutdown() may run concurrently with producers that already entered
+// try_enqueue(), but destruction requires external lifetime quiescence.  The
+// try_enqueue() operation is noexcept, non-blocking, allocation-free after
+// construction, and safe to call until shutdown begins while the owner lives.
 class capture_store {
   public:
     explicit capture_store(capture_store_config config);
