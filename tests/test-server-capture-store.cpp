@@ -1,4 +1,5 @@
 #include "server-capture-store.h"
+#include "server-capture-sha256.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -206,6 +207,52 @@ void test_compact_round_trip_and_privacy() {
     expect(!contains_u64(static_cast<uint64_t>(static_cast<uint32_t>(observation.target_correction_or_bonus_id))),
            "compact persisted raw correction token");
     expect_status(store.shutdown().status, capture_store_status::ok, "compact shutdown");
+}
+
+void test_sha256_file_footers() {
+    temporary_directory temp;
+    capture_store       store(make_config(temp.path()));
+    expect(store.try_enqueue(make_observation(1)), "digest fixture enqueue one");
+    expect(store.try_enqueue(make_observation(2)), "digest fixture enqueue two");
+    expect_status(store.flush().status, capture_store_status::ok, "digest fixture flush");
+
+    const std::vector<uint8_t> manifest_bytes = read_bytes(temp.path() / "capture.manifest");
+    const std::vector<uint8_t> shard_bytes    = read_bytes(only_shard(temp.path()));
+    expect(manifest_bytes.size() == 184 && shard_bytes.size() == 392, "digest fixture sizes");
+
+    // These values come from Python hashlib.sha256 over each payload prefix,
+    // independently of the in-tree implementation under test.
+    const capture_digest expected_manifest = {
+        { 0xa2, 0x1e, 0x7c, 0x9f, 0x86, 0xd5, 0x53, 0x17, 0x9b, 0x40, 0xed, 0xd9, 0x84, 0x94, 0xf8, 0xc5,
+          0x83, 0x0d, 0x4f, 0x80, 0xa2, 0x53, 0xe4, 0xdc, 0x1c, 0x0b, 0xaf, 0x81, 0x31, 0x45, 0xe7, 0x6a }
+    };
+    const capture_digest expected_shard = {
+        { 0x5c, 0x5d, 0x56, 0xdb, 0x04, 0x51, 0xfe, 0x5f, 0x8f, 0x39, 0xaf, 0x5e, 0xdc, 0x5a, 0x71, 0x14,
+          0xe9, 0xe1, 0xa1, 0x3c, 0xe8, 0x46, 0x29, 0x42, 0xbb, 0xc0, 0x25, 0xd5, 0x58, 0xfd, 0x9b, 0xc7 }
+    };
+    const auto footer = [](const std::vector<uint8_t> & bytes) {
+        capture_digest digest = {};
+        std::copy_n(bytes.end() - static_cast<std::ptrdiff_t>(CAPTURE_SHARD_FOOTER_BYTES), digest.size(),
+                    digest.begin());
+        return digest;
+    };
+    const capture_digest actual_manifest = [&manifest_bytes]() {
+        capture_digest digest = {};
+        std::copy_n(manifest_bytes.end() - static_cast<std::ptrdiff_t>(CAPTURE_MANIFEST_FOOTER_BYTES), digest.size(),
+                    digest.begin());
+        return digest;
+    }();
+    const capture_digest actual_shard = footer(shard_bytes);
+    expect(capture_sha256::equal(actual_manifest, expected_manifest), "SCAPMF01 digest oracle");
+    expect(capture_sha256::equal(actual_shard, expected_shard), "SCAPSH01 digest oracle");
+    expect(capture_sha256::equal(actual_manifest,
+                                 capture_sha256::hash(manifest_bytes.data(),
+                                                     manifest_bytes.size() - CAPTURE_MANIFEST_FOOTER_BYTES)),
+           "SCAPMF01 footer matches shared SHA-256");
+    expect(capture_sha256::equal(actual_shard,
+                                 capture_sha256::hash(shard_bytes.data(), shard_bytes.size() - CAPTURE_SHARD_FOOTER_BYTES)),
+           "SCAPSH01 footer matches shared SHA-256");
+    expect_status(store.shutdown().status, capture_store_status::ok, "digest fixture shutdown");
 }
 
 void test_sampled_rich_explicit_opt_in() {
@@ -1337,6 +1384,7 @@ void test_post_publication_callbacks_and_pending_flush() {
 int main() {
     try {
         test_compact_round_trip_and_privacy();
+        test_sha256_file_footers();
         test_sampled_rich_explicit_opt_in();
         test_metrics_only_identity_redaction();
         test_retention_and_restart();

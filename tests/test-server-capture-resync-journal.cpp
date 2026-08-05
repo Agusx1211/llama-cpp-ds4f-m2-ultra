@@ -1,4 +1,5 @@
 #include "server-capture-resync-journal.h"
+#include "server-capture-sha256.h"
 #include "server-capture-store.h"
 
 #include <fcntl.h>
@@ -163,6 +164,34 @@ void mutate_byte(const fs::path & path, uint64_t offset) {
     value ^= 0x80U;
     expect(::pwrite(descriptor, &value, sizeof(value), static_cast<off_t>(offset)) == 1, "write journal mutation");
     expect(::fsync(descriptor) == 0 && ::close(descriptor) == 0, "close journal mutation");
+}
+
+void write_u32_le(std::vector<uint8_t> & bytes, size_t offset, uint32_t value) {
+    expect(offset <= bytes.size() && bytes.size() - offset >= sizeof(value), "journal u32 mutation bounds");
+    for (unsigned shift = 0; shift < 32; shift += 8) {
+        bytes[offset + shift / 8] = static_cast<uint8_t>(value >> shift);
+    }
+}
+
+void write_u64_le(std::vector<uint8_t> & bytes, size_t offset, uint64_t value) {
+    expect(offset <= bytes.size() && bytes.size() - offset >= sizeof(value), "journal u64 mutation bounds");
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+        bytes[offset + shift / 8] = static_cast<uint8_t>(value >> shift);
+    }
+}
+
+void rewrite_journal_footer(const fs::path & path, std::vector<uint8_t> bytes) {
+    expect(bytes.size() >= RESYNC_JOURNAL_FOOTER_BYTES, "journal footer mutation bounds");
+    const capture_sha256::digest checksum =
+            capture_sha256::hash(bytes.data(), bytes.size() - RESYNC_JOURNAL_FOOTER_BYTES);
+    std::copy(checksum.begin(), checksum.end(), bytes.end() - static_cast<std::ptrdiff_t>(checksum.size()));
+    write_file(path, bytes);
+}
+
+void mutate_event_commit(std::vector<uint8_t> & bytes, size_t event_index, uint32_t record) {
+    const size_t event_offset = RESYNC_JOURNAL_HEADER_BYTES + event_index * RESYNC_JOURNAL_EVENT_BYTES;
+    write_u32_le(bytes, event_offset + 52, record);
+    write_u64_le(bytes, event_offset + 28, 1000 + record);
 }
 
 void test_boundaries_and_patterns() {
@@ -350,9 +379,28 @@ void test_persistence_opt_in() {
     }
     expect(threw, "persistent journal without private-root enforcement rejected");
 
+    for (mode_t insecure_mode : { static_cast<mode_t>(0755), static_cast<mode_t>(0777) }) {
+        const fs::path insecure_root = temp.path() / (insecure_mode == 0755 ? "insecure-0755" : "insecure-0777");
+        expect(fs::create_directory(insecure_root), "create insecure root fixture");
+        expect(::chmod(insecure_root.c_str(), insecure_mode) == 0, "chmod insecure root fixture");
+        config = persistent_config(insecure_root);
+        threw  = false;
+        try {
+            resync_journal rejected_insecure_root(config);
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        expect(threw, "pre-existing insecure root rejected without mutation");
+        struct stat insecure_status = {};
+        expect(::stat(insecure_root.c_str(), &insecure_status) == 0 &&
+                   (insecure_status.st_mode & 07777) == insecure_mode,
+               "insecure root mode remains unchanged");
+    }
+
     const fs::path real_root = temp.path() / "real-root";
     const fs::path link_root = temp.path() / "link-root";
     expect(fs::create_directory(real_root), "create private root fixture");
+    expect(::chmod(real_root.c_str(), S_IRWXU) == 0, "chmod private root fixture");
     std::error_code symlink_error;
     fs::create_directory_symlink(real_root, link_root, symlink_error);
     if (!symlink_error) {
@@ -367,10 +415,96 @@ void test_persistence_opt_in() {
     }
 }
 
+void test_temp_file_security() {
+    {
+        temporary_directory temp;
+        const fs::path root = temp.path() / "valid-orphan";
+        expect(fs::create_directory(root), "create valid orphan root");
+        expect(::chmod(root.c_str(), S_IRWXU) == 0, "chmod valid orphan root");
+        const fs::path orphan = root / ".resync.journal.tmp";
+        write_file(orphan, { 9, 8, 7 });
+        resync_journal journal(persistent_config(root));
+        expect_status(append(journal, make_commit(1), { accepted(0, 1) }).status,
+                      resync_journal_status::ok, "validated orphan replacement");
+        expect(fs::exists(root / "resync.journal") && !fs::exists(orphan), "validated orphan replaced atomically");
+    }
+    {
+        temporary_directory temp;
+        const fs::path root = temp.path() / "unsafe-mode-orphan";
+        expect(fs::create_directory(root), "create unsafe-mode root");
+        expect(::chmod(root.c_str(), S_IRWXU) == 0, "chmod unsafe-mode root");
+        const fs::path orphan = root / ".resync.journal.tmp";
+        write_file(orphan, { 1, 2, 3, 4 });
+        expect(::chmod(orphan.c_str(), S_IRUSR | S_IWUSR | S_IRGRP) == 0, "chmod unsafe orphan");
+        const std::vector<uint8_t> before = read_file(orphan);
+        resync_journal journal(persistent_config(root));
+        expect_status(append(journal, make_commit(1), { accepted(0, 1) }).status,
+                      resync_journal_status::path_security, "unsafe orphan rejected");
+        expect(read_file(orphan) == before, "unsafe orphan not truncated");
+        struct stat orphan_status = {};
+        expect(::stat(orphan.c_str(), &orphan_status) == 0 &&
+                   (orphan_status.st_mode & 07777) == (S_IRUSR | S_IWUSR | S_IRGRP),
+               "unsafe orphan mode remains unchanged");
+    }
+    {
+        temporary_directory temp;
+        const fs::path root = temp.path() / "symlink-orphan";
+        expect(fs::create_directory(root), "create symlink-orphan root");
+        expect(::chmod(root.c_str(), S_IRWXU) == 0, "chmod symlink-orphan root");
+        const fs::path target = temp.path() / "orphan-target";
+        write_file(target, { 5, 6, 7 });
+        expect(::symlink(target.c_str(), (root / ".resync.journal.tmp").c_str()) == 0,
+               "create orphan symlink");
+        resync_journal journal(persistent_config(root));
+        expect_status(append(journal, make_commit(1), { accepted(0, 1) }).status,
+                      resync_journal_status::path_security, "orphan symlink rejected");
+        expect(read_file(target) == std::vector<uint8_t>({ 5, 6, 7 }), "orphan symlink target unchanged");
+        expect(fs::is_symlink(root / ".resync.journal.tmp"), "orphan symlink remains");
+    }
+}
+
 void make_persisted_fixture(const fs::path & root) {
     resync_journal journal(persistent_config(root));
     expect_status(append(journal, make_commit(1), { accepted(0, 12345), rejected(1, 54321) }).status,
                   resync_journal_status::ok, "persist fixture append");
+}
+
+void test_sha256_vectors_and_journal_footer() {
+    const std::array<uint8_t, 32> empty_expected = {
+        { 0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+          0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55 }
+    };
+    const std::array<uint8_t, 32> abc_expected = {
+        { 0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+          0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad }
+    };
+    expect(capture_sha256::equal(capture_sha256::hash(nullptr, 0), empty_expected), "SHA-256 empty vector");
+    const char abc[] = "abc";
+    expect(capture_sha256::equal(capture_sha256::hash(abc, 3), abc_expected), "SHA-256 abc vector");
+
+    temporary_directory temp;
+    const fs::path root = temp.path() / "footer-fixture";
+    make_persisted_fixture(root);
+    const std::vector<uint8_t> bytes = read_file(root / "resync.journal");
+    expect(bytes.size() == RESYNC_JOURNAL_HEADER_BYTES + 2 * RESYNC_JOURNAL_EVENT_BYTES +
+                                RESYNC_JOURNAL_FOOTER_BYTES,
+           "deterministic footer fixture size");
+    // This footer is independently produced by Python hashlib.sha256 over
+    // the serialized payload, not copied from the implementation under test.
+    const capture_sha256::digest expected_footer = {
+        { 0x7d, 0x90, 0x1b, 0xe4, 0x9d, 0x5d, 0xba, 0xe1, 0x2e, 0xa7, 0x92, 0x97, 0x4f, 0xb1, 0xe5, 0x41,
+          0x42, 0xca, 0xd2, 0xc0, 0x48, 0x46, 0x28, 0xae, 0x18, 0x18, 0xb6, 0x5a, 0xa9, 0x4c, 0x26, 0x4b }
+    };
+    const capture_sha256::digest actual_footer = [&bytes]() {
+        capture_sha256::digest digest = {};
+        std::copy_n(bytes.end() - static_cast<std::ptrdiff_t>(RESYNC_JOURNAL_FOOTER_BYTES), digest.size(),
+                    digest.begin());
+        return digest;
+    }();
+    expect(capture_sha256::equal(actual_footer, expected_footer), "deterministic journal SHA-256 footer");
+    expect(capture_sha256::equal(actual_footer,
+                                 capture_sha256::hash(bytes.data(), bytes.size() - RESYNC_JOURNAL_FOOTER_BYTES)),
+           "journal footer matches shared SHA-256 parser");
 }
 
 void test_restart_and_privacy() {
@@ -474,6 +608,7 @@ void test_corruption_fail_closed() {
         temporary_directory temp;
         const fs::path root = temp.path() / "empty-file";
         fs::create_directories(root);
+        expect(::chmod(root.c_str(), S_IRWXU) == 0, "chmod empty-file root");
         write_file(root / "resync.journal", {});
         resync_journal corrupt(persistent_config(root));
         resync_journal_snapshot snapshot;
@@ -534,6 +669,7 @@ void test_corruption_fail_closed() {
         temporary_directory temp;
         const fs::path root = temp.path() / "symlink-file";
         fs::create_directories(root);
+        expect(::chmod(root.c_str(), S_IRWXU) == 0, "chmod symlink-file root");
         const fs::path target = temp.path() / "outside-journal";
         write_file(target, { 1, 2, 3 });
         expect(::symlink(target.c_str(), (root / "resync.journal").c_str()) == 0,
@@ -542,6 +678,107 @@ void test_corruption_fail_closed() {
         resync_journal_snapshot snapshot;
         expect_status(linked.inspect(snapshot).status, resync_journal_status::path_security,
                       "journal-file symlink rejected");
+    }
+}
+
+void test_parser_commit_and_boundary_ordering() {
+    {
+        temporary_directory temp;
+        const fs::path root = temp.path() / "event-event-order";
+        {
+            resync_journal journal(persistent_config(root));
+            expect_status(append(journal, make_commit(1), { accepted(0, 11) }).status,
+                          resync_journal_status::ok, "event-order first commit");
+            expect_status(append(journal, make_commit(2), { accepted(1, 22) }).status,
+                          resync_journal_status::ok, "event-order second commit");
+        }
+        const fs::path path = root / "resync.journal";
+        std::vector<uint8_t> bytes = read_file(path);
+        mutate_event_commit(bytes, 0, 3);
+        rewrite_journal_footer(path, std::move(bytes));
+        resync_journal corrupt(persistent_config(root));
+        resync_journal_snapshot snapshot;
+        expect_status(corrupt.inspect(snapshot).status, resync_journal_status::invalid_commit,
+                      "parser rejects non-monotonic accepted identities");
+    }
+    {
+        temporary_directory temp;
+        const fs::path root = temp.path() / "boundary-event-order";
+        {
+            resync_journal journal(persistent_config(root));
+            expect_status(append(journal, make_commit(1), { rejected(0, 31) }).status,
+                          resync_journal_status::ok, "boundary-order rejection");
+            expect_status(append(journal, make_commit(2), { accepted(0, 32) }).status,
+                          resync_journal_status::ok, "boundary-order accepted token");
+        }
+        const fs::path path = root / "resync.journal";
+        std::vector<uint8_t> bytes = read_file(path);
+        mutate_event_commit(bytes, 0, 3);
+        // The boundary follows the accepted ring in the file and has its own
+        // event frame after the accepted count.
+        const size_t boundary_offset = RESYNC_JOURNAL_HEADER_BYTES + RESYNC_JOURNAL_EVENT_BYTES;
+        write_u32_le(bytes, boundary_offset + 52, 3);
+        write_u64_le(bytes, boundary_offset + 28, 1003);
+        // Restore the accepted event to commit 2; only boundary/event order is
+        // invalid in this fixture.
+        mutate_event_commit(bytes, 0, 2);
+        rewrite_journal_footer(path, std::move(bytes));
+        resync_journal corrupt(persistent_config(root));
+        resync_journal_snapshot snapshot;
+        expect_status(corrupt.inspect(snapshot).status, resync_journal_status::invalid_commit,
+                      "parser rejects boundary identity newer than following event");
+    }
+    {
+        temporary_directory temp;
+        const fs::path root = temp.path() / "metadata-order";
+        {
+            resync_journal journal(persistent_config(root));
+            expect_status(append(journal, make_commit(1), { accepted(0, 41) }).status,
+                          resync_journal_status::ok, "metadata-order physical commit");
+            expect_status(append(journal, make_commit(2), {}).status,
+                          resync_journal_status::ok, "metadata-order watermark commit");
+        }
+        const fs::path path = root / "resync.journal";
+        std::vector<uint8_t> bytes = read_file(path);
+        // Header commit record/observation fields are at offsets 64/72.  A
+        // metadata-only watermark older than the retained event must fail.
+        write_u32_le(bytes, 64, 0);
+        write_u64_le(bytes, 72, 1000);
+        rewrite_journal_footer(path, std::move(bytes));
+        resync_journal corrupt(persistent_config(root));
+        resync_journal_snapshot snapshot;
+        expect_status(corrupt.inspect(snapshot).status, resync_journal_status::invalid_commit,
+                      "parser rejects regressed metadata watermark");
+    }
+    {
+        temporary_directory temp;
+        const fs::path root = temp.path() / "boundary-position-order";
+        resync_journal_config config = persistent_config(root);
+        config.initial_token_position = 10;
+        {
+            resync_journal journal(config);
+            expect_status(append(journal, make_commit(1), { rejected(10, 51) }).status,
+                          resync_journal_status::ok, "boundary-position rejection");
+            std::vector<resync_token_event_input> accepted_tokens;
+            accepted_tokens.reserve(RESYNC_JOURNAL_MAX_EVENTS);
+            for (size_t index = 0; index < RESYNC_JOURNAL_MAX_EVENTS; ++index) {
+                accepted_tokens.push_back(accepted(10 + index, static_cast<int32_t>(60 + index)));
+            }
+            expect_status(append(journal, make_commit(2), accepted_tokens).status,
+                          resync_journal_status::ok, "boundary-position accepted ring");
+        }
+        const fs::path path = root / "resync.journal";
+        std::vector<uint8_t> bytes = read_file(path);
+        const size_t boundary_offset = RESYNC_JOURNAL_HEADER_BYTES +
+                                       RESYNC_JOURNAL_MAX_EVENTS * RESYNC_JOURNAL_EVENT_BYTES;
+        // The rejection is older than the retained ring.  A position below
+        // the stream's initial watermark is impossible and must fail closed.
+        write_u64_le(bytes, boundary_offset + 16, 9);
+        rewrite_journal_footer(path, std::move(bytes));
+        resync_journal corrupt(config);
+        resync_journal_snapshot snapshot;
+        expect_status(corrupt.inspect(snapshot).status, resync_journal_status::token_position_gap,
+                      "parser rejects boundary before initial position");
     }
 }
 
@@ -774,9 +1011,12 @@ int main() {
         test_capacity_wrap_and_watermarks();
         test_overflow_and_invalid_commits();
         test_persistence_opt_in();
+        test_sha256_vectors_and_journal_footer();
+        test_temp_file_security();
         test_restart_and_privacy();
         test_reject_only_restart();
         test_corruption_fail_closed();
+        test_parser_commit_and_boundary_ordering();
         test_publication_faults();
         test_owner_lock_and_process_recovery();
         test_capture_store_does_not_receive_journal_tokens();

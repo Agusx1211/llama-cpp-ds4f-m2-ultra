@@ -64,6 +64,14 @@ orphan `.resync.journal.tmp` is ignored on restart.  If the directory fence is
 uncertain, the new image is still accepted only after checksum validation and
 the caller receives `commit_uncertain`.
 
+The footer uses the standard SHA-256 constants and padding.  Earlier dormant
+prototype builds emitted non-standard digests for `SCRJNL01` and the related
+`SCAPMF01`/`SCAPSH01` capture-store sidecars; those images fail checksum
+validation and are intentionally unsupported rather than silently migrated.
+Neither sidecar has live `llama-server` wiring, so replacing a pre-fix root is
+safe for the current product surface and a future format migration can be
+designed before activation.
+
 Malformed headers, unsupported future versions, impossible counts or sequences,
 trailing bytes, truncation, and checksum failures return an explicit status.
 Recovery never exposes a

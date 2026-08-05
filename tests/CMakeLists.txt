@@ -311,6 +311,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-server-capture-store.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-capture.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-capture-sha256.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-capture-store.cpp)
     target_include_directories(test-server-capture-store PRIVATE
         ${PROJECT_SOURCE_DIR}/tools/server)
@@ -324,6 +325,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     endif()
     llama_build_and_test(test-server-capture-resync-journal.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-capture-resync-journal.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-capture-sha256.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-capture.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-capture-store.cpp)
     target_include_directories(test-server-capture-resync-journal PRIVATE
