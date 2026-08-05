@@ -165,6 +165,14 @@ enum class llama_dsv4_resident_status : uint8_t {
     invalid_scope,
     invalid_sequence,
     unsupported_components,
+    capacity_exhausted,
+    slot_occupied,
+    not_quiescent,
+    stale_quote,
+    stale_handle,
+    generation_exhausted,
+    resource_exhausted,
+    backend_error,
 };
 
 const char * llama_dsv4_resident_status_name(llama_dsv4_resident_status status);
@@ -173,6 +181,23 @@ struct llama_dsv4_resident_detach_request {
     llama_seq_id              seq_id = -1;
     llama_dsv4_resident_scope scope  = llama_dsv4_resident_scope::single_context;
 };
+
+struct llama_dsv4_resident_handle {
+    uint64_t cache_id          = 0;
+    uint64_t id                = 0;
+    uint64_t handle_generation = 0;
+    uint64_t lease_generation  = 0;
+
+    bool operator==(const llama_dsv4_resident_handle & other) const {
+        return cache_id == other.cache_id && id == other.id &&
+               handle_generation == other.handle_generation &&
+               lease_generation == other.lease_generation;
+    }
+};
+
+struct llama_dsv4_resident_detach_plan;
+struct llama_dsv4_resident_attach_plan;
+class llama_dsv4_composite_resident;
 
 // This is a capability quote, not an ownership handle. It snapshots the
 // rollback index and reports every execution-independent component before any
@@ -186,6 +211,35 @@ struct llama_dsv4_resident_detach_quote {
     uint32_t                   required_components    = 0;
     uint32_t                   detachable_components  = 0;
     uint32_t                   unsupported_components = 0;
+    uint32_t                   resident_state_slot    = UINT32_MAX;
+    llama_dsv4_resident_handle resident;
+
+  private:
+    std::shared_ptr<llama_dsv4_resident_detach_plan> plan;
+    friend class llama_dsv4_composite_resident;
+};
+
+struct llama_dsv4_resident_result {
+    llama_dsv4_resident_status status = llama_dsv4_resident_status::unsupported_components;
+    llama_dsv4_resident_handle resident;
+};
+
+struct llama_dsv4_resident_attach_quote {
+    llama_dsv4_resident_status status       = llama_dsv4_resident_status::unsupported_components;
+    llama_seq_id               execution_id = -1;
+    llama_dsv4_resident_handle resident;
+
+  private:
+    std::shared_ptr<llama_dsv4_resident_attach_plan> plan;
+    friend class llama_dsv4_composite_resident;
+};
+
+struct llama_dsv4_resident_usage {
+    uint64_t cache_id       = 0;
+    uint64_t epoch          = 0;
+    uint32_t capacity       = 0;
+    uint32_t occupied_slots = 0;
+    uint32_t handles        = 0;
 };
 
 // Host-testable policy used by llama_kv_cache_dsv4::quote_resident_detach.
@@ -221,12 +275,22 @@ public:
     void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, uint32_t src_depth = 0);
     void apply_copies(const stream_copy_info & sc_info) const;
 
+    // Copy every current and rollback plane for one sequence between separate
+    // fixed allocations. Resident apertures use a different n_stream and are
+    // never exposed to graph construction.
+    void copy_sequence_all_depths_to(
+            llama_dsv4_comp_state & destination,
+            llama_seq_id            source_sequence,
+            llama_seq_id            destination_sequence) const;
+    bool sequence_all_depths_zero(llama_seq_id seq_id) const;
+
     uint32_t get_ratio()      const;
     uint32_t get_state_size() const;
     uint32_t get_n_stream()   const;
     uint32_t get_n_rs_seq()   const;
     uint32_t get_n_rows()     const;
     uint64_t state_identity() const;
+    uint64_t state_generation() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -264,7 +328,67 @@ private:
 
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
+    mutable uint64_t generation = 1;
+
     size_t total_size() const;
+    void bump_generation() const;
+    bool has_generation_headroom(uint64_t increments) const;
+
+    friend class llama_dsv4_composite_resident;
+};
+
+// Deterministic fault seam for cross-instance recurrent-state copies. A
+// nonnegative value fails after that many successful tensor-plane copies.
+void llama_dsv4_comp_state_fail_copy_after_for_test(int successful_copies);
+
+// Backend-only whole-sequence coordinator. Production constructs it only for
+// the default-off target aggregate layout. Tests instantiate the same class
+// with host buffers and the raw/SWA backend override.
+class llama_dsv4_composite_resident {
+public:
+    llama_dsv4_composite_resident(
+            llama_kv_cache_iswa & raw,
+            llama_dsv4_comp_pool & compressed,
+            llama_dsv4_comp_state & csa_execution,
+            llama_dsv4_comp_state & hca_execution,
+            llama_dsv4_comp_state & lid_execution,
+            llama_dsv4_comp_state & csa_resident,
+            llama_dsv4_comp_state & hca_resident,
+            llama_dsv4_comp_state & lid_resident,
+            std::vector<uint32_t> & rollback_index,
+            uint32_t & active_rollback_depth,
+            uint32_t n_seq_max,
+            uint32_t resident_capacity);
+    ~llama_dsv4_composite_resident();
+
+    llama_dsv4_composite_resident(const llama_dsv4_composite_resident &) = delete;
+    llama_dsv4_composite_resident & operator=(const llama_dsv4_composite_resident &) = delete;
+
+    llama_dsv4_resident_detach_quote quote_detach(llama_dsv4_resident_detach_request request) const;
+    llama_dsv4_resident_result       detach(const llama_dsv4_resident_detach_quote & quote);
+    llama_dsv4_resident_attach_quote quote_attach(llama_dsv4_resident_handle resident,
+                                                   llama_seq_id execution_id) const;
+    llama_dsv4_resident_status       attach(const llama_dsv4_resident_attach_quote & quote);
+    llama_dsv4_resident_status       release(
+            llama_dsv4_resident_handle resident,
+            llama_kv_iswa_resident_release_audit * audit = nullptr);
+
+    bool has_handles() const;
+    llama_dsv4_resident_usage usage() const;
+
+private:
+    friend class llama_kv_cache_dsv4;
+
+    class aggregate_clear_transaction;
+
+    // Retain the coordinator mutex and raw resident transaction while an
+    // aggregate whole-sequence clear performs its fail-before-mutation check
+    // and raw/compressed reset.  The scope is denied if any resident ownership
+    // remains in the composite, raw, or compressed component.
+    std::unique_ptr<aggregate_clear_transaction> acquire_aggregate_clear_transaction();
+
+    struct impl;
+    std::unique_ptr<impl> pimpl;
 };
 
 //
@@ -346,6 +470,14 @@ public:
     llama_dsv4_comp_pool * get_comp_pool() const;
 
     llama_dsv4_resident_detach_quote quote_resident_detach(llama_dsv4_resident_detach_request request) const;
+    llama_dsv4_resident_result       detach_resident(const llama_dsv4_resident_detach_quote & quote);
+    llama_dsv4_resident_attach_quote quote_resident_attach(llama_dsv4_resident_handle resident,
+                                                           llama_seq_id execution_id) const;
+    llama_dsv4_resident_status       attach_resident(const llama_dsv4_resident_attach_quote & quote);
+    llama_dsv4_resident_status       release_resident(
+            llama_dsv4_resident_handle resident,
+            llama_kv_iswa_resident_release_audit * audit = nullptr);
+    llama_dsv4_resident_usage        resident_usage() const;
 
     uint32_t get_n_rs_seq() const;
     const std::vector<uint32_t> & get_rs_idx() const;
@@ -411,6 +543,11 @@ private:
     std::unique_ptr<llama_dsv4_comp_state> hca_state;
     std::unique_ptr<llama_dsv4_comp_state> lid_state;
     std::unique_ptr<llama_dsv4_comp_pool> comp_pool;
+
+    std::unique_ptr<llama_dsv4_comp_state> resident_csa_state;
+    std::unique_ptr<llama_dsv4_comp_state> resident_hca_state;
+    std::unique_ptr<llama_dsv4_comp_state> resident_lid_state;
+    std::unique_ptr<llama_dsv4_composite_resident> composite_resident;
 
     bool aggregate_compressed = false;
     uint32_t c4_logical_rows = 0;

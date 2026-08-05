@@ -4,6 +4,7 @@
 #include "llama-kv-cache.h"
 
 #include <memory>
+#include <mutex>
 #include <vector>
 
 //
@@ -29,6 +30,22 @@ enum class llama_kv_iswa_resident_status : uint8_t {
 
 const char * llama_kv_iswa_resident_status_name(llama_kv_iswa_resident_status status);
 
+// Test-only release audit. The raw resident release fills this from the
+// exact sparse move quote that it prepares and then commits; callers never
+// re-quote the resident handle. The before/after records retain the backend's
+// stable source hashes and physical accounting counters for assertions.
+struct llama_kv_iswa_resident_release_pool_audit {
+    ggml_dsv4_sparse_move_audit_pool before = {};
+    ggml_dsv4_sparse_move_audit_pool after  = {};
+};
+
+struct llama_kv_iswa_resident_release_audit {
+    bool observed = false;
+    int before_status = GGML_DSV4_SPARSE_UNSUPPORTED;
+    int after_status  = GGML_DSV4_SPARSE_UNSUPPORTED;
+    std::vector<llama_kv_iswa_resident_release_pool_audit> pools;
+};
+
 // Host-test seam for the execution-independent ownership protocol. Production
 // leaves this unset and resolves the backend procedures from the tensor's
 // device registry. The override is thread-local and affects resident calls
@@ -37,11 +54,26 @@ struct llama_kv_iswa_resident_backend_override {
     ggml_dsv4_sparse_move_quote_fn  quote  = nullptr;
     ggml_dsv4_sparse_move_commit_fn commit = nullptr;
     ggml_dsv4_sparse_move_free_fn   free   = nullptr;
+    ggml_dsv4_sparse_move_audit_fn  audit  = nullptr;
 };
 
 void llama_kv_iswa_set_resident_backend_override_for_test(
         llama_kv_iswa_resident_backend_override backend);
 void llama_kv_iswa_fail_next_resident_allocation_for_test();
+
+enum class llama_kv_iswa_resident_lock_phase : uint8_t {
+    before_lock,
+    lock_contended,
+    lock_acquired,
+};
+
+using llama_kv_iswa_resident_lock_hook_for_test = void (*)(llama_kv_iswa_resident_lock_phase phase, void * context);
+
+// One-shot, thread-local synchronization seam. The hook runs immediately
+// before and after the next outer ISWA resident-lock acquisition, then clears
+// itself before either callback so recursive coordinator calls cannot replay
+// it. Production leaves the hook unset.
+void llama_kv_iswa_set_resident_lock_hook_for_test(llama_kv_iswa_resident_lock_hook_for_test hook, void * context);
 
 struct llama_kv_iswa_resident_handle {
     uint64_t pool_id    = 0;
@@ -79,6 +111,34 @@ struct llama_kv_iswa_resident_attach_quote {
 
   private:
     std::shared_ptr<llama_kv_iswa_resident_attach_plan> plan;
+    friend class llama_kv_cache_iswa;
+};
+
+// Move-only exclusive capability for a composite resident transaction. The
+// token retains the raw/SWA recursive mutex for its entire lifetime, so
+// ordinary cache mutation and graph preparation in other threads cannot enter
+// between component validation and publication. Coordinator calls on the
+// owning thread may safely re-enter the same mutex.
+class llama_kv_iswa_resident_transaction {
+  public:
+    llama_kv_iswa_resident_transaction() = default;
+    ~llama_kv_iswa_resident_transaction();
+
+    llama_kv_iswa_resident_transaction(const llama_kv_iswa_resident_transaction &)             = delete;
+    llama_kv_iswa_resident_transaction & operator=(const llama_kv_iswa_resident_transaction &) = delete;
+    llama_kv_iswa_resident_transaction(llama_kv_iswa_resident_transaction && other) noexcept;
+    llama_kv_iswa_resident_transaction & operator=(llama_kv_iswa_resident_transaction &&) = delete;
+
+    explicit operator bool() const { return active; }
+
+  private:
+    llama_kv_iswa_resident_transaction(std::shared_ptr<llama_kv_cache_resident_guard> guard,
+                                       std::unique_lock<std::recursive_mutex>         lock);
+
+    std::shared_ptr<llama_kv_cache_resident_guard> guard;
+    std::unique_lock<std::recursive_mutex>         lock;
+    bool                                           active = false;
+
     friend class llama_kv_cache_iswa;
 };
 
@@ -182,9 +242,13 @@ public:
     // irreversible atomic success and must follow all reversible component
     // commits. release drops the resident page references.
     llama_kv_iswa_resident_detach_quote quote_resident_detach(llama_seq_id execution_id) const;
+    llama_kv_iswa_resident_status validate_resident_detach(
+            const llama_kv_iswa_resident_detach_quote & quote) const;
     llama_kv_iswa_resident_result detach_resident(const llama_kv_iswa_resident_detach_quote & quote);
     llama_kv_iswa_resident_attach_quote quote_resident_attach(llama_kv_iswa_resident_handle resident,
                                                               llama_seq_id execution_id) const;
+    llama_kv_iswa_resident_status validate_resident_attach(
+            const llama_kv_iswa_resident_attach_quote & quote) const;
     llama_kv_iswa_resident_status commit_resident_attach_final(
             const llama_kv_iswa_resident_attach_quote & quote,
             llama_kv_iswa_resident_final_step final_step);
@@ -195,12 +259,24 @@ public:
     // the explicit prepared/final-step API above.
     llama_kv_iswa_resident_status attach_resident(llama_kv_iswa_resident_handle resident,
                                                   llama_seq_id execution_id);
-    llama_kv_iswa_resident_status release_resident(llama_kv_iswa_resident_handle resident);
+    llama_kv_iswa_resident_status release_resident(
+            llama_kv_iswa_resident_handle resident,
+            llama_kv_iswa_resident_release_audit * audit = nullptr);
 
     // Used by generic ISWA and DSV4 raw graph contexts. The opaque lease keeps
     // residency fail-closed from preparation through graph completion or
     // rollback; destruction releases it.
     std::shared_ptr<void> acquire_resident_batch_lease() const;
+
+    // A composite DSV4 ownership transaction takes this retained exclusive
+    // token only after all component quotes exist. It requires quiescence and
+    // excludes graph preparation plus every raw/SWA public mutation until the
+    // composite reaches a terminal commit or rollback boundary.
+    llama_kv_iswa_resident_transaction acquire_resident_transaction() const;
+    // True when the cache owns a resident aperture.  This distinguishes the
+    // unsupported (no-aperture) layout from a resident layout whose
+    // transaction is temporarily unavailable because it is not quiescent.
+    bool has_resident_aperture() const;
     bool has_resident_handles() const;
 
 private:

@@ -838,6 +838,14 @@ static void ggml_backend_metal_dsv4_sparse_move_tensor_rows_free(void * quote) {
     ggml_metal_sparse_move_free((ggml_metal_sparse_move_t) quote);
 }
 
+static int ggml_backend_metal_dsv4_sparse_move_audit(
+        void * quote,
+        int committed,
+        struct ggml_dsv4_sparse_move_audit * audit) {
+    return ggml_metal_sparse_move_audit(
+            (ggml_metal_sparse_move_t) quote, committed, audit);
+}
+
 // Returns 0 for a non-sparse tensor, 1 on success, and -1 on a sparse error.
 static int ggml_backend_metal_dsv4_sparse_alias_tensor_rows(
         const ggml_tensor * src,
@@ -1401,6 +1409,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_dsv4_sparse_move_tensor_rows_free") == 0) {
         return (void *)ggml_backend_metal_dsv4_sparse_move_tensor_rows_free;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_move_audit") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_move_audit;
     }
     if (strcmp(name, "ggml_backend_metal_dsv4_sparse_move_fail_for_test") == 0) {
         return (void *)ggml_backend_metal_dsv4_sparse_move_fail_for_test;

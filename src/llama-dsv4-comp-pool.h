@@ -17,6 +17,8 @@ constexpr uint32_t LLAMA_DSV4_COMP_TICKET_TOMBSTONES  = 64;
 
 using llama_dsv4_comp_handle_id = uint64_t;
 
+class llama_dsv4_composite_resident;
+
 enum class llama_dsv4_comp_family : uint8_t {
     none,
     c4,
@@ -131,6 +133,7 @@ struct llama_dsv4_comp_resident_handle {
 
 struct llama_dsv4_comp_detach_plan;
 struct llama_dsv4_comp_attach_plan;
+struct llama_dsv4_comp_release_plan;
 
 struct llama_dsv4_comp_detach_quote {
     llama_dsv4_comp_status          status       = llama_dsv4_comp_status::invalid_argument;
@@ -139,7 +142,7 @@ struct llama_dsv4_comp_detach_quote {
     llama_dsv4_comp_resident_handle resident;
 
   private:
-    std::shared_ptr<const llama_dsv4_comp_detach_plan> plan;
+    std::shared_ptr<llama_dsv4_comp_detach_plan> plan;
     friend class llama_dsv4_comp_pool;
 };
 
@@ -156,6 +159,15 @@ struct llama_dsv4_comp_attach_quote {
 
   private:
     std::shared_ptr<llama_dsv4_comp_attach_plan> plan;
+    friend class llama_dsv4_comp_pool;
+};
+
+struct llama_dsv4_comp_release_quote {
+    llama_dsv4_comp_status          status = llama_dsv4_comp_status::invalid_argument;
+    llama_dsv4_comp_resident_handle resident;
+
+  private:
+    std::shared_ptr<llama_dsv4_comp_release_plan> plan;
     friend class llama_dsv4_comp_pool;
 };
 
@@ -252,12 +264,14 @@ class llama_dsv4_comp_pool {
 
     // quote_detach is a fail-before-mutation preflight. detach consumes the
     // exact quote and transfers one uniquely bound compressed root into a
-    // generation-checked resident lease. Prepared attach preallocates its map
-    // node and can be committed and rolled back without allocation. A rollback
-    // after commit restores the exact resident lease if no intervening pool
-    // mutation occurred. release is the only operation that destroys it.
+    // generation-checked resident lease. rollback_detach restores the original
+    // execution binding without allocation if no intervening mutation occurred.
+    // Prepared attach likewise preallocates its map node and can be committed
+    // and rolled back without allocation. release is the only operation that
+    // destroys a resident root.
     llama_dsv4_comp_detach_quote    quote_detach(uint32_t execution_id) const;
     llama_dsv4_comp_resident_result detach(const llama_dsv4_comp_detach_quote & quote);
+    llama_dsv4_comp_status          rollback_detach(const llama_dsv4_comp_detach_quote & quote);
     llama_dsv4_comp_attach_quote    quote_attach(llama_dsv4_comp_resident_handle resident,
                                                  uint32_t execution_id) const;
     llama_dsv4_comp_status          commit_attach(const llama_dsv4_comp_attach_quote & quote);
@@ -295,10 +309,25 @@ class llama_dsv4_comp_pool {
     uint64_t scratch_physical_row(llama_dsv4_comp_family family, uint32_t graph_stream) const;
 
   private:
+    // Composite restore can target an otherwise empty execution slot whose
+    // aggregate pool still owns its constructor-created empty root. These
+    // prepared operations are intentionally private: abandoning one would
+    // leave the pool's short exclusive transaction active.
+    llama_dsv4_comp_detach_quote  quote_detach_preserving_empty_execution(uint32_t execution_id) const;
+    llama_dsv4_comp_attach_quote  quote_attach_replacing_empty(
+                                             llama_dsv4_comp_resident_handle resident,
+                                             uint32_t execution_id) const;
+    llama_dsv4_comp_release_quote prepare_release(llama_dsv4_comp_resident_handle resident);
+    llama_dsv4_comp_status        commit_release(const llama_dsv4_comp_release_quote & quote);
+    llama_dsv4_comp_status        rollback_release(const llama_dsv4_comp_release_quote & quote);
+
     struct impl;
+    llama_dsv4_comp_detach_quote quote_detach_impl(uint32_t execution_id, bool preserve_empty_execution) const;
     llama_dsv4_comp_directory make_directory(llama_dsv4_comp_family             family,
                                              const std::vector<uint32_t> &      execution_ids,
                                              uint32_t                           logical_segments,
                                              const llama_dsv4_comp_quote_plan * plan) const;
     std::unique_ptr<impl>     pimpl;
+
+    friend class llama_dsv4_composite_resident;
 };

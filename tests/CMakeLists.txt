@@ -300,6 +300,21 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-dsv4-resident-contract.cpp)
     target_include_directories(test-dsv4-resident-contract PRIVATE
         ${PROJECT_SOURCE_DIR}/src)
+    # Manual exact-model Phase 4 resident lifecycle gate. This target is
+    # intentionally not registered with CTest: it requires the pinned
+    # DeepSeek V4 Flash artifact and the target M2 Ultra sparse backend. The
+    # target embeds the repository's public-domain SHA-256 implementation so
+    # model identity does not depend on an inherited PATH helper.
+    llama_build(test-dsv4-resident-model.cpp
+        ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c)
+    target_include_directories(test-dsv4-resident-model PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps)
+    # Host-only placement helper: exercises null-device CPU/CPU_Mapped
+    # classification without requiring the pinned model or an M2 Ultra.
+    llama_test(test-dsv4-resident-model
+        NAME test-dsv4-resident-placement-self-test
+        ARGS --placement-self-test)
     llama_build_and_test(test-kv-iswa-resident-metadata.cpp)
     target_include_directories(test-kv-iswa-resident-metadata PRIVATE
         ${PROJECT_SOURCE_DIR}/src)

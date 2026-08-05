@@ -5,6 +5,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <exception>
@@ -61,12 +62,20 @@ struct sparse_move_api {
     ggml_dsv4_sparse_move_quote_fn quote = nullptr;
     ggml_dsv4_sparse_move_commit_fn commit = nullptr;
     ggml_dsv4_sparse_move_free_fn free = nullptr;
+    ggml_dsv4_sparse_move_audit_fn audit = nullptr;
 };
 
 thread_local sparse_move_api sparse_move_test_override;
 thread_local bool sparse_move_test_fail_next_allocation = false;
 
-sparse_move_api llama_kv_iswa_sparse_move_api(const ggml_tensor * tensor) {
+struct resident_lock_test_hook {
+    llama_kv_iswa_resident_lock_hook_for_test callback = nullptr;
+    void *                                    context  = nullptr;
+};
+
+thread_local resident_lock_test_hook resident_lock_hook;
+
+sparse_move_api llama_kv_iswa_sparse_move_api(const ggml_tensor * tensor, bool need_audit) {
     if (sparse_move_test_override.quote != nullptr ||
             sparse_move_test_override.commit != nullptr ||
             sparse_move_test_override.free != nullptr) {
@@ -88,24 +97,30 @@ sparse_move_api llama_kv_iswa_sparse_move_api(const ggml_tensor * tensor) {
             reg, "ggml_backend_metal_dsv4_sparse_move_tensor_rows_commit");
     result.free = (ggml_dsv4_sparse_move_free_fn) ggml_backend_reg_get_proc_address(
             reg, "ggml_backend_metal_dsv4_sparse_move_tensor_rows_free");
+    if (need_audit) {
+        result.audit = (ggml_dsv4_sparse_move_audit_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_metal_dsv4_sparse_move_audit");
+    }
     return result;
 }
 
 struct backend_move_quote {
     int status = GGML_DSV4_SPARSE_UNSUPPORTED;
     ggml_dsv4_sparse_move_commit_fn commit = nullptr;
+    ggml_dsv4_sparse_move_audit_fn audit = nullptr;
     std::shared_ptr<void> value;
 };
 
 backend_move_quote llama_kv_iswa_quote_move(
         const std::vector<ggml_tensor *> & sources,
-        const std::vector<ggml_tensor *> * destinations) {
+        const std::vector<ggml_tensor *> * destinations,
+        bool need_audit = false) {
     backend_move_quote result;
     if (sources.empty() || (destinations != nullptr && destinations->size() != sources.size())) {
         result.status = GGML_DSV4_SPARSE_INVALID;
         return result;
     }
-    const sparse_move_api api = llama_kv_iswa_sparse_move_api(sources.front());
+    const sparse_move_api api = llama_kv_iswa_sparse_move_api(sources.front(), need_audit);
     if (api.quote == nullptr || api.commit == nullptr || api.free == nullptr) {
         return result;
     }
@@ -122,6 +137,7 @@ backend_move_quote llama_kv_iswa_quote_move(
         return result;
     }
     result.commit = api.commit;
+    result.audit = api.audit;
     result.value = std::shared_ptr<void>(raw, api.free);
     return result;
 }
@@ -155,15 +171,81 @@ llama_kv_iswa_resident_status llama_kv_iswa_backend_status(int status, sparse_mo
     return llama_kv_iswa_resident_status::backend_error;
 }
 
+struct resident_move_audit_snapshot {
+    int status = GGML_DSV4_SPARSE_UNSUPPORTED;
+    size_t n_pools = 0;
+    std::array<ggml_dsv4_sparse_move_audit_pool, GGML_DSV4_SPARSE_MOVE_AUDIT_MAX_POOLS> pools = {};
+};
+
+resident_move_audit_snapshot llama_kv_iswa_capture_move_audit(
+        const backend_move_quote & backend,
+        int committed) {
+    resident_move_audit_snapshot result;
+    if (!backend.audit || !backend.value) {
+        return result;
+    }
+    ggml_dsv4_sparse_move_audit audit = {};
+    try {
+        result.status = backend.audit(backend.value.get(), committed, &audit);
+    } catch (...) {
+        result.status = GGML_DSV4_SPARSE_UNSUPPORTED;
+        return result;
+    }
+    if (result.status != GGML_DSV4_SPARSE_OK ||
+            audit.n_pools > GGML_DSV4_SPARSE_MOVE_AUDIT_MAX_POOLS) {
+        result.n_pools = 0;
+        return result;
+    }
+    result.n_pools = audit.n_pools;
+    std::copy(audit.pools, audit.pools + audit.n_pools, result.pools.begin());
+    return result;
+}
+
+void llama_kv_iswa_publish_move_audit(
+        const resident_move_audit_snapshot & before,
+        const resident_move_audit_snapshot & after,
+        llama_kv_iswa_resident_release_audit * result) {
+    if (result == nullptr) {
+        return;
+    }
+    result->before_status = before.status;
+    result->after_status  = after.status;
+    result->pools.clear();
+    result->observed = false;
+    if (before.status != GGML_DSV4_SPARSE_OK || after.status != GGML_DSV4_SPARSE_OK) {
+        return;
+    }
+    result->pools.reserve(GGML_DSV4_SPARSE_MOVE_AUDIT_MAX_POOLS);
+    for (size_t i = 0; i < before.n_pools; ++i) {
+        const auto & before_pool = before.pools[i];
+        const auto it = std::find_if(after.pools.begin(), after.pools.begin() + after.n_pools,
+                                     [&](const auto & pool) { return pool.pool_id == before_pool.pool_id; });
+        if (it == after.pools.begin() + after.n_pools) {
+            result->pools.clear();
+            return;
+        }
+        result->pools.push_back({ before_pool, *it });
+    }
+    if (result->pools.size() != after.n_pools) {
+        result->pools.clear();
+        return;
+    }
+    result->observed = true;
+}
+
 } // namespace
 
 void llama_kv_iswa_set_resident_backend_override_for_test(
         llama_kv_iswa_resident_backend_override backend) {
-    sparse_move_test_override = { backend.quote, backend.commit, backend.free };
+    sparse_move_test_override = { backend.quote, backend.commit, backend.free, backend.audit };
 }
 
 void llama_kv_iswa_fail_next_resident_allocation_for_test() {
     sparse_move_test_fail_next_allocation = true;
+}
+
+void llama_kv_iswa_set_resident_lock_hook_for_test(llama_kv_iswa_resident_lock_hook_for_test hook, void * context) {
+    resident_lock_hook = { hook, context };
 }
 
 struct llama_kv_cache_iswa::resident_impl {
@@ -178,6 +260,34 @@ struct llama_kv_cache_iswa::resident_impl {
     std::vector<bool>                                 slots;
     std::map<uint64_t, llama_kv_iswa_resident_record> handles;
 };
+
+llama_kv_iswa_resident_transaction::llama_kv_iswa_resident_transaction(
+    std::shared_ptr<llama_kv_cache_resident_guard> guard,
+    std::unique_lock<std::recursive_mutex>         lock) :
+    guard(std::move(guard)),
+    lock(std::move(lock)),
+    active(true) {
+    GGML_ASSERT(this->guard != nullptr && this->lock.owns_lock());
+    GGML_ASSERT(!this->guard->resident_transaction_active);
+    this->guard->resident_transaction_active = true;
+}
+
+llama_kv_iswa_resident_transaction::llama_kv_iswa_resident_transaction(
+    llama_kv_iswa_resident_transaction && other) noexcept :
+    guard(std::move(other.guard)),
+    lock(std::move(other.lock)),
+    active(other.active) {
+    other.active = false;
+}
+
+llama_kv_iswa_resident_transaction::~llama_kv_iswa_resident_transaction() {
+    if (!active) {
+        return;
+    }
+    GGML_ASSERT(guard != nullptr && lock.owns_lock());
+    GGML_ASSERT(guard->resident_transaction_active);
+    guard->resident_transaction_active = false;
+}
 
 struct llama_kv_iswa_resident_detach_plan {
     std::shared_ptr<const llama_kv_iswa_resident_identity> owner;
@@ -346,7 +456,20 @@ llama_kv_cache_iswa::~llama_kv_cache_iswa() {
 
 std::unique_lock<std::recursive_mutex> llama_kv_cache_iswa::lock_resident() const {
     if (resident) {
-        return std::unique_lock<std::recursive_mutex>(resident->guard->mutex);
+        const auto hook    = resident_lock_hook;
+        resident_lock_hook = {};
+        if (hook.callback == nullptr) {
+            return std::unique_lock<std::recursive_mutex>(resident->guard->mutex);
+        }
+
+        hook.callback(llama_kv_iswa_resident_lock_phase::before_lock, hook.context);
+        std::unique_lock<std::recursive_mutex> result(resident->guard->mutex, std::try_to_lock);
+        if (!result.owns_lock()) {
+            hook.callback(llama_kv_iswa_resident_lock_phase::lock_contended, hook.context);
+            result.lock();
+        }
+        hook.callback(llama_kv_iswa_resident_lock_phase::lock_acquired, hook.context);
+        return result;
     }
     return {};
 }
@@ -363,7 +486,22 @@ std::shared_ptr<void> llama_kv_cache_iswa::acquire_resident_batch_lease() const 
     if (!resident) {
         return {};
     }
+    if (resident->guard->resident_transaction_active) {
+        throw std::runtime_error("cannot begin ISWA graph while a resident transaction is active");
+    }
     return std::make_shared<llama_kv_iswa_batch_lease>(resident->guard);
+}
+
+llama_kv_iswa_resident_transaction llama_kv_cache_iswa::acquire_resident_transaction() const {
+    auto resident_scope = lock_resident();
+    if (!resident || resident->guard->resident_transaction_active || !resident_is_quiescent()) {
+        return {};
+    }
+    return llama_kv_iswa_resident_transaction(resident->guard, std::move(resident_scope));
+}
+
+bool llama_kv_cache_iswa::has_resident_aperture() const {
+    return resident != nullptr;
 }
 
 bool llama_kv_cache_iswa::has_resident_handles() const {
@@ -415,11 +553,13 @@ void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
 }
 
 llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
+    [[maybe_unused]] auto resident_scope = lock_resident();
     // the base cache is a superset of the SWA cache, so we can just check the SWA cache
     return kv_swa->seq_pos_min(seq_id);
 }
 
 llama_pos llama_kv_cache_iswa::seq_pos_max(llama_seq_id seq_id) const {
+    [[maybe_unused]] auto resident_scope = lock_resident();
     return kv_swa->seq_pos_max(seq_id);
 }
 
@@ -685,6 +825,20 @@ llama_kv_iswa_resident_result llama_kv_cache_iswa::detach_resident(const llama_k
     }
 }
 
+llama_kv_iswa_resident_status llama_kv_cache_iswa::validate_resident_detach(
+        const llama_kv_iswa_resident_detach_quote & quote) const {
+    [[maybe_unused]] auto resident_scope = lock_resident();
+    if (!resident || !quote.plan || quote.plan->owner != resident->identity ||
+        quote.plan->epoch != resident->epoch || quote.plan->resident.id != resident->next_handle_id ||
+        quote.plan->version[0] != resident->guard->version[0] ||
+        quote.plan->version[1] != resident->guard->version[1] || !resident_is_quiescent() ||
+        quote.plan->resident_slot >= resident->slots.size() || resident->slots[quote.plan->resident_slot] ||
+        quote.plan->prepared.empty()) {
+        return llama_kv_iswa_resident_status::stale_quote;
+    }
+    return llama_kv_iswa_resident_status::ok;
+}
+
 llama_kv_iswa_resident_attach_quote llama_kv_cache_iswa::quote_resident_attach(
         llama_kv_iswa_resident_handle handle,
         llama_seq_id                  execution_id) const {
@@ -809,6 +963,27 @@ llama_kv_iswa_resident_status llama_kv_cache_iswa::commit_resident_attach_final(
     return llama_kv_iswa_resident_status::ok;
 }
 
+llama_kv_iswa_resident_status llama_kv_cache_iswa::validate_resident_attach(
+        const llama_kv_iswa_resident_attach_quote & quote) const {
+    [[maybe_unused]] auto resident_scope = lock_resident();
+    if (!resident || !quote.plan || quote.plan->owner != resident->identity ||
+        quote.plan->state != llama_kv_iswa_resident_attach_state::prepared ||
+        quote.plan->epoch != resident->epoch || quote.plan->version[0] != resident->guard->version[0] ||
+        quote.plan->version[1] != resident->guard->version[1] || !resident_is_quiescent() ||
+        quote.plan->execution_id < 0 || (uint32_t) quote.plan->execution_id >= kv_base->get_n_stream() ||
+        !kv_base->resident_execution_empty(quote.plan->execution_id) ||
+        !kv_swa->resident_execution_empty(quote.plan->execution_id)) {
+        return llama_kv_iswa_resident_status::stale_quote;
+    }
+    const auto it = resident->handles.find(quote.plan->resident.id);
+    if (it == resident->handles.end() || it->second.generation != quote.plan->resident.generation ||
+        it->second.slot != quote.plan->resident_slot || quote.plan->resident_slot >= resident->slots.size() ||
+        !resident->slots[quote.plan->resident_slot]) {
+        return llama_kv_iswa_resident_status::stale_quote;
+    }
+    return llama_kv_iswa_resident_status::ok;
+}
+
 llama_kv_iswa_resident_status llama_kv_cache_iswa::rollback_resident_attach(
         const llama_kv_iswa_resident_attach_quote & quote) {
     [[maybe_unused]] auto resident_scope = lock_resident();
@@ -837,8 +1012,14 @@ llama_kv_iswa_resident_status llama_kv_cache_iswa::attach_resident(
     return commit_resident_attach_final(quote, llama_kv_iswa_resident_final_step::confirmed);
 }
 
-llama_kv_iswa_resident_status llama_kv_cache_iswa::release_resident(llama_kv_iswa_resident_handle handle) {
+llama_kv_iswa_resident_status llama_kv_cache_iswa::release_resident(
+        llama_kv_iswa_resident_handle handle,
+        llama_kv_iswa_resident_release_audit * audit) {
     try {
+        if (audit != nullptr) {
+            *audit = {};
+            audit->pools.reserve(GGML_DSV4_SPARSE_MOVE_AUDIT_MAX_POOLS);
+        }
         [[maybe_unused]] auto resident_scope = lock_resident();
         if (!resident || handle.pool_id != resident->identity->id || handle.id == 0) {
             return llama_kv_iswa_resident_status::stale_handle;
@@ -851,14 +1032,20 @@ llama_kv_iswa_resident_status llama_kv_cache_iswa::release_resident(llama_kv_isw
         std::vector<ggml_tensor *> sources;
         kv_base->resident_append_views(it->second.slot, true, sources);
         kv_swa->resident_append_views(it->second.slot, true, sources);
-        auto backend = llama_kv_iswa_quote_move(sources, nullptr);
+        auto backend = llama_kv_iswa_quote_move(sources, nullptr, audit != nullptr);
         if (!backend.value) {
             return llama_kv_iswa_backend_status(backend.status, sparse_move_phase::release_quote);
+        }
+        const auto before_audit = llama_kv_iswa_capture_move_audit(backend, 0);
+        if (audit != nullptr) {
+            audit->before_status = before_audit.status;
         }
         const int backend_status = backend.commit(backend.value.get());
         if (backend_status != GGML_DSV4_SPARSE_OK) {
             return llama_kv_iswa_backend_status(backend_status, sparse_move_phase::release_commit);
         }
+        const auto after_audit = llama_kv_iswa_capture_move_audit(backend, 1);
+        llama_kv_iswa_publish_move_audit(before_audit, after_audit, audit);
 
         const uint32_t slot   = it->second.slot;
         resident->slots[slot] = false;

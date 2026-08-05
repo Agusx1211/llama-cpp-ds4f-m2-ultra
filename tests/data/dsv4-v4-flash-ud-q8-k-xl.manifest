@@ -1,0 +1,15 @@
+manifest_version=1
+model_prefix=DeepSeek-V4-Flash-0731-UD-Q8_K_XL
+architecture=deepseek4
+name=Deepseek-V4-Flash-0731
+size_label=256x8.4B
+quantization_label=UD-Q8_K_XL
+quantization_version=2
+file_type=38
+total_file_bytes=161869615520
+shard_count=5
+shard=1|DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf|5257408|d13ce8f90855547bdaebe7312f531a1f2c4f822178d3103951f27fe884395cfa
+shard=2|DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00002-of-00005.gguf|49215492960|3da2f2443063f83635986f9b67fa7e8e3d03c53b81a9a08d2007936612423610
+shard=3|DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00003-of-00005.gguf|49700372160|7d622a7760d359ec9257b3493ad531e3bf0bfbe6f6533267e16e6dde8153ddce
+shard=4|DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00004-of-00005.gguf|49466495968|6ed2bce452214f156b85e7c5f7d4fc242a3052f409d1b90a61422f60669c2de3
+shard=5|DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00005-of-00005.gguf|13481997024|ea4727af4888fdca0fff796ec81ac2f3ebb43c310b2feb4798f41d82744b42ea

@@ -15,6 +15,7 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -38,6 +39,7 @@ static std::atomic<uint64_t> dsv4_test_cow_copy_operations    = 0;
 static std::atomic<bool>                       dsv4_test_page_delta_audit_enabled = false;
 static std::mutex                              dsv4_test_page_delta_audit_mutex;
 static llama_dsv4_sparse_page_delta_test_audit dsv4_test_page_delta_audit;
+static thread_local int                        dsv4_test_comp_state_copy_after = -1;
 
 static uint64_t dsv4_hash_u64(uint64_t hash, uint64_t value) {
     // FNV-1a over an explicit little-endian integer encoding. This keeps the
@@ -1691,6 +1693,7 @@ void llama_dsv4_comp_state::clear(llama_seq_id seq_id, bool data) {
     if (!data) {
         return;
     }
+    bump_generation();
 
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_stream);
@@ -1726,6 +1729,9 @@ void llama_dsv4_comp_state::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_
 }
 
 void llama_dsv4_comp_state::apply_copies(const stream_copy_info & sc_info) const {
+    if (!sc_info.ssrc.empty()) {
+        bump_generation();
+    }
     for (size_t i = 0; i < sc_info.ssrc.size(); ++i) {
         const uint32_t ssrc = sc_info.ssrc[i];
         const uint32_t sdst = sc_info.sdst[i];
@@ -1735,6 +1741,78 @@ void llama_dsv4_comp_state::apply_copies(const stream_copy_info & sc_info) const
             ggml_backend_tensor_copy(layer.score_stream[ssrc], layer.score_stream[sdst]);
         }
     }
+}
+
+void llama_dsv4_comp_state_fail_copy_after_for_test(int successful_copies) {
+    dsv4_test_comp_state_copy_after = successful_copies;
+}
+
+void llama_dsv4_comp_state::copy_sequence_all_depths_to(
+        llama_dsv4_comp_state & destination,
+        llama_seq_id            source_sequence,
+        llama_seq_id            destination_sequence) const {
+    if (source_sequence < 0 || (uint32_t) source_sequence >= n_stream ||
+        destination_sequence < 0 || (uint32_t) destination_sequence >= destination.n_stream) {
+        throw std::invalid_argument("DSV4 resident state sequence out of range");
+    }
+    if (this == &destination || ratio != destination.ratio || state_size != destination.state_size ||
+        n_embd_state != destination.n_embd_state || n_rs_seq != destination.n_rs_seq ||
+        layers.size() != destination.layers.size()) {
+        throw std::invalid_argument("DSV4 resident state geometry mismatch");
+    }
+    for (size_t i = 0; i < layers.size(); ++i) {
+        if (layers[i].il != destination.layers[i].il || layers[i].kv->type != destination.layers[i].kv->type ||
+            layers[i].score->type != destination.layers[i].score->type ||
+            layers[i].kv->ne[0] != destination.layers[i].kv->ne[0] ||
+            layers[i].kv->ne[1] != destination.layers[i].kv->ne[1] ||
+            layers[i].score->ne[0] != destination.layers[i].score->ne[0] ||
+            layers[i].score->ne[1] != destination.layers[i].score->ne[1]) {
+            throw std::invalid_argument("DSV4 resident state layer mismatch");
+        }
+    }
+
+    destination.clear(destination_sequence, true);
+    const auto copy_tensor = [](ggml_tensor * source, ggml_tensor * target) {
+        if (dsv4_test_comp_state_copy_after == 0) {
+            throw std::runtime_error("injected DSV4 resident state copy failure");
+        }
+        ggml_backend_tensor_copy(source, target);
+        if (dsv4_test_comp_state_copy_after > 0) {
+            --dsv4_test_comp_state_copy_after;
+        }
+    };
+    for (uint32_t depth = 0; depth <= n_rs_seq; ++depth) {
+        const uint32_t source_stream = depth*n_stream + (uint32_t) source_sequence;
+        const uint32_t destination_stream = depth*destination.n_stream + (uint32_t) destination_sequence;
+        for (size_t i = 0; i < layers.size(); ++i) {
+            copy_tensor(layers[i].kv_stream[source_stream], destination.layers[i].kv_stream[destination_stream]);
+            copy_tensor(layers[i].score_stream[source_stream], destination.layers[i].score_stream[destination_stream]);
+        }
+    }
+}
+
+bool llama_dsv4_comp_state::sequence_all_depths_zero(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_stream) {
+        return false;
+    }
+    std::array<uint8_t, 4096> bytes;
+    for (uint32_t depth = 0; depth <= n_rs_seq; ++depth) {
+        const uint32_t stream = depth*n_stream + (uint32_t) seq_id;
+        for (const auto & layer : layers) {
+            for (ggml_tensor * tensor : { layer.kv_stream[stream], layer.score_stream[stream] }) {
+                const size_t size = ggml_nbytes(tensor);
+                for (size_t offset = 0; offset < size; offset += bytes.size()) {
+                    const size_t chunk = std::min(bytes.size(), size - offset);
+                    ggml_backend_tensor_get(tensor, bytes.data(), offset, chunk);
+                    if (std::any_of(bytes.begin(), bytes.begin() + chunk,
+                                    [](uint8_t value) { return value != 0; })) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
 }
 
 uint32_t llama_dsv4_comp_state::get_ratio() const {
@@ -1771,6 +1849,21 @@ uint64_t llama_dsv4_comp_state::state_identity() const {
         hash = dsv4_hash_tensor(hash, layer.score);
     }
     return hash;
+}
+
+uint64_t llama_dsv4_comp_state::state_generation() const {
+    return generation;
+}
+
+void llama_dsv4_comp_state::bump_generation() const {
+    if (generation == std::numeric_limits<uint64_t>::max()) {
+        throw std::overflow_error("DSV4 recurrent-state generation exhausted");
+    }
+    ++generation;
+}
+
+bool llama_dsv4_comp_state::has_generation_headroom(uint64_t increments) const {
+    return increments <= std::numeric_limits<uint64_t>::max() - generation;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_dsv4_comp_state::memory_breakdown() const {
@@ -1822,6 +1915,8 @@ void llama_dsv4_comp_state::state_write(
 
 void llama_dsv4_comp_state::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     GGML_UNUSED(flags);
+
+    bump_generation();
 
     uint32_t version;
     uint32_t ratio_ref;
@@ -1922,6 +2017,14 @@ const char * llama_dsv4_resident_status_name(llama_dsv4_resident_status status) 
             return "invalid_sequence";
         case llama_dsv4_resident_status::unsupported_components:
             return "unsupported_components";
+        case llama_dsv4_resident_status::capacity_exhausted: return "capacity_exhausted";
+        case llama_dsv4_resident_status::slot_occupied:      return "slot_occupied";
+        case llama_dsv4_resident_status::not_quiescent:      return "not_quiescent";
+        case llama_dsv4_resident_status::stale_quote:        return "stale_quote";
+        case llama_dsv4_resident_status::stale_handle:       return "stale_handle";
+        case llama_dsv4_resident_status::generation_exhausted: return "generation_exhausted";
+        case llama_dsv4_resident_status::resource_exhausted: return "resource_exhausted";
+        case llama_dsv4_resident_status::backend_error:      return "backend_error";
     }
     return "unknown";
 }
@@ -1967,6 +2070,646 @@ llama_dsv4_resident_detach_quote llama_dsv4_quote_resident_detach_layout(llama_d
     result.unsupported_components = result.required_components & ~result.detachable_components;
     result.status                 = result.unsupported_components == 0 ? llama_dsv4_resident_status::ok :
                                                                          llama_dsv4_resident_status::unsupported_components;
+    return result;
+}
+
+namespace {
+
+uint64_t dsv4_allocate_resident_cache_id() {
+    static std::atomic<uint64_t> next{ 1 };
+    uint64_t current = next.load(std::memory_order_relaxed);
+    while (true) {
+        if (current == 0 || current == std::numeric_limits<uint64_t>::max()) {
+            throw std::overflow_error("DSV4 resident cache identity space exhausted");
+        }
+        if (next.compare_exchange_weak(current, current + 1, std::memory_order_relaxed)) {
+            return current;
+        }
+    }
+}
+
+llama_dsv4_resident_status dsv4_resident_status_from_raw(llama_kv_iswa_resident_status status) {
+    switch (status) {
+        case llama_kv_iswa_resident_status::ok:                   return llama_dsv4_resident_status::ok;
+        case llama_kv_iswa_resident_status::invalid_sequence:     return llama_dsv4_resident_status::invalid_sequence;
+        case llama_kv_iswa_resident_status::unsupported_layout:   return llama_dsv4_resident_status::unsupported_components;
+        case llama_kv_iswa_resident_status::slot_occupied:        return llama_dsv4_resident_status::slot_occupied;
+        case llama_kv_iswa_resident_status::capacity_exhausted:   return llama_dsv4_resident_status::capacity_exhausted;
+        case llama_kv_iswa_resident_status::stale_quote:          return llama_dsv4_resident_status::stale_quote;
+        case llama_kv_iswa_resident_status::stale_handle:         return llama_dsv4_resident_status::stale_handle;
+        case llama_kv_iswa_resident_status::generation_exhausted: return llama_dsv4_resident_status::generation_exhausted;
+        case llama_kv_iswa_resident_status::not_quiescent:        return llama_dsv4_resident_status::not_quiescent;
+        case llama_kv_iswa_resident_status::resource_exhausted:   return llama_dsv4_resident_status::resource_exhausted;
+        case llama_kv_iswa_resident_status::backend_error:        return llama_dsv4_resident_status::backend_error;
+    }
+    return llama_dsv4_resident_status::backend_error;
+}
+
+llama_dsv4_resident_status dsv4_resident_status_from_compressed(llama_dsv4_comp_status status) {
+    switch (status) {
+        case llama_dsv4_comp_status::ok:                   return llama_dsv4_resident_status::ok;
+        case llama_dsv4_comp_status::capacity_exhausted:   return llama_dsv4_resident_status::capacity_exhausted;
+        case llama_dsv4_comp_status::generation_exhausted: return llama_dsv4_resident_status::generation_exhausted;
+        case llama_dsv4_comp_status::stale_quote:          return llama_dsv4_resident_status::stale_quote;
+        case llama_dsv4_comp_status::stale_ticket:         return llama_dsv4_resident_status::stale_quote;
+        case llama_dsv4_comp_status::stale_handle:
+        case llama_dsv4_comp_status::handle_not_found:
+        case llama_dsv4_comp_status::binding_not_found:    return llama_dsv4_resident_status::stale_handle;
+        case llama_dsv4_comp_status::busy:                 return llama_dsv4_resident_status::not_quiescent;
+        case llama_dsv4_comp_status::slot_occupied:
+        case llama_dsv4_comp_status::handle_bound:
+        case llama_dsv4_comp_status::handle_resident:      return llama_dsv4_resident_status::slot_occupied;
+        case llama_dsv4_comp_status::resource_exhausted:   return llama_dsv4_resident_status::resource_exhausted;
+        case llama_dsv4_comp_status::invalid_argument:     return llama_dsv4_resident_status::backend_error;
+    }
+    return llama_dsv4_resident_status::backend_error;
+}
+
+struct dsv4_resident_identity {
+    uint64_t id = dsv4_allocate_resident_cache_id();
+};
+
+enum class dsv4_composite_plan_state : uint8_t {
+    prepared,
+    committed,
+    rolled_back,
+};
+
+struct dsv4_composite_record {
+    llama_dsv4_resident_handle       handle;
+    llama_kv_iswa_resident_handle    raw;
+    llama_dsv4_comp_resident_handle  compressed;
+    uint32_t                         state_slot = UINT32_MAX;
+    uint32_t                         rollback_index = 0;
+    uint32_t                         active_rollback_depth = 0;
+};
+
+class dsv4_raw_transaction_scope {
+public:
+  explicit dsv4_raw_transaction_scope(llama_kv_cache_iswa & raw) : token(raw.acquire_resident_transaction()) {}
+
+  explicit operator bool() const { return static_cast<bool>(token); }
+
+private:
+  llama_kv_iswa_resident_transaction token;
+};
+
+} // namespace
+
+struct llama_dsv4_resident_detach_plan {
+    std::shared_ptr<const dsv4_resident_identity> owner;
+    uint64_t                                      epoch = 0;
+    llama_seq_id                                  execution_id = -1;
+    uint32_t                                      state_slot = UINT32_MAX;
+    uint32_t                                      rollback_index = 0;
+    uint32_t                                      active_rollback_depth = 0;
+    std::array<uint64_t, 3>                       state_generation = {};
+    llama_kv_iswa_resident_detach_quote           raw;
+    llama_dsv4_comp_detach_quote                  compressed;
+    std::map<uint64_t, dsv4_composite_record>     prepared_record;
+    dsv4_composite_plan_state                     state = dsv4_composite_plan_state::prepared;
+};
+
+struct llama_dsv4_resident_attach_plan {
+    std::shared_ptr<const dsv4_resident_identity> owner;
+    uint64_t                                      epoch = 0;
+    llama_seq_id                                  execution_id = -1;
+    llama_dsv4_resident_handle                    resident;
+    std::array<uint64_t, 3>                       state_generation = {};
+    llama_kv_iswa_resident_attach_quote           raw;
+    llama_dsv4_comp_attach_quote                  compressed;
+    dsv4_composite_plan_state                     state = dsv4_composite_plan_state::prepared;
+};
+
+struct llama_dsv4_composite_resident::impl {
+    impl(
+            llama_kv_cache_iswa & raw,
+            llama_dsv4_comp_pool & compressed,
+            llama_dsv4_comp_state & csa_execution,
+            llama_dsv4_comp_state & hca_execution,
+            llama_dsv4_comp_state & lid_execution,
+            llama_dsv4_comp_state & csa_resident,
+            llama_dsv4_comp_state & hca_resident,
+            llama_dsv4_comp_state & lid_resident,
+            std::vector<uint32_t> & rollback_index,
+            uint32_t & active_rollback_depth,
+            uint32_t n_seq_max,
+            uint32_t resident_capacity) :
+        raw(raw),
+        compressed(compressed),
+        execution{ &csa_execution, &hca_execution, &lid_execution },
+        resident{ &csa_resident, &hca_resident, &lid_resident },
+        rollback_index(rollback_index),
+        active_rollback_depth(active_rollback_depth),
+        n_seq_max(n_seq_max),
+        slots(resident_capacity, false) {
+        if (resident_capacity == 0 || rollback_index.size() != n_seq_max ||
+            csa_execution.get_n_stream() != n_seq_max || hca_execution.get_n_stream() != n_seq_max ||
+            lid_execution.get_n_stream() != n_seq_max || csa_resident.get_n_stream() != resident_capacity ||
+            hca_resident.get_n_stream() != resident_capacity || lid_resident.get_n_stream() != resident_capacity ||
+            csa_execution.get_n_rs_seq() != csa_resident.get_n_rs_seq() ||
+            hca_execution.get_n_rs_seq() != hca_resident.get_n_rs_seq() ||
+            lid_execution.get_n_rs_seq() != lid_resident.get_n_rs_seq()) {
+            throw std::invalid_argument("invalid DSV4 composite resident geometry");
+        }
+    }
+
+    void clear_state(std::array<llama_dsv4_comp_state *, 3> states, llama_seq_id seq) const {
+        for (auto * state : states) {
+            state->clear(seq, true);
+        }
+    }
+
+    bool state_is_empty(std::array<llama_dsv4_comp_state *, 3> states, llama_seq_id seq) const {
+        return std::all_of(states.begin(), states.end(),
+                [seq](const llama_dsv4_comp_state * state) { return state->sequence_all_depths_zero(seq); });
+    }
+
+    void copy_state(
+            std::array<llama_dsv4_comp_state *, 3> source,
+            std::array<llama_dsv4_comp_state *, 3> destination,
+            llama_seq_id source_seq,
+            llama_seq_id destination_seq) const {
+        for (size_t i = 0; i < source.size(); ++i) {
+            source[i]->copy_sequence_all_depths_to(*destination[i], source_seq, destination_seq);
+        }
+    }
+
+    llama_kv_cache_iswa & raw;
+    llama_dsv4_comp_pool & compressed;
+    std::array<llama_dsv4_comp_state *, 3> execution;
+    std::array<llama_dsv4_comp_state *, 3> resident;
+    std::vector<uint32_t> & rollback_index;
+    uint32_t & active_rollback_depth;
+    uint32_t n_seq_max;
+    std::shared_ptr<const dsv4_resident_identity> identity =
+            std::make_shared<const dsv4_resident_identity>();
+    mutable std::recursive_mutex mutex;
+    std::vector<bool> slots;
+    std::map<uint64_t, dsv4_composite_record> handles;
+    uint64_t epoch = 1;
+    uint64_t next_handle_id = 1;
+    uint64_t next_handle_generation = 1;
+    uint64_t next_lease_generation = 1;
+};
+
+class llama_dsv4_composite_resident::aggregate_clear_transaction {
+public:
+    explicit aggregate_clear_transaction(impl & state) :
+        coordinator_lock(state.mutex),
+        raw_transaction(state.raw),
+        permitted(static_cast<bool>(raw_transaction) && state.handles.empty() &&
+                  !state.raw.has_resident_handles() &&
+                  state.compressed.memory_usage_snapshot().resident_handles == 0) {
+    }
+
+    explicit operator bool() const {
+        return permitted;
+    }
+
+private:
+    std::unique_lock<std::recursive_mutex> coordinator_lock;
+    dsv4_raw_transaction_scope             raw_transaction;
+    bool                                   permitted = false;
+};
+
+llama_dsv4_composite_resident::llama_dsv4_composite_resident(
+        llama_kv_cache_iswa & raw,
+        llama_dsv4_comp_pool & compressed,
+        llama_dsv4_comp_state & csa_execution,
+        llama_dsv4_comp_state & hca_execution,
+        llama_dsv4_comp_state & lid_execution,
+        llama_dsv4_comp_state & csa_resident,
+        llama_dsv4_comp_state & hca_resident,
+        llama_dsv4_comp_state & lid_resident,
+        std::vector<uint32_t> & rollback_index,
+        uint32_t & active_rollback_depth,
+        uint32_t n_seq_max,
+        uint32_t resident_capacity) :
+    pimpl(std::make_unique<impl>(raw, compressed, csa_execution, hca_execution, lid_execution,
+            csa_resident, hca_resident, lid_resident, rollback_index, active_rollback_depth,
+            n_seq_max, resident_capacity)) {
+}
+
+llama_dsv4_composite_resident::~llama_dsv4_composite_resident() {
+    if (pimpl && !pimpl->handles.empty()) {
+        std::terminate();
+    }
+}
+
+std::unique_ptr<llama_dsv4_composite_resident::aggregate_clear_transaction>
+llama_dsv4_composite_resident::acquire_aggregate_clear_transaction() {
+    return std::make_unique<aggregate_clear_transaction>(*pimpl);
+}
+
+llama_dsv4_resident_detach_quote llama_dsv4_composite_resident::quote_detach(
+        llama_dsv4_resident_detach_request request) const {
+    llama_dsv4_resident_detach_quote result;
+    result.seq_id = request.seq_id;
+    result.scope  = request.scope;
+    result.required_components = LLAMA_DSV4_RESIDENT_RAW_SWA | LLAMA_DSV4_RESIDENT_COMPRESSED |
+            LLAMA_DSV4_RESIDENT_CSA_STATE | LLAMA_DSV4_RESIDENT_HCA_STATE |
+            LLAMA_DSV4_RESIDENT_LID_STATE | LLAMA_DSV4_RESIDENT_ROLLBACK_INDEX;
+    result.unsupported_components = result.required_components;
+    if (request.scope != llama_dsv4_resident_scope::single_context) {
+        result.status = request.scope == llama_dsv4_resident_scope::target_draft_pair ?
+                llama_dsv4_resident_status::unsupported_components : llama_dsv4_resident_status::invalid_scope;
+        if (request.scope == llama_dsv4_resident_scope::target_draft_pair) {
+            result.required_components |= LLAMA_DSV4_RESIDENT_PAIRED_CONTEXT;
+            result.unsupported_components = result.required_components;
+        }
+        return result;
+    }
+    if (request.seq_id < 0 || (uint32_t) request.seq_id >= pimpl->n_seq_max) {
+        result.status = llama_dsv4_resident_status::invalid_sequence;
+        return result;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(pimpl->mutex);
+    const auto free_slot = std::find(pimpl->slots.begin(), pimpl->slots.end(), false);
+    if (free_slot == pimpl->slots.end()) {
+        result.status = llama_dsv4_resident_status::capacity_exhausted;
+        return result;
+    }
+    if (pimpl->next_handle_id == 0 || pimpl->next_handle_generation == 0 ||
+        pimpl->next_lease_generation == 0) {
+        result.status = llama_dsv4_resident_status::generation_exhausted;
+        return result;
+    }
+    const uint32_t rollback = pimpl->rollback_index[(uint32_t) request.seq_id];
+    if (rollback > pimpl->execution[0]->get_n_rs_seq() ||
+        pimpl->active_rollback_depth > pimpl->execution[0]->get_n_rs_seq()) {
+        result.status = llama_dsv4_resident_status::backend_error;
+        return result;
+    }
+    if (std::any_of(pimpl->resident.begin(), pimpl->resident.end(),
+                    [](const llama_dsv4_comp_state * state) { return !state->has_generation_headroom(2); }) ||
+        std::any_of(pimpl->execution.begin(), pimpl->execution.end(),
+                    [](const llama_dsv4_comp_state * state) { return !state->has_generation_headroom(1); })) {
+        result.status = llama_dsv4_resident_status::generation_exhausted;
+        return result;
+    }
+
+    auto raw = pimpl->raw.quote_resident_detach(request.seq_id);
+    if (raw.status != llama_kv_iswa_resident_status::ok) {
+        result.status = dsv4_resident_status_from_raw(raw.status);
+        return result;
+    }
+    auto compressed = pimpl->compressed.quote_detach_preserving_empty_execution((uint32_t) request.seq_id);
+    if (compressed.status != llama_dsv4_comp_status::ok) {
+        result.status = dsv4_resident_status_from_compressed(compressed.status);
+        return result;
+    }
+
+    try {
+        auto plan                   = std::make_shared<llama_dsv4_resident_detach_plan>();
+        plan->owner                 = pimpl->identity;
+        plan->epoch                 = pimpl->epoch;
+        plan->execution_id          = request.seq_id;
+        plan->state_slot            = (uint32_t) std::distance(pimpl->slots.begin(), free_slot);
+        plan->rollback_index        = rollback;
+        plan->active_rollback_depth = pimpl->active_rollback_depth;
+        for (size_t i = 0; i < pimpl->execution.size(); ++i) {
+            plan->state_generation[i] = pimpl->execution[i]->state_generation();
+        }
+        plan->raw                   = std::move(raw);
+        plan->compressed            = std::move(compressed);
+
+        dsv4_composite_record record;
+        record.handle = {
+            pimpl->identity->id,
+            pimpl->next_handle_id,
+            pimpl->next_handle_generation,
+            pimpl->next_lease_generation,
+        };
+        record.raw                   = plan->raw.resident;
+        record.compressed            = plan->compressed.resident;
+        record.state_slot            = plan->state_slot;
+        record.rollback_index        = rollback;
+        record.active_rollback_depth = pimpl->active_rollback_depth;
+        plan->prepared_record.emplace(record.handle.id, record);
+
+        pimpl->next_handle_id = record.handle.id == std::numeric_limits<uint64_t>::max() ?
+                0 : record.handle.id + 1;
+        pimpl->next_handle_generation = record.handle.handle_generation == std::numeric_limits<uint64_t>::max() ?
+                0 : record.handle.handle_generation + 1;
+        pimpl->next_lease_generation = record.handle.lease_generation == std::numeric_limits<uint64_t>::max() ?
+                0 : record.handle.lease_generation + 1;
+
+        result.status                 = llama_dsv4_resident_status::ok;
+        result.rollback_index         = rollback;
+        result.detachable_components  = result.required_components;
+        result.unsupported_components = 0;
+        result.resident_state_slot    = plan->state_slot;
+        result.resident               = record.handle;
+        result.plan                   = std::move(plan);
+        return result;
+    } catch (const std::bad_alloc &) {
+        result.status = llama_dsv4_resident_status::resource_exhausted;
+        return result;
+    }
+}
+
+llama_dsv4_resident_result llama_dsv4_composite_resident::detach(
+        const llama_dsv4_resident_detach_quote & quote) {
+    llama_dsv4_resident_result result;
+    std::lock_guard<std::recursive_mutex> lock(pimpl->mutex);
+    if (!quote.plan || quote.plan->owner != pimpl->identity ||
+        quote.plan->state != dsv4_composite_plan_state::prepared ||
+        quote.plan->epoch != pimpl->epoch || quote.plan->execution_id < 0 ||
+        (uint32_t) quote.plan->execution_id >= pimpl->n_seq_max ||
+        quote.plan->state_slot >= pimpl->slots.size() || pimpl->slots[quote.plan->state_slot] ||
+        pimpl->rollback_index[(uint32_t) quote.plan->execution_id] != quote.plan->rollback_index ||
+        pimpl->active_rollback_depth != quote.plan->active_rollback_depth ||
+        quote.plan->prepared_record.empty()) {
+        result.status = llama_dsv4_resident_status::stale_quote;
+        return result;
+    }
+    dsv4_raw_transaction_scope transaction(pimpl->raw);
+    if (!transaction) {
+        result.status = llama_dsv4_resident_status::not_quiescent;
+        return result;
+    }
+    if (pimpl->raw.validate_resident_detach(quote.plan->raw) != llama_kv_iswa_resident_status::ok ||
+        !std::equal(quote.plan->state_generation.begin(), quote.plan->state_generation.end(),
+                pimpl->execution.begin(),
+                [](uint64_t generation, const llama_dsv4_comp_state * state) {
+                    return generation == state->state_generation();
+                })) {
+        result.status = llama_dsv4_resident_status::stale_quote;
+        return result;
+    }
+
+    try {
+        pimpl->copy_state(pimpl->execution, pimpl->resident,
+                quote.plan->execution_id, (llama_seq_id) quote.plan->state_slot);
+    } catch (const std::bad_alloc &) {
+        pimpl->clear_state(pimpl->resident, (llama_seq_id) quote.plan->state_slot);
+        result.status = llama_dsv4_resident_status::resource_exhausted;
+        return result;
+    } catch (...) {
+        pimpl->clear_state(pimpl->resident, (llama_seq_id) quote.plan->state_slot);
+        result.status = llama_dsv4_resident_status::backend_error;
+        return result;
+    }
+
+    const auto compressed = pimpl->compressed.detach(quote.plan->compressed);
+    if (compressed.status != llama_dsv4_comp_status::ok) {
+        pimpl->clear_state(pimpl->resident, (llama_seq_id) quote.plan->state_slot);
+        result.status = dsv4_resident_status_from_compressed(compressed.status);
+        return result;
+    }
+    const auto rollback = [&]() {
+        if (pimpl->compressed.rollback_detach(quote.plan->compressed) != llama_dsv4_comp_status::ok) {
+            std::terminate();
+        }
+        pimpl->clear_state(pimpl->resident, (llama_seq_id) quote.plan->state_slot);
+        quote.plan->state = dsv4_composite_plan_state::rolled_back;
+    };
+    llama_kv_iswa_resident_result raw;
+    try {
+        raw = pimpl->raw.detach_resident(quote.plan->raw);
+    } catch (const std::bad_alloc &) {
+        rollback();
+        result.status = llama_dsv4_resident_status::resource_exhausted;
+        return result;
+    } catch (...) {
+        rollback();
+        result.status = llama_dsv4_resident_status::backend_error;
+        return result;
+    }
+    if (raw.status != llama_kv_iswa_resident_status::ok) {
+        rollback();
+        result.status = dsv4_resident_status_from_raw(raw.status);
+        return result;
+    }
+
+    auto node = quote.plan->prepared_record.extract(quote.plan->prepared_record.begin());
+    if (node.empty()) {
+        std::terminate();
+    }
+    const auto inserted = pimpl->handles.insert(std::move(node));
+    if (!inserted.inserted) {
+        std::terminate();
+    }
+    pimpl->slots[quote.plan->state_slot] = true;
+    pimpl->clear_state(pimpl->execution, quote.plan->execution_id);
+    pimpl->rollback_index[(uint32_t) quote.plan->execution_id] = 0;
+    ++pimpl->epoch;
+    quote.plan->state = dsv4_composite_plan_state::committed;
+    result.status     = llama_dsv4_resident_status::ok;
+    result.resident   = inserted.position->second.handle;
+    return result;
+}
+
+llama_dsv4_resident_attach_quote llama_dsv4_composite_resident::quote_attach(
+        llama_dsv4_resident_handle resident,
+        llama_seq_id execution_id) const {
+    llama_dsv4_resident_attach_quote result;
+    result.execution_id = execution_id;
+    result.resident     = resident;
+    std::lock_guard<std::recursive_mutex> lock(pimpl->mutex);
+    if (resident.cache_id != pimpl->identity->id || resident.id == 0) {
+        result.status = llama_dsv4_resident_status::stale_handle;
+        return result;
+    }
+    const auto record = pimpl->handles.find(resident.id);
+    if (record == pimpl->handles.end() || !(record->second.handle == resident)) {
+        result.status = llama_dsv4_resident_status::stale_handle;
+        return result;
+    }
+    if (execution_id < 0 || (uint32_t) execution_id >= pimpl->n_seq_max) {
+        result.status = llama_dsv4_resident_status::invalid_sequence;
+        return result;
+    }
+    if (pimpl->rollback_index[(uint32_t) execution_id] != 0 ||
+        pimpl->active_rollback_depth != record->second.active_rollback_depth ||
+        !pimpl->state_is_empty(pimpl->execution, execution_id)) {
+        result.status = llama_dsv4_resident_status::slot_occupied;
+        return result;
+    }
+    if (std::any_of(pimpl->execution.begin(), pimpl->execution.end(),
+                    [](const llama_dsv4_comp_state * state) { return !state->has_generation_headroom(2); }) ||
+        std::any_of(pimpl->resident.begin(), pimpl->resident.end(),
+                    [](const llama_dsv4_comp_state * state) { return !state->has_generation_headroom(1); })) {
+        result.status = llama_dsv4_resident_status::generation_exhausted;
+        return result;
+    }
+
+    auto raw = pimpl->raw.quote_resident_attach(record->second.raw, execution_id);
+    if (raw.status != llama_kv_iswa_resident_status::ok) {
+        result.status = dsv4_resident_status_from_raw(raw.status);
+        return result;
+    }
+    llama_dsv4_comp_handle_id destination_root = 0;
+    const auto binding = pimpl->compressed.get_binding((uint32_t) execution_id, destination_root);
+    auto compressed = binding == llama_dsv4_comp_status::binding_not_found ?
+            pimpl->compressed.quote_attach(record->second.compressed, (uint32_t) execution_id) :
+            pimpl->compressed.quote_attach_replacing_empty(record->second.compressed, (uint32_t) execution_id);
+    if (compressed.status != llama_dsv4_comp_status::ok) {
+        result.status = dsv4_resident_status_from_compressed(compressed.status);
+        return result;
+    }
+
+    try {
+        auto plan          = std::make_shared<llama_dsv4_resident_attach_plan>();
+        plan->owner        = pimpl->identity;
+        plan->epoch        = pimpl->epoch;
+        plan->execution_id = execution_id;
+        plan->resident     = resident;
+        for (size_t i = 0; i < pimpl->execution.size(); ++i) {
+            plan->state_generation[i] = pimpl->execution[i]->state_generation();
+        }
+        plan->raw          = std::move(raw);
+        plan->compressed   = std::move(compressed);
+        result.status      = llama_dsv4_resident_status::ok;
+        result.plan        = std::move(plan);
+        return result;
+    } catch (const std::bad_alloc &) {
+        result.status = llama_dsv4_resident_status::resource_exhausted;
+        return result;
+    }
+}
+
+llama_dsv4_resident_status llama_dsv4_composite_resident::attach(
+        const llama_dsv4_resident_attach_quote & quote) {
+    std::lock_guard<std::recursive_mutex> lock(pimpl->mutex);
+    if (!quote.plan || quote.plan->owner != pimpl->identity ||
+        quote.plan->state != dsv4_composite_plan_state::prepared || quote.plan->epoch != pimpl->epoch ||
+        quote.plan->execution_id < 0 || (uint32_t) quote.plan->execution_id >= pimpl->n_seq_max) {
+        return llama_dsv4_resident_status::stale_quote;
+    }
+    const auto record = pimpl->handles.find(quote.plan->resident.id);
+    if (record == pimpl->handles.end() || !(record->second.handle == quote.plan->resident) ||
+        pimpl->rollback_index[(uint32_t) quote.plan->execution_id] != 0 ||
+        pimpl->active_rollback_depth != record->second.active_rollback_depth) {
+        return llama_dsv4_resident_status::stale_quote;
+    }
+    dsv4_raw_transaction_scope transaction(pimpl->raw);
+    if (!transaction) {
+        return llama_dsv4_resident_status::not_quiescent;
+    }
+    if (pimpl->raw.validate_resident_attach(quote.plan->raw) != llama_kv_iswa_resident_status::ok ||
+        !std::equal(quote.plan->state_generation.begin(), quote.plan->state_generation.end(),
+                pimpl->execution.begin(),
+                [](uint64_t generation, const llama_dsv4_comp_state * state) {
+                    return generation == state->state_generation();
+                })) {
+        return llama_dsv4_resident_status::stale_quote;
+    }
+
+    const auto compressed = pimpl->compressed.commit_attach(quote.plan->compressed);
+    if (compressed != llama_dsv4_comp_status::ok) {
+        return dsv4_resident_status_from_compressed(compressed);
+    }
+    const auto rollback = [&]() {
+        pimpl->clear_state(pimpl->execution, quote.plan->execution_id);
+        if (pimpl->compressed.rollback_attach(quote.plan->compressed) != llama_dsv4_comp_status::ok) {
+            std::terminate();
+        }
+        quote.plan->state = dsv4_composite_plan_state::rolled_back;
+    };
+    try {
+        pimpl->copy_state(pimpl->resident, pimpl->execution,
+                (llama_seq_id) record->second.state_slot, quote.plan->execution_id);
+    } catch (const std::bad_alloc &) {
+        rollback();
+        return llama_dsv4_resident_status::resource_exhausted;
+    } catch (...) {
+        rollback();
+        return llama_dsv4_resident_status::backend_error;
+    }
+
+    llama_kv_iswa_resident_status raw;
+    try {
+        raw = pimpl->raw.commit_resident_attach_final(
+                quote.plan->raw, llama_kv_iswa_resident_final_step::confirmed);
+    } catch (const std::bad_alloc &) {
+        rollback();
+        return llama_dsv4_resident_status::resource_exhausted;
+    } catch (...) {
+        rollback();
+        return llama_dsv4_resident_status::backend_error;
+    }
+    if (raw != llama_kv_iswa_resident_status::ok) {
+        rollback();
+        return dsv4_resident_status_from_raw(raw);
+    }
+
+    pimpl->rollback_index[(uint32_t) quote.plan->execution_id] = record->second.rollback_index;
+    pimpl->clear_state(pimpl->resident, (llama_seq_id) record->second.state_slot);
+    pimpl->slots[record->second.state_slot] = false;
+    pimpl->handles.erase(record);
+    ++pimpl->epoch;
+    quote.plan->state = dsv4_composite_plan_state::committed;
+    return llama_dsv4_resident_status::ok;
+}
+
+llama_dsv4_resident_status llama_dsv4_composite_resident::release(
+        llama_dsv4_resident_handle resident,
+        llama_kv_iswa_resident_release_audit * audit) {
+    std::lock_guard<std::recursive_mutex> lock(pimpl->mutex);
+    if (resident.cache_id != pimpl->identity->id || resident.id == 0) {
+        return llama_dsv4_resident_status::stale_handle;
+    }
+    const auto record = pimpl->handles.find(resident.id);
+    if (record == pimpl->handles.end() || !(record->second.handle == resident)) {
+        return llama_dsv4_resident_status::stale_handle;
+    }
+    if (std::any_of(pimpl->resident.begin(), pimpl->resident.end(),
+                    [](const llama_dsv4_comp_state * state) { return !state->has_generation_headroom(1); })) {
+        return llama_dsv4_resident_status::generation_exhausted;
+    }
+    dsv4_raw_transaction_scope transaction(pimpl->raw);
+    if (!transaction) {
+        return llama_dsv4_resident_status::not_quiescent;
+    }
+    const auto compressed = pimpl->compressed.prepare_release(record->second.compressed);
+    if (compressed.status != llama_dsv4_comp_status::ok) {
+        return dsv4_resident_status_from_compressed(compressed.status);
+    }
+    const auto rollback = [&]() {
+        if (pimpl->compressed.rollback_release(compressed) != llama_dsv4_comp_status::ok) {
+            std::terminate();
+        }
+    };
+    llama_kv_iswa_resident_status raw;
+    try {
+        raw = pimpl->raw.release_resident(record->second.raw, audit);
+    } catch (const std::bad_alloc &) {
+        rollback();
+        return llama_dsv4_resident_status::resource_exhausted;
+    } catch (...) {
+        rollback();
+        return llama_dsv4_resident_status::backend_error;
+    }
+    if (raw != llama_kv_iswa_resident_status::ok) {
+        rollback();
+        return dsv4_resident_status_from_raw(raw);
+    }
+    if (pimpl->compressed.commit_release(compressed) != llama_dsv4_comp_status::ok) {
+        std::terminate();
+    }
+    pimpl->clear_state(pimpl->resident, (llama_seq_id) record->second.state_slot);
+    pimpl->slots[record->second.state_slot] = false;
+    pimpl->handles.erase(record);
+    ++pimpl->epoch;
+    return llama_dsv4_resident_status::ok;
+}
+
+bool llama_dsv4_composite_resident::has_handles() const {
+    std::lock_guard<std::recursive_mutex> lock(pimpl->mutex);
+    return !pimpl->handles.empty();
+}
+
+llama_dsv4_resident_usage llama_dsv4_composite_resident::usage() const {
+    std::lock_guard<std::recursive_mutex> lock(pimpl->mutex);
+    llama_dsv4_resident_usage result;
+    result.cache_id       = pimpl->identity->id;
+    result.epoch          = pimpl->epoch;
+    result.capacity       = (uint32_t) pimpl->slots.size();
+    result.occupied_slots = (uint32_t) std::count(pimpl->slots.begin(), pimpl->slots.end(), true);
+    result.handles        = (uint32_t) pimpl->handles.size();
     return result;
 }
 
@@ -2093,7 +2836,9 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     // same physical pages while parked. A divisor of two therefore keeps one
     // full execution allocation plus sparse COW slack, rather than sizing the
     // heap as if only one of n_seq_max execution streams could be active.
-    const bool raw_resident_enabled = std::getenv("LLAMA_DSV4_RAW_RESIDENT_ENABLE") != nullptr;
+    const bool composite_resident_enabled = std::getenv("LLAMA_DSV4_COMPOSITE_RESIDENT_ENABLE") != nullptr;
+    const bool raw_resident_enabled = composite_resident_enabled ||
+            std::getenv("LLAMA_DSV4_RAW_RESIDENT_ENABLE") != nullptr;
     ggml_backend_buffer_type_t raw_resident_buft = raw_resident_enabled && offload && n_seq_max > 1 ?
             dsv4_sparse_buft(model, 2) : nullptr;
     const uint32_t raw_resident_slots = raw_resident_buft != nullptr ? n_seq_max : 0;
@@ -2177,6 +2922,25 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             model, offload, false, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
             2*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_csa);
 
+    if (composite_resident_enabled) {
+        if (!aggregate_compressed || raw_resident_slots == 0) {
+            LLAMA_LOG_WARN("%s: composite DSV4 resident ownership requires target aggregate and raw sparse apertures\n",
+                    __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: creating default-off DSV4 composite resident state aperture, slots = %u\n",
+                    __func__, raw_resident_slots);
+            resident_csa_state = std::make_unique<llama_dsv4_comp_state>(
+                    model, offload, false, raw_resident_slots, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
+                    2*model.hparams.n_embd_head_k(), n_rs_seq, "resident_csa", filter_csa);
+            resident_hca_state = std::make_unique<llama_dsv4_comp_state>(
+                    model, offload, false, raw_resident_slots, DSV4_HCA_RATIO, DSV4_HCA_RATIO,
+                    model.hparams.n_embd_head_k(), n_rs_seq, "resident_hca", filter_hca);
+            resident_lid_state = std::make_unique<llama_dsv4_comp_state>(
+                    model, offload, false, raw_resident_slots, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
+                    2*model.hparams.indexer_head_size, n_rs_seq, "resident_lid", filter_csa);
+        }
+    }
+
     // Bind sequence snapshots to the stable model metadata and every cache /
     // compressor geometry that controls interpretation of their tensor bytes.
     // llama.cpp does not currently expose a persistent model-content digest,
@@ -2228,6 +2992,12 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     // otherwise leak in (instance-specific garbage) and corrupt recall. Zero all
     // compressed buffers up front so reads of un-written rows are deterministic.
     clear_compressed(-1, true);
+    if (resident_csa_state) {
+        composite_resident = std::make_unique<llama_dsv4_composite_resident>(
+                *kv_raw, *comp_pool, *csa_state, *hca_state, *lid_state,
+                *resident_csa_state, *resident_hca_state, *resident_lid_state,
+                rs_idx, n_rs_seq_active, n_seq_max, resident_csa_state->get_n_stream());
+    }
 }
 
 llama_kv_cache_dsv4::~llama_kv_cache_dsv4() = default;
@@ -2551,8 +3321,21 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
 }
 
 void llama_kv_cache_dsv4::clear(bool data) {
+    if (composite_resident && composite_resident->has_handles()) {
+        throw std::runtime_error("cannot clear DSV4 cache with composite resident handles");
+    }
+    composite_resident.reset();
     kv_raw->clear(data);
     clear_compressed(-1, true); // DSV4 compressed buffers must never expose stale/uninit rows
+    if (resident_csa_state) {
+        resident_csa_state->clear(-1, true);
+        resident_hca_state->clear(-1, true);
+        resident_lid_state->clear(-1, true);
+        composite_resident = std::make_unique<llama_dsv4_composite_resident>(
+                *kv_raw, *comp_pool, *csa_state, *hca_state, *lid_state,
+                *resident_csa_state, *resident_hca_state, *resident_lid_state,
+                rs_idx, n_rs_seq_active, n_seq_max, resident_csa_state->get_n_stream());
+    }
 }
 
 bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -2596,13 +3379,43 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         return res;
     }
 
-    const bool res = kv_raw->seq_rm(seq_id, p0, p1);
+    const auto remove_and_clear = [&]() {
+        const bool res = kv_raw->seq_rm(seq_id, p0, p1);
 
-    if (res) {
-        clear_compressed(seq_id, true);
+        if (res) {
+            clear_compressed(seq_id, true);
+        }
+
+        return res;
+    };
+
+    if (seq_id < 0 && aggregate_compressed) {
+        if (composite_resident) {
+            auto aggregate_transaction = composite_resident->acquire_aggregate_clear_transaction();
+            if (!aggregate_transaction || !*aggregate_transaction) {
+                return false;
+            }
+            return remove_and_clear();
+        }
+
+        if (kv_raw->has_resident_aperture()) {
+            dsv4_raw_transaction_scope raw_transaction(*kv_raw);
+            if (!raw_transaction || kv_raw->has_resident_handles() ||
+                comp_pool->memory_usage_snapshot().resident_handles != 0) {
+                return false;
+            }
+            return remove_and_clear();
+        }
+
+        if (kv_raw->has_resident_handles() || comp_pool->memory_usage_snapshot().resident_handles != 0) {
+            // The raw-only resident mode has no composite coordinator to hold
+            // the resident transaction.  Reject before touching raw storage;
+            // callers can release the external resident lease and retry.
+            return false;
+        }
     }
 
-    return res;
+    return remove_and_clear();
 }
 
 void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -2696,6 +3509,14 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
     }
     for (const auto & buft_size : lid_state->memory_breakdown()) {
         mb[buft_size.first] += buft_size.second;
+    }
+    for (const auto * state : { resident_csa_state.get(), resident_hca_state.get(), resident_lid_state.get() }) {
+        if (state == nullptr) {
+            continue;
+        }
+        for (const auto & buft_size : state->memory_breakdown()) {
+            mb[buft_size.first] += buft_size.second;
+        }
     }
     return mb;
 }
@@ -2822,6 +3643,9 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     // The lease closes the gap between the fail-closed handle check and the
     // DSV4 header write. A new detach cannot land until the complete state
     // operation reaches its terminal boundary.
+    if (seq_id < 0 && composite_resident && composite_resident->has_handles()) {
+        throw std::runtime_error("DSV4 composite resident handles are not serializable");
+    }
     [[maybe_unused]] auto raw_state_lease =
             seq_id < 0 ? kv_raw->acquire_resident_batch_lease() : nullptr;
     if (seq_id < 0 && kv_raw->has_resident_handles()) {
@@ -2865,6 +3689,9 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (seq_id < 0 && composite_resident && composite_resident->has_handles()) {
+        throw std::runtime_error("DSV4 composite resident handles cannot survive whole-cache restore");
+    }
     [[maybe_unused]] auto raw_state_lease =
             seq_id < 0 ? kv_raw->acquire_resident_batch_lease() : nullptr;
     if (seq_id < 0 && kv_raw->has_resident_handles()) {
@@ -2979,6 +3806,9 @@ llama_dsv4_comp_pool * llama_kv_cache_dsv4::get_comp_pool() const {
 
 llama_dsv4_resident_detach_quote llama_kv_cache_dsv4::quote_resident_detach(
     llama_dsv4_resident_detach_request request) const {
+    if (composite_resident) {
+        return composite_resident->quote_detach(request);
+    }
     const uint32_t rollback_index =
         request.seq_id >= 0 && (uint32_t) request.seq_id < n_seq_max ? rs_idx[request.seq_id] : 0;
     auto result = llama_dsv4_quote_resident_detach_layout(
@@ -2994,6 +3824,40 @@ llama_dsv4_resident_detach_quote llama_kv_cache_dsv4::quote_resident_detach(
                                                              llama_dsv4_resident_status::unsupported_components;
     }
     return result;
+}
+
+llama_dsv4_resident_result llama_kv_cache_dsv4::detach_resident(
+        const llama_dsv4_resident_detach_quote & quote) {
+    if (!composite_resident) {
+        return {};
+    }
+    return composite_resident->detach(quote);
+}
+
+llama_dsv4_resident_attach_quote llama_kv_cache_dsv4::quote_resident_attach(
+        llama_dsv4_resident_handle resident,
+        llama_seq_id execution_id) const {
+    if (!composite_resident) {
+        return {};
+    }
+    return composite_resident->quote_attach(resident, execution_id);
+}
+
+llama_dsv4_resident_status llama_kv_cache_dsv4::attach_resident(
+        const llama_dsv4_resident_attach_quote & quote) {
+    return composite_resident ? composite_resident->attach(quote) :
+                                llama_dsv4_resident_status::unsupported_components;
+}
+
+llama_dsv4_resident_status llama_kv_cache_dsv4::release_resident(
+        llama_dsv4_resident_handle resident,
+        llama_kv_iswa_resident_release_audit * audit) {
+    return composite_resident ? composite_resident->release(resident, audit) :
+                                llama_dsv4_resident_status::unsupported_components;
+}
+
+llama_dsv4_resident_usage llama_kv_cache_dsv4::resident_usage() const {
+    return composite_resident ? composite_resident->usage() : llama_dsv4_resident_usage{};
 }
 
 uint32_t llama_kv_cache_dsv4::get_n_rs_seq() const {
@@ -3046,15 +3910,21 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
             kv_lid->clear(true);
         }
         const auto usage = comp_pool->memory_usage_snapshot();
-        comp_pool = std::make_unique<llama_dsv4_comp_pool>(llama_dsv4_comp_pool_config {
+        llama_dsv4_comp_pool replacement(llama_dsv4_comp_pool_config {
                 usage.c4.capacity_segments - usage.c4.permanent_segments,
                 usage.hca.capacity_segments - usage.hca.permanent_segments,
         });
         for (uint32_t execution_id = 0; execution_id < n_seq_max; ++execution_id) {
-            const auto handle = comp_pool->create_handle();
+            const auto handle = replacement.create_handle();
             GGML_ASSERT(handle.status == llama_dsv4_comp_status::ok);
-            GGML_ASSERT(comp_pool->bind(execution_id, handle.handle) == llama_dsv4_comp_status::ok);
+            GGML_ASSERT(replacement.bind(execution_id, handle.handle) == llama_dsv4_comp_status::ok);
         }
+        // Keep the coordinator's compressed-pool reference valid.  Replacing
+        // the unique_ptr leaves a dangling reference even when no resident
+        // lease is outstanding; move assignment swaps the pool implementation
+        // in place after the transaction above has proved that no resident
+        // handles remain.
+        *comp_pool = std::move(replacement);
     } else if (aggregate_compressed) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
         llama_dsv4_comp_handle_id old_handle = 0;

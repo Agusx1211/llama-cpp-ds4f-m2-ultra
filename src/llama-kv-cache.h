@@ -26,6 +26,7 @@ struct llama_kv_cache_resident_guard {
     bool update_active[2] = { false, false };
     uint32_t active_batches = 0;
     uint32_t parked_handles = 0;
+    bool resident_transaction_active = false;
 };
 
 //
