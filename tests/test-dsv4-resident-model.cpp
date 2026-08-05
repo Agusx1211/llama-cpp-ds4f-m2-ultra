@@ -1912,7 +1912,9 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary, bool
     const auto initial_binding0       = comp_binding(comp_pool, 0, "candidate creation");
     const auto initial_binding1       = comp_binding(comp_pool, 1, "candidate creation");
     const auto initial_binding2       = comp_binding(comp_pool, 2, "candidate creation");
+    const auto initial_info0          = comp_handle_info(comp_pool, initial_binding0, "candidate creation");
     const auto initial_info1          = comp_handle_info(comp_pool, initial_binding1, "candidate creation");
+    const auto initial_info2          = comp_handle_info(comp_pool, initial_binding2, "candidate creation");
     const auto resident_before_detach = memory->resident_usage();
     expect_resident_usage(resident_before_detach, 0, 0, "candidate creation", boundary);
     const auto memory_baseline = memory->memory_usage_snapshot();
@@ -2159,18 +2161,19 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary, bool
     expect(comp_pool->get_handle(initial_binding0, released_source_info) == llama_dsv4_comp_status::handle_not_found,
            "released source compressed handle remained addressable");
     expect(counter.evaluations == callback_before_release, "resident release changed graph callback count");
-    const auto final_binding0 = comp_binding(comp_pool, 0, "released");
-    const auto final_binding1 = comp_binding(comp_pool, 1, "released");
-    const auto final_binding2 = comp_binding(comp_pool, 2, "released");
-    expect(final_binding0 == replacement_info_before_release.id && final_binding2 == destination_info_before_release.id &&
-               final_binding1 == survivor_info_before_second_detach.id && final_binding0 != initial_binding0 &&
-               final_binding2 != initial_binding2,
+    const auto released_binding0 = comp_binding(comp_pool, 0, "released");
+    const auto released_binding1 = comp_binding(comp_pool, 1, "released");
+    const auto released_binding2 = comp_binding(comp_pool, 2, "released");
+    expect(released_binding0 == replacement_info_before_release.id &&
+               released_binding2 == destination_info_before_release.id &&
+               released_binding1 == survivor_info_before_second_detach.id && released_binding0 != initial_binding0 &&
+               released_binding2 != initial_binding2,
            "resident release did not preserve the expected per-sequence binding identities");
     expect_comp_handle_info_equal(replacement_info_before_release,
-                                  comp_handle_info(comp_pool, final_binding0, "released"),
+                                  comp_handle_info(comp_pool, released_binding0, "released"),
                                   "released replacement handle");
     expect_comp_handle_info_equal(destination_info_before_release,
-                                  comp_handle_info(comp_pool, final_binding2, "released"),
+                                  comp_handle_info(comp_pool, released_binding2, "released"),
                                   "released destination handle");
     const auto resident_after_release = memory->resident_usage();
     expect_resident_transition(resident_after_second_detach, resident_after_release, "released", boundary);
@@ -2220,33 +2223,54 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary, bool
     expect(llama_memory_seq_pos_max(llama_get_memory(candidate.get()), 0) == 2,
            "replacement position ledger mismatch after release");
 
+    // clear(true) replaces the aggregate compressed pool.  The raw pointer
+    // captured before this boundary is intentionally not used again: handles
+    // and bindings are pool-instance scoped, so numeric IDs from the old pool
+    // must not be interpreted as identities in the replacement pool.
     llama_memory_clear(llama_get_memory(candidate.get()), true);
+    auto * final_comp_pool = memory->get_comp_pool();
+    expect(final_comp_pool != nullptr, "final clear did not recreate compressed pool");
+    const auto final_comp   = final_comp_pool->memory_usage_snapshot();
     const auto final_memory = memory->memory_usage_snapshot();
-    const auto final_comp   = memory->get_comp_pool()->memory_usage_snapshot();
     expect_sparse_counters_monotonic(memory_baseline, final_memory, "final", boundary);
     compare_memory_baseline(memory_baseline, final_memory, "final", boundary);
-    expect(final_comp.epoch >= comp_baseline.epoch, "compressed pool epoch regressed after clear");
+    expect(final_comp.epoch == comp_baseline.epoch, "recreated compressed pool epoch differs from constructor baseline");
     compare_comp_baseline(comp_baseline, final_comp, "final", boundary);
+    expect(final_comp.handles == N_SEQ_MAX && final_comp.bindings == N_SEQ_MAX &&
+               final_comp.resident_handles == 0 && final_comp.active_tickets == 0 &&
+               final_comp.retained_ticket_records == 0,
+           "recreated compressed pool did not return to empty constructor ownership");
     expect_resident_usage(memory->resident_usage(), 0, 0, "final", boundary);
     expect_logical_rows(final_memory, { -1, -1, -1 }, "final", boundary);
     for (llama_seq_id sequence = 0; sequence < (llama_seq_id) N_SEQ_MAX; ++sequence) {
         expect(llama_memory_seq_pos_max(llama_get_memory(candidate.get()), sequence) == -1,
                "final clear left a per-sequence position populated");
     }
-    expect(comp_binding(comp_pool, 0, "final") == final_binding0 &&
-               comp_binding(comp_pool, 1, "final") == final_binding1 &&
-               comp_binding(comp_pool, 2, "final") == final_binding2,
-           "final clear changed compressed binding identities");
-    expect_comp_handle_info_equal(replacement_info_before_release,
-                                  comp_handle_info(comp_pool, final_binding0, "final"), "final replacement handle");
-    expect_comp_handle_info_equal(initial_info1, comp_handle_info(comp_pool, final_binding1, "final"),
-                                  "final survivor handle");
-    expect_comp_handle_info_equal(destination_info_before_release,
-                                  comp_handle_info(comp_pool, final_binding2, "final"), "final destination handle");
+    // The released composite handle carries the old resident-cache identity;
+    // the replacement composite rejects it even though the old lease was
+    // already released before clear.
+    expect(memory->quote_resident_attach(second_detached.resident, 2).status ==
+                   llama_dsv4_resident_status::stale_handle &&
+               memory->release_resident(second_detached.resident) == llama_dsv4_resident_status::stale_handle,
+           "final clear accepted a resident handle from the old pool instance");
+
+    const auto final_binding0 = comp_binding(final_comp_pool, 0, "final");
+    const auto final_binding1 = comp_binding(final_comp_pool, 1, "final");
+    const auto final_binding2 = comp_binding(final_comp_pool, 2, "final");
+    expect(final_binding0 == initial_info0.id && final_binding1 == initial_info1.id &&
+               final_binding2 == initial_info2.id,
+           "recreated compressed pool did not restore constructor binding IDs");
+    expect_comp_handle_info_equal(initial_info0, comp_handle_info(final_comp_pool, final_binding0, "final"),
+                                  "final replacement constructor handle");
+    expect_comp_handle_info_equal(initial_info1, comp_handle_info(final_comp_pool, final_binding1, "final"),
+                                  "final survivor constructor handle");
+    expect_comp_handle_info_equal(initial_info2, comp_handle_info(final_comp_pool, final_binding2, "final"),
+                                  "final destination constructor handle");
+
     llama_dsv4_comp_handle_info removed_info;
-    expect(comp_pool->get_handle(initial_binding0, removed_info) == llama_dsv4_comp_status::handle_not_found &&
-               comp_pool->get_handle(initial_binding2, removed_info) == llama_dsv4_comp_status::handle_not_found,
-           "final clear resurrected an obsolete compressed handle");
+    expect(final_comp_pool->get_handle(released_binding0, removed_info) == llama_dsv4_comp_status::handle_not_found &&
+               final_comp_pool->get_handle(released_binding2, removed_info) == llama_dsv4_comp_status::handle_not_found,
+           "final clear resurrected an obsolete non-colliding compressed handle");
     expect_rs_idx("final");
 }
 

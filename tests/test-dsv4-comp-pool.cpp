@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -944,6 +945,77 @@ void test_bounded_ticket_history_and_pool_identity() {
     }
 }
 
+void test_recreated_pool_rejects_old_handles() {
+    // llama_kv_cache_dsv4::clear(true) models a clear/recreate boundary by
+    // replacing its aggregate pool.  Exercise the same host-side lifecycle
+    // without retaining a raw pointer into the destroyed object.
+    auto old_pool = std::make_unique<llama_dsv4_comp_pool>(llama_dsv4_comp_pool_config { 8, 4 });
+    const auto initial_source      = create_handle(*old_pool);
+    const auto initial_survivor    = create_handle(*old_pool);
+    const auto initial_destination = create_handle(*old_pool);
+    expect_status(old_pool->bind(0, initial_source), llama_dsv4_comp_status::ok,
+                  "bind recreated-pool source");
+    expect_status(old_pool->bind(1, initial_survivor), llama_dsv4_comp_status::ok,
+                  "bind recreated-pool survivor");
+    expect_status(old_pool->bind(2, initial_destination), llama_dsv4_comp_status::ok,
+                  "bind recreated-pool destination");
+
+    const auto detached = old_pool->detach(old_pool->quote_detach(0));
+    expect_status(detached.status, llama_dsv4_comp_status::ok, "detach before pool recreation");
+    const auto old_resident = detached.resident;
+    expect_status(old_pool->release(old_resident), llama_dsv4_comp_status::ok,
+                  "release before pool recreation");
+
+    // IDs 4 and 5 were created only in the old pool.  They deliberately do
+    // not collide with the three constructor bindings in the replacement.
+    expect_status(old_pool->unbind(2), llama_dsv4_comp_status::ok,
+                  "unbind old destination before pool recreation");
+    expect_status(old_pool->remove_handle(initial_destination), llama_dsv4_comp_status::ok,
+                  "remove old destination before pool recreation");
+    const auto old_replacement = create_handle(*old_pool);
+    const auto old_destination = create_handle(*old_pool);
+    expect(old_replacement > initial_destination && old_destination > old_replacement,
+           "old replacement/destination IDs did not advance past constructor IDs");
+
+    old_pool.reset();
+    auto fresh_pool = std::make_unique<llama_dsv4_comp_pool>(llama_dsv4_comp_pool_config { 8, 4 });
+    const auto fresh_baseline = fresh_pool->memory_usage_snapshot();
+    expect(fresh_baseline.c4.capacity_segments == 10 && fresh_baseline.hca.capacity_segments == 6 &&
+               fresh_baseline.c4.mapped_segments == 2 && fresh_baseline.hca.mapped_segments == 2 &&
+               fresh_baseline.handles == 0 && fresh_baseline.bindings == 0 &&
+               fresh_baseline.resident_handles == 0 && fresh_baseline.active_tickets == 0 &&
+               fresh_baseline.retained_ticket_records == 0,
+           "recreated pool did not return to constructor-empty accounting");
+    expect_status(fresh_pool->attach(old_resident, 0), llama_dsv4_comp_status::stale_handle,
+                  "old resident attached to recreated pool");
+    expect_status(fresh_pool->release(old_resident), llama_dsv4_comp_status::stale_handle,
+                  "old resident released by recreated pool");
+
+    const auto fresh0 = create_handle(*fresh_pool);
+    const auto fresh1 = create_handle(*fresh_pool);
+    const auto fresh2 = create_handle(*fresh_pool);
+    expect_status(fresh_pool->bind(0, fresh0), llama_dsv4_comp_status::ok,
+                  "bind recreated constructor source");
+    expect_status(fresh_pool->bind(1, fresh1), llama_dsv4_comp_status::ok,
+                  "bind recreated constructor survivor");
+    expect_status(fresh_pool->bind(2, fresh2), llama_dsv4_comp_status::ok,
+                  "bind recreated constructor destination");
+    const auto fresh_usage = fresh_pool->memory_usage_snapshot();
+    expect(fresh_usage.c4.capacity_segments == fresh_baseline.c4.capacity_segments &&
+               fresh_usage.hca.capacity_segments == fresh_baseline.hca.capacity_segments &&
+               fresh_usage.c4.mapped_segments == fresh_baseline.c4.mapped_segments &&
+               fresh_usage.hca.mapped_segments == fresh_baseline.hca.mapped_segments &&
+               fresh_usage.handles == 3 && fresh_usage.bindings == 3 && fresh_usage.resident_handles == 0 &&
+               fresh_usage.active_tickets == 0 && fresh_usage.retained_ticket_records == 0,
+           "recreated constructor bindings changed pool accounting");
+
+    llama_dsv4_comp_handle_info removed;
+    expect_status(fresh_pool->get_handle(old_replacement, removed), llama_dsv4_comp_status::handle_not_found,
+                  "old replacement handle survived pool recreation");
+    expect_status(fresh_pool->get_handle(old_destination, removed), llama_dsv4_comp_status::handle_not_found,
+                  "old destination handle survived pool recreation");
+}
+
 void test_sixty_four_handle_rounded_capacity_contract() {
     constexpr uint64_t c4_total_rows  = 262144;
     constexpr uint64_t hca_total_rows = 8192;
@@ -1112,6 +1184,7 @@ int main() {
         test_prepared_resident_detach_rollback();
         test_prepared_resident_attach_transaction();
         test_bounded_ticket_history_and_pool_identity();
+        test_recreated_pool_rejects_old_handles();
         test_sixty_four_handle_rounded_capacity_contract();
         test_deterministic_quotes_and_full_context_boundary();
     } catch (const std::exception & error) {
