@@ -352,9 +352,11 @@ capture_store_result open_private_root(const fs::path & root, bool require_priva
     if (path_has_traversal(root) || root == root.root_path()) {
         return result(capture_store_status::path_security, EINVAL);
     }
-    // Intermediate parent directories are no-follow walked but are not made
-    // private here; deployment policy must trust that containing path. Only
-    // the capture root itself is enforced as private when requested.
+    // Callers must pass a canonical absolute root path. Intermediate parent
+    // directories are no-follow walked (so symlink aliases such as macOS's
+    // /tmp -> /private/tmp are rejected) and are not made private here;
+    // deployment policy must trust that containing path. Only the capture root
+    // itself is enforced as private when requested.
     int current = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (current < 0) {
         return errno_result(errno);

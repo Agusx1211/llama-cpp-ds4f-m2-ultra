@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -33,6 +34,10 @@ namespace {
     throw std::runtime_error(message);
 }
 
+[[noreturn]] void throw_worker_barrier_failure() {
+    throw std::runtime_error("worker barrier failure");
+}
+
 void expect(bool condition, const std::string & message) {
     if (!condition) {
         fail(message);
@@ -49,8 +54,18 @@ void expect_status(capture_store_status actual, capture_store_status expected, c
 class temporary_directory {
   public:
     temporary_directory() {
-        char   pattern[] = "/tmp/llama-capture-store-XXXXXX";
-        char * path      = ::mkdtemp(pattern);
+        const char *   configured_base = std::getenv("TMPDIR");
+        const fs::path configured =
+            configured_base != nullptr && *configured_base != '\0' ? fs::path(configured_base) : fs::path("/tmp");
+        std::error_code canonical_error;
+        const fs::path  canonical_base = fs::canonical(configured, canonical_error);
+        if (canonical_error || canonical_base.empty() || !canonical_base.is_absolute()) {
+            fail("canonical temporary base failed: " + canonical_error.message());
+        }
+        std::string       pattern = (canonical_base / "llama-capture-store-XXXXXX").string();
+        std::vector<char> writable_pattern(pattern.begin(), pattern.end());
+        writable_pattern.push_back('\0');
+        char * path = ::mkdtemp(writable_pattern.data());
         if (path == nullptr) {
             fail("mkdtemp failed: " + std::string(std::strerror(errno)));
         }
@@ -501,9 +516,7 @@ void test_wakeup_barrier_and_worker_exception() {
 
     temporary_directory  throwing_temp;
     capture_store_config throwing      = make_config(throwing_temp.path());
-    throwing.faults.before_worker_wait = []() {
-        throw std::runtime_error("worker barrier failure");
-    };
+    throwing.faults.before_worker_wait = throw_worker_barrier_failure;
     capture_store failed(throwing);
     for (unsigned attempt = 0; attempt < 200 && !failed.stats().worker_failed; ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -602,6 +615,16 @@ void test_root_file_and_tombstone_security() {
     temporary_directory symlink_temp;
     const fs::path      target = symlink_temp.path() / "target";
     fs::create_directory(target);
+    const fs::path intermediate_link_target = symlink_temp.path() / "intermediate-target";
+    expect(fs::create_directory(intermediate_link_target), "create intermediate symlink target");
+    const fs::path intermediate_link = symlink_temp.path() / "intermediate-link";
+    expect(::symlink(intermediate_link_target.c_str(), intermediate_link.c_str()) == 0, "create intermediate symlink");
+    capture_store_config intermediate = make_config(intermediate_link / "capture");
+    capture_store        intermediate_store(intermediate);
+    expect(intermediate_store.stats().worker_failed, "intermediate symlink was accepted");
+    expect_status(intermediate_store.shutdown(false).status, capture_store_status::path_security,
+                  "intermediate symlink status");
+
     const fs::path root_link = symlink_temp.path() / "root-link";
     expect(::symlink(target.c_str(), root_link.c_str()) == 0, "create root symlink");
     capture_store_config linked = make_config(root_link);
