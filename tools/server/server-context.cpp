@@ -2013,10 +2013,11 @@ private:
                 return result;
             }
 
-            // Elastic + prompt cache: do NOT clear the slot or force cache off.
-            // The cached prefix is restored by prompt_load (slot selection) and
-            // the admission reserves the full prompt span; the arm-time commit
-            // (arm_admission) establishes the pages before the first prefill.
+            // Clear idle logical residue so the range-native admission planner
+            // sees a clean slot (required for the quote). The cached prefix is
+            // restored AFTER the arm-time commit (in launch_slots_*), so it
+            // writes to committed pages.
+            slot.prompt_clear();
 
             const auto plan = server_dsv4_plan_admission(
                     task.tokens.size(), task.params.n_predict, params_base.n_predict,
@@ -2773,6 +2774,15 @@ private:
             parent_slot.kv_admission = std::move(admission.ticket);
         }
 
+        // Elastic + cache: restore the cached prefix into the now-committed pages.
+        if (prompt_cache) {
+            for (auto * s : family_slots) {
+                if (s->task) {
+                    s->prompt_load(*prompt_cache, s->task->tokens);
+                }
+            }
+        }
+
         return true;
     }
 
@@ -2794,6 +2804,12 @@ private:
             }
             slot.kv_admission = std::move(admission.ticket);
         }
+
+        // Elastic + cache: restore the cached prefix into the now-committed pages.
+        if (prompt_cache && slot.task) {
+            slot.prompt_load(*prompt_cache, slot.task->tokens);
+        }
+
         return true;
     }
 
