@@ -1989,6 +1989,9 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary, bool
     expect(comp_binding(comp_pool, 2, "released") != initial_binding0 &&
                comp_binding(comp_pool, 1, "released") == survivor_binding_before_detach,
            "resident release altered destination or survivor compressed binding");
+    // Compare release isolation against the snapshot taken after resumed
+    // writes; initial_info1 is only the empty-pool baseline used again after
+    // final clear.
     expect_comp_handle_info_equal(survivor_info_before_second_detach,
                                   comp_handle_info(comp_pool, survivor_binding_before_detach, "released"), "released");
     llama_dsv4_comp_handle_info released_source_info;
@@ -2002,8 +2005,6 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary, bool
                final_binding1 == survivor_info_before_second_detach.id && final_binding0 != initial_binding0 &&
                final_binding2 != initial_binding2,
            "resident release did not preserve the expected per-sequence binding identities");
-    expect_comp_handle_info_equal(initial_info1, comp_handle_info(comp_pool, final_binding1, "released"),
-                                  "released survivor handle");
     expect_comp_handle_info_equal(replacement_info_before_release,
                                   comp_handle_info(comp_pool, final_binding0, "released"),
                                   "released replacement handle");
