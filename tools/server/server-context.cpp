@@ -1469,8 +1469,9 @@ private:
                 SRV_ERR("%s", "LLAMA_DSV4_ADMISSION_VERTICAL requires target Metal sparse DSV4 unified storage\n");
                 return false;
             }
-            params_base.cache_prompt = false;
-            SRV_INF("%s", "enabled exact DSV4 admission vertical: slots=2, cache_prompt=false, ctx_shift=false\n");
+            // Prompt cache is allowed with elastic vertical (restored prefix +
+            // arm-time-committed pages). Do not force cache_prompt=false here.
+            SRV_INF("%s", "enabled exact DSV4 admission vertical: slots=2, cache_prompt=allowed, ctx_shift=false\n");
         }
 
         slots.clear();
@@ -2012,10 +2013,10 @@ private:
                 return result;
             }
 
-            // This vertical deliberately admits full, uncached prompts. Clear
-            // any idle logical residue before asking the range-native planner.
-            slot.prompt_clear();
-            task.params.cache_prompt = false;
+            // Elastic + prompt cache: do NOT clear the slot or force cache off.
+            // The cached prefix is restored by prompt_load (slot selection) and
+            // the admission reserves the full prompt span; the arm-time commit
+            // (arm_admission) establishes the pages before the first prefill.
 
             const auto plan = server_dsv4_plan_admission(
                     task.tokens.size(), task.params.n_predict, params_base.n_predict,
