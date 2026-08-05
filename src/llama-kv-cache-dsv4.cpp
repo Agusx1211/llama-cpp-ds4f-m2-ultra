@@ -3203,10 +3203,12 @@ llama_kv_cache_dsv4::admission_consume_status llama_kv_cache_dsv4::consume_admis
         quote = entry.quote;
         limiting_family_mask = entry.limiting_family_mask;
         const auto commit_status = entry.reservation->commit_ranges();
+        fprintf(stderr, "DSV4CACHE consume commit_status=%d\n", (int) commit_status);
         admission_state->entries.erase(it);
         return commit_status == GGML_METAL_SPARSE_RESERVATION_OK ? ADMISSION_COMMITTED : ADMISSION_ERROR;
     }
 
+    fprintf(stderr, "DSV4CACHE consume NO_MATCH\n");
     return ADMISSION_NO_MATCH;
 }
 
