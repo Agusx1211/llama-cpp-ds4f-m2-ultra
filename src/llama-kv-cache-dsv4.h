@@ -369,7 +369,9 @@ public:
     llama_dsv4_resident_attach_quote quote_attach(llama_dsv4_resident_handle resident,
                                                    llama_seq_id execution_id) const;
     llama_dsv4_resident_status       attach(const llama_dsv4_resident_attach_quote & quote);
-    llama_dsv4_resident_status       release(llama_dsv4_resident_handle resident);
+    llama_dsv4_resident_status       release(
+            llama_dsv4_resident_handle resident,
+            llama_kv_iswa_resident_release_audit * audit = nullptr);
 
     bool has_handles() const;
     llama_dsv4_resident_usage usage() const;
@@ -462,7 +464,9 @@ public:
     llama_dsv4_resident_attach_quote quote_resident_attach(llama_dsv4_resident_handle resident,
                                                            llama_seq_id execution_id) const;
     llama_dsv4_resident_status       attach_resident(const llama_dsv4_resident_attach_quote & quote);
-    llama_dsv4_resident_status       release_resident(llama_dsv4_resident_handle resident);
+    llama_dsv4_resident_status       release_resident(
+            llama_dsv4_resident_handle resident,
+            llama_kv_iswa_resident_release_audit * audit = nullptr);
     llama_dsv4_resident_usage        resident_usage() const;
 
     uint32_t get_n_rs_seq() const;

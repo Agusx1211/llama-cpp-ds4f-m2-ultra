@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-dsv4-sparse.h"
 #include "ggml-metal-sparse-planner.h"
 
 #ifdef __cplusplus
@@ -454,6 +455,10 @@ enum ggml_metal_sparse_reservation_result ggml_metal_buffers_sparse_move_quote(
 enum ggml_metal_sparse_reservation_result ggml_metal_sparse_move_commit(
         ggml_metal_sparse_move_t quote);
 void ggml_metal_sparse_move_free(ggml_metal_sparse_move_t quote);
+int ggml_metal_sparse_move_audit(
+        ggml_metal_sparse_move_t quote,
+        int committed,
+        struct ggml_dsv4_sparse_move_audit * audit);
 
 bool ggml_metal_buffer_sparse_map_write(
         ggml_metal_buffer_t buf,

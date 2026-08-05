@@ -2514,6 +2514,7 @@ struct ggml_metal_sparse_move_entry {
     size_t n_moves;
     uint64_t generation;
     uint32_t * source_physical;
+    uint32_t * source_refcount;
     uint8_t * selected;
     MTL4UpdateSparseBufferMappingOperation * operations;
     size_t n_operations;
@@ -2554,6 +2555,7 @@ static void ggml_metal_sparse_move_destroy(ggml_metal_sparse_move_t move) {
     for (size_t i = 0; i < move->n_entries; ++i) {
         free(move->entries[i].moves);
         free(move->entries[i].source_physical);
+        free(move->entries[i].source_refcount);
         free(move->entries[i].selected);
         free(move->entries[i].operations);
     }
@@ -2644,6 +2646,7 @@ static enum ggml_metal_sparse_reservation_result ggml_metal_sparse_move_prepare(
         }
         if (entry->n_moves > SIZE_MAX/sizeof(*entry->moves) ||
                 entry->n_moves > SIZE_MAX/sizeof(*entry->source_physical) ||
+                entry->n_moves > SIZE_MAX/sizeof(*entry->source_refcount) ||
                 entry->n_moves > SIZE_MAX/(3*sizeof(*entry->operations))) {
             free(sorted);
             ggml_metal_sparse_move_destroy(move);
@@ -2651,10 +2654,11 @@ static enum ggml_metal_sparse_reservation_result ggml_metal_sparse_move_prepare(
         }
         entry->moves = malloc(entry->n_moves*sizeof(*entry->moves));
         entry->source_physical = malloc(entry->n_moves*sizeof(*entry->source_physical));
+        entry->source_refcount = malloc(entry->n_moves*sizeof(*entry->source_refcount));
         entry->selected = calloc(entry->buffer->sparse_n_virtual, sizeof(*entry->selected));
         entry->operations = calloc(3*entry->n_moves, sizeof(*entry->operations));
         if (entry->moves == NULL || entry->source_physical == NULL ||
-                entry->selected == NULL || entry->operations == NULL) {
+                entry->source_refcount == NULL || entry->selected == NULL || entry->operations == NULL) {
             free(sorted);
             ggml_metal_sparse_move_destroy(move);
             return GGML_METAL_SPARSE_RESERVATION_OOM;
@@ -2691,6 +2695,10 @@ static enum ggml_metal_sparse_reservation_result ggml_metal_sparse_move_prepare(
         if (plan != GGML_METAL_SPARSE_PLAN_OK) {
             status = GGML_METAL_SPARSE_RESERVATION_INVALID;
             break;
+        }
+        for (size_t j = 0; j < entry->n_moves; ++j) {
+            const uint32_t physical = entry->source_physical[j];
+            entry->source_refcount[j] = physical == UINT32_MAX ? 0 : entry->buffer->sparse_p_ref[physical];
         }
     }
     ggml_metal_sparse_move_unlock(move);
@@ -3250,6 +3258,112 @@ enum ggml_metal_sparse_reservation_result ggml_metal_sparse_move_commit(
 #endif
     GGML_UNUSED(move);
     return GGML_METAL_SPARSE_RESERVATION_UNSUPPORTED;
+}
+
+static uint64_t ggml_metal_sparse_audit_hash_mix(uint64_t hash, uint64_t value) {
+    hash ^= value;
+    hash *= UINT64_C(1099511628211);
+    return hash;
+}
+
+int ggml_metal_sparse_move_audit(
+        ggml_metal_sparse_move_t move,
+        int committed,
+        struct ggml_dsv4_sparse_move_audit * audit) {
+#if TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
+    if (@available(macOS 26.4, *)) {
+        if (move == NULL || audit == NULL || move->consumed == (committed == 0)) {
+            return GGML_DSV4_SPARSE_INVALID;
+        }
+        if (move->n_entries > GGML_DSV4_SPARSE_MOVE_AUDIT_MAX_POOLS) {
+            return GGML_DSV4_SPARSE_INVALID;
+        }
+        memset(audit, 0, sizeof(*audit));
+        ggml_metal_sparse_move_lock(move);
+        audit->n_pools = move->n_entries;
+        for (size_t i = 0; i < move->n_entries; ++i) {
+            struct ggml_metal_sparse_move_entry * entry = &move->entries[i];
+            ggml_metal_buffer_t buf = entry->buffer;
+            struct ggml_dsv4_sparse_move_audit_pool * pool = &audit->pools[i];
+            struct ggml_metal_sparse_usage usage;
+            ggml_metal_sparse_get_usage_locked(buf, &usage);
+            pool->pool_id = (uint64_t) (uintptr_t) buf;
+            pool->generation = buf->sparse_generation;
+            pool->virtual_move_count = entry->n_moves;
+            pool->destination_page_count = 0;
+            pool->mapping_operation_count = committed ? entry->n_operations : 0;
+            pool->source_virtual_hash = UINT64_C(1469598103934665603);
+            pool->source_physical_hash = UINT64_C(1469598103934665603);
+            pool->source_refcount_hash = UINT64_C(1469598103934665603);
+            pool->survivor_mapping_hash = UINT64_C(1469598103934665603);
+
+            for (size_t j = 0; j < entry->n_moves; ++j) {
+                const size_t source = entry->moves[j].source;
+                const size_t destination = entry->moves[j].destination;
+                pool->source_virtual_hash = ggml_metal_sparse_audit_hash_mix(
+                        pool->source_virtual_hash, source);
+                pool->source_virtual_hash = ggml_metal_sparse_audit_hash_mix(
+                        pool->source_virtual_hash, destination);
+                if (destination != SIZE_MAX) {
+                    ++pool->destination_page_count;
+                }
+                const uint32_t physical = entry->source_physical[j];
+                if (physical == UINT32_MAX) {
+                    continue;
+                }
+                ++pool->mapped_source_count;
+                pool->source_physical_hash = ggml_metal_sparse_audit_hash_mix(
+                        pool->source_physical_hash, physical);
+                const uint32_t refcount = entry->source_refcount[j];
+                size_t occurrences = 0;
+                bool first = true;
+                for (size_t k = 0; k < entry->n_moves; ++k) {
+                    if (entry->source_physical[k] == physical) {
+                        ++occurrences;
+                        if (k < j) {
+                            first = false;
+                        }
+                    }
+                }
+                if (first) {
+                    ++pool->source_unique_physical_count;
+                    pool->source_refcount_sum += refcount;
+                    if (refcount == occurrences) {
+                        ++pool->source_released_physical_count;
+                    }
+                    pool->source_refcount_hash = ggml_metal_sparse_audit_hash_mix(
+                            pool->source_refcount_hash, physical);
+                    pool->source_refcount_hash = ggml_metal_sparse_audit_hash_mix(
+                            pool->source_refcount_hash, refcount);
+                    pool->source_refcount_hash = ggml_metal_sparse_audit_hash_mix(
+                            pool->source_refcount_hash, occurrences);
+                }
+            }
+            for (size_t page = 0; page < buf->sparse_n_virtual; ++page) {
+                if (entry->selected[page] != 0) {
+                    continue;
+                }
+                pool->survivor_mapping_hash = ggml_metal_sparse_audit_hash_mix(
+                        pool->survivor_mapping_hash, page);
+                pool->survivor_mapping_hash = ggml_metal_sparse_audit_hash_mix(
+                        pool->survivor_mapping_hash, buf->sparse_v2p[page]);
+            }
+            pool->free_pages = usage.free_pages;
+            pool->mapped_mappings = usage.mapped_mappings;
+            pool->unique_physical_pages = usage.unique_physical_pages;
+            pool->shared_physical_pages = usage.shared_physical_pages;
+            pool->shared_mappings = usage.shared_mappings;
+            pool->refcount_sum = usage.refcount_sum;
+            pool->refcount_max = usage.refcount_max;
+        }
+        ggml_metal_sparse_move_unlock(move);
+        return GGML_DSV4_SPARSE_OK;
+    }
+#endif
+    GGML_UNUSED(move);
+    GGML_UNUSED(committed);
+    GGML_UNUSED(audit);
+    return GGML_DSV4_SPARSE_UNSUPPORTED;
 }
 
 void ggml_metal_sparse_move_free(ggml_metal_sparse_move_t move) {

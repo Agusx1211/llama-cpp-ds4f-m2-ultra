@@ -5,6 +5,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <exception>
@@ -61,6 +62,7 @@ struct sparse_move_api {
     ggml_dsv4_sparse_move_quote_fn quote = nullptr;
     ggml_dsv4_sparse_move_commit_fn commit = nullptr;
     ggml_dsv4_sparse_move_free_fn free = nullptr;
+    ggml_dsv4_sparse_move_audit_fn audit = nullptr;
 };
 
 thread_local sparse_move_api sparse_move_test_override;
@@ -73,7 +75,7 @@ struct resident_lock_test_hook {
 
 thread_local resident_lock_test_hook resident_lock_hook;
 
-sparse_move_api llama_kv_iswa_sparse_move_api(const ggml_tensor * tensor) {
+sparse_move_api llama_kv_iswa_sparse_move_api(const ggml_tensor * tensor, bool need_audit) {
     if (sparse_move_test_override.quote != nullptr ||
             sparse_move_test_override.commit != nullptr ||
             sparse_move_test_override.free != nullptr) {
@@ -95,24 +97,30 @@ sparse_move_api llama_kv_iswa_sparse_move_api(const ggml_tensor * tensor) {
             reg, "ggml_backend_metal_dsv4_sparse_move_tensor_rows_commit");
     result.free = (ggml_dsv4_sparse_move_free_fn) ggml_backend_reg_get_proc_address(
             reg, "ggml_backend_metal_dsv4_sparse_move_tensor_rows_free");
+    if (need_audit) {
+        result.audit = (ggml_dsv4_sparse_move_audit_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_metal_dsv4_sparse_move_audit");
+    }
     return result;
 }
 
 struct backend_move_quote {
     int status = GGML_DSV4_SPARSE_UNSUPPORTED;
     ggml_dsv4_sparse_move_commit_fn commit = nullptr;
+    ggml_dsv4_sparse_move_audit_fn audit = nullptr;
     std::shared_ptr<void> value;
 };
 
 backend_move_quote llama_kv_iswa_quote_move(
         const std::vector<ggml_tensor *> & sources,
-        const std::vector<ggml_tensor *> * destinations) {
+        const std::vector<ggml_tensor *> * destinations,
+        bool need_audit = false) {
     backend_move_quote result;
     if (sources.empty() || (destinations != nullptr && destinations->size() != sources.size())) {
         result.status = GGML_DSV4_SPARSE_INVALID;
         return result;
     }
-    const sparse_move_api api = llama_kv_iswa_sparse_move_api(sources.front());
+    const sparse_move_api api = llama_kv_iswa_sparse_move_api(sources.front(), need_audit);
     if (api.quote == nullptr || api.commit == nullptr || api.free == nullptr) {
         return result;
     }
@@ -129,6 +137,7 @@ backend_move_quote llama_kv_iswa_quote_move(
         return result;
     }
     result.commit = api.commit;
+    result.audit = api.audit;
     result.value = std::shared_ptr<void>(raw, api.free);
     return result;
 }
@@ -162,11 +171,73 @@ llama_kv_iswa_resident_status llama_kv_iswa_backend_status(int status, sparse_mo
     return llama_kv_iswa_resident_status::backend_error;
 }
 
+struct resident_move_audit_snapshot {
+    int status = GGML_DSV4_SPARSE_UNSUPPORTED;
+    size_t n_pools = 0;
+    std::array<ggml_dsv4_sparse_move_audit_pool, GGML_DSV4_SPARSE_MOVE_AUDIT_MAX_POOLS> pools = {};
+};
+
+resident_move_audit_snapshot llama_kv_iswa_capture_move_audit(
+        const backend_move_quote & backend,
+        int committed) {
+    resident_move_audit_snapshot result;
+    if (!backend.audit || !backend.value) {
+        return result;
+    }
+    ggml_dsv4_sparse_move_audit audit = {};
+    try {
+        result.status = backend.audit(backend.value.get(), committed, &audit);
+    } catch (...) {
+        result.status = GGML_DSV4_SPARSE_UNSUPPORTED;
+        return result;
+    }
+    if (result.status != GGML_DSV4_SPARSE_OK ||
+            audit.n_pools > GGML_DSV4_SPARSE_MOVE_AUDIT_MAX_POOLS) {
+        result.n_pools = 0;
+        return result;
+    }
+    result.n_pools = audit.n_pools;
+    std::copy(audit.pools, audit.pools + audit.n_pools, result.pools.begin());
+    return result;
+}
+
+void llama_kv_iswa_publish_move_audit(
+        const resident_move_audit_snapshot & before,
+        const resident_move_audit_snapshot & after,
+        llama_kv_iswa_resident_release_audit * result) {
+    if (result == nullptr) {
+        return;
+    }
+    result->before_status = before.status;
+    result->after_status  = after.status;
+    result->pools.clear();
+    result->observed = false;
+    if (before.status != GGML_DSV4_SPARSE_OK || after.status != GGML_DSV4_SPARSE_OK) {
+        return;
+    }
+    result->pools.reserve(GGML_DSV4_SPARSE_MOVE_AUDIT_MAX_POOLS);
+    for (size_t i = 0; i < before.n_pools; ++i) {
+        const auto & before_pool = before.pools[i];
+        const auto it = std::find_if(after.pools.begin(), after.pools.begin() + after.n_pools,
+                                     [&](const auto & pool) { return pool.pool_id == before_pool.pool_id; });
+        if (it == after.pools.begin() + after.n_pools) {
+            result->pools.clear();
+            return;
+        }
+        result->pools.push_back({ before_pool, *it });
+    }
+    if (result->pools.size() != after.n_pools) {
+        result->pools.clear();
+        return;
+    }
+    result->observed = true;
+}
+
 } // namespace
 
 void llama_kv_iswa_set_resident_backend_override_for_test(
         llama_kv_iswa_resident_backend_override backend) {
-    sparse_move_test_override = { backend.quote, backend.commit, backend.free };
+    sparse_move_test_override = { backend.quote, backend.commit, backend.free, backend.audit };
 }
 
 void llama_kv_iswa_fail_next_resident_allocation_for_test() {
@@ -937,8 +1008,14 @@ llama_kv_iswa_resident_status llama_kv_cache_iswa::attach_resident(
     return commit_resident_attach_final(quote, llama_kv_iswa_resident_final_step::confirmed);
 }
 
-llama_kv_iswa_resident_status llama_kv_cache_iswa::release_resident(llama_kv_iswa_resident_handle handle) {
+llama_kv_iswa_resident_status llama_kv_cache_iswa::release_resident(
+        llama_kv_iswa_resident_handle handle,
+        llama_kv_iswa_resident_release_audit * audit) {
     try {
+        if (audit != nullptr) {
+            *audit = {};
+            audit->pools.reserve(GGML_DSV4_SPARSE_MOVE_AUDIT_MAX_POOLS);
+        }
         [[maybe_unused]] auto resident_scope = lock_resident();
         if (!resident || handle.pool_id != resident->identity->id || handle.id == 0) {
             return llama_kv_iswa_resident_status::stale_handle;
@@ -951,14 +1028,20 @@ llama_kv_iswa_resident_status llama_kv_cache_iswa::release_resident(llama_kv_isw
         std::vector<ggml_tensor *> sources;
         kv_base->resident_append_views(it->second.slot, true, sources);
         kv_swa->resident_append_views(it->second.slot, true, sources);
-        auto backend = llama_kv_iswa_quote_move(sources, nullptr);
+        auto backend = llama_kv_iswa_quote_move(sources, nullptr, audit != nullptr);
         if (!backend.value) {
             return llama_kv_iswa_backend_status(backend.status, sparse_move_phase::release_quote);
+        }
+        const auto before_audit = llama_kv_iswa_capture_move_audit(backend, 0);
+        if (audit != nullptr) {
+            audit->before_status = before_audit.status;
         }
         const int backend_status = backend.commit(backend.value.get());
         if (backend_status != GGML_DSV4_SPARSE_OK) {
             return llama_kv_iswa_backend_status(backend_status, sparse_move_phase::release_commit);
         }
+        const auto after_audit = llama_kv_iswa_capture_move_audit(backend, 1);
+        llama_kv_iswa_publish_move_audit(before_audit, after_audit, audit);
 
         const uint32_t slot   = it->second.slot;
         resident->slots[slot] = false;

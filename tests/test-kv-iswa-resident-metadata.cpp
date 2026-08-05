@@ -123,6 +123,13 @@ int quote_status = GGML_DSV4_SPARSE_OK;
 int commit_status = GGML_DSV4_SPARSE_OK;
 int live_quotes = 0;
 int commit_calls = 0;
+int quote_calls = 0;
+int audit_calls = 0;
+void * last_quote = nullptr;
+void * first_audit_quote = nullptr;
+std::vector<int> audit_committed;
+std::vector<ggml_dsv4_sparse_move_audit_pool> audit_before_pools;
+std::vector<ggml_dsv4_sparse_move_audit_pool> audit_after_pools;
 
 int fake_quote(
         ggml_tensor * const * sources,
@@ -147,6 +154,8 @@ int fake_quote(
     }
     *quote = move.release();
     ++live_quotes;
+    ++quote_calls;
+    last_quote = *quote;
     return GGML_DSV4_SPARSE_OK;
 }
 
@@ -172,16 +181,42 @@ void fake_free(void * raw) {
     --live_quotes;
 }
 
+int fake_audit(void * raw, int committed, ggml_dsv4_sparse_move_audit * audit) {
+    assert(raw != nullptr);
+    assert(audit != nullptr);
+    ++audit_calls;
+    if (first_audit_quote == nullptr) {
+        first_audit_quote = raw;
+    }
+    audit_committed.push_back(committed);
+    const auto & pools = committed ? audit_after_pools : audit_before_pools;
+    if (pools.size() > GGML_DSV4_SPARSE_MOVE_AUDIT_MAX_POOLS) {
+        return GGML_DSV4_SPARSE_INVALID;
+    }
+    *audit = {};
+    audit->n_pools = pools.size();
+    std::copy(pools.begin(), pools.end(), audit->pools);
+    return GGML_DSV4_SPARSE_OK;
+}
+
 static_assert(std::is_same_v<decltype(&fake_quote), ggml_dsv4_sparse_move_quote_fn>);
 static_assert(std::is_same_v<decltype(&fake_commit), ggml_dsv4_sparse_move_commit_fn>);
 static_assert(std::is_same_v<decltype(&fake_free), ggml_dsv4_sparse_move_free_fn>);
+static_assert(std::is_same_v<decltype(&fake_audit), ggml_dsv4_sparse_move_audit_fn>);
 
 struct backend_scope {
     backend_scope() {
         quote_status = GGML_DSV4_SPARSE_OK;
         commit_status = GGML_DSV4_SPARSE_OK;
         commit_calls = 0;
-        llama_kv_iswa_set_resident_backend_override_for_test({ fake_quote, fake_commit, fake_free });
+        quote_calls = 0;
+        audit_calls = 0;
+        last_quote = nullptr;
+        first_audit_quote = nullptr;
+        audit_committed.clear();
+        audit_before_pools.clear();
+        audit_after_pools.clear();
+        llama_kv_iswa_set_resident_backend_override_for_test({ fake_quote, fake_commit, fake_free, fake_audit });
     }
 
     ~backend_scope() {
@@ -891,6 +926,117 @@ void test_backend_status_mapping_by_transaction_phase() {
     }
 }
 
+bool resident_release_audit_shape_ok(const llama_kv_iswa_resident_release_audit & audit) {
+    if (!audit.observed || audit.before_status != GGML_DSV4_SPARSE_OK ||
+            audit.after_status != GGML_DSV4_SPARSE_OK || audit.pools.empty()) {
+        return false;
+    }
+    for (const auto & pool : audit.pools) {
+        const auto & before = pool.before;
+        const auto & after  = pool.after;
+        if (before.pool_id == 0 || before.pool_id != after.pool_id ||
+                before.destination_page_count != 0 || after.destination_page_count != 0 ||
+                before.mapping_operation_count != 0 ||
+                after.mapping_operation_count != after.mapped_source_count ||
+                before.virtual_move_count < before.mapped_source_count ||
+                after.virtual_move_count != before.virtual_move_count ||
+                after.source_virtual_hash != before.source_virtual_hash ||
+                after.source_physical_hash != before.source_physical_hash ||
+                after.source_refcount_hash != before.source_refcount_hash ||
+                after.survivor_mapping_hash != before.survivor_mapping_hash ||
+                before.source_released_physical_count > before.source_unique_physical_count ||
+                before.mapped_mappings < after.mapped_mappings ||
+                before.mapped_mappings - after.mapped_mappings != after.mapped_source_count ||
+                before.refcount_sum < after.refcount_sum ||
+                before.refcount_sum - after.refcount_sum != after.mapped_source_count ||
+                after.free_pages < before.free_pages ||
+                after.free_pages - before.free_pages != after.source_released_physical_count ||
+                before.unique_physical_pages < after.unique_physical_pages ||
+                before.unique_physical_pages - after.unique_physical_pages !=
+                    after.source_released_physical_count ||
+                (after.mapping_operation_count != 0 && after.generation <= before.generation)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+llama_kv_iswa_resident_release_pool_audit make_release_audit_pool(
+        uint64_t pool_id,
+        bool shared,
+        bool zero_mapped) {
+    llama_kv_iswa_resident_release_pool_audit result;
+    auto & before = result.before;
+    before.pool_id = pool_id;
+    before.generation = 10 + pool_id;
+    before.virtual_move_count = zero_mapped ? 4 : 5;
+    before.mapped_source_count = zero_mapped ? 0 : (shared ? 3 : 2);
+    before.source_unique_physical_count = zero_mapped ? 0 : (shared ? 2 : 2);
+    before.source_released_physical_count = zero_mapped ? 0 : (shared ? 1 : 2);
+    before.source_refcount_sum = zero_mapped ? 0 : (shared ? 4 : 2);
+    before.source_virtual_hash = 0x101 + pool_id;
+    before.source_physical_hash = 0x202 + pool_id;
+    before.source_refcount_hash = 0x303 + pool_id;
+    before.survivor_mapping_hash = 0x404 + pool_id;
+    before.free_pages = 20 + pool_id;
+    before.mapped_mappings = 30 + pool_id;
+    before.unique_physical_pages = 8 + pool_id;
+    before.shared_physical_pages = shared ? 2 : 0;
+    before.shared_mappings = shared ? 5 : 0;
+    before.refcount_sum = before.mapped_mappings;
+    before.refcount_max = shared ? 3 : 1;
+
+    result.after = before;
+    result.after.generation += before.mapped_source_count == 0 ? 0 : 1;
+    result.after.mapping_operation_count = before.mapped_source_count;
+    result.after.free_pages += before.source_released_physical_count;
+    result.after.mapped_mappings -= before.mapped_source_count;
+    result.after.unique_physical_pages -= before.source_released_physical_count;
+    result.after.refcount_sum -= before.mapped_source_count;
+    return result;
+}
+
+void test_release_audit_adversarial_cases() {
+    backend_scope backend;
+    struct audit_case {
+        std::vector<llama_kv_iswa_resident_release_pool_audit> pools;
+        bool valid;
+    };
+    std::vector<audit_case> cases;
+    cases.push_back({ { make_release_audit_pool(17, true, false) }, true }); // shared/COW source pages
+    cases.push_back({ { make_release_audit_pool(19, false, true) }, true }); // all source pages unmapped
+    cases.push_back({ { make_release_audit_pool(23, true, false),
+                        make_release_audit_pool(29, false, true) }, true }); // independent pools
+    auto adversarial = make_release_audit_pool(31, false, false);
+    adversarial.after.destination_page_count = 1;
+    cases.push_back({ { adversarial }, false }); // destination mapping must never be present on release
+
+    for (const auto & test_case : cases) {
+        cache_fixture f;
+        f.put_metadata(0, 0, 0, 5);
+        const auto handle = park_sequence(f);
+        audit_before_pools.clear();
+        audit_after_pools.clear();
+        for (const auto & pool : test_case.pools) {
+            audit_before_pools.push_back(pool.before);
+            audit_after_pools.push_back(pool.after);
+        }
+        quote_calls = 0;
+        audit_calls = 0;
+        first_audit_quote = nullptr;
+        audit_committed.clear();
+        llama_kv_iswa_resident_release_audit audit;
+        const auto status = f.cache.release_resident(handle, &audit);
+        assert(status == llama_kv_iswa_resident_status::ok);
+        assert(quote_calls == 1); // release prepares exactly one move quote
+        assert(audit_calls == 2);
+        assert(first_audit_quote == last_quote); // both snapshots inspect that quote
+        assert(audit_committed == std::vector<int>({ 0, 1 }));
+        assert(audit.pools.size() == test_case.pools.size());
+        assert(resident_release_audit_shape_ok(audit) == test_case.valid);
+    }
+}
+
 void test_cross_pool_handle_rejected() {
     backend_scope backend;
     cache_fixture a;
@@ -925,6 +1071,7 @@ int main() {
     test_backend_failures_are_atomic_and_retryable();
     test_prepared_attach_final_step_contract();
     test_backend_status_mapping_by_transaction_phase();
+    test_release_audit_adversarial_cases();
     test_cross_pool_handle_rejected();
     test_disabled_path_does_not_offer_residency();
     assert(std::strcmp(llama_kv_iswa_resident_status_name(

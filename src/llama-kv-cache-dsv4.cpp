@@ -2621,7 +2621,8 @@ llama_dsv4_resident_status llama_dsv4_composite_resident::attach(
 }
 
 llama_dsv4_resident_status llama_dsv4_composite_resident::release(
-        llama_dsv4_resident_handle resident) {
+        llama_dsv4_resident_handle resident,
+        llama_kv_iswa_resident_release_audit * audit) {
     std::lock_guard<std::recursive_mutex> lock(pimpl->mutex);
     if (resident.cache_id != pimpl->identity->id || resident.id == 0) {
         return llama_dsv4_resident_status::stale_handle;
@@ -2649,7 +2650,7 @@ llama_dsv4_resident_status llama_dsv4_composite_resident::release(
     };
     llama_kv_iswa_resident_status raw;
     try {
-        raw = pimpl->raw.release_resident(record->second.raw);
+        raw = pimpl->raw.release_resident(record->second.raw, audit);
     } catch (const std::bad_alloc &) {
         rollback();
         return llama_dsv4_resident_status::resource_exhausted;
@@ -3794,8 +3795,9 @@ llama_dsv4_resident_status llama_kv_cache_dsv4::attach_resident(
 }
 
 llama_dsv4_resident_status llama_kv_cache_dsv4::release_resident(
-        llama_dsv4_resident_handle resident) {
-    return composite_resident ? composite_resident->release(resident) :
+        llama_dsv4_resident_handle resident,
+        llama_kv_iswa_resident_release_audit * audit) {
+    return composite_resident ? composite_resident->release(resident, audit) :
                                 llama_dsv4_resident_status::unsupported_components;
 }
 

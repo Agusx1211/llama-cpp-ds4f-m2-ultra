@@ -1398,6 +1398,130 @@ void expect_sparse_counters_monotonic(const llama_dsv4_memory_usage_snapshot & b
     check(before.sparse_total, after.sparse_total);
 }
 
+void print_raw_release_audit(
+        uint32_t boundary,
+        const llama_kv_iswa_resident_release_audit & audit) {
+    for (const auto & pool : audit.pools) {
+        const auto & before = pool.before;
+        const auto & after  = pool.after;
+        std::fprintf(stderr,
+                     "resident-model diagnostic sparse-release-audit boundary=%u pool=%llu "
+                     "generation=%llu->%llu virtual_moves=%llu mapped_sources=%llu "
+                     "source_unique=%llu source_released=%llu source_refsum=%llu "
+                     "destination_pages=%llu mapping_operations=%llu "
+                     "source_virtual_hash=%016llx source_physical_hash=%016llx "
+                     "source_refcount_hash=%016llx survivor_hash=%016llx "
+                     "free=%llu->%llu mapped=%llu->%llu unique=%llu->%llu "
+                     "refsum=%llu->%llu refmax=%u->%u\n",
+                     boundary, (unsigned long long) before.pool_id,
+                     (unsigned long long) before.generation, (unsigned long long) after.generation,
+                     (unsigned long long) before.virtual_move_count,
+                     (unsigned long long) after.mapped_source_count,
+                     (unsigned long long) after.source_unique_physical_count,
+                     (unsigned long long) after.source_released_physical_count,
+                     (unsigned long long) after.source_refcount_sum,
+                     (unsigned long long) after.destination_page_count,
+                     (unsigned long long) after.mapping_operation_count,
+                     (unsigned long long) after.source_virtual_hash,
+                     (unsigned long long) after.source_physical_hash,
+                     (unsigned long long) after.source_refcount_hash,
+                     (unsigned long long) after.survivor_mapping_hash,
+                     (unsigned long long) before.free_pages, (unsigned long long) after.free_pages,
+                     (unsigned long long) before.mapped_mappings, (unsigned long long) after.mapped_mappings,
+                     (unsigned long long) before.unique_physical_pages,
+                     (unsigned long long) after.unique_physical_pages,
+                     (unsigned long long) before.refcount_sum, (unsigned long long) after.refcount_sum,
+                     before.refcount_max, after.refcount_max);
+    }
+}
+
+void expect_raw_release_audit(
+        const llama_dsv4_memory_usage_snapshot & before,
+        const llama_dsv4_memory_usage_snapshot & after,
+        const llama_kv_iswa_resident_release_audit & audit,
+        const char * phase,
+        uint32_t boundary) {
+    expect(audit.observed && audit.before_status == GGML_DSV4_SPARSE_OK &&
+               audit.after_status == GGML_DSV4_SPARSE_OK,
+           std::string(phase) + " raw sparse release audit was not observed");
+    const auto & raw_before = before.families[LLAMA_DSV4_MEMORY_RAW];
+    const auto & raw_after  = after.families[LLAMA_DSV4_MEMORY_RAW];
+    expect(raw_before.pools.size() == raw_after.pools.size() &&
+               raw_before.pools.size() == audit.pools.size(),
+           std::string(phase) + " raw sparse release pool count changed");
+    for (const auto & pool : audit.pools) {
+        const auto before_it = std::find_if(raw_before.pools.begin(), raw_before.pools.end(),
+                                            [&](const auto & candidate) {
+                                                return (uint64_t) candidate.pool_id == pool.before.pool_id;
+                                            });
+        const auto after_it = std::find_if(raw_after.pools.begin(), raw_after.pools.end(),
+                                           [&](const auto & candidate) {
+                                               return (uint64_t) candidate.pool_id == pool.after.pool_id;
+                                           });
+        expect(before_it != raw_before.pools.end() && after_it != raw_after.pools.end(),
+               std::string(phase) + " raw sparse release audit referenced an unknown pool");
+        const auto & audit_before = pool.before;
+        const auto & audit_after  = pool.after;
+        expect(audit_before.pool_id == audit_after.pool_id &&
+                   audit_before.destination_page_count == 0 && audit_after.destination_page_count == 0 &&
+                   audit_before.mapping_operation_count == 0 &&
+                   audit_after.mapping_operation_count == audit_after.mapped_source_count &&
+                   audit_before.virtual_move_count >= audit_before.mapped_source_count &&
+                   audit_after.virtual_move_count == audit_before.virtual_move_count,
+               std::string(phase) + " raw sparse release move shape was invalid");
+        expect(audit_before.source_virtual_hash == audit_after.source_virtual_hash &&
+                   audit_before.source_physical_hash == audit_after.source_physical_hash &&
+                   audit_before.source_refcount_hash == audit_after.source_refcount_hash &&
+                   audit_before.survivor_mapping_hash == audit_after.survivor_mapping_hash,
+               std::string(phase) + " raw sparse release source/survivor set changed");
+        expect(audit_before.free_pages == before_it->free_pages &&
+                   audit_before.mapped_mappings == before_it->mapped_mappings &&
+                   audit_before.unique_physical_pages == before_it->unique_physical_pages &&
+                   audit_before.shared_physical_pages == before_it->shared_physical_pages &&
+                   audit_before.shared_mappings == before_it->shared_mappings &&
+                   audit_before.refcount_sum == before_it->refcount_sum &&
+                   audit_before.refcount_max == before_it->refcount_max &&
+                   audit_before.generation == before_it->generation,
+               std::string(phase) + " raw sparse release pre-snapshot disagrees with usage");
+        expect(audit_after.free_pages == after_it->free_pages &&
+                   audit_after.mapped_mappings == after_it->mapped_mappings &&
+                   audit_after.unique_physical_pages == after_it->unique_physical_pages &&
+                   audit_after.shared_physical_pages == after_it->shared_physical_pages &&
+                   audit_after.shared_mappings == after_it->shared_mappings &&
+                   audit_after.refcount_sum == after_it->refcount_sum &&
+                   audit_after.refcount_max == after_it->refcount_max &&
+                   audit_after.generation == after_it->generation,
+               std::string(phase) + " raw sparse release post-snapshot disagrees with usage");
+        expect(before_it->mapped_mappings >= after_it->mapped_mappings &&
+                   before_it->mapped_mappings - after_it->mapped_mappings == audit_after.mapped_source_count &&
+                   before_it->refcount_sum >= after_it->refcount_sum &&
+                   before_it->refcount_sum - after_it->refcount_sum == audit_after.mapped_source_count &&
+                   after_it->free_pages >= before_it->free_pages &&
+                   after_it->free_pages - before_it->free_pages == audit_after.source_released_physical_count &&
+                   before_it->unique_physical_pages >= after_it->unique_physical_pages &&
+                   before_it->unique_physical_pages - after_it->unique_physical_pages ==
+                       audit_after.source_released_physical_count,
+               std::string(phase) + " raw sparse release physical/refcount delta was invalid");
+        if (audit_after.mapping_operation_count != 0) {
+            expect(audit_after.generation > audit_before.generation,
+                   std::string(phase) + " raw sparse release generation did not advance");
+        }
+    }
+    // The raw quote is the only backend audit source. Compressed CSA/HCA/LID
+    // pools must never appear in this release's source set; their component
+    // ownership is committed later by the coordinator.
+    for (size_t family = LLAMA_DSV4_MEMORY_CSA; family < LLAMA_DSV4_MEMORY_FAMILY_COUNT; ++family) {
+        for (const auto & pool : before.families[family].pools) {
+            expect(std::none_of(audit.pools.begin(), audit.pools.end(),
+                                [&](const auto & audit_pool) {
+                                    return (uint64_t) pool.pool_id == audit_pool.before.pool_id;
+                                }),
+                   std::string(phase) + " raw release audit included a compressed pool");
+        }
+    }
+    (void) boundary;
+}
+
 uint32_t logical_row_ratio(llama_dsv4_memory_family family) {
     switch (family) {
         case LLAMA_DSV4_MEMORY_RAW:
@@ -2012,7 +2136,8 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary, bool
     if (diagnostic_trace) {
         print_sparse_snapshot(boundary, "candidate-before-release", memory_after_second_detach);
     }
-    const auto release_status = memory->release_resident(second_detached.resident);
+    llama_kv_iswa_resident_release_audit raw_release_audit;
+    const auto release_status = memory->release_resident(second_detached.resident, &raw_release_audit);
     if (release_status == llama_dsv4_resident_status::ok) {
         cleanup.disarm();
     }
@@ -2052,6 +2177,11 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary, bool
     expect_resident_usage(resident_after_release, 0, 0, "released", boundary);
     expect_rs_idx("released");
     const auto memory_after_release = memory->memory_usage_snapshot();
+    expect_raw_release_audit(memory_after_second_detach, memory_after_release, raw_release_audit,
+                             "released", boundary);
+    if (diagnostic_trace) {
+        print_raw_release_audit(boundary, raw_release_audit);
+    }
     const auto comp_after_release   = memory->get_comp_pool()->memory_usage_snapshot();
     expect(comp_after_release.handles + 1 == comp_after_second_detach.handles &&
                comp_after_release.bindings == comp_after_second_detach.bindings &&

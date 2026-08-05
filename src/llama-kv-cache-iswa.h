@@ -30,6 +30,22 @@ enum class llama_kv_iswa_resident_status : uint8_t {
 
 const char * llama_kv_iswa_resident_status_name(llama_kv_iswa_resident_status status);
 
+// Test-only release audit. The raw resident release fills this from the
+// exact sparse move quote that it prepares and then commits; callers never
+// re-quote the resident handle. The before/after records retain the backend's
+// stable source hashes and physical accounting counters for assertions.
+struct llama_kv_iswa_resident_release_pool_audit {
+    ggml_dsv4_sparse_move_audit_pool before = {};
+    ggml_dsv4_sparse_move_audit_pool after  = {};
+};
+
+struct llama_kv_iswa_resident_release_audit {
+    bool observed = false;
+    int before_status = GGML_DSV4_SPARSE_UNSUPPORTED;
+    int after_status  = GGML_DSV4_SPARSE_UNSUPPORTED;
+    std::vector<llama_kv_iswa_resident_release_pool_audit> pools;
+};
+
 // Host-test seam for the execution-independent ownership protocol. Production
 // leaves this unset and resolves the backend procedures from the tensor's
 // device registry. The override is thread-local and affects resident calls
@@ -38,6 +54,7 @@ struct llama_kv_iswa_resident_backend_override {
     ggml_dsv4_sparse_move_quote_fn  quote  = nullptr;
     ggml_dsv4_sparse_move_commit_fn commit = nullptr;
     ggml_dsv4_sparse_move_free_fn   free   = nullptr;
+    ggml_dsv4_sparse_move_audit_fn  audit  = nullptr;
 };
 
 void llama_kv_iswa_set_resident_backend_override_for_test(
@@ -242,7 +259,9 @@ public:
     // the explicit prepared/final-step API above.
     llama_kv_iswa_resident_status attach_resident(llama_kv_iswa_resident_handle resident,
                                                   llama_seq_id execution_id);
-    llama_kv_iswa_resident_status release_resident(llama_kv_iswa_resident_handle resident);
+    llama_kv_iswa_resident_status release_resident(
+            llama_kv_iswa_resident_handle resident,
+            llama_kv_iswa_resident_release_audit * audit = nullptr);
 
     // Used by generic ISWA and DSV4 raw graph contexts. The opaque lease keeps
     // residency fail-closed from preparation through graph completion or
