@@ -309,6 +309,19 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-snapshot-worker.cpp)
     target_include_directories(test-snapshot-worker PRIVATE
         ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-server-capture-store.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-capture.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-capture-store.cpp)
+    target_include_directories(test-server-capture-store PRIVATE
+        ${PROJECT_SOURCE_DIR}/tools/server)
+    option(LLAMA_CAPTURE_STORE_TSAN_TEST "llama: run the capture-store lifecycle suite under ThreadSanitizer" OFF)
+    if (LLAMA_CAPTURE_STORE_TSAN_TEST)
+        add_test(
+            NAME test-server-capture-store-tsan
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run-server-capture-store-tsan.sh)
+        set_tests_properties(test-server-capture-store-tsan PROPERTIES LABELS sanitizer)
+    endif()
     llama_build_and_test(test-snapshot-metal-staging.cpp)
     target_include_directories(test-snapshot-metal-staging PRIVATE
         ${PROJECT_SOURCE_DIR}/src)
