@@ -1469,9 +1469,8 @@ private:
                 SRV_ERR("%s", "LLAMA_DSV4_ADMISSION_VERTICAL requires target Metal sparse DSV4 unified storage\n");
                 return false;
             }
-            // Prompt cache is allowed with elastic vertical (restored prefix +
-            // arm-time-committed pages). Do not force cache_prompt=false here.
-            SRV_INF("%s", "enabled exact DSV4 admission vertical: slots=2, cache_prompt=allowed, ctx_shift=false\n");
+            params_base.cache_prompt = false;
+            SRV_INF("%s", "enabled exact DSV4 admission vertical: slots=2, cache_prompt=false, ctx_shift=false\n");
         }
 
         slots.clear();
@@ -2013,11 +2012,10 @@ private:
                 return result;
             }
 
-            // Clear idle logical residue so the range-native admission planner
-            // sees a clean slot (required for the quote). The cached prefix is
-            // restored AFTER the arm-time commit (in launch_slots_*), so it
-            // writes to committed pages.
+            // This vertical deliberately admits full, uncached prompts. Clear
+            // any idle logical residue before asking the range-native planner.
             slot.prompt_clear();
+            task.params.cache_prompt = false;
 
             const auto plan = server_dsv4_plan_admission(
                     task.tokens.size(), task.params.n_predict, params_base.n_predict,
@@ -2774,15 +2772,6 @@ private:
             parent_slot.kv_admission = std::move(admission.ticket);
         }
 
-        // Elastic + cache: restore the cached prefix into the now-committed pages.
-        if (prompt_cache) {
-            for (auto * s : family_slots) {
-                if (s->task) {
-                    s->prompt_load(*prompt_cache, s->task->tokens);
-                }
-            }
-        }
-
         return true;
     }
 
@@ -2804,12 +2793,6 @@ private:
             }
             slot.kv_admission = std::move(admission.ticket);
         }
-
-        // Elastic + cache: restore the cached prefix into the now-committed pages.
-        if (prompt_cache && slot.task) {
-            slot.prompt_load(*prompt_cache, slot.task->tokens);
-        }
-
         return true;
     }
 
