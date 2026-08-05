@@ -805,13 +805,14 @@ std::vector<row_input> make_prompt_rows(const model_plan & plan,
 
 void prompt_batch_geometry_self_test() {
     constexpr uint32_t boundary = 3;
-    const auto make_unsorted_rows = [boundary](llama_seq_id source_sequence, llama_seq_id survivor_sequence) {
+    const auto make_unsorted_rows = [](llama_seq_id source_sequence, llama_seq_id survivor_sequence) {
+        constexpr uint32_t self_test_boundary = 3;
         std::vector<row_input> rows;
-        for (uint32_t position = 0; position <= boundary; ++position) {
-            rows.push_back({ 0, source_sequence, (llama_pos) position, 0, position == boundary });
+        for (uint32_t position = 0; position <= self_test_boundary; ++position) {
+            rows.push_back({ 0, source_sequence, (llama_pos) position, 0, position == self_test_boundary });
         }
-        for (uint32_t position = 0; position <= boundary; ++position) {
-            rows.push_back({ 1, survivor_sequence, (llama_pos) position, 0, position == boundary });
+        for (uint32_t position = 0; position <= self_test_boundary; ++position) {
+            rows.push_back({ 1, survivor_sequence, (llama_pos) position, 0, position == self_test_boundary });
         }
         return rows;
     };
