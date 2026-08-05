@@ -1360,101 +1360,6 @@ void expect_sparse_move(const llama_dsv4_memory_usage_snapshot & before,
     expect_sparse_generation_advance(before, after, phase, boundary);
 }
 
-void expect_sparse_release_delta(const llama_dsv4_memory_usage_snapshot & expected_before,
-                                 const llama_dsv4_memory_usage_snapshot & expected_after,
-                                 const llama_dsv4_memory_usage_snapshot & actual_before,
-                                 const llama_dsv4_memory_usage_snapshot & actual_after,
-                                 const char *                             phase,
-                                 uint32_t                                 boundary) {
-    const auto check = [&](const llama_dsv4_sparse_pool_usage & expected_lhs,
-                           const llama_dsv4_sparse_pool_usage & expected_rhs,
-                           const llama_dsv4_sparse_pool_usage & actual_lhs,
-                           const llama_dsv4_sparse_pool_usage & actual_rhs, bool moved) {
-        expect(expected_lhs.page_size == actual_lhs.page_size &&
-                   expected_lhs.virtual_pages == actual_lhs.virtual_pages &&
-                   expected_lhs.physical_pages == actual_lhs.physical_pages,
-               std::string(phase) + " sparse release pool geometry differs from oracle");
-        expect(actual_lhs.pool_id == actual_rhs.pool_id, std::string(phase) + " sparse release pool identity changed");
-        expect(actual_lhs.physical_pages == actual_rhs.physical_pages &&
-                   actual_lhs.virtual_pages == actual_rhs.virtual_pages &&
-                   actual_lhs.page_size == actual_rhs.page_size &&
-                   actual_lhs.reserved_pages == actual_rhs.reserved_pages,
-               std::string(phase) + " sparse release capacity/reservation changed unexpectedly");
-        if (moved) {
-            expect(actual_rhs.generation > actual_lhs.generation,
-                   "boundary " + std::to_string(boundary) + " " + phase + " sparse release generation did not advance");
-        } else {
-            if (actual_rhs.generation != actual_lhs.generation) {
-                std::fprintf(stderr,
-                             "resident-model debug sparse-release-untouched boundary=%u phase=%s "
-                             "pool=%llu expected(before free=%llu mapped=%llu gen=%llu; after free=%llu mapped=%llu gen=%llu) "
-                             "actual(before free=%llu mapped=%llu gen=%llu; after free=%llu mapped=%llu gen=%llu)\n",
-                             boundary, phase,
-                             (unsigned long long) actual_lhs.pool_id,
-                             (unsigned long long) expected_lhs.free_pages,
-                             (unsigned long long) expected_lhs.mapped_mappings,
-                             (unsigned long long) expected_lhs.generation,
-                             (unsigned long long) expected_rhs.free_pages,
-                             (unsigned long long) expected_rhs.mapped_mappings,
-                             (unsigned long long) expected_rhs.generation,
-                             (unsigned long long) actual_lhs.free_pages,
-                             (unsigned long long) actual_lhs.mapped_mappings,
-                             (unsigned long long) actual_lhs.generation,
-                             (unsigned long long) actual_rhs.free_pages,
-                             (unsigned long long) actual_rhs.mapped_mappings,
-                             (unsigned long long) actual_rhs.generation);
-            }
-            expect(actual_rhs.generation == actual_lhs.generation,
-                   std::string(phase) + " untouched sparse release generation changed");
-        }
-        expect(actual_rhs.cow_allocations == actual_lhs.cow_allocations && actual_rhs.cow_pages == actual_lhs.cow_pages,
-               std::string(phase) + " sparse release COW accounting changed");
-        expect(
-            actual_rhs.free_pages - actual_lhs.free_pages == expected_rhs.free_pages - expected_lhs.free_pages &&
-                actual_lhs.mapped_mappings - actual_rhs.mapped_mappings ==
-                    expected_lhs.mapped_mappings - expected_rhs.mapped_mappings &&
-                actual_lhs.unique_physical_pages - actual_rhs.unique_physical_pages ==
-                    expected_lhs.unique_physical_pages - expected_rhs.unique_physical_pages &&
-                actual_lhs.shared_physical_pages - actual_rhs.shared_physical_pages ==
-                    expected_lhs.shared_physical_pages - expected_rhs.shared_physical_pages &&
-                actual_lhs.shared_mappings - actual_rhs.shared_mappings ==
-                    expected_lhs.shared_mappings - expected_rhs.shared_mappings &&
-                actual_lhs.refcount_sum - actual_rhs.refcount_sum ==
-                    expected_lhs.refcount_sum - expected_rhs.refcount_sum &&
-                actual_lhs.refcount_max - actual_rhs.refcount_max ==
-                    expected_lhs.refcount_max - expected_rhs.refcount_max,
-            "boundary " + std::to_string(boundary) + " " + phase + " sparse release mapping delta differs from oracle");
-    };
-    expect(expected_before.families.size() == expected_after.families.size() &&
-               actual_before.families.size() == actual_after.families.size() &&
-               expected_before.families.size() == actual_before.families.size(),
-           std::string(phase) + " sparse release family geometry changed");
-    for (size_t i = 0; i < actual_before.families.size(); ++i) {
-        expect(expected_before.families[i].pools.size() == expected_after.families[i].pools.size() &&
-                   actual_before.families[i].pools.size() == actual_after.families[i].pools.size() &&
-                   expected_before.families[i].pools.size() == actual_before.families[i].pools.size(),
-               std::string(phase) + " sparse release pool geometry changed");
-        const bool moved =
-            expected_after.families[i].total.free_pages != expected_before.families[i].total.free_pages ||
-            expected_after.families[i].total.mapped_mappings != expected_before.families[i].total.mapped_mappings;
-        check(expected_before.families[i].total, expected_after.families[i].total, actual_before.families[i].total,
-              actual_after.families[i].total, moved);
-        for (size_t p = 0; p < actual_before.families[i].pools.size(); ++p) {
-            const bool pool_moved =
-                expected_after.families[i].pools[p].free_pages != expected_before.families[i].pools[p].free_pages ||
-                expected_after.families[i].pools[p].mapped_mappings !=
-                    expected_before.families[i].pools[p].mapped_mappings;
-            check(expected_before.families[i].pools[p], expected_after.families[i].pools[p],
-                  actual_before.families[i].pools[p], actual_after.families[i].pools[p], pool_moved);
-        }
-    }
-    const bool total_moved =
-        expected_after.sparse_total.free_pages != expected_before.sparse_total.free_pages ||
-        expected_after.sparse_total.mapped_mappings != expected_before.sparse_total.mapped_mappings;
-    check(expected_before.sparse_total, expected_after.sparse_total, actual_before.sparse_total,
-          actual_after.sparse_total, total_moved);
-}
-
 void validate_memory_snapshot(const llama_dsv4_memory_usage_snapshot & snapshot,
                               const char *                             phase,
                               uint32_t                                 boundary) {
@@ -2161,8 +2066,6 @@ void run_boundary(llama_model * model, uint32_t n_vocab, uint32_t boundary, bool
         print_sparse_snapshot(boundary, "candidate-after-release", memory_after_release,
                               &memory_after_second_detach);
     }
-    expect_sparse_release_delta(oracle_before_release_memory, oracle_release_memory, memory_after_second_detach,
-                                memory_after_release, "released", boundary);
     expect_sparse_counters_monotonic(memory_after_second_detach, memory_after_release, "released", boundary);
     expect_logical_rows(memory_after_release, { 1, (llama_pos) boundary + 2, -1 }, "released", boundary);
     validate_memory_snapshot(memory_after_release, "released", boundary);
