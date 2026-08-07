@@ -151,14 +151,18 @@ void dequantize_e4m3_m2(device const block_e4m3_m2 * xb, short il, thread type4x
     const uint4 qv = *(device const uint4 *)(xb->qs + 16*il);
     const float d  = e4m3_m2_scale_to_f32(xb->sc[il/8]);
 
+    float4x4 tmp;
     FOR_UNROLL (short i = 0; i < 4; i++) {
         const uint32_t qw = qv[i];
 
-        reg[i][0] = e4m3_m2_code_to_f32((qw >>  0) & 0xFF)*d;
-        reg[i][1] = e4m3_m2_code_to_f32((qw >>  8) & 0xFF)*d;
-        reg[i][2] = e4m3_m2_code_to_f32((qw >> 16) & 0xFF)*d;
-        reg[i][3] = e4m3_m2_code_to_f32((qw >> 24)       )*d;
+        tmp[i][0] = e4m3_m2_code_to_f32((qw >>  0) & 0xFF)*d;
+        tmp[i][1] = e4m3_m2_code_to_f32((qw >>  8) & 0xFF)*d;
+        tmp[i][2] = e4m3_m2_code_to_f32((qw >> 16) & 0xFF)*d;
+        tmp[i][3] = e4m3_m2_code_to_f32((qw >> 24)       )*d;
     }
+
+    // exact for every value the converter emits (each is a bf16 value)
+    reg = (type4x4)tmp;
 }
 
 // il in [0, QK_E4M3_M2/4): which 4-element chunk of the block; used by the
@@ -168,10 +172,13 @@ void dequantize_e4m3_m2_t4(device const block_e4m3_m2 * xb, short il, thread typ
     const uint32_t qw = *(device const uint32_t *)(xb->qs + 4*il);
     const float d  = e4m3_m2_scale_to_f32(xb->sc[il/32]);
 
-    reg[0] = e4m3_m2_code_to_f32((qw >>  0) & 0xFF)*d;
-    reg[1] = e4m3_m2_code_to_f32((qw >>  8) & 0xFF)*d;
-    reg[2] = e4m3_m2_code_to_f32((qw >> 16) & 0xFF)*d;
-    reg[3] = e4m3_m2_code_to_f32((qw >> 24)       )*d;
+    float4 tmp;
+    tmp[0] = e4m3_m2_code_to_f32((qw >>  0) & 0xFF)*d;
+    tmp[1] = e4m3_m2_code_to_f32((qw >>  8) & 0xFF)*d;
+    tmp[2] = e4m3_m2_code_to_f32((qw >> 16) & 0xFF)*d;
+    tmp[3] = e4m3_m2_code_to_f32((qw >> 24)       )*d;
+
+    reg = (type4)tmp;
 }
 
 template <typename type4x4>
