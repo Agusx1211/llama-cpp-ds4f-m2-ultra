@@ -116,7 +116,13 @@ struct dispatch_result {
 };
 
 struct runtime_config {
-    static constexpr uint64_t queue_timeout_default_us  = 30ULL * 1000 * 1000;
+    // Queue waits scale with the number of elastic lanes: admissions are
+    // serialized behind the prefill owner, so a cold burst on -np 4 can
+    // legitimately hold a request for several prefills (30 s expired queued
+    // requests with 408 during 4-lane validation). Match the run timeout;
+    // stuck clients are still bounded by the run deadline and by
+    // disconnect-driven task cancellation.
+    static constexpr uint64_t queue_timeout_default_us  = 10ULL * 60 * 1000 * 1000;
     static constexpr uint64_t run_timeout_default_us    = 10ULL * 60 * 1000 * 1000;
     static constexpr size_t   fast_refill_min_members   = 3;
     static constexpr size_t   fast_refill_max_members   = 16;
