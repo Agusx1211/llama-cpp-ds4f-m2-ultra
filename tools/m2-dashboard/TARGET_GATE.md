@@ -1,5 +1,13 @@
 # M2 Ultra live-dashboard target gate
 
+> 2026-08-07 dashboard redesign note: the browser UI was rewritten to poll
+> `/slots` plus the registry snapshot instead of holding the SSE stream. This
+> gate's server-route contract, the dependency-free Python probe, and the
+> retained `lib/schema.mjs` + `lib/live.mjs` host coverage are unchanged and
+> remain the authority on admin-route behavior and observer overhead. A fresh
+> queued A/B run against the new polling cadence has not been executed; the
+> existing PASS predates the redesign and measures the SSE-based client.
+
 This gate measures the live dashboard's inference cost with one identical,
 deterministic DeepSeek V4 Flash workload. It runs four counterbalanced blocks:
 dashboard disconnected, connected, connected, disconnected. Each connected
