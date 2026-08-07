@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -56,8 +57,11 @@ static const test_shape shapes[] = {
 };
 
 // batch sizes covering every kernel path: 1 -> mul_mv (_4), 2..8 -> mul_mv_ext
-// (r1 2..5), >8 -> mul_mm
-static const int64_t batch_sizes[] = { 1, 2, 3, 5, 8, 16, 512 };
+// (the full speculative-verify range: r1_2 at 2, r1_3 at 3/6, r1_4 at 4/7/8,
+// r1_5 at 5 — every r1ptg with both full and partial last threadgroups),
+// >8 -> mul_mm (16: bounds-checked store, second B tile of the NT1=2 kernel
+// empty; 33: second B tile partial with 1 column; 512: direct store path)
+static const int64_t batch_sizes[] = { 1, 2, 3, 4, 5, 6, 7, 8, 16, 33, 512 };
 
 static std::mt19937 rng(1234);
 
@@ -182,26 +186,35 @@ struct bench_chain {
     int64_t k1, m1; // 0 = self-chain
 };
 
-static int run_bench_dense(ggml_backend_t gpu) {
+static int run_bench_dense(ggml_backend_t gpu, int64_t nb_filter, const char * chain_filter) {
     const bench_chain chains[] = {
         { "attn 4096<->8192 (output_b pair)", 4096, 8192, 8192, 4096 },
         { "shexp 4096<->2048 (gate/down)",    4096, 2048, 2048, 4096 },
         { "attn_q_b 1024->32768 (self)",      1024, 32768, 0, 0 },
     };
-    const int64_t batches[] = { 1, 4, 512 };
+    const int64_t batches[] = { 1, 2, 4, 8, 512, 2048 };
     const ggml_type types[2] = { GGML_TYPE_BF16, GGML_TYPE_E4M3_M2 };
 
     const int WARMUP = 3;
     const int REPS   = 10;
 
     for (const bench_chain & c : chains) {
+        if (chain_filter != nullptr && strstr(c.name, chain_filter) == nullptr) {
+            continue;
+        }
         // enough distinct weight copies to exceed the SLC by a wide margin
         // (BF16 bytes of one (k0,m0) matrix; target ~1 GiB per type)
         const int64_t w_bytes = c.k0*c.m0*2;
         const int NCOPY = (int)std::min<int64_t>(16, std::max<int64_t>(4, (1ll << 30)/std::max<int64_t>(1, (c.k1 ? 2 : 1)*w_bytes)));
 
         for (const int64_t nb : batches) {
-            const int NREP = nb > 8 ? 8 : 64; // node count (pairs count double)
+            if (nb_filter > 0 && nb != nb_filter) {
+                continue;
+            }
+
+            // node count (pairs count double); n=2048 halves it to keep the
+            // activation working set inside the <=4 GiB allocation budget
+            const int NREP = nb >= 2048 ? 4 : nb > 8 ? 8 : 64;
 
             double t_med[2] = {0.0, 0.0};
 
@@ -312,7 +325,11 @@ int main(int argc, char ** argv) {
             return 1;
         }
         printf("GPU backend: %s\n", ggml_backend_name(gpu));
-        return run_bench_dense(gpu);
+        // optional args: batch-size filter and chain-name substring filter
+        // (fast A/B iteration)
+        const int64_t nb_filter    = argc > 2 ? atoll(argv[2]) : 0;
+        const char *  chain_filter = argc > 3 ? argv[3] : nullptr;
+        return run_bench_dense(gpu, nb_filter, chain_filter);
     }
 
     ok = test_decode_bf16_exact() && ok;

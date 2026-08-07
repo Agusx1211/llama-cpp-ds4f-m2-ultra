@@ -6,6 +6,7 @@
 
 #include <cassert>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -786,6 +787,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
         ggml_metal_cv_free(cv);
     }
 
+    // fork: the dedicated E4M3_M2 ext kernel stages its 256-entry decode LUT
+    // in threadgroup memory (the generic template kernels take no threadgroup
+    // buffer; smem stays 0 for them)
+    if (tsrc0 == GGML_TYPE_E4M3_M2) {
+        res.smem = 256*sizeof(float);
+    }
+
     return res;
 }
 
@@ -803,7 +811,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
 
-    const bool bc_out = has_tensor
+    // fork: the dedicated E4M3_M2 GEMM processes NT1 32-column B tiles per
+    // threadgroup against one staged+decoded A tile (amortizes the e4m3
+    // decode and the A refetch across 32*NT1 columns instead of 32).
+    // GGML_E4M3_MM_NT1=1 selects the single-tile variant for A/B runs.
+    int e4m3_nt1 = 2;
+    if (tsrc0 == GGML_TYPE_E4M3_M2 && getenv("GGML_E4M3_MM_NT1") != NULL) {
+        // NT1=4 was measured DEAD (mc[32] register collapse, 6.4-8.4x) and
+        // its instantiations were removed — only 1 and 2 exist
+        e4m3_nt1 = atoi(getenv("GGML_E4M3_MM_NT1")) == 1 ? 1 : 2;
+    }
+    if (tsrc0 == GGML_TYPE_E4M3_M2 && getenv("GGML_E4M3_MM_TMPL") != NULL) {
+        e4m3_nt1 = 1; // the shared-template probe is a 64x32 tile
+    }
+
+    const bool bc_out = tsrc0 == GGML_TYPE_E4M3_M2
+        ? (op->ne[0] % 64  != 0 || op->ne[1] % (e4m3_nt1*32) != 0)
+        : has_tensor
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
         : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
 
@@ -813,7 +837,43 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    // decode-style A/B (attribution knobs; the DEFAULT for E4M3_M2 is
+    // "_u16c" — constant-memory u16 bf16-bits LUT + integer exponent add,
+    // the measured winner): GGML_E4M3_MM_STYLE in {tg, cl, u16, u16c}
+    const char * e4m3_style = "_u16c";
+    size_t       e4m3_lut_bytes = 0;
+    if (tsrc0 == GGML_TYPE_E4M3_M2 && getenv("GGML_E4M3_MM_STYLE") != NULL) {
+        const char * s = getenv("GGML_E4M3_MM_STYLE");
+        if (strcmp(s, "tg") == 0) {
+            e4m3_style = "";
+            e4m3_lut_bytes = 1024;
+        } else if (strcmp(s, "cl") == 0) {
+            e4m3_style = "_cl";
+        } else if (strcmp(s, "u16") == 0) {
+            e4m3_style = "_u16";
+            e4m3_lut_bytes = 512;
+        } else {
+            e4m3_style = "_u16c";
+        }
+    }
+
+    // GGML_E4M3_MM_SHARED=1: shared-sb two-tile variant (u16/u16c styles only)
+    const bool e4m3_shared = tsrc0 == GGML_TYPE_E4M3_M2 && getenv("GGML_E4M3_MM_SHARED") != NULL &&
+                             (strcmp(e4m3_style, "_u16") == 0 || strcmp(e4m3_style, "_u16c") == 0);
+    if (e4m3_shared) {
+        e4m3_nt1 = 2;
+    }
+
+    if (tsrc0 == GGML_TYPE_E4M3_M2 && getenv("GGML_E4M3_MM_TMPL") != NULL) {
+        // A/B probe: the shared-template instantiation (part-2 ship state)
+        e4m3_nt1 = 1;
+        snprintf(base, 256, "kernel_mul_mm_%s_%s_tmpl", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    } else if (tsrc0 == GGML_TYPE_E4M3_M2) {
+        snprintf(base, 256, "kernel_mul_mm_%s_%s_nt%d%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), e4m3_nt1,
+                 e4m3_shared ? "s" : "", e4m3_style);
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    }
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3);
 
@@ -833,7 +893,29 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         ggml_metal_cv_free(cv);
     }
 
-    if (has_tensor) {
+    if (tsrc0 == GGML_TYPE_E4M3_M2) {
+        // fork: dedicated kernel (always the classic simdgroup pipeline —
+        // the target M2 Ultra has no tensor API): 64 x (NT1*32) tile,
+        // sa 4096 + NT1 B tiles of 2048 + 1024-byte decode LUT; the
+        // bounds-checked output path stages 64x32 f32 = 8192 bytes over the
+        // then-dead sa/sb region.
+        res.nr0 = 64;
+        res.nr1 = e4m3_nt1*32;
+
+        if (getenv("GGML_E4M3_MM_TMPL") != NULL) {
+            res.smem = bc_out ? 8192 : (4096 + 2048); // template geometry
+        } else if (e4m3_shared) {
+            res.smem = std::max<size_t>(4096 + 2048 + e4m3_lut_bytes, bc_out ? 8192 : 0);
+        } else {
+            res.smem = std::max<size_t>(4096 + e4m3_nt1*2048 + e4m3_lut_bytes, bc_out ? 8192 : 0);
+        }
+
+        // A/B attribution knob: pad the threadgroup allocation to probe pure
+        // occupancy effects (concurrent tgs/core = 32 KiB / smem)
+        if (getenv("GGML_E4M3_MM_SMEM_PAD") != NULL) {
+            res.smem += (size_t) atoi(getenv("GGML_E4M3_MM_SMEM_PAD"));
+        }
+    } else if (has_tensor) {
         res.nr0 = NRA;
         res.nr1 = NRB;
 
@@ -902,6 +984,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                          // activation load across 4 rows. Per-row accumulation
                          // order is NR0-independent, so bit-identity vs the
                          // BF16 kernels is preserved (verified by test-m2-e4m3).
+                // NOTE: nr0 = 8 for the short-row shapes (attn_q_b class,
+                // ne00 = 1024) was tried to amortize the per-threadgroup
+                // fixed costs behind that shape's 1.06x cell — it PASSED
+                // bit-identity (NR0-independent row order) but measured
+                // 1.31x: the longer 8-row serial loop per thread loses more
+                // than the halved fixed costs buy. The kernel keeps its
+                // case-8 dispatch for future experiments; the host stays at 4.
                 nr1 = 1;
                 smem = 32*sizeof(float)*nr0 + 256*sizeof(float);
                 suffix = "_4";
