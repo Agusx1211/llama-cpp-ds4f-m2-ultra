@@ -350,6 +350,9 @@ def main() -> int:
     parser.add_argument("--max-expert", type=int, default=0, help="convert at most N expert tensors (testing), 0 = all")
     parser.add_argument("--keep-expert-plane", action="store_true",
                         help="pass MXFP4 expert tensors through unchanged instead of repacking to MXFP4_M2")
+    parser.add_argument("--keep-dense-plane", action="store_true",
+                        help="pass BF16 dense tensors through unchanged instead of repacking to E4M3_M2 "
+                             "(experts-only artifact)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -392,7 +395,7 @@ def main() -> int:
         if is_e4m3_target(t.name):
             if t.tensor_type != GGMLQuantizationType.BF16 or len(t.shape) != 2:
                 raise RuntimeError(f"pass-list tensor {t.name} is {t.tensor_type.name}/{len(t.shape)}D, expected BF16/2D")
-            if args.max_e4m3 and n_e4m3 >= args.max_e4m3:
+            if args.keep_dense_plane or (args.max_e4m3 and n_e4m3 >= args.max_e4m3):
                 plan.append((t, "copy"))
                 continue
             n_e4m3 += 1
