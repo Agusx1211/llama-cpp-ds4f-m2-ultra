@@ -13,10 +13,15 @@
 
 // M2 Ultra has 192 GiB of unified memory. Below this declared compressed-K
 // footprint, the affine per-stream layout is intentionally preferred because
-// it avoids the placement-sparse mapping/submission cost while consuming less
-// than 5% of target memory. Larger layouts need the aggregate pool to preserve
-// high-context/high-concurrency feasibility.
-static constexpr uint64_t LLAMA_DSV4_MAX_AFFINE_COMPRESSED_BYTES = UINT64_C(8)*1024*1024*1024;
+// it avoids the placement-sparse mapping/submission cost. The declared bytes
+// are virtual on the placement-sparse pool (physical pages materialize per
+// used row), so the bound guards address-space/bookkeeping growth rather than
+// resident memory. 20 GiB covers the validated elastic-vertical envelope -
+// up to 4 unified lanes at 512k (~9.4 GiB declared) and up to 4 lanes at 1M
+// (~18.8 GiB declared); the exact admission vertical requires the affine
+// layout, so configurations beyond this bound fall back to the aggregate
+// pool and the vertical refuses to start (loudly) instead of degrading.
+static constexpr uint64_t LLAMA_DSV4_MAX_AFFINE_COMPRESSED_BYTES = UINT64_C(20)*1024*1024*1024;
 
 struct llama_dsv4_aggregate_selector {
     bool     unified                   = false;

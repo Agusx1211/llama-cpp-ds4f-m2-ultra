@@ -1474,8 +1474,9 @@ private:
         }
 
         if (SERVER_DSV4_ADMISSION_VERTICAL) {
-            if (params_base.n_parallel != 2 || !params_base.kv_unified || params_base.ctx_shift || has_mmproj) {
-                SRV_ERR("%s", "LLAMA_DSV4_ADMISSION_VERTICAL requires exactly two unified elastic-KV text slots with context shift disabled\n");
+            if (params_base.n_parallel < 2 || params_base.n_parallel > 4 ||
+                    !params_base.kv_unified || params_base.ctx_shift || has_mmproj) {
+                SRV_ERR("%s", "LLAMA_DSV4_ADMISSION_VERTICAL requires 2-4 unified elastic-KV text slots with context shift disabled\n");
                 return false;
             }
             const llama_kv_admission_span probe_span = { 0, 0, 1 };
@@ -1488,7 +1489,8 @@ private:
                 SRV_ERR("%s", "LLAMA_DSV4_ADMISSION_VERTICAL requires target Metal sparse DSV4 unified storage\n");
                 return false;
             }
-            SRV_INF("%s", "enabled exact DSV4 admission vertical: slots=2, ctx_shift=false, prompt cache allowed\n");
+            SRV_INF("enabled exact DSV4 admission vertical: slots=%d, ctx_shift=false, prompt cache allowed\n",
+                    params_base.n_parallel);
         }
 
         slots.clear();
@@ -2023,7 +2025,8 @@ private:
         if (!SERVER_DSV4_ADMISSION_VERTICAL) {
             return result;
         }
-        if (family_slots.empty() || family_slots.size() > 2 || family_slots.size() != family_tasks.size() ||
+        if (family_slots.empty() || family_slots.size() > (size_t) params_base.n_parallel ||
+                family_slots.size() != family_tasks.size() ||
                 !params_base.lora_adapters.empty()) {
             send_error(result_task, "request is outside the exact DSV4 admission geometry", ERROR_TYPE_NOT_SUPPORTED);
             result.status = admission_gate_status::rejected;
@@ -2057,7 +2060,7 @@ private:
 
             active_continuations.push_back(&slot);
         }
-        if (family_slots.size() + active_continuations.size() > 2) {
+        if (family_slots.size() + active_continuations.size() > (size_t) params_base.n_parallel) {
             result.status = admission_gate_status::deferred;
             return result;
         }
