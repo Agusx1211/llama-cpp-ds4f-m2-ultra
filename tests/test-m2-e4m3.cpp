@@ -214,16 +214,24 @@ int main(void) {
                 }
             }
 
-            // sanity vs the CPU reference (different accumulation order — NMSE)
-            const double err = nmse(out_ref, out_q);
+            // sanity vs the CPU reference (different accumulation order — NMSE).
+            // n_batch > 8 dispatches the mul_mm path, which stages the B
+            // operand (activations) as bfloat in threadgroup memory — the
+            // exact numerics of the production BF16 mul_mm today (and the
+            // BIT-EXACT check above proves E4M3_M2 inherits them precisely).
+            // The CPU reference keeps activations f32, so that path carries
+            // an inherent ~1e-6 NMSE vs the reference; the mul_mv/ext paths
+            // (n_batch <= 8) keep activations f32 and sit at ~1e-14.
+            const double err     = nmse(out_ref, out_q);
+            const double err_max = n_batch > 8 ? 1e-4 : 1e-6;
 
-            const bool pass = n_diff == 0 && err < 1e-6;
+            const bool pass = n_diff == 0 && err < err_max;
             ok = pass && ok;
 
             printf("%-32s n_batch=%-4" PRId64 " vs-bf16: %s (%zu diffs, max %g)  vs-cpu nmse: %.3g %s\n",
                    s.name, n_batch,
                    n_diff == 0 ? "BIT-EXACT" : "FAIL", n_diff, (double) max_abs,
-                   err, err < 1e-6 ? "OK" : "FAIL");
+                   err, err < err_max ? "OK" : "FAIL");
         }
     }
 
