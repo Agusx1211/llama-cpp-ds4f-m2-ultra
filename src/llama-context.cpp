@@ -2286,17 +2286,21 @@ llama_kv_admission_status llama_context::kv_admission_prepare_ranges(
     quote.status = LLAMA_KV_ADMISSION_INVALID;
     id = 0;
 
-    if (spans == nullptr || n_spans == 0 || n_spans > 2) {
+    // one span per sequence; the vertical is validated for small lane counts
+    constexpr uint32_t ADMISSION_MAX_SEQS = 8;
+
+    if (spans == nullptr || n_spans == 0 || n_spans > cparams.n_seq_max || n_spans > ADMISSION_MAX_SEQS) {
         return quote.status;
     }
 
-    bool seen[2] = { false, false };
+    bool seen[ADMISSION_MAX_SEQS] = {};
     for (size_t i = 0; i < n_spans; ++i) {
         const auto & span = spans[i];
-        const llama_pos seq_pos_max =
-                span.seq_id >= 0 && span.seq_id < 2 ? memory->seq_pos_max(span.seq_id) : -1;
+        const bool seq_ok = span.seq_id >= 0 && (uint32_t) span.seq_id < cparams.n_seq_max &&
+                (uint32_t) span.seq_id < ADMISSION_MAX_SEQS;
+        const llama_pos seq_pos_max = seq_ok ? memory->seq_pos_max(span.seq_id) : -1;
         const bool starts_at_frontier = seq_pos_max < 0 ? span.pos_begin == 0 : span.pos_begin == seq_pos_max + 1;
-        if (span.seq_id < 0 || span.seq_id >= 2 || seen[span.seq_id] ||
+        if (!seq_ok || seen[span.seq_id] ||
                 span.pos_begin < 0 || span.pos_end <= span.pos_begin ||
                 (uint32_t) span.pos_end > n_ctx_seq() || !starts_at_frontier) {
             return quote.status;
@@ -2305,7 +2309,8 @@ llama_kv_admission_status llama_context::kv_admission_prepare_ranges(
     }
 
     auto * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
-    if (dsv4 == nullptr || dsv4->is_aggregate_compressed() || !cparams.kv_unified || cparams.n_seq_max != 2) {
+    if (dsv4 == nullptr || dsv4->is_aggregate_compressed() || !cparams.kv_unified ||
+            cparams.n_seq_max < 2 || cparams.n_seq_max > ADMISSION_MAX_SEQS) {
         quote.status = LLAMA_KV_ADMISSION_UNSUPPORTED;
         return quote.status;
     }
