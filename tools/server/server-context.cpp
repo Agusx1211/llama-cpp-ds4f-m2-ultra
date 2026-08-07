@@ -327,13 +327,20 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    // set by server_context when the prompt cache exists; lets release()
+    // snapshot a spec-bypassed slot's target state before the mandatory clear
+    server_prompt_cache * cache_on_release = nullptr;
+
+    // include_dft = false saves a target-only snapshot; used when the draft
+    // context did not advance with the target (speculation bypassed for a
+    // parallel cohort) and its state must not be resurrected on restore
+    bool prompt_save(server_prompt_cache & prompt_cache, bool include_dft = true) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const size_t cur_size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t cur_size_dft = (include_dft && ctx_dft) ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
@@ -346,7 +353,7 @@ struct server_slot {
         }
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
+        if (include_dft && ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
@@ -631,6 +638,18 @@ struct server_slot {
             // A slot bypassing MTP has advanced only the target context. Clear both
             // contexts before reuse so a later request cannot inherit stale draft state.
             if (task->is_child() || spec_parallel_disabled) {
+                // The clear is mandatory, but for a completed non-child
+                // completion the target KV is valid and represents the whole
+                // conversation - snapshot it (target-only) into the prompt
+                // cache first so a continuation restores instead of
+                // re-prefilling. Without this, concurrent elastic cohorts
+                // (which always bypass speculation) never populate the cache.
+                if (cache_on_release != nullptr && !task->is_child() &&
+                        task->type == SERVER_TASK_TYPE_COMPLETION) {
+                    if (prompt_save(*cache_on_release, /*include_dft=*/false)) {
+                        cache_on_release->update();
+                    }
+                }
                 prompt_clear();
             }
 
@@ -1469,8 +1488,7 @@ private:
                 SRV_ERR("%s", "LLAMA_DSV4_ADMISSION_VERTICAL requires target Metal sparse DSV4 unified storage\n");
                 return false;
             }
-            params_base.cache_prompt = false;
-            SRV_INF("%s", "enabled exact DSV4 admission vertical: slots=2, cache_prompt=false, ctx_shift=false\n");
+            SRV_INF("%s", "enabled exact DSV4 admission vertical: slots=2, ctx_shift=false, prompt cache allowed\n");
         }
 
         slots.clear();
@@ -1598,9 +1616,47 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            // fingerprint for the SSD tier: spilled state files are only valid
+            // for the exact model artifact and context geometry that wrote
+            // them; anything else is deleted on rescan or dropped on load
+            uint64_t fingerprint = 0xcbf29ce484222325ull; // FNV-1a
+            const auto fp_mix = [&fingerprint](const void * p, size_t n) {
+                const uint8_t * b = static_cast<const uint8_t *>(p);
+                for (size_t i = 0; i < n; ++i) {
+                    fingerprint = (fingerprint ^ b[i]) * 0x100000001b3ull;
+                }
+            };
+            {
+                const std::string & path = params_base.model.path;
+                fp_mix(path.data(), path.size());
+
+                std::error_code ec;
+                const uint64_t fsize = std::filesystem::file_size(path, ec);
+                const int64_t  mtime = ec ? 0 : (int64_t) std::filesystem::last_write_time(path, ec).time_since_epoch().count();
+                fp_mix(&fsize, sizeof(fsize));
+                fp_mix(&mtime, sizeof(mtime));
+
+                const uint32_t fp_n_ctx = llama_n_ctx(ctx_tgt);
+                const uint32_t fp_n_seq = llama_n_seq_max(ctx_tgt);
+                const uint8_t  fp_dft   = ctx_dft ? 1 : 0;
+                fp_mix(&fp_n_ctx, sizeof(fp_n_ctx));
+                fp_mix(&fp_n_seq, sizeof(fp_n_seq));
+                fp_mix(&fp_dft,   sizeof(fp_dft));
+            }
+
+            if (!params_base.cache_disk.empty()) {
+                SRV_INF("prompt cache SSD tier enabled: dir = '%s', limit = %d GiB\n",
+                        params_base.cache_disk.c_str(), params_base.cache_disk_limit_gib);
+            }
+
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx,
+                    params_base.cache_disk, params_base.cache_disk_limit_gib, fingerprint);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+        }
+
+        for (auto & slot : slots) {
+            slot.cache_on_release = prompt_cache.get();
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1896,7 +1952,7 @@ private:
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
-    bool try_clear_idle_slots() {
+    bool try_clear_idle_slots(const std::vector<server_slot *> * exclude = nullptr) {
         bool res = false;
 
         if (!params_base.kv_unified) {
@@ -1908,7 +1964,19 @@ private:
                 continue;
             }
 
+            if (exclude != nullptr && std::find(exclude->begin(), exclude->end(), &slot) != exclude->end()) {
+                continue;
+            }
+
             if (slot.prompt.n_tokens() > 0) {
+                // capacity reclaim must not silently discard a resumable
+                // conversation - snapshot it to the prompt cache first
+                if (prompt_cache) {
+                    if (slot.prompt_save(*prompt_cache)) {
+                        prompt_cache->update();
+                    }
+                }
+
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
                 slot.prompt_clear();
@@ -2012,10 +2080,55 @@ private:
                 return result;
             }
 
-            // This vertical deliberately admits full, uncached prompts. Clear
-            // any idle logical residue before asking the range-native planner.
-            slot.prompt_clear();
-            task.params.cache_prompt = false;
+            // Reuse the slot's resident KV for continuations instead of the
+            // unconditional clear. The admission API requires spans to start
+            // at the sequence frontier (seq_pos_max + 1, enforced by
+            // llama_context::kv_admission_prepare_ranges), so a reuse span
+            // covers only the new suffix [frontier, span_end). Rows the
+            // prefill touches below the frontier (a checkpoint-restore
+            // landing plus its bounded backfill) are handled by the ordinary
+            // per-batch reservation path until the batch enters the armed
+            // span. Reuse is kept only when the prefill landing - predicted
+            // by mirroring its n_past logic (server-context.cpp ~4289-4383) -
+            // is provably benign; anything else keeps the exact full-clear
+            // geometry.
+            const size_t n_prompt_res = slot.prompt.tokens.size();
+            const size_t n_lcp = n_prompt_res > 0 ? slot.prompt.tokens.get_common_prefix(task.tokens) : 0;
+
+            bool reuse_resident =
+                    family_slots.size() == 1 &&
+                    n_lcp > 0 &&
+                    n_lcp <= n_prompt_res &&
+                    n_lcp < (size_t) task.n_tokens() &&
+                    !slot.prompt.tokens.has_mtmd &&
+                    task.params.n_cache_reuse == 0 &&
+                    task.params.cache_prompt;
+
+            if (reuse_resident) {
+                const llama_pos pos_next = slot.prompt.tokens.pos_next(n_lcp);
+                const llama_pos pos_min_thold = std::max(0, pos_next - n_swa);
+                const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+
+                if (pos_min < 0) {
+                    reuse_resident = false;
+                } else if (pos_min >= pos_min_thold) {
+                    // the prefill checkpoint block will run: it restores the
+                    // newest covering checkpoint or resets to zero. Reuse only
+                    // when a covering checkpoint exists - a reset would
+                    // re-decode the full span with resident rows freed
+                    // mid-flight, strictly worse than clearing here.
+                    reuse_resident = std::any_of(
+                            slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                            [&](const common_prompt_checkpoint & cur) {
+                                return cur.pos_max <= pos_next && (cur.pos_min < pos_min_thold || cur.pos_min == 0);
+                            });
+                } else {
+                    // no checkpoint pass: the tail trim at the prefill must
+                    // fit the bounded rs rollback window (DSV4 has no general
+                    // partial seq_rm)
+                    reuse_resident = (int64_t) (n_prompt_res - n_lcp) <= (int64_t) llama_n_rs_seq(ctx_tgt);
+                }
+            }
 
             const auto plan = server_dsv4_plan_admission(
                     task.tokens.size(), task.params.n_predict, params_base.n_predict,
@@ -2032,7 +2145,34 @@ private:
                 result.status = admission_gate_status::rejected;
                 return result;
             }
-            spans.push_back({ slot.id, 0, (llama_pos) plan.span_tokens });
+
+            // the reuse span must start at the resident frontier and still
+            // contain new rows; otherwise fall back to the full clear
+            const llama_pos pos_frontier = reuse_resident ? slot.prompt.tokens.pos_next() : 0;
+            if (reuse_resident && (llama_pos) plan.span_tokens <= pos_frontier) {
+                reuse_resident = false;
+            }
+
+            if (reuse_resident) {
+                SLT_INF(slot, "elastic admission reuses resident prefix: lcp=%zu resident=%zu frontier=%d task=%d span_end=%zu\n",
+                        n_lcp, n_prompt_res, (int) pos_frontier, (int) task.n_tokens(), (size_t) plan.span_tokens);
+                spans.push_back({ slot.id, pos_frontier, (llama_pos) plan.span_tokens });
+            } else {
+                // full-clear admission: quote the whole span against an empty
+                // sequence, exactly like the original uncached vertical. The
+                // displaced conversation is snapshotted first (the idle-slot
+                // cache pass runs only after launch, when this clear has
+                // already destroyed the state) so a later continuation
+                // restores from the cache instead of re-prefilling.
+                if (prompt_cache && slot.prompt.n_tokens() > 0 &&
+                        task.type == SERVER_TASK_TYPE_COMPLETION) {
+                    if (slot.prompt_save(*prompt_cache)) {
+                        prompt_cache->update();
+                    }
+                }
+                slot.prompt_clear();
+                spans.push_back({ slot.id, 0, (llama_pos) plan.span_tokens });
+            }
         }
 
         for (server_slot * active : active_continuations) {
@@ -2045,7 +2185,15 @@ private:
         }
 
         llama_kv_admission_quote quote = {};
-        const auto quote_status = llama_kv_admission_quote_ranges(ctx_tgt, spans.data(), spans.size(), &quote);
+        auto quote_status = llama_kv_admission_quote_ranges(ctx_tgt, spans.data(), spans.size(), &quote);
+        if (quote_status == LLAMA_KV_ADMISSION_PRESSURE && active_continuations.empty()) {
+            // Idle residency (kept for prompt reuse) may be occupying the
+            // pages this admission needs. Snapshot and purge idle slots other
+            // than the admitted family, then re-quote once before failing.
+            if (try_clear_idle_slots(&family_slots)) {
+                quote_status = llama_kv_admission_quote_ranges(ctx_tgt, spans.data(), spans.size(), &quote);
+            }
+        }
         if (quote_status == LLAMA_KV_ADMISSION_PRESSURE) {
             if (!active_continuations.empty()) {
                 result.status = admission_gate_status::deferred;
@@ -2927,8 +3075,13 @@ private:
                                     prompt_cache->update();
                                 }
 
-                                if (params_base.kv_unified) {
+                                if (params_base.kv_unified && !SERVER_DSV4_ADMISSION_VERTICAL) {
                                     // [TAG_IDLE_SLOT_CLEAR]
+                                    // The elastic vertical keeps idle residency so a
+                                    // pure-extension continuation reuses the resident
+                                    // prefix with zero copies; capacity pressure
+                                    // reclaims idle slots via try_clear_idle_slots
+                                    // (admission relief and decode-pressure paths).
                                     slot.prompt_clear();
                                 }
                             }
