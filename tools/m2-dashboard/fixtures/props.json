@@ -1,0 +1,15 @@
+{
+ "total_slots": 4,
+ "model_alias": "/Users/agusx1211/unsloth/gguf-m2/dsv4-flash-0731-full.m2.gguf",
+ "model_ftype": "MXFP4 MoE",
+ "model_path": "/Users/agusx1211/unsloth/gguf-m2/dsv4-flash-0731-full.m2.gguf",
+ "build_info": "b10590-70d51bee7",
+ "endpoint_slots": true,
+ "endpoint_props": false,
+ "endpoint_metrics": false,
+ "is_sleeping": false,
+ "default_generation_settings": {
+  "n_ctx": 524288
+ },
+ "chat_template": "[truncated in fixture]"
+}
