@@ -30,16 +30,32 @@ Other models and hardware are unsupported unless they help develop, validate, or
 
 ## Project status
 
-The first phase is to establish a reproducible DeepSeek V4 Flash baseline on the target Mac and identify the highest-cost operations. Optimization work will then concentrate on model-specific graph construction, quantization, Metal kernels, command scheduling, memory layout, and CPU/GPU overlap.
+The fork is in production on the target machine. Beyond upstream llama.cpp it currently carries, among other things: a dedicated DSV4 Metal kernel stack; DSpark speculative decoding; elastic multi-lane serving (up to 4 concurrent conversations sharing one 512k-token KV budget with physical-page admission); a prompt cache with RAM and SSD tiers plus cross-conversation zero-copy prefix reuse; and the fork-owned `gguf-m2` weight artifact format below.
 
-Until target artifacts and benchmark recipes are recorded, existing generic llama.cpp commands and documentation remain the operational starting point:
+Build for the target:
 
 ```sh
-cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release -j
-./build/bin/llama-bench --help
-./build/bin/llama-cli --help
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DLLAMA_BUILD_MTMD=OFF
+cmake --build build --target llama-server -j
 ```
+
+## The gguf-m2 artifact format
+
+The fork does not serve stock GGUF files at full performance; it re-processes them offline into `*.m2.gguf` artifacts whose tensor encodings fit this fork's Metal kernels exactly. The transformation is **bit-exact**: the artifact stores the same values the source GGUF holds, verified block-by-block during conversion, and the served model produces byte-identical outputs. Two fork-owned tensor types (ggml ids 90–99 are reserved for the fork):
+
+- `E4M3_M2` — the dense plane. DeepSeek V4 Flash's checkpoint stores most dense 2D tensors as FP8 (E4M3 × power-of-two 128×128-tile scales); public GGUFs upcast them to BF16, doubling their size and per-token read traffic. The converter recovers the FP8 form losslessly from the BF16 GGUF itself (no checkpoint download) and the kernels decode it in-register.
+- `MXFP4_M2` — the routed-expert plane. Splits the 17-byte interleaved MXFP4 blocks into 16-byte-aligned code groups plus a packed 4-bit scale plane (the released expert scales use only 9 distinct values), enabling vector loads in the expert GEMV kernels.
+
+Convert (reads the stock shards, writes one artifact, self-checks every converted block):
+
+```sh
+python3 conversion/gguf_m2_repack.py <stock-shard-*.gguf> -o model.m2.gguf
+# variants: --keep-dense-plane (experts-only artifact), --keep-expert-plane (dense-only)
+```
+
+Interoperability is deliberately one-way: this fork still loads stock GGUFs, but `*.m2.gguf` artifacts declare `m2.layout.version` and the loader refuses any mismatch, while stock llama.cpp builds reject the unknown tensor types outright. A generic build can never silently misread repacked weights.
+
+Measured on the target (M2 Ultra, DSV4 Flash 0731 UD-Q8_K_XL source, 2026-08-07): decode +4.4%, prefill −3.5%, artifact 150.7 → 141.3 GiB, outputs byte-identical. Details, alternatives considered, and the measurement ladder live in the local research notes and the commit history of the `gguf-m2` changes.
 
 See [the build guide](docs/build.md) and its [Metal build section](docs/build.md#metal-build) for the inherited build options. Target-specific build and run commands will replace this section as they stabilize.
 
