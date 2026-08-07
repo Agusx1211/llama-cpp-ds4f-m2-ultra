@@ -5220,7 +5220,8 @@ private:
                 // alloc() containment dedup makes repeat saves cheap; the
                 // token threshold skips prompts whose re-prefill is cheaper
                 // than the state copy.
-                if (prompt_cache && slot.state == SLOT_STATE_GENERATING &&
+                if (prompt_cache &&
+                        (slot.state == SLOT_STATE_GENERATING || slot.state == SLOT_STATE_GENERATING_STAGED) &&
                         slot.task->type == SERVER_TASK_TYPE_COMPLETION && !slot.task->is_child() &&
                         slot.prompt.n_tokens() >= 1024) {
                     const int64_t t_pub = ggml_time_us();
