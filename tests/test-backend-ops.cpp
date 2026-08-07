@@ -10094,7 +10094,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // mul_mv (n=1), mul_mv_ext (n=2..8) and mul_mm (n>8) paths; BF16 twins run
     // at the same shapes for A/B comparison. The strict bit-exactness matrix
     // vs BF16 lives in test-m2-e4m3.cpp — these are the cross-backend checks.
-    for (ggml_type type_w : {GGML_TYPE_E4M3_M2, GGML_TYPE_BF16}) {
+    for (ggml_type type_w : {GGML_TYPE_E4M3_M2, GGML_TYPE_NF8_M2, GGML_TYPE_BF16}) {
         for (int64_t n : {1, 2, 5, 8, 16, 512}) {
             test_cases.emplace_back(new test_mul_mat(type_w, GGML_TYPE_F32,  1024, n, 4096, {1, 1}, {1, 1})); // attn_q_a
             test_cases.emplace_back(new test_mul_mat(type_w, GGML_TYPE_F32, 32768, n, 1024, {1, 1}, {1, 1})); // attn_q_b

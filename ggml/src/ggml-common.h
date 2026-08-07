@@ -271,6 +271,53 @@ typedef struct {
 } block_mxfp4_m2;
 static_assert(sizeof(block_mxfp4_m2) == QK_MXFP4_M2/2 + QK_MXFP4_M2/64, "wrong mxfp4_m2 block size/padding");
 
+// GGML_TYPE_NF8_M2 — fork-owned gguf-m2 dense-plane encoding, second variant
+// (M2 Ultra target). Same value set as GGML_TYPE_E4M3_M2 (every element is
+// exactly e4m3 * 2^k, i.e. a normal BF16 value or +-0), re-encoded so the
+// fast decode is pure integer bit-insertion into the f32/bf16 bit layout —
+// no table gather, no clz/renormalize (E4M3's denormal region is what makes
+// its ALU decode expensive; block-local normalization removes it).
+//
+// One block covers 1024 row elements: 1024 code bytes followed by 32 "sb"
+// base bytes, one per 32 consecutive elements (row-major, matching GEMV read
+// order). sizeof == 1056, a multiple of 16, so with any 16-byte-aligned
+// tensor base every 16-byte group of code bytes stays 16-byte aligned for
+// uint4 loads (same property as block_e4m3_m2; no pad needed).
+//
+// sb byte, high bit clear (FAST block, census: 99.94% of 32-elem blocks):
+//   base exponent b = (sb & 0x7F) - NF8_M2_EXP_BIAS   (b in [-63, +64])
+//   code v = s|E4|m3 (sign 1, biased exponent 4, mantissa 3):
+//     em == 0  (E=0, m=0)  ->  +-0.0 (the reserved zero code, both signs)
+//     else                 ->  value = sign * (1 + m/8) * 2^(b + E)
+//   All nonzero codes are NORMALIZED (implicit leading 1); f32 decode is
+//   sign | ((em + ((sb7 + 64) << 3)) << 20) with a select keeping +-0,
+//   because b + 127 = sb7 + 64. The encoder places the block's largest
+//   exponent at E = 15 (base = e_max - 15), so E spans [0, 15]; a nonzero
+//   value at E == 0 with m == 0 would collide with the zero code and forces
+//   the escape instead (see below).
+//
+// sb byte, high bit set (ESCAPE block, the remaining ~0.06%; wide blocks are
+// scattered across all 365 pass-list tensors so the escape is per-block):
+//   scale k = (sb & 0x7F) - NF8_M2_EXP_BIAS   (k in [-63, +64])
+//   the 32 code bytes are plain OCP E4M3(fn) bytes (the original E4M3_M2
+//   encoding of the same values): value = e4m3(v) * 2^k, decoded through the
+//   e4m3 path (denormals included). The converter never emits the two E4M3
+//   NaN codes; branchless decode maps them to +-480 * 2^k.
+//
+// A FAST block encodes exactly {+-0} U {+-(1+m/8) * 2^(b+E)}: 16 binades of
+// 3-bit-mantissa values; an ESCAPE block covers e4m3's full 18-binade range
+// at any k. Both decode bit-exactly to the served BF16 values, which is the
+// whole contract (see notes/2026-08-07-gguf-m2-artifact-format-design.md,
+// "Round-3 candidate formats", design (b)).
+#define QK_NF8_M2 1024
+#define NF8_M2_GSZ 32          // elements per sb byte
+#define NF8_M2_EXP_BIAS 63     // sb low-7-bit bias for both base (fast) and k (escape)
+typedef struct {
+    uint8_t qs[QK_NF8_M2];            // codes: s|E4|m3 (fast) or OCP E4M3 (escape), 1 byte per element
+    uint8_t sb[QK_NF8_M2/NF8_M2_GSZ]; // 32 base/escape bytes, one per 32 elements
+} block_nf8_m2;
+static_assert(sizeof(block_nf8_m2) == QK_NF8_M2 + QK_NF8_M2/NF8_M2_GSZ, "wrong nf8_m2 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta

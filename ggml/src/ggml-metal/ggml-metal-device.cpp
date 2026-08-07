@@ -827,6 +827,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const bool bc_out = tsrc0 == GGML_TYPE_E4M3_M2
         ? (op->ne[0] % 64  != 0 || op->ne[1] % (e4m3_nt1*32) != 0)
+        : tsrc0 == GGML_TYPE_NF8_M2 // fork: dedicated single-tile 64x32 kernel
+        ? (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0)
         : has_tensor
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
         : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
@@ -871,6 +873,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     } else if (tsrc0 == GGML_TYPE_E4M3_M2) {
         snprintf(base, 256, "kernel_mul_mm_%s_%s_nt%d%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), e4m3_nt1,
                  e4m3_shared ? "s" : "", e4m3_style);
+    } else if (tsrc0 == GGML_TYPE_NF8_M2) {
+        // fork: NF8_M2 GEMM is single-tile only (NT1=2 is deliberately not
+        // implemented for this type: it collapsed in-graph prefill by -28%
+        // for E4M3_M2 round 1). GGML_NF8_MM_STYLE=f32 selects the f32-decode
+        // attribution variant; the default is the integer bf16-bits decode.
+        const char * s = getenv("GGML_NF8_MM_STYLE");
+        snprintf(base, 256, "kernel_mul_mm_%s_%s_nt1%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1),
+                 (s != NULL && strcmp(s, "f32") == 0) ? "_f32" : "");
     } else {
         snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
     }
@@ -915,6 +925,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         if (getenv("GGML_E4M3_MM_SMEM_PAD") != NULL) {
             res.smem += (size_t) atoi(getenv("GGML_E4M3_MM_SMEM_PAD"));
         }
+    } else if (tsrc0 == GGML_TYPE_NF8_M2) {
+        // fork: dedicated single-tile kernel with the BF16 template's exact
+        // geometry and threadgroup allocation (sa 4096 + sb 2048; no decode
+        // LUT bytes — the decode is pure ALU, escape uses constant memory);
+        // the bounds-checked output path stages 64x32 f32 = 8192 bytes over
+        // the then-dead sa/sb region.
+        res.nr0 = 64;
+        res.nr1 = 32;
+
+        res.smem = bc_out ? 8192 : (4096 + 2048);
     } else if (has_tensor) {
         res.nr0 = NRA;
         res.nr1 = NRB;
@@ -993,6 +1013,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 // case-8 dispatch for future experiments; the host stays at 4.
                 nr1 = 1;
                 smem = 32*sizeof(float)*nr0 + 256*sizeof(float);
+                suffix = "_4";
+            } break;
+        case GGML_TYPE_NF8_M2:
+            {
+                // fork: same dispatch geometry as the E4M3_M2 GEMV above
+                // (both are bit-exact clones of kernel_mul_mv_bf16_f32_4;
+                // NR0=4 for the same measured reasons). Unlike E4M3_M2 the
+                // NF8_M2 kernel stages NO decode LUT — the decode is pure
+                // bit-insertion — so smem carries only the reduction area.
+                GGML_ASSERT(ne00 % 4 == 0); // ne00 % QK_NF8_M2 == 0 by block invariant
+                nsg = std::min(4, (ne00 + 127) / 128);
+                nr0 = 4;
+                nr1 = 1;
+                smem = 32*sizeof(float)*nr0;
                 suffix = "_4";
             } break;
         case GGML_TYPE_MXFP4_M2:
