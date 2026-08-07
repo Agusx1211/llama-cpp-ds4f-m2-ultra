@@ -3078,6 +3078,9 @@ llama_kv_admission_status llama_kv_cache_dsv4::quote_admission(
     llama_dsv4_batch_quote internal_quote = {};
     std::vector<dsv4_sparse_range> ranges;
     if (!collect_admission_ranges(spans, n_spans, ranges, internal_quote)) {
+        LLAMA_LOG_ERROR("%s: QUOTE-DBG collect failed: n_spans=%zu span0={seq=%d,%d..%d}\n",
+                __func__, n_spans, n_spans ? spans[0].seq_id : -1,
+                n_spans ? spans[0].pos_begin : -1, n_spans ? spans[0].pos_end : -1);
         dsv4_public_admission_quote(internal_quote, LLAMA_KV_ADMISSION_UNSUPPORTED, 0, quote);
         return quote.status;
     }
@@ -3091,6 +3094,12 @@ llama_kv_admission_status llama_kv_cache_dsv4::quote_admission(
         public_status = LLAMA_KV_ADMISSION_FEASIBLE;
     } else if (prepare_status == dsv4_sparse_transaction::PRESSURE) {
         public_status = LLAMA_KV_ADMISSION_PRESSURE;
+    }
+    if (public_status != LLAMA_KV_ADMISSION_FEASIBLE && public_status != LLAMA_KV_ADMISSION_PRESSURE) {
+        LLAMA_LOG_ERROR("%s: QUOTE-DBG prepare=%d sparse_ranges=%zu n_ranges=%zu span0={seq=%d,%d..%d}\n",
+                __func__, (int) prepare_status, transaction.sparse_range_count(), ranges.size(),
+                n_spans ? spans[0].seq_id : -1, n_spans ? spans[0].pos_begin : -1,
+                n_spans ? spans[0].pos_end : -1);
     }
     dsv4_public_admission_quote(internal_quote, public_status, transaction.limiting_family_mask(), quote);
     return quote.status;
