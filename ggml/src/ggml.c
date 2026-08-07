@@ -953,6 +953,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_e4m3_m2,
         .from_float_ref           = (ggml_from_float_t) quantize_row_e4m3_m2_ref,
     },
+    [GGML_TYPE_MXFP4_M2] = { // fork-owned gguf-m2 v1 expert plane (M2 Ultra target)
+        .type_name                = "mxfp4_m2",
+        .blck_size                = QK_MXFP4_M2,
+        .type_size                = sizeof(block_mxfp4_m2),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_mxfp4_m2,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_mxfp4_m2_ref,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -8205,6 +8213,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_E4M3_M2: result = quantize_e4m3_m2(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_MXFP4_M2: result = quantize_mxfp4_m2(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_K:    result = quantize_q2_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q3_K:    result = quantize_q3_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_K:    result = quantize_q4_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

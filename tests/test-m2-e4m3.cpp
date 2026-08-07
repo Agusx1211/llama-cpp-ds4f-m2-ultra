@@ -15,12 +15,17 @@
 //   and mul_mat(BF16 weights with identical values, x) are computed on the
 //   GPU backend and compared byte-for-byte. Additionally the GPU E4M3_M2
 //   result is compared against the CPU reference with an NMSE tolerance.
+//
+// Extra mode (not run by ctest):
+//   test-m2-e4m3 bench-dense — E4M3_M2 vs BF16 wall-clock A/B at the real
+//                              dense-plane shapes (serialized kernel chains).
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstdint>
@@ -157,8 +162,158 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     return den > 0.0 ? num/den : num;
 }
 
-int main(void) {
+// ---------------------------------------------------------------------------
+// bench-dense (not run by ctest): E4M3_M2 vs BF16 wall-clock A/B at the real
+// dense-plane shapes. Each chain serializes the GEMV/GEMM nodes by data
+// dependency (the next node's activations are a view of the previous
+// output), so the measurement reflects sequential kernel latency like the
+// production graph, not overlapped bandwidth. Every node uses a DIFFERENT
+// copy of the weight matrix, cycled so the aggregate working set (~1 GiB
+// per type) stays DRAM-resident — in production every dense tensor is read
+// cold once per token, so an SLC-resident rerun of one matrix would
+// overstate ALU-bound behavior and hide the byte-ratio win. E4M3_M2 reads
+// ~50.8% of the BF16 bytes, so the DRAM-bound expectation is a time ratio
+// near 0.5-0.6.
+
+struct bench_chain {
+    const char * name;
+    // alternating (k, m) pairs; single-entry chains self-feed through a view
+    int64_t k0, m0;
+    int64_t k1, m1; // 0 = self-chain
+};
+
+static int run_bench_dense(ggml_backend_t gpu) {
+    const bench_chain chains[] = {
+        { "attn 4096<->8192 (output_b pair)", 4096, 8192, 8192, 4096 },
+        { "shexp 4096<->2048 (gate/down)",    4096, 2048, 2048, 4096 },
+        { "attn_q_b 1024->32768 (self)",      1024, 32768, 0, 0 },
+    };
+    const int64_t batches[] = { 1, 4, 512 };
+    const ggml_type types[2] = { GGML_TYPE_BF16, GGML_TYPE_E4M3_M2 };
+
+    const int WARMUP = 3;
+    const int REPS   = 10;
+
+    for (const bench_chain & c : chains) {
+        // enough distinct weight copies to exceed the SLC by a wide margin
+        // (BF16 bytes of one (k0,m0) matrix; target ~1 GiB per type)
+        const int64_t w_bytes = c.k0*c.m0*2;
+        const int NCOPY = (int)std::min<int64_t>(16, std::max<int64_t>(4, (1ll << 30)/std::max<int64_t>(1, (c.k1 ? 2 : 1)*w_bytes)));
+
+        for (const int64_t nb : batches) {
+            const int NREP = nb > 8 ? 8 : 64; // node count (pairs count double)
+
+            double t_med[2] = {0.0, 0.0};
+
+            for (int ti = 0; ti < 2; ti++) {
+                const ggml_type wtype = types[ti];
+
+                ggml_init_params ip = {
+                    /*.mem_size   =*/ ggml_tensor_overhead()*(size_t)(3*NREP + 2*NCOPY + 16) + ggml_graph_overhead_custom(3*NREP + 16, false),
+                    /*.mem_buffer =*/ nullptr,
+                    /*.no_alloc   =*/ true,
+                };
+                ggml_context * ctx = ggml_init(ip);
+
+                const bool self = c.k1 == 0;
+
+                std::vector<ggml_tensor *> w0(NCOPY);
+                std::vector<ggml_tensor *> w1(NCOPY);
+                for (int i = 0; i < NCOPY; i++) {
+                    w0[i] = ggml_new_tensor_2d(ctx, wtype, c.k0, c.m0);
+                    w1[i] = self ? nullptr : ggml_new_tensor_2d(ctx, wtype, c.k1, c.m1);
+                }
+
+                ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.k0, nb);
+                ggml_tensor * x0 = x;
+
+                for (int j = 0; j < NREP; j++) {
+                    x = ggml_mul_mat(ctx, w0[j % NCOPY], x);            // [m0, nb]
+                    if (self) {
+                        // feed the first k0 outputs back in (m0 >= k0)
+                        x = ggml_view_2d(ctx, x, c.k0, nb, x->nb[1], 0);
+                    } else {
+                        x = ggml_mul_mat(ctx, w1[j % NCOPY], x);        // [m1, nb] == [k0, nb]
+                    }
+                }
+
+                ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, gpu);
+                GGML_ASSERT(buf != nullptr);
+
+                // weight values are irrelevant for timing; make them valid
+                for (int i = 0; i < NCOPY; i++) {
+                    ggml_tensor * ws[2] = { w0[i], w1[i] };
+                    for (ggml_tensor * w : ws) {
+                        if (w == nullptr) {
+                            continue;
+                        }
+                        const int64_t n_w = ggml_nelements(w);
+                        std::vector<float> wf(n_w);
+                        fill_uniform(wf.data(), n_w);
+                        if (wtype == GGML_TYPE_BF16) {
+                            std::vector<ggml_bf16_t> wb(n_w);
+                            ggml_fp32_to_bf16_row(wf.data(), wb.data(), n_w);
+                            ggml_backend_tensor_set(w, wb.data(), 0, ggml_nbytes(w));
+                        } else {
+                            std::vector<uint8_t> wq(ggml_nbytes(w));
+                            ggml_quantize_chunk(wtype, wf.data(), wq.data(), 0, w->ne[1], w->ne[0], nullptr);
+                            ggml_backend_tensor_set(w, wq.data(), 0, ggml_nbytes(w));
+                        }
+                    }
+                }
+
+                std::vector<float> xv(ggml_nelements(x0));
+                fill_uniform(xv.data(), xv.size());
+                ggml_backend_tensor_set(x0, xv.data(), 0, ggml_nbytes(x0));
+
+                ggml_cgraph * gf = ggml_new_graph_custom(ctx, 3*NREP + 16, false);
+                ggml_build_forward_expand(gf, x);
+
+                std::vector<double> ts;
+                for (int it = 0; it < WARMUP + REPS; it++) {
+                    const int64_t t0 = ggml_time_us();
+                    const ggml_status st = ggml_backend_graph_compute(gpu, gf);
+                    const int64_t t1 = ggml_time_us();
+                    GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+                    if (it >= WARMUP) {
+                        ts.push_back((t1 - t0)/1e3);
+                    }
+                }
+                std::sort(ts.begin(), ts.end());
+                t_med[ti] = ts[ts.size()/2];
+
+                const int n_mm = self ? NREP : 2*NREP;
+                printf("  %-34s n=%-4" PRId64 " %-8s: median %8.3f ms/graph (min %8.3f, max %8.3f), %8.2f us/matmul\n",
+                       c.name, nb, ggml_type_name(wtype),
+                       t_med[ti], ts.front(), ts.back(), t_med[ti]*1e3/n_mm);
+
+                ggml_backend_buffer_free(buf);
+                ggml_free(ctx);
+            }
+
+            printf("  %-34s n=%-4" PRId64 " ratio e4m3_m2/bf16 = %.4f\n", c.name, nb, t_med[1]/t_med[0]);
+        }
+    }
+
+    return 0;
+}
+
+int main(int argc, char ** argv) {
+    ggml_time_init();
+
+    const bool bench_dense = argc > 1 && strcmp(argv[1], "bench-dense") == 0;
+
     bool ok = true;
+
+    if (bench_dense) {
+        ggml_backend_t gpu = find_gpu_backend();
+        if (gpu == nullptr) {
+            printf("bench-dense requires a GPU backend\n");
+            return 1;
+        }
+        printf("GPU backend: %s\n", ggml_backend_name(gpu));
+        return run_bench_dense(gpu);
+    }
 
     ok = test_decode_bf16_exact() && ok;
 

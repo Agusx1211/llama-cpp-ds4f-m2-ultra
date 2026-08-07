@@ -508,6 +508,78 @@ void dequantize_row_e4m3_m2(const block_e4m3_m2 * GGML_RESTRICT x, float * GGML_
     }
 }
 
+// GGML_TYPE_MXFP4_M2 (fork-owned gguf-m2 expert plane): identical values to
+// GGML_TYPE_MXFP4, split code/scale planes + 4-bit absolute biased scales.
+// The generic quantizer mirrors quantize_row_mxfp4_ref except that the E8M0
+// byte is clamped into the nibble-representable window
+// [MXFP4_M2_SCALE_BIAS, MXFP4_M2_SCALE_BIAS+15] (test data never hits the
+// clamp; the artifact path in conversion/gguf_m2_repack.py is an exact
+// repack that fails loudly instead of clamping).
+void quantize_row_mxfp4_m2_ref(const float * GGML_RESTRICT x, block_mxfp4_m2 * GGML_RESTRICT y, int64_t k) {
+    static const int qk  = QK_MXFP4_M2;
+    static const int nsb = QK_MXFP4_M2/QK_MXFP4; // 64 sub-blocks per block
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        memset(y[i].sc, 0, sizeof(y[i].sc));
+
+        for (int s = 0; s < nsb; s++) {
+            const float * xs = x + i*qk + s*QK_MXFP4;
+
+            float amax = 0.0f; // absolute max
+
+            for (int j = 0; j < QK_MXFP4; j++) {
+                amax = MAX(amax, fabsf(xs[j]));
+            }
+
+            // same selection as quantize_row_mxfp4_ref, then clamp into the window
+            int e = amax > 0.0f ? (int) (floorf(log2f(amax)) - 2 + 127) : 0;
+            e = MAX(MXFP4_M2_SCALE_BIAS, MIN(MXFP4_M2_SCALE_BIAS + 15, e));
+
+            const float d = GGML_E8M0_TO_FP32_HALF((uint8_t) e);
+
+            y[i].sc[s/2] |= (uint8_t)(e - MXFP4_M2_SCALE_BIAS) << (4*(s % 2));
+
+            for (int j = 0; j < QK_MXFP4/2; ++j) {
+                const uint8_t x0 = best_index_mxfp4(xs[j             ], d);
+                const uint8_t x1 = best_index_mxfp4(xs[j + QK_MXFP4/2], d);
+
+                y[i].qs[16*s + j] = x0 | (x1 << 4);
+            }
+        }
+    }
+}
+
+void dequantize_row_mxfp4_m2(const block_mxfp4_m2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk  = QK_MXFP4_M2;
+    static const int nsb = QK_MXFP4_M2/QK_MXFP4;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        for (int s = 0; s < nsb; s++) {
+            const uint8_t e = (uint8_t)(MXFP4_M2_SCALE_BIAS + ((x[i].sc[s/2] >> (4*(s % 2))) & 0x0F));
+            const float   d = GGML_E8M0_TO_FP32_HALF(e);
+
+            const uint8_t * qs = x[i].qs + 16*s;
+            float         * ys = y + i*qk + s*QK_MXFP4;
+
+            for (int j = 0; j < QK_MXFP4/2; ++j) {
+                const int8_t x0 = kvalues_mxfp4[qs[j] & 0x0F];
+                const int8_t x1 = kvalues_mxfp4[qs[j] >>   4];
+
+                ys[j             ] = x0*d;
+                ys[j + QK_MXFP4/2] = x1*d;
+            }
+        }
+    }
+}
+
 void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK1_0;
 
@@ -2408,6 +2480,13 @@ size_t quantize_e4m3_m2(const float * GGML_RESTRICT src, void * GGML_RESTRICT ds
     GGML_ASSERT(n_per_row % QK_E4M3_M2 == 0);
     quantize_row_e4m3_m2_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_E4M3_M2, n_per_row);
+}
+
+size_t quantize_mxfp4_m2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    GGML_ASSERT(n_per_row % QK_MXFP4_M2 == 0);
+    quantize_row_mxfp4_m2_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_MXFP4_M2, n_per_row);
 }
 
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)
@@ -5775,6 +5854,11 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 }
             } break;
 
+        case GGML_TYPE_MXFP4_M2:
+            // every byte pattern decodes to a finite value (all 16 E2M1 codes
+            // are valid and the biased scale nibble always lands in the E8M0
+            // window [MXFP4_M2_SCALE_BIAS, MXFP4_M2_SCALE_BIAS+15]) — nothing
+            // to validate
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:

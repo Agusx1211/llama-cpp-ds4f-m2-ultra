@@ -892,13 +892,26 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 // fork: mirrors the F32/F16/BF16 branch above exactly — the
                 // E4M3_M2 GEMV is a bit-exact clone of kernel_mul_mv_bf16_f32_4
-                // and must be dispatched with the same geometry
+                // and must be dispatched with the same geometry. smem carries
+                // an extra 256-float region: the kernel stages its decode LUT
+                // in threadgroup memory after the reduction area.
                 GGML_ASSERT(ne00 % 4 == 0); // ne00 % QK_E4M3_M2 == 0 by block invariant
                 nsg = std::min(4, (ne00 + 127) / 128);
-                nr0 = 2;
+                nr0 = 4; // 2 in the BF16 original; 4 halves the per-threadgroup
+                         // fixed costs (LUT staging, reduce) and shares each
+                         // activation load across 4 rows. Per-row accumulation
+                         // order is NR0-independent, so bit-identity vs the
+                         // BF16 kernels is preserved (verified by test-m2-e4m3).
                 nr1 = 1;
-                smem = 32*sizeof(float)*nr0;
+                smem = 32*sizeof(float)*nr0 + 256*sizeof(float);
                 suffix = "_4";
+            } break;
+        case GGML_TYPE_MXFP4_M2:
+            {
+                // fork: mirrors the MXFP4 geometry (bit-exact split-plane clone)
+                nsg = N_SG_MXFP4_M2;
+                nr0 = N_R0_MXFP4_M2;
+                smem = 32*sizeof(float);
             } break;
         case GGML_TYPE_Q1_0:
             {
@@ -1099,23 +1112,25 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(
     const bool use_dsv4_tile =
         dsv4_tile_enabled &&
         ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->device_id == GGML_METAL_DEVICE_M2_ULTRA &&
-        tsrc0 == GGML_TYPE_MXFP4 && tsrc1 == GGML_TYPE_F32 &&
+        (tsrc0 == GGML_TYPE_MXFP4 || tsrc0 == GGML_TYPE_MXFP4_M2) && // fork: M2 twin kernels exist for every dsv4 variant
+        tsrc1 == GGML_TYPE_F32 &&
         op->src[0]->ne[2] == 256 && op->src[2]->ne[0] == 6 &&
         ((op->src[0]->ne[0] == 4096 && op->src[0]->ne[1] == 2048) ||
          (op->src[0]->ne[0] == 2048 && op->src[0]->ne[1] == 4096));
 
     if (use_dsv4_tile) {
+        const char * tname = ggml_type_name(tsrc0); // "mxfp4" or "mxfp4_m2"
         if (weighted) {
             GGML_ASSERT(compact && !paired &&
                 op->src[0]->ne[0] == 2048 && op->src[0]->ne[1] == 4096);
-            snprintf(base, 256, "kernel_mul_mm_id_mxfp4_f32_dsv4_n16_compact_weighted");
+            snprintf(base, 256, "kernel_mul_mm_id_%s_f32_dsv4_n16_compact_weighted", tname);
         } else if (paired) {
             GGML_ASSERT(compact && op->src[0]->ne[0] == 4096 && op->src[0]->ne[1] == 2048);
-            snprintf(base, 256, "kernel_mul_mm_id_mxfp4_f32_dsv4_n16_compact_pair");
+            snprintf(base, 256, "kernel_mul_mm_id_%s_f32_dsv4_n16_compact_pair", tname);
         } else {
-            snprintf(base, 256, "%s", compact ?
-                    "kernel_mul_mm_id_mxfp4_f32_dsv4_n16_compact" :
-                    "kernel_mul_mm_id_mxfp4_f32_dsv4_n16");
+            snprintf(base, 256, compact ?
+                    "kernel_mul_mm_id_%s_f32_dsv4_n16_compact" :
+                    "kernel_mul_mm_id_%s_f32_dsv4_n16", tname);
         }
     } else {
         GGML_ASSERT(!compact && !paired && !weighted);
@@ -1173,6 +1188,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(
                 nr1 = 1;
                 smem = 32*sizeof(float)*nr0;
                 suffix = ne00 % 4 == 0 ? "_4" : "";
+            } break;
+        case GGML_TYPE_MXFP4_M2:
+            {
+                // fork: mirrors the MXFP4 geometry (bit-exact split-plane clone)
+                nsg = N_SG_MXFP4_M2;
+                nr0 = N_R0_MXFP4_M2;
+                smem = 32*sizeof(float);
             } break;
         case GGML_TYPE_Q1_0:
             {
@@ -1305,7 +1327,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(
     const bool use_dsv4_expert_geometry =
         dsv4_expert_geometry_enabled &&
         props_dev->device_id == GGML_METAL_DEVICE_M2_ULTRA &&
-        tsrc0 == GGML_TYPE_MXFP4 && tsrc1 == GGML_TYPE_F32 &&
+        (tsrc0 == GGML_TYPE_MXFP4 || tsrc0 == GGML_TYPE_MXFP4_M2) && // fork: M2 twin kernels exist for every dsv4 variant
+        tsrc1 == GGML_TYPE_F32 &&
         ne02 == 256 && op->src[2]->ne[0] == 6 &&
         ((ne00 == 4096 && ne01 == 2048) || (ne00 == 2048 && ne01 == 4096));
 
