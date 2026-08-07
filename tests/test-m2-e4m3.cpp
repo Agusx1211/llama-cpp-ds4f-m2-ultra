@@ -16,9 +16,18 @@
 //   GPU backend and compared byte-for-byte. Additionally the GPU E4M3_M2
 //   result is compared against the CPU reference with an NMSE tolerance.
 //
-// Extra mode (not run by ctest):
+// Extra modes (not run by ctest):
 //   test-m2-e4m3 bench-dense — E4M3_M2 vs BF16 wall-clock A/B at the real
 //                              dense-plane shapes (serialized kernel chains).
+//   test-m2-e4m3 bench-graph — E4M3_M2 vs BF16 wall-clock A/B inside a
+//                              prefill-shaped MIXED-OP graph (dense mms with
+//                              real concurrency structure + the real-geometry
+//                              MXFP4_M2 expert MUL_MAT_ID chain). Round 1
+//                              proved isolated kernel chains do NOT predict
+//                              in-graph behavior on this box (mm measured
+//                              1.03-1.09x isolated but -28% end-to-end); this
+//                              mode is the round-2 selection instrument and
+//                              was calibrated by reproducing that failure.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -311,20 +320,359 @@ static int run_bench_dense(ggml_backend_t gpu, int64_t nb_filter, const char * c
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// bench-graph (not run by ctest): E4M3_M2 vs BF16 dense plane inside a
+// prefill-shaped mixed-op graph.
+//
+// Structure per "layer" (mirrors the DSV4-Flash prefill layer's dependency
+// shape, which is what the concurrent hazard-tracked Metal encoder sees):
+//
+//   x[4096,n] -> qa = Wqa*x          [1024,n]      (dense mm)
+//             -> kv = Wkv*x          [512,n]       (dense mm, CONCURRENT w/ qa)
+//   qa        -> qb = Wqb*qa         [32768,n]     (dense mm)
+//             -> iq = Wiq*qa         [8192,n]      (dense mm, CONCURRENT w/ qb)
+//   qb[0:8192]-> ob = Wob*qb'        [4096,n]      (dense mm)
+//   h = ob + x + bcast(kv) + iq[0:4096]            (join, like attn residual)
+//   h -> sg = Wg*h, su = Wu*h        [2048,n]x2    (shexp gate/up, CONCURRENT
+//                                                   with the MoE chain below)
+//        gu = sg*su; sd = Wd*gu      [4096,n]
+//   h -> ge = mul_mat_id(Eg, h, ids) [2048,6,n]    (256-expert MXFP4_M2 gate,
+//                                                   real worklist geometry)
+//        de = mul_mat_id(Ed, ge, ids)[4096,6,n]    (down)
+//        dw = de * wts               (down+route-weight fusion shape)
+//   x' = sd + dw[expert 0] + h
+//
+// Dense weights cycle over NCOPY distinct sets so every dense read is
+// DRAM-cold (same rationale as bench-dense); the expert tensors are the REAL
+// 2.2 GiB gate+down pair (one copy — production reads them from DRAM every
+// layer anyway) and are byte-identical between the two dense-type runs, so
+// the A/B difference is the dense plane only.
+//
+// usage: test-m2-e4m3 bench-graph [n] [n_layer] [nomoe]
+//   n = 0 (default) sweeps { 30, 512, 2048 }; "nomoe" drops the expert chain
+//   (attribution: dense-only concurrency vs mixed-op concurrency).
+
+static void fill_mxfp4_m2_valid(ggml_tensor * as) {
+    // one expert slice of valid random MXFP4_M2 blocks (codes: any byte;
+    // scale nibbles biased to the census range so magnitudes stay sane),
+    // replicated to every expert: identical bytes at different addresses are
+    // indistinguishable for bandwidth purposes and fill 2.2 GiB in ~1 s.
+    constexpr size_t BB = 1056; // block_mxfp4_m2: qs[1024] + sc[32]
+    const size_t slice = as->nb[2];
+    GGML_ASSERT(slice % BB == 0);
+
+    std::vector<uint8_t> slab(slice);
+    std::mt19937_64 r64(0xE4A3);
+    for (size_t off = 0; off < slab.size(); off += 8) {
+        const uint64_t v = r64();
+        memcpy(slab.data() + off, &v, 8);
+    }
+    for (size_t off = 0; off + BB <= slab.size(); off += BB) {
+        for (size_t i = 0; i < 32; i++) {
+            const uint8_t lo = 2 + (slab[off + 1024 + i] & 3); // E8M0 118..121
+            const uint8_t hi = 2 + ((slab[off + 1024 + i] >> 4) & 3);
+            slab[off + 1024 + i] = (uint8_t)(lo | (hi << 4));
+        }
+    }
+    for (int64_t e = 0; e < as->ne[2]; e++) {
+        ggml_backend_tensor_set(as, slab.data(), (size_t)e*slice, slice);
+    }
+}
+
+struct bg_shape {
+    const char * nm;
+    int64_t k, m;
+};
+
+static int run_bench_graph(ggml_backend_t gpu, int64_t n_filter, int n_layer, bool moe) {
+    // the real dense-plane per-layer shapes; "oa" is attn_output_a consumed
+    // reshaped 3D [4096, 1024, 8] against a PERMUTED src1 exactly like
+    // deepseek4.cpp (out reshaped [o_group_dim, n_groups, nt] then
+    // permute(0,2,1,3))
+    static const bg_shape ds[] = {
+        { "qa", 4096,  1024 },
+        { "qb", 1024, 32768 },
+        { "kv", 4096,   512 },
+        { "iq", 1024,  8192 },
+        { "ob", 8192,  4096 },
+        { "sg", 4096,  2048 },
+        { "su", 4096,  2048 },
+        { "sd", 2048,  4096 },
+        { "oa", 4096,  1024*8 }, // stored 3D [4096, 1024, 8]
+    };
+    constexpr int NDS   = (int)(sizeof(ds)/sizeof(ds[0]));
+    constexpr int NCOPY = 2; // distinct dense sets; reuse distance stays >> SLC
+
+    const int64_t n_experts = 256;
+    const int64_t n_used    = 6;
+
+    const int WARMUP = 3;
+    const int REPS   = 10;
+
+    // n_filter > 0 runs exactly that batch size (any value — needed to probe
+    // bco=1 shapes like the 15k-prompt tail and budget-sized prefill chunks)
+    const int64_t batches_all[] = { n_filter > 0 ? n_filter : 30,
+                                    n_filter > 0 ? -1 : 512,
+                                    n_filter > 0 ? -1 : 2048 };
+
+    // host-side dense weight bytes, quantized once per shape, shared by copies
+    std::vector<std::vector<uint8_t>>    wq(NDS);
+    std::vector<std::vector<ggml_bf16_t>> wb(NDS);
+    for (int s = 0; s < NDS; s++) {
+        const int64_t nel = ds[s].k*ds[s].m;
+        std::vector<float> wf(nel);
+        fill_uniform(wf.data(), nel);
+        wq[s].resize(ggml_row_size(GGML_TYPE_E4M3_M2, ds[s].k)*ds[s].m);
+        ggml_quantize_chunk(GGML_TYPE_E4M3_M2, wf.data(), wq[s].data(), 0, ds[s].m, ds[s].k, nullptr);
+        std::vector<float> wdec(nel);
+        ggml_get_type_traits(GGML_TYPE_E4M3_M2)->to_float(wq[s].data(), wdec.data(), nel);
+        wb[s].resize(nel);
+        ggml_fp32_to_bf16_row(wdec.data(), wb[s].data(), nel);
+    }
+
+    // expert tensors: allocated once, shared by both dense-type runs
+    ggml_context * ctx_e = nullptr;
+    ggml_backend_buffer_t buf_e = nullptr;
+    ggml_tensor * eg = nullptr;
+    ggml_tensor * ed = nullptr;
+    if (moe) {
+        ggml_init_params ipe = { ggml_tensor_overhead()*8, nullptr, true };
+        ctx_e = ggml_init(ipe);
+        eg = ggml_new_tensor_3d(ctx_e, GGML_TYPE_MXFP4_M2, 4096, 2048, n_experts);
+        ed = ggml_new_tensor_3d(ctx_e, GGML_TYPE_MXFP4_M2, 2048, 4096, n_experts);
+        buf_e = ggml_backend_alloc_ctx_tensors(ctx_e, gpu);
+        GGML_ASSERT(buf_e != nullptr);
+        fill_mxfp4_m2_valid(eg);
+        fill_mxfp4_m2_valid(ed);
+        printf("bench-graph: expert plane %.2f GiB (MXFP4_M2, 256e, shared by both runs)\n",
+               (double)(ggml_nbytes(eg) + ggml_nbytes(ed))/(1ll << 30));
+    }
+
+    printf("bench-graph: %d layers, %d dense copies, moe=%s, median of %d\n",
+           n_layer, NCOPY, moe ? "on" : "off", REPS);
+
+    for (const int64_t n : batches_all) {
+        if (n <= 0) {
+            continue;
+        }
+
+        double t_med[2] = { 0.0, 0.0 };
+        const ggml_type types[2] = { GGML_TYPE_BF16, GGML_TYPE_E4M3_M2 };
+
+        for (int ti = 0; ti < 2; ti++) {
+            const ggml_type wtype = types[ti];
+
+            // weights + graph inputs
+            ggml_init_params ipw = { ggml_tensor_overhead()*(size_t)(NCOPY*NDS + 2*n_layer + 16), nullptr, true };
+            ggml_context * ctx_w = ggml_init(ipw);
+
+            ggml_tensor * W[NCOPY][NDS];
+            for (int c = 0; c < NCOPY; c++) {
+                for (int s = 0; s < NDS; s++) {
+                    W[c][s] = strcmp(ds[s].nm, "oa") == 0
+                        ? ggml_new_tensor_3d(ctx_w, wtype, ds[s].k, ds[s].m/8, 8)
+                        : ggml_new_tensor_2d(ctx_w, wtype, ds[s].k, ds[s].m);
+                }
+            }
+            ggml_tensor * x0  = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, 4096, n);
+            ggml_tensor * wts = moe ? ggml_new_tensor_3d(ctx_w, GGML_TYPE_F32, 1, n_used, n) : nullptr;
+            // static K/V/mask for the flash-attention op (shared read-only by
+            // all layers; prod attends up to the full context — 4096 keeps the
+            // bench inside the GPU budget while making FA a first-class
+            // concurrent kernel like production prefill)
+            const int64_t fa_kv = 4096;
+            ggml_tensor * fk = ggml_new_tensor_4d(ctx_w, GGML_TYPE_F16, 128, fa_kv, 8, 1);
+            ggml_tensor * fv = ggml_new_tensor_4d(ctx_w, GGML_TYPE_F16, 128, fa_kv, 8, 1);
+            ggml_tensor * fm = ggml_new_tensor_4d(ctx_w, GGML_TYPE_F16, fa_kv, n, 1, 1);
+            std::vector<ggml_tensor *> ids(n_layer, nullptr);
+            if (moe) {
+                for (int l = 0; l < n_layer; l++) {
+                    ids[l] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_I32, n_used, n);
+                }
+            }
+
+            ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors(ctx_w, gpu);
+            GGML_ASSERT(buf_w != nullptr);
+
+            for (int c = 0; c < NCOPY; c++) {
+                for (int s = 0; s < NDS; s++) {
+                    if (wtype == GGML_TYPE_BF16) {
+                        ggml_backend_tensor_set(W[c][s], wb[s].data(), 0, ggml_nbytes(W[c][s]));
+                    } else {
+                        ggml_backend_tensor_set(W[c][s], wq[s].data(), 0, ggml_nbytes(W[c][s]));
+                    }
+                }
+            }
+
+            {
+                std::vector<float> xv(4096*n);
+                fill_uniform(xv.data(), xv.size());
+                ggml_backend_tensor_set(x0, xv.data(), 0, ggml_nbytes(x0));
+
+                std::vector<float> kf(ggml_nelements(fk));
+                std::vector<ggml_fp16_t> kh(kf.size());
+                fill_uniform(kf.data(), kf.size());
+                ggml_fp32_to_fp16_row(kf.data(), kh.data(), kf.size());
+                ggml_backend_tensor_set(fk, kh.data(), 0, ggml_nbytes(fk));
+                fill_uniform(kf.data(), kf.size());
+                ggml_fp32_to_fp16_row(kf.data(), kh.data(), kf.size());
+                ggml_backend_tensor_set(fv, kh.data(), 0, ggml_nbytes(fv));
+
+                std::vector<ggml_fp16_t> mh(ggml_nelements(fm));
+                memset(mh.data(), 0, mh.size()*sizeof(ggml_fp16_t)); // f16 zero = no masking
+                ggml_backend_tensor_set(fm, mh.data(), 0, ggml_nbytes(fm));
+            }
+            if (moe) {
+                std::vector<float> wv(n_used*n);
+                fill_uniform(wv.data(), wv.size());
+                ggml_backend_tensor_set(wts, wv.data(), 0, ggml_nbytes(wts));
+
+                std::mt19937 ridg(777);
+                std::vector<int32_t> iv(n_used*n);
+                for (int l = 0; l < n_layer; l++) {
+                    for (int64_t t = 0; t < n; t++) {
+                        // 6 distinct experts per token (real router property)
+                        int32_t pick[6];
+                        for (int r = 0; r < 6; r++) {
+                            bool dup;
+                            do {
+                                pick[r] = (int32_t)(ridg() % n_experts);
+                                dup = false;
+                                for (int p = 0; p < r; p++) {
+                                    dup = dup || pick[p] == pick[r];
+                                }
+                            } while (dup);
+                            iv[t*n_used + r] = pick[r];
+                        }
+                    }
+                    ggml_backend_tensor_set(ids[l], iv.data(), 0, ggml_nbytes(ids[l]));
+                }
+            }
+
+            // graph (intermediates via gallocr so the live set stays small)
+            const size_t graph_nodes = (size_t)n_layer*48 + 16;
+            ggml_init_params ipg = {
+                ggml_tensor_overhead()*graph_nodes + ggml_graph_overhead_custom(graph_nodes, false),
+                nullptr, true,
+            };
+            ggml_context * ctx_g = ggml_init(ipg);
+
+            ggml_tensor * x = x0;
+            for (int l = 0; l < n_layer; l++) {
+                ggml_tensor ** Wl = W[l % NCOPY];
+
+                ggml_tensor * qa = ggml_mul_mat(ctx_g, Wl[0], x);   // [1024, n]
+                ggml_tensor * kv = ggml_mul_mat(ctx_g, Wl[2], x);   // [512, n]
+                ggml_tensor * qb = ggml_mul_mat(ctx_g, Wl[1], qa);  // [32768, n]
+                ggml_tensor * iq = ggml_mul_mat(ctx_g, Wl[3], qa);  // [8192, n]
+
+                // flash attention (q = 32 heads x 128 from qb, GQA over the
+                // shared 8-head K/V) — the big concurrent kernel class the
+                // dense mms co-reside with during production prefill
+                ggml_tensor * fq = ggml_view_3d(ctx_g, qb, 128, 32, n, 128*sizeof(float), qb->nb[1], 0);
+                fq = ggml_permute(ctx_g, fq, 0, 2, 1, 3); // [128, n, 32]
+                ggml_tensor * fa = ggml_flash_attn_ext(ctx_g, fq, fk, fv, fm, 1.0f/sqrtf(128.0f), 0.0f, 0.0f);
+                ggml_tensor * fa2 = ggml_reshape_2d(ctx_g, fa, 4096, n);
+
+                // attn_output_a exactly as deepseek4.cpp applies it: 3D weight
+                // [4096, 1024, 8] against a permuted src1 [4096, n, 8]
+                ggml_tensor * oai = ggml_view_3d(ctx_g, qb, 4096, 8, n, 4096*sizeof(float), qb->nb[1], 0);
+                oai = ggml_permute(ctx_g, oai, 0, 2, 1, 3);          // [4096, n, 8]
+                ggml_tensor * oa = ggml_mul_mat(ctx_g, Wl[8], oai);  // [1024, n, 8]
+                oa = ggml_cont_2d(ctx_g, ggml_permute(ctx_g, oa, 0, 2, 1, 3), 8192, n);
+                ggml_tensor * ob = ggml_mul_mat(ctx_g, Wl[4], oa);   // [4096, n]
+
+                ggml_tensor * iqv = ggml_view_2d(ctx_g, iq, 4096, n, iq->nb[1], 0);
+                ggml_tensor * h   = ggml_add(ctx_g,
+                        ggml_add(ctx_g, ggml_add(ctx_g, ggml_add(ctx_g, ob, x), iqv), kv), fa2);
+
+                ggml_tensor * sg = ggml_mul_mat(ctx_g, Wl[5], h);   // [2048, n]
+                ggml_tensor * su = ggml_mul_mat(ctx_g, Wl[6], h);   // [2048, n]
+                ggml_tensor * gu = ggml_mul(ctx_g, sg, su);
+                ggml_tensor * sd = ggml_mul_mat(ctx_g, Wl[7], gu);  // [4096, n]
+
+                if (moe) {
+                    ggml_tensor * hr = ggml_reshape_3d(ctx_g, h, 4096, 1, n);
+                    // gate + up adjacent with identical src1/ids/weight layout
+                    // -> exercises the dsv4 pair-fusion worklist path like
+                    // production (the same physical tensor twice reads the
+                    // same bytes DRAM-cold either way)
+                    ggml_tensor * ge = ggml_mul_mat_id(ctx_g, eg, hr, ids[l]); // [2048, 6, n]
+                    ggml_tensor * ue = ggml_mul_mat_id(ctx_g, eg, hr, ids[l]); // [2048, 6, n]
+                    ggml_tensor * gue = ggml_mul(ctx_g, ge, ue);
+                    ggml_tensor * de = ggml_mul_mat_id(ctx_g, ed, gue, ids[l]); // [4096, 6, n]
+                    ggml_tensor * dw = ggml_mul(ctx_g, de, wts);
+                    ggml_tensor * mo = ggml_view_2d(ctx_g, dw, 4096, n, dw->nb[2], 0);
+                    x = ggml_add(ctx_g, ggml_add(ctx_g, sd, mo), h);
+                } else {
+                    x = ggml_add(ctx_g, sd, h);
+                }
+            }
+
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx_g, graph_nodes, false);
+            ggml_build_forward_expand(gf, x);
+
+            ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu));
+            GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+
+            std::vector<double> ts;
+            for (int it = 0; it < WARMUP + REPS; it++) {
+                const int64_t t0 = ggml_time_us();
+                const ggml_status st = ggml_backend_graph_compute(gpu, gf);
+                const int64_t t1 = ggml_time_us();
+                GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+                if (it >= WARMUP) {
+                    ts.push_back((t1 - t0)/1e3);
+                }
+            }
+            std::sort(ts.begin(), ts.end());
+            t_med[ti] = ts[ts.size()/2];
+
+            printf("  n=%-5" PRId64 " %-8s: median %8.3f ms/graph (min %8.3f, max %8.3f), %d nodes\n",
+                   n, ggml_type_name(wtype), t_med[ti], ts.front(), ts.back(), ggml_graph_n_nodes(gf));
+
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx_g);
+            ggml_backend_buffer_free(buf_w);
+            ggml_free(ctx_w);
+        }
+
+        printf("  n=%-5" PRId64 " graph time ratio e4m3_m2/bf16 = %.4f  (dense-plane delta %+.1f%% of total)\n",
+               n, t_med[1]/t_med[0], (t_med[1]/t_med[0] - 1.0)*100.0);
+    }
+
+    if (buf_e) {
+        ggml_backend_buffer_free(buf_e);
+    }
+    if (ctx_e) {
+        ggml_free(ctx_e);
+    }
+
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     ggml_time_init();
 
     const bool bench_dense = argc > 1 && strcmp(argv[1], "bench-dense") == 0;
+    const bool bench_graph = argc > 1 && strcmp(argv[1], "bench-graph") == 0;
 
     bool ok = true;
 
-    if (bench_dense) {
+    if (bench_dense || bench_graph) {
         ggml_backend_t gpu = find_gpu_backend();
         if (gpu == nullptr) {
-            printf("bench-dense requires a GPU backend\n");
+            printf("bench requires a GPU backend\n");
             return 1;
         }
         printf("GPU backend: %s\n", ggml_backend_name(gpu));
+        if (bench_graph) {
+            // optional args: batch-size filter (0 = sweep), layer count, "nomoe"
+            const int64_t n_filter = argc > 2 ? atoll(argv[2]) : 0;
+            const int     n_layer  = argc > 3 ? atoi(argv[3]) : 8;
+            const bool    moe      = !(argc > 4 && strcmp(argv[4], "nomoe") == 0);
+            return run_bench_graph(gpu, n_filter, n_layer, moe);
+        }
         // optional args: batch-size filter and chain-name substring filter
         // (fast A/B iteration)
         const int64_t nb_filter    = argc > 2 ? atoll(argv[2]) : 0;
