@@ -2146,17 +2146,25 @@ private:
                 return result;
             }
 
-            // the reuse span must start at the resident frontier and still
-            // contain new rows; otherwise fall back to the full clear
+            // the admission span must start at the resident frontier
+            // (API invariant). When the whole span already lies below the
+            // frontier - the common thinking-model chat shape, where the
+            // re-rendered history drops the reasoning tokens so the task is
+            // shorter than the resident sequence - the prefill only rewrites
+            // and frees rows below the frontier and needs no reservation at
+            // all: it trims the resident tail (freeing more rows than the
+            // re-decode writes back) and the ordinary per-batch reservation
+            // covers the landing, exactly like the sub-frontier backfill of
+            // a spanned reuse.
             const llama_pos pos_frontier = reuse_resident ? slot.prompt.tokens.pos_next() : 0;
-            if (reuse_resident && (llama_pos) plan.span_tokens <= pos_frontier) {
-                reuse_resident = false;
-            }
 
             if (reuse_resident) {
-                SLT_INF(slot, "elastic admission reuses resident prefix: lcp=%zu resident=%zu frontier=%d task=%d span_end=%zu\n",
-                        n_lcp, n_prompt_res, (int) pos_frontier, (int) task.n_tokens(), (size_t) plan.span_tokens);
-                spans.push_back({ slot.id, pos_frontier, (llama_pos) plan.span_tokens });
+                SLT_INF(slot, "elastic admission reuses resident prefix: lcp=%zu resident=%zu frontier=%d task=%d span_end=%zu%s\n",
+                        n_lcp, n_prompt_res, (int) pos_frontier, (int) task.n_tokens(), (size_t) plan.span_tokens,
+                        (llama_pos) plan.span_tokens <= pos_frontier ? " (below frontier, spanless)" : "");
+                if ((llama_pos) plan.span_tokens > pos_frontier) {
+                    spans.push_back({ slot.id, pos_frontier, (llama_pos) plan.span_tokens });
+                }
             } else {
                 // full-clear admission: quote the whole span against an empty
                 // sequence, exactly like the original uncached vertical. The
@@ -2182,6 +2190,12 @@ private:
                 return result;
             }
             spans.push_back({ active->id, pos_begin, pos_begin + 1 });
+        }
+
+        if (spans.empty()) {
+            // spanless reuse only: nothing new to reserve, the prefill works
+            // entirely below the resident frontier
+            return result;
         }
 
         llama_kv_admission_quote quote = {};
