@@ -5812,6 +5812,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_F64:
         case GGML_TYPE_E4M3_M2:
         case GGML_TYPE_MXFP4_M2:
+        case GGML_TYPE_NF8_M2:
         case GGML_TYPE_COUNT:
             {
                 GGML_ABORT("fatal error");

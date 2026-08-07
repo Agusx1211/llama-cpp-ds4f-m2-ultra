@@ -4800,6 +4800,7 @@ class GGMLQuantizationType(IntEnum):
     # already written into gguf-m2 artifacts.
     E4M3_M2  = 90
     MXFP4_M2 = 91
+    NF8_M2   = 92
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4987,6 +4988,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
     GGMLQuantizationType.E4M3_M2: (1024, 1024 + 8 + 8),  # gguf-m2 v1 dense plane: 1024 e4m3 codes + 8 E8M0 scales + 8 pad
     GGMLQuantizationType.MXFP4_M2: (2048, 1024 + 32),    # gguf-m2 v1 expert plane: 64x16 code bytes + 64 scale nibbles
+    GGMLQuantizationType.NF8_M2:  (1024, 1024 + 32),     # gguf-m2 dense plane v2: 1024 nf8 codes + 32 base/escape bytes
 }
 
 

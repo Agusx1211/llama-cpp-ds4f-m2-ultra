@@ -709,7 +709,7 @@ llama_model_loader::llama_model_loader(
         bool has_m2_types = false;
         for (const auto & it : weights_map) {
             const enum ggml_type t = it.second.tensor->type;
-            if (t == GGML_TYPE_E4M3_M2 || t == GGML_TYPE_MXFP4_M2) {
+            if (t == GGML_TYPE_E4M3_M2 || t == GGML_TYPE_MXFP4_M2 || t == GGML_TYPE_NF8_M2) {
                 has_m2_types = true;
                 break;
             }

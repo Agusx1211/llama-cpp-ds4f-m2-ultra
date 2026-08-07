@@ -407,6 +407,32 @@ static inline float ggml_e4m3_m2_scale_to_f32(uint8_t sc) {
     return fp32_from_bits((uint32_t) sc << 23);
 }
 
+// GGML_TYPE_NF8_M2 (fork-owned gguf-m2 dense plane, second encoding) decode
+// helpers — the reference semantics the Metal shaders mirror bit-for-bit.
+//
+// Fast-block code decode: v = s|E4|m3 normalized against the block base
+// exponent b (from the sb byte low 7 bits, bias NF8_M2_EXP_BIAS). Exact:
+// f32 bits are assembled directly. em == 0 is the reserved zero code (both
+// signs). For any sb7/em combination the assembled exponent field stays in
+// [64, 206], so the result is always a finite normal f32 (or +-0).
+static inline float ggml_nf8_m2_code_to_f32(uint8_t v, uint8_t sb7) {
+    const uint32_t sign = ((uint32_t) v & 0x80u) << 24;
+    const uint32_t em   = (uint32_t) v & 0x7Fu; // relative exponent(4) | mantissa(3)
+    if (em == 0) {
+        return fp32_from_bits(sign); // +-0.0
+    }
+    // value = (1 + m/8) * 2^(b + E) with b = sb7 - 63:
+    // f32 exponent field = b + E + 127 = E + sb7 + 64  ->  bits =
+    // (em + ((sb7 + 64) << 3)) << 20 (mantissa m lands in the top 3 bits)
+    return fp32_from_bits(sign | ((em + (((uint32_t) sb7 + 64u) << 3)) << 20));
+}
+
+// Escape-block scale: 2^k with k = sb7 - 63, i.e. f32 exponent field
+// k + 127 = sb7 + 64 in [64, 191] — always a normal, nonzero power of two.
+static inline float ggml_nf8_m2_escape_scale_to_f32(uint8_t sb7) {
+    return fp32_from_bits(((uint32_t) sb7 + 64u) << 23);
+}
+
 static inline float ggml_compute_fp16_to_fp32(ggml_fp16_t h) {
     const uint32_t w = (uint32_t) h << 16;
     const uint32_t sign = w & UINT32_C(0x80000000);

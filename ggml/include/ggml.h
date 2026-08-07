@@ -442,7 +442,8 @@ extern "C" {
         // GGML_TYPE_COUNT above the highest fork id.
         GGML_TYPE_E4M3_M2  = 90, // gguf-m2 v1 dense plane: OCP E4M3 codes + per-128-elem E8M0 scales
         GGML_TYPE_MXFP4_M2 = 91, // gguf-m2 v1 expert plane: split-plane MXFP4, 4-bit absolute E8M0 scales
-        GGML_TYPE_COUNT    = 92,
+        GGML_TYPE_NF8_M2   = 92, // gguf-m2 dense plane, alt encoding: block-normalized s|E4|m3 codes + per-32-elem base byte with escape flag
+        GGML_TYPE_COUNT    = 93,
     };
 
     // precision
