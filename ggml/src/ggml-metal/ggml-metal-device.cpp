@@ -814,12 +814,36 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     // fork: the dedicated E4M3_M2 GEMM processes NT1 32-column B tiles per
     // threadgroup against one staged+decoded A tile (amortizes the e4m3
     // decode and the A refetch across 32*NT1 columns instead of 32).
-    // GGML_E4M3_MM_NT1=1 selects the single-tile variant for A/B runs.
-    int e4m3_nt1 = 2;
+    // ROUND 2 (notes/2026-08-07-gguf-m2-artifact-format-design.md): NT1=2
+    // measured 1.03-1.09x BF16 in ISOLATION but collapsed IN-GRAPH (-28%
+    // end-to-end prefill, 2.4x 30-token prompt evals). The bench-graph
+    // concurrency harness (test-m2-e4m3 bench-graph) reproduced the
+    // collapse: whenever ne1 % 64 != 0 the nt2 pipeline compiles its
+    // bounds-checked specialization at th_max 576 (vs 1024 for the BF16
+    // template) and the whole mixed-op graph runs 2.6x (n=664) to 3.5x
+    // (n=30) BF16; even aligned it sits at th_max 640 with the second
+    // B tile fully wasted at small ne1 (branch-free staging + MMA run
+    // regardless). NT1=1 with the same u16c decode keeps th_max 896-1024
+    // and measured 1.05x total-graph at every ne1 probed (30/512/664/2048).
+    // DEFAULT: NT1=1 everywhere. NT1=2 stays selectable for A/B:
+    // GGML_E4M3_MM_NT1=2 forces it, GGML_E4M3_MM_NT2_MIN_N=<n> re-enables
+    // it for tile-aligned ops with ne1 >= n (in-bench it is 1-4pp faster
+    // than NT1=1 at aligned n >= 512, but that is exactly the regime where
+    // the bench could NOT reproduce round 1's aligned-prefill deficit, so
+    // enabling it needs an end-to-end A/B first).
+    static const int e4m3_nt2_min_n = [] {
+        const char * s = getenv("GGML_E4M3_MM_NT2_MIN_N");
+        return s != NULL ? atoi(s) : 0; // 0 = NT1=2 never (round-2 default)
+    }();
+    // the NT2_MIN_N lever only ever selects NT1=2 for fully tile-aligned
+    // outputs: the nt2 bco=1 specialization is the measured 2.6-3.5x
+    // in-graph catastrophe (bench-graph, n=664/30) and must be unreachable
+    int e4m3_nt1 = (e4m3_nt2_min_n > 0 && op->ne[1] >= e4m3_nt2_min_n &&
+                    op->ne[0] % 64 == 0 && op->ne[1] % 64 == 0) ? 2 : 1;
     if (tsrc0 == GGML_TYPE_E4M3_M2 && getenv("GGML_E4M3_MM_NT1") != NULL) {
         // NT1=4 was measured DEAD (mc[32] register collapse, 6.4-8.4x) and
         // its instantiations were removed — only 1 and 2 exist
-        e4m3_nt1 = atoi(getenv("GGML_E4M3_MM_NT1")) == 1 ? 1 : 2;
+        e4m3_nt1 = atoi(getenv("GGML_E4M3_MM_NT1")) == 2 ? 2 : 1;
     }
     if (tsrc0 == GGML_TYPE_E4M3_M2 && getenv("GGML_E4M3_MM_TMPL") != NULL) {
         e4m3_nt1 = 1; // the shared-template probe is a 64x32 tile

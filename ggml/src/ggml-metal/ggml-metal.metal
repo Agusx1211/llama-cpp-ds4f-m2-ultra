@@ -11712,6 +11712,11 @@ template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mul_mm_t kernel_mul_m
 //   the device refetch of A (the template refetches + re-decodes A for
 //   every 32-column tile). Each B tile keeps its own mc accumulators and
 //   the per-output-element accumulation order is unchanged.
+//   ROUND 2: NT1=2 won isolated benches but COLLAPSED in-graph (register
+//   pressure compiles to th_max 576-640 vs the BF16 template's 1024;
+//   2.6-3.5x total mixed-graph time at any ne1 % 64 != 0, measured by
+//   test-m2-e4m3 bench-graph). The host now dispatches NT1=1 by default —
+//   see ggml_metal_library_get_pipeline_mul_mm and the design note.
 // FC_mul_mm_bc_inp is structurally impossible here (ne00 % 1024 == 0 by the
 // E4M3_M2 block invariant), so the unaligned-K branch is omitted. The host
 // sets FC_mul_mm_bc_out against the NT1*32-column granularity.
