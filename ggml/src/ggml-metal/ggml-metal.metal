@@ -230,6 +230,59 @@ static inline float e4m3_m2_scale_to_f32(uint32_t sc) {
     return as_type<float>(sc << 23);
 }
 
+// GGML_TYPE_NF8_M2 (fork-owned gguf-m2 dense plane, second encoding) — decode
+// helpers, bit-for-bit mirrors of ggml_nf8_m2_code_to_f32 /
+// ggml_nf8_m2_escape_scale_to_f32 in ggml-impl.h. The whole point of this
+// encoding is that the FAST path (99.94% of 32-element groups) needs NO table
+// gather and NO clz/renormalize: the code byte is block-locally NORMALIZED
+// (s|E4|m3, implicit leading 1, em == 0 reserved for +-0), so decode is pure
+// integer bit-insertion into the f32/bf16 bit layout plus one select for the
+// zero code. The rare ESCAPE groups (sb high bit set) hold plain OCP E4M3
+// bytes against a power-of-two scale and go through the e4m3 ALU decode; the
+// branch is uniform per 32-element group.
+//
+// Unscaled fast decode: em == 0 -> +-0, else (1 + m/8) * 2^(E - 7) — the
+// e4m3 NORMAL formula extended to em < 8 (no denormal region exists in this
+// encoding). The true value is unscaled * 2^(base + 7); like the E4M3_M2
+// kernels the mv/ext paths keep the power-of-two scale as a separate exact
+// multiply so the compiled FP chain mirrors the proven-bit-identical shape.
+static inline float nf8_m2_code_to_f32_unscaled(uint32_t v) {
+    const uint32_t s  = (v & 0x80u) << 24;
+    const uint32_t em = v & 0x7Fu;
+    return as_type<float>(em ? (s | ((em + 960u) << 20)) : s); // 960 = 120<<3
+}
+
+// sb byte helpers: t = (sb & 0x7F) + 64 (== base + 127 == k + 127 + 0/..).
+// fast-block scale 2^(base + 7): f32 exponent field base + 134 = t + 7
+static inline float nf8_m2_fast_scale_to_f32(uint32_t t) {
+    return as_type<float>((t + 7u) << 23);
+}
+// escape-block scale 2^k: f32 exponent field k + 127 = t
+static inline float nf8_m2_escape_scale_to_f32(uint32_t t) {
+    return as_type<float>(t << 23);
+}
+
+// Unified BRANCHLESS per-element decode to the UNSCALED value, used by the
+// batch-1 GEMV: fast groups decode to the normalized (1 + m/8) * 2^(E - 7)
+// form, escape groups to the plain e4m3 value (denormals included) — both
+// through ONE straight-line expression whose behavior is selected by two
+// per-chunk scalars instead of control flow:
+//   lim  = escape ? 8 : 1   (codes below lim take the "small" path)
+//   dden = escape ? 2^-9 : 0.0   (so the small path yields m * 2^-9 on
+//          escape chunks and exactly +-0 on fast chunks)
+// The caller multiplies by the per-chunk power-of-two scale (2^k escape,
+// 2^(base+7) fast). Keeping the loop body free of control flow is REQUIRED
+// for bit-identity: branchy drafts of the mv kernel compiled the loop-
+// carried dot/sum chain differently from the BF16 kernel whenever the block
+// loop ran >= 2 iterations, producing ~1e-6-relative diffs.
+static inline float nf8_m2_code_to_f32_unified(uint32_t v, uint32_t lim, float dden) {
+    const uint32_t s   = (v & 0x80u) << 24;
+    const uint32_t em  = v & 0x7Fu;
+    const float    mag = (float) em * dden; // escape denormal magnitude; +0 on fast chunks
+    const uint32_t nrm = s | ((em + 960u) << 20); // 960 = 120<<3
+    return as_type<float>(em < lim ? (s | as_type<uint32_t>(mag)) : nrm);
+}
+
 // il in [0, QK_E4M3_M2/16): which 16-element chunk of the block. All 16
 // elements of a chunk share one scale (128 % 16 == 0). The 16 code bytes are
 // 16-byte aligned, fetched as a single uint4. Consumer: the shared-template
@@ -4569,6 +4622,195 @@ template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_6")]] kernel mul_mv_ext_e
 template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_7")]] kernel mul_mv_ext_e4m3_m2_f32_t kernel_mul_mv_ext_e4m3_m2_f32_disp<7>;
 template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_8")]] kernel mul_mv_ext_e4m3_m2_f32_t kernel_mul_mv_ext_e4m3_m2_f32_disp<8>;
 
+// fork: GGML_TYPE_NF8_M2 small-batch GEMV (mul_mv_ext path). Structural copy
+// of kernel_mul_mv_ext_e4m3_m2_f32_impl above — identical thread-to-chunk
+// assignment, per-chunk dot() and exact scale-fold fma accumulation, and the
+// same verbatim reduction tree — with the decode swapped for the NF8_M2 pure
+// bit-insertion path:
+// - NO decode LUT at all (the e4m3 kernel stages 1 KiB in threadgroup
+//   memory; this kernel needs no threadgroup memory and no barrier);
+// - the block's 32 sb bytes replace the 8 E8M0 scale bytes. A thread's four
+//   chunks of one g iteration touch sb bytes within one aligned 4-byte
+//   (nxpsg=8) or 8-byte (nxpsg=16) window, preloaded as registers;
+// - per chunk, lx[c] holds UNSCALED decoded values and ld[c] the exact
+//   power-of-two scale, folded with fma exactly like the e4m3 ext kernel:
+//   fast groups lx = (1+m/8)*2^(E-7), ld = 2^(base+7); escape groups
+//   lx = e4m3(code), ld = 2^k. Same overflow bound (|lx| <= 480) and the
+//   same exactness argument, so the output stays bit-identical to
+//   kernel_mul_mv_ext_bf16_f32_r1_N (enforced by tests/test-m2-nf8.cpp);
+// - the decode is BRANCHLESS (nf8_m2_code_to_f32_unified selected by
+//   per-chunk scalars) — see the comment at the decode site: control flow
+//   inside the unrolled operand loop measured 1.4-2.3x SLOWER.
+template<short r1ptg, short nxpsg>
+void kernel_mul_mv_ext_nf8_m2_f32_impl(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig,
+        ushort  tiisg,
+        ushort  sgitg) {
+    const short NSG   = FC_mul_mv_nsg;
+
+    const short nypsg = (32/nxpsg);
+
+    const short tx = tiisg%nxpsg;
+    const short ty = tiisg/nxpsg;
+
+    // sb-byte sub-index for nxpsg == 16: a thread's chunk cc covers elements
+    // [4*cc, 4*cc+4) and its sb byte is cc/8 = 2*(4g+c) + (tx >> 3)
+    const short hsb = tx >> 3;
+
+    const int i01 = tgpig.x*(nypsg*NSG) + nypsg*sgitg + ty;
+    const int i11 = tgpig.y*r1ptg;
+    const int i1m = tgpig.z;
+
+    const int i12 = i1m%FC_mul_mv_ne12;
+    const int i13 = i1m/FC_mul_mv_ne12;
+
+    const uint64_t offset0 = i01*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 = i11*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_nf8_m2 * xb = (device const block_nf8_m2 *) ((i01 < args.ne01) ? src0 + offset0 : src0);
+
+    device const float4 * y4[r1ptg];
+
+    for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
+        y4[ir1] = (i11 + ir1 < args.ne11) ? (device const float4 *) (src1 + offset1 + ir1*args.nb11) + tx : (device const float4 *) src1;
+    }
+
+    float sumf[r1ptg] = { [ 0 ... r1ptg - 1 ] = 0.0f };
+
+    const int nblk = args.ne00/QK_NF8_M2;
+
+    for (int ib = 0; ib < nblk; ++ib, ++xb) {
+        for (short g = 0; g < 64/nxpsg; ++g) {
+            // the sb bytes for this thread's 4 chunks, one aligned load
+            // (block base is 16-byte aligned, sb sits at offset 1024)
+            uint32_t sw0 = 0;
+            uint32_t sw1 = 0;
+            if (nxpsg == 8) {
+                // chunks 4g+c -> sb bytes 4g..4g+3 == word g
+                sw0 = ((device const uint32_t *)(xb->sb))[g];
+            } else {
+                // chunks tx + (4g+c)*16 -> sb bytes 8g..8g+7 == uint2 g
+                const uint2 w = ((device const uint2 *)(xb->sb))[g];
+                sw0 = w.x;
+                sw1 = w.y;
+            }
+
+            float4 lx[4];
+            float  ld[4];
+
+            FOR_UNROLL (short c = 0; c < 4; ++c) {
+                const short cc = tx + (4*g + c)*nxpsg;
+
+                const uint32_t qw = *(device const uint32_t *)(xb->qs + 4*cc);
+
+                const short    bi    = (nxpsg == 8) ? c : (short)(2*c + hsb);
+                const uint32_t sword = (nxpsg == 8 || c < 2) ? sw0 : sw1; // compile-time select
+                const uint32_t sbyte = (sword >> (8*(bi & 3))) & 0xFFu;
+                const uint32_t t     = (sbyte & 0x7Fu) + 64u;
+                const bool     esc   = (sbyte & 0x80u) != 0;
+
+                // BRANCHLESS decode, exactly like the batch-1 GEMV above:
+                // per-chunk scalars select the escape behavior inside the
+                // straight-line nf8_m2_code_to_f32_unified expression. A
+                // branchy draft (fast/escape if-else filling lx/ld inside
+                // this FOR_UNROLL) measured 1.4-2.3x the BF16 ext time even
+                // at the real ~0.17% escape density — control flow inside
+                // the unrolled operand loop defeats the unroll/pipelining
+                // (the lx[] register-spill landmine class), independent of
+                // which side the branches take.
+                const uint32_t lim  = esc ? 8u : 1u;
+                const float    dden = esc ? 0x1p-9f : 0.0f;
+
+                lx[c] = float4(nf8_m2_code_to_f32_unified((qw >>  0) & 0xFF, lim, dden),
+                               nf8_m2_code_to_f32_unified((qw >>  8) & 0xFF, lim, dden),
+                               nf8_m2_code_to_f32_unified((qw >> 16) & 0xFF, lim, dden),
+                               nf8_m2_code_to_f32_unified((qw >> 24)       , lim, dden));
+
+                ld[c] = as_type<float>((t + (esc ? 0u : 7u)) << 23);
+            }
+
+            FOR_UNROLL (short c = 0; c < 4; ++c) {
+                FOR_UNROLL (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+                    // EXACTNESS: identical argument to the e4m3 ext kernel —
+                    // the weight value is lx*ld with ld a power of two, codes
+                    // are <= 480 so the unscaled dot cannot overflow, and
+                    // fma(ld, t, s) == (ld*t) + s since ld*t is exact.
+                    const float t = dot(lx[c], y4[ir1][c*nxpsg]);
+
+                    sumf[ir1] = fma(ld[c], t, sumf[ir1]);
+                }
+            }
+
+            FOR_UNROLL (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+                y4[ir1] += 4*nxpsg;
+            }
+        }
+    }
+
+    // reduce only the threads in each row (verbatim from the template)
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+        if (nxpsg >= 32) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
+        }
+        if (nxpsg >= 16) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  8);
+        }
+        if (nxpsg >= 8) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  4);
+        }
+        if (nxpsg >= 4) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  2);
+        }
+        if (nxpsg >= 2) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  1);
+        }
+    }
+
+    if (tx == 0) {
+        for (short ir1 = 0; ir1 < r1ptg && i11 + ir1 < args.ne11; ++ir1) {
+            device float * dst_f32 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1 + (uint64_t)(i11 + ir1)*args.ne0;
+
+            if (i01 < args.ne01) {
+                dst_f32[i01] = sumf[ir1];
+            }
+        }
+    }
+}
+
+template<short r1ptg>
+kernel void kernel_mul_mv_ext_nf8_m2_f32_disp(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    // same host contract as the e4m3 disp above: nxpsg is 16 or 8 only
+    if (FC_mul_mv_nxpsg == 16) {
+        kernel_mul_mv_ext_nf8_m2_f32_impl<r1ptg, 16>(args, src0, src1, dst, tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_ext_nf8_m2_f32_impl<r1ptg,  8>(args, src0, src1, dst, tgpig, tiisg, sgitg);
+    }
+}
+
+typedef decltype(kernel_mul_mv_ext_nf8_m2_f32_disp<2>) mul_mv_ext_nf8_m2_f32_t;
+
+// r1_6/7/8: same single-pass dispatch policy as E4M3_M2 (ne11 in {6,7,8} at
+// ne01 >= 16384) — decode is cheaper here but the double fetch of the stock
+// two-column-group split costs the same bytes
+template [[host_name("kernel_mul_mv_ext_nf8_m2_f32_r1_2")]] kernel mul_mv_ext_nf8_m2_f32_t kernel_mul_mv_ext_nf8_m2_f32_disp<2>;
+template [[host_name("kernel_mul_mv_ext_nf8_m2_f32_r1_3")]] kernel mul_mv_ext_nf8_m2_f32_t kernel_mul_mv_ext_nf8_m2_f32_disp<3>;
+template [[host_name("kernel_mul_mv_ext_nf8_m2_f32_r1_4")]] kernel mul_mv_ext_nf8_m2_f32_t kernel_mul_mv_ext_nf8_m2_f32_disp<4>;
+template [[host_name("kernel_mul_mv_ext_nf8_m2_f32_r1_5")]] kernel mul_mv_ext_nf8_m2_f32_t kernel_mul_mv_ext_nf8_m2_f32_disp<5>;
+template [[host_name("kernel_mul_mv_ext_nf8_m2_f32_r1_6")]] kernel mul_mv_ext_nf8_m2_f32_t kernel_mul_mv_ext_nf8_m2_f32_disp<6>;
+template [[host_name("kernel_mul_mv_ext_nf8_m2_f32_r1_7")]] kernel mul_mv_ext_nf8_m2_f32_t kernel_mul_mv_ext_nf8_m2_f32_disp<7>;
+template [[host_name("kernel_mul_mv_ext_nf8_m2_f32_r1_8")]] kernel mul_mv_ext_nf8_m2_f32_t kernel_mul_mv_ext_nf8_m2_f32_disp<8>;
+
 template [[host_name("kernel_mul_mv_ext_q1_0_f32_r1_2")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_q1_0,   128, dequantize_q1_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q1_0_f32_r1_3")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_q1_0,   128, dequantize_q1_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q1_0_f32_r1_4")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_q1_0,   128, dequantize_q1_0_t4>;
@@ -5025,6 +5267,149 @@ kernel void kernel_mul_mv_e4m3_m2_f32_4(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_e4m3_m2_f32_disp<constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+// fork: GGML_TYPE_NF8_M2 GEMV — a structural copy of
+// kernel_mul_mv_e4m3_m2_f32_impl above (itself a proven bit-identical mirror
+// of the BF16 kernel) with the threadgroup-LUT decode replaced by the pure
+// bit-insertion decode: no LUT staging, no threadgroup barrier, no gather.
+// Each 16-element chunk sits inside one 32-element group (q % 32 in {0, 16})
+// so one sb byte covers the whole uint4 code load; the escape branch is
+// uniform per chunk. Both arms keep the per-element value*d multiply and the
+// identical sumq/dot chain — the compiled FP shape the E4M3_M2 mv kernel
+// empirically requires for bit-identity vs the BF16 kernel (its scale-folded
+// variant produced ~1e-6 diffs; see the NOTE in the kernel above).
+template<short NR0, typename args_t>
+void kernel_mul_mv_nf8_m2_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    const int nb = args.ne00/NB;
+
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const float4 * y4 = (device const float4 *) (src1 + offset1);
+
+    // pointers to src0 rows (block layout)
+    device const block_nf8_m2 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+
+        ax[row] = (device const block_nf8_m2 *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+
+    const int ib0 = sgitg*NF + ix;
+
+    float4 yl4[NF4];
+
+    device const float4 * yb4 = y4 + (ib0*NB + il*NF)/4;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        for (short i = 0; i < NF4; ++i) {
+            yl4[i] = yb4[i];
+        }
+
+        const int   p   = ib*NB + il*NF;      // element offset in the row, multiple of 16
+        const int   ibq = p/QK_NF8_M2;        // block index
+        const short q   = p%QK_NF8_M2;        // in-block code offset, multiple of 16
+
+        for (short row = 0; row < NR0; row++) {
+            device const block_nf8_m2 * xb = ax[row] + ibq;
+
+            const uint4    qv    = *(device const uint4 *)(xb->qs + q); // 16-B aligned
+            const uint32_t sbyte = xb->sb[q/NF8_M2_GSZ]; // one sb byte covers all 16
+            const uint32_t t     = (sbyte & 0x7Fu) + 64u;
+            const bool     esc   = (sbyte & 0x80u) != 0;
+
+            // BRANCHLESS decode: the escape/fast distinction is carried by
+            // three per-chunk scalars (lim/dden select the small-code path
+            // inside nf8_m2_code_to_f32_unified; d is the exact power-of-two
+            // scale — 2^k escape, 2^(base+7) fast), and the loop body below
+            // is the E4M3_M2 mv kernel's exact interleaved shape: unscaled
+            // value, per-element *d, dot, running sum. Two branchy drafts
+            // (accumulation inside the arms; produce-then-accumulate) both
+            // changed the fast-math lowering of this chain vs the BF16
+            // kernel and failed bit-identity — control flow in this loop is
+            // the landmine, not the arithmetic.
+            const uint32_t lim  = esc ? 8u : 1u;
+            const float    dden = esc ? 0x1p-9f : 0.0f;
+            const float    d    = as_type<float>((t + (esc ? 0u : 7u)) << 23);
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                const uint32_t qw = qv[i];
+
+                float4 xv;
+                xv[0] = nf8_m2_code_to_f32_unified((qw >>  0) & 0xFF, lim, dden)*d;
+                xv[1] = nf8_m2_code_to_f32_unified((qw >>  8) & 0xFF, lim, dden)*d;
+                xv[2] = nf8_m2_code_to_f32_unified((qw >> 16) & 0xFF, lim, dden)*d;
+                xv[3] = nf8_m2_code_to_f32_unified((qw >> 24)       , lim, dden)*d;
+
+                sumq += dot(xv, yl4[i]);
+            }
+
+            sumf[row] += sumq;
+        }
+
+        yb4 += NSG*NF*NW/4;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+template<typename args_t>
+void kernel_mul_mv_nf8_m2_f32_disp(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    switch (args.nr0) {
+        case 2: kernel_mul_mv_nf8_m2_f32_impl<2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 4: kernel_mul_mv_nf8_m2_f32_impl<4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 8: kernel_mul_mv_nf8_m2_f32_impl<8, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+    }
+}
+
+kernel void kernel_mul_mv_nf8_m2_f32_4(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_nf8_m2_f32_disp<constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 template<typename T0, typename T1, typename args_t>
@@ -12227,6 +12612,283 @@ typedef decltype(kernel_mul_mm_e4m3_m2_s<2>) mul_mm_e4m3_m2_s_t;
 
 template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt2s_u16")]]  kernel mul_mm_e4m3_m2_s_t kernel_mul_mm_e4m3_m2_s<2>;
 template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt2s_u16c")]] kernel mul_mm_e4m3_m2_s_t kernel_mul_mm_e4m3_m2_s<3>;
+
+// fork: dedicated GGML_TYPE_NF8_M2 GEMM (prefill path) — a DELIBERATELY
+// CONSERVATIVE single-tile variant. The template tile pipeline is copied from
+// kernel_mul_mm_e4m3_m2 with NT1 fixed to 1: the round-1 NT1=2 structure won
+// isolated benches but collapsed -28% on in-graph prefill (register/
+// threadgroup footprint cut graph concurrency; see the design note's
+// "Full-artifact re-A/B" section), so this kernel keeps the BF16 template's
+// exact 64x32 tile geometry, threadgroup allocation (6144 B) and occupancy.
+// What changes vs the E4M3_M2 mm is ONLY the A-tile decode: the per-element
+// table GATHER (the residual mm cost beside the saturated MMA pipeline) is
+// replaced by the NF8_M2 pure bit-insertion decode.
+// DECODE_STYLE: 1 (default) assembles bf16 BIT PATTERNS with integer ops on
+// the int pipe (the e4m3 mm's winning decode class, sans gather on the fast
+// path); 0 decodes to f32 and converts pre-barrier (attribution knob,
+// GGML_NF8_MM_STYLE=f32). Escape groups keep a per-chunk branch + the e4m3
+// constant table — a fully branchless gather-free variant measured SLOWER
+// here (see the decode-site comment).
+// Bit-identical to kernel_mul_mm_bf16_f32 by the same argument as the e4m3
+// mm kernels: identical staging shape, identical simdgroup ik order, and
+// every decoded value is exactly the bf16 weight value (all NF8_M2 values
+// are normal bf16 or +-0 by construction). Enforced by tests/test-m2-nf8.cpp.
+template<short DECODE_STYLE>
+kernel void kernel_mul_mm_nf8_m2(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32; // columns per B tile
+
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    threadgroup bfloat * sa = (threadgroup bfloat *)(shmem);        // 64x32 A tile (4096 B)
+    threadgroup bfloat * sb = (threadgroup bfloat *)(shmem + 4096); // 32x32 B tile (2048 B)
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1; // 0 .. 63
+    const short il0 = (tiitg % NL0);
+
+    short il = il0; // 16-element chunk within the current block, walks 0,2,..,62 (il0=0) / 1,3,..,63 (il0=1)
+
+    const int i12 = im % FC_mul_mm_ne12;
+    const int i13 = im / FC_mul_mm_ne12;
+
+    const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
+
+    device const block_nf8_m2 * x = (device const block_nf8_m2 *)(src0 + args.nb01*(r0 + lr0) + offset0);
+
+    const short iy = 8*(tiitg % NL1);
+
+    // B row, clamped to a VALID row of src1 (same branch-free staging as the
+    // template and the e4m3 mm kernels)
+    const short lr  = (short)(tiitg/NL1);
+    const int   row = r1 + lr < args.ne1 ? r1 + lr : args.ne1 - 1;
+
+    device const float * y = (device const float *)(src1
+        + args.nb13*i13
+        + args.nb12*i12
+        + args.nb11*row
+        + args.nb10*iy);
+
+    simdgroup_bfloat8x8 ma[4];
+    simdgroup_bfloat8x8 mb[2];
+
+    simdgroup_float8x8 mc[8];
+
+    for (short i = 0; i < 8; i++){
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        // === A tile: decode 16 nf8 elements per thread (one sb byte: a
+        //     16-element chunk sits inside one 32-element group). Unlike the
+        //     mv/ext kernels this decode keeps the per-chunk escape BRANCH:
+        //     a fully branchless gather-free variant (escape exponent add
+        //     folded into (em + off), denormals via the exact float-
+        //     magnitude path) was built and measured 1.29-1.33x BF16 vs
+        //     1.23-1.25x for this branchy form — the always-executed
+        //     cvt+fmul magnitude chain beside the near-saturated MMA
+        //     pipeline costs more than the rare branch + constant gather
+        //     (escape density is ~0.1% real). The decode-in-unrolled-loop
+        //     landmine that bit the ext kernel does not apply here: the mm
+        //     decode runs once per k-slab between barriers, not inside the
+        //     accumulation loop. ===
+        const uint4    qv    = *(device const uint4 *)(x->qs + 16*il);
+        const uint32_t sbyte = x->sb[il/2];
+        const uint32_t t     = (sbyte & 0x7Fu) + 64u;
+
+        bfloat4x4 temp_a;
+
+        if (DECODE_STYLE == 1) {
+            // integer path: bf16 bits assembled with shift/add on the int
+            // pipe — no gather on the fast path, +-0 kept by the select
+            if ((sbyte & 0x80u) == 0) {
+                // FAST group: bits = sign | ((em + ((sb7+64)<<3)) << 4)
+                const uint32_t eb = t << 3;
+
+                FOR_UNROLL (short i = 0; i < 4; i++) {
+                    const uint32_t qw = qv[i];
+
+                    FOR_UNROLL (short j = 0; j < 4; j++) {
+                        const uint32_t b8 = (qw >> (8*j)) & 0xFF;
+                        const uint32_t em = b8 & 0x7Fu;
+                        const ushort   sg = (ushort)((b8 & 0x80u) << 8);
+
+                        temp_a[i][j] = as_type<bfloat>(em ? (ushort)(sg | ((em + eb) << 4)) : sg);
+                    }
+                }
+            } else {
+                // ESCAPE group (~0.1%): the e4m3 u16 bit patterns (constant-
+                // memory gather — rare) + integer exponent add, exactly the
+                // shipped e4m3 mm decode with kk = k << 7
+                const int kk = ((int)(sbyte & 0x7Fu) - 63) << 7;
+
+                FOR_UNROLL (short i = 0; i < 4; i++) {
+                    const uint32_t qw = qv[i];
+
+                    FOR_UNROLL (short j = 0; j < 4; j++) {
+                        const ushort b = kvalues_e4m3_m2_u16[(qw >> (8*j)) & 0xFF];
+
+                        temp_a[i][j] = as_type<bfloat>(ushort((b & 0x7FFF) ? int(b) + kk : int(b)));
+                    }
+                }
+            }
+        } else {
+            // f32 path (attribution knob, GGML_NF8_MM_STYLE=f32): decode to
+            // f32, convert BEFORE the barrier (exact: every decoded value is
+            // a bf16 value)
+            float4x4 tmp;
+            if ((sbyte & 0x80u) == 0) {
+                const float d = nf8_m2_fast_scale_to_f32(t);
+
+                FOR_UNROLL (short i = 0; i < 4; i++) {
+                    const uint32_t qw = qv[i];
+
+                    tmp[i][0] = nf8_m2_code_to_f32_unscaled((qw >>  0) & 0xFF)*d;
+                    tmp[i][1] = nf8_m2_code_to_f32_unscaled((qw >>  8) & 0xFF)*d;
+                    tmp[i][2] = nf8_m2_code_to_f32_unscaled((qw >> 16) & 0xFF)*d;
+                    tmp[i][3] = nf8_m2_code_to_f32_unscaled((qw >> 24)       )*d;
+                }
+            } else {
+                const float d = nf8_m2_escape_scale_to_f32(t);
+
+                FOR_UNROLL (short i = 0; i < 4; i++) {
+                    const uint32_t qw = qv[i];
+
+                    tmp[i][0] = e4m3_m2_code_to_f32((qw >>  0) & 0xFF)*d;
+                    tmp[i][1] = e4m3_m2_code_to_f32((qw >>  8) & 0xFF)*d;
+                    tmp[i][2] = e4m3_m2_code_to_f32((qw >> 16) & 0xFF)*d;
+                    tmp[i][3] = e4m3_m2_code_to_f32((qw >> 24)       )*d;
+                }
+            }
+
+            temp_a = (bfloat4x4)tmp;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+
+            const short ib = 8*sx + sy;
+
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        // === B tile: identical bf16 conversion staging as the bf16 mul_mm ===
+        {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+
+            const short ly = (tiitg/NL1)%8;
+
+            const short ib = 4*sx + sy;
+
+            *(threadgroup bfloat2x4 *)(sb + 64*ib + 8*ly) = (bfloat2x4)(*((device const float2x4 *) y));
+        }
+
+        il = (il + 2 < 64) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + 1 : x;
+
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // === outer products: identical ik order per output element ===
+        threadgroup const bfloat * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const bfloat * lsmb = (sb + 2*64*(sgitg/2));
+
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 8; i++){
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+        // no bounds checks on the output: direct device stores
+        device float * C = (device float *) dst +
+            (r0 + 32*(sgitg &  1)) + \
+            (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+        }
+    } else {
+        // bounds-checked path: stage through shmem (clobbers sa/sb, dead by now)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0) {
+            for (int j = tiitg; j < nr1; j += NR1) {
+                device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                device float4 * D4 = (device float4 *) D;
+
+                threadgroup float  * C  = ((threadgroup float *) shmem) + (j*NR0);
+                threadgroup float4 * C4 = (threadgroup float4 *) C;
+
+                int i = 0;
+                for (; i < nr0/4; i++) {
+                    *(D4 + i) = *(C4 + i);
+                }
+
+                i *= 4;
+                for (; i < nr0; i++) {
+                    *(D + i) = *(C + i);
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_nf8_m2<1>) mul_mm_nf8_m2_t;
+
+template [[host_name("kernel_mul_mm_nf8_m2_f32_nt1")]]     kernel mul_mm_nf8_m2_t kernel_mul_mm_nf8_m2<1>;
+template [[host_name("kernel_mul_mm_nf8_m2_f32_nt1_f32")]] kernel mul_mm_nf8_m2_t kernel_mul_mm_nf8_m2<0>;
 #endif
 template [[host_name("kernel_mul_mm_q1_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q1_0,    8,     dequantize_q1_0,    float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q2_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_0,    4,     dequantize_q2_0,    float,  float4x4,  float, float2x4>;

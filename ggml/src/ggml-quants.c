@@ -508,6 +508,142 @@ void dequantize_row_e4m3_m2(const block_e4m3_m2 * GGML_RESTRICT x, float * GGML_
     }
 }
 
+// GGML_TYPE_NF8_M2 (fork-owned gguf-m2 dense plane, second encoding).
+//
+// Encoder policy (mirrored by conversion/gguf_m2_repack.py --dense-format nf8;
+// the block layout is documented at block_nf8_m2 in ggml-common.h):
+// per 32-element group,
+//   1. round every nonzero |x| to the 3-bit-mantissa grid: |x| ~ (1+m/8)*2^p
+//      (round-to-nearest-even; m == 8 carries into p);
+//   2. base = p_max - 15 (the group's largest exponent sits at E = 15);
+//   3. the group is FAST iff base fits the 7-bit field (base in [-63, 64])
+//      and every nonzero element is exactly representable: p >= base and not
+//      (p == base && m == 0) — that last pattern would collide with the
+//      reserved zero code (E=0, m=0). Zeros are always representable.
+//   4. otherwise ESCAPE: the group stores plain OCP E4M3 codes against a
+//      single power-of-two scale k chosen exactly like the E4M3_M2 quantizer
+//      does per scale group (smallest k with amax <= 448 * 2^k), clamped to
+//      the 7-bit window [-63, 64].
+// For data whose values are already e4m3 * 2^k (the gguf-m2 pass list), both
+// paths are EXACT: fast groups by construction, and escape groups because
+// the e4m3 value grid is closed under scaling by 2^j (j >= 0) below 448, so
+// the minimal-k rescale keeps every value on the grid.
+
+// round |x| (nonzero, finite) to the nearest (1 + m/8) * 2^p; RNE via rintf
+static void ggml_nf8_m2_round_pm(float a, int * p_out, int * m_out) {
+    int e;
+    const float f = frexpf(a, &e); // a = f * 2^e, f in [0.5, 1)
+    int p = e - 1;                 // a = 2f * 2^(e-1), 2f in [1, 2)
+    int m = (int) rintf((2.0f*f - 1.0f) * 8.0f);
+    if (m == 8) { // rounded up across the binade
+        m = 0;
+        p += 1;
+    }
+    *p_out = p;
+    *m_out = m;
+}
+
+void quantize_row_nf8_m2_ref(const float * GGML_RESTRICT x, block_nf8_m2 * GGML_RESTRICT y, int64_t k) {
+    static const int qk  = QK_NF8_M2;
+    static const int gsz = NF8_M2_GSZ;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        for (int g = 0; g < qk/gsz; g++) {
+            const float * xg = x + i*qk + g*gsz;
+            uint8_t     * qg = y[i].qs + g*gsz;
+
+            int  p[NF8_M2_GSZ];
+            int  m[NF8_M2_GSZ];
+            bool z[NF8_M2_GSZ];
+
+            bool  any_nz = false;
+            int   pmax = 0;
+            float amax = 0.0f;
+
+            for (int j = 0; j < gsz; j++) {
+                const float a = fabsf(xg[j]);
+                z[j] = (a == 0.0f);
+                if (z[j]) {
+                    continue;
+                }
+                ggml_nf8_m2_round_pm(a, &p[j], &m[j]);
+                pmax = any_nz ? MAX(pmax, p[j]) : p[j];
+                any_nz = true;
+                amax = MAX(amax, a);
+            }
+
+            if (!any_nz) { // all-zero group: any base decodes it; use base 0
+                y[i].sb[g] = NF8_M2_EXP_BIAS;
+                for (int j = 0; j < gsz; j++) {
+                    qg[j] = signbit(xg[j]) ? 0x80 : 0x00;
+                }
+                continue;
+            }
+
+            const int base = pmax - 15;
+
+            bool fast = base >= -NF8_M2_EXP_BIAS && base <= 127 - NF8_M2_EXP_BIAS;
+            for (int j = 0; fast && j < gsz; j++) {
+                if (!z[j] && (p[j] < base || (p[j] == base && m[j] == 0))) {
+                    fast = false;
+                }
+            }
+
+            if (fast) {
+                y[i].sb[g] = (uint8_t)(base + NF8_M2_EXP_BIAS);
+                for (int j = 0; j < gsz; j++) {
+                    const uint8_t sign = signbit(xg[j]) ? 0x80 : 0x00;
+                    qg[j] = z[j] ? sign : (uint8_t)(sign | ((p[j] - base) << 3) | m[j]);
+                }
+            } else {
+                // escape: plain e4m3 codes against one power-of-two scale,
+                // chosen exactly like the E4M3_M2 quantizer's group scale
+                int ea;
+                const float ma = frexpf(amax, &ea); // amax = ma * 2^ea, ma in [0.5, 1)
+                int e = (ma <= 0.875f) ? ea - 9 : ea - 8; // 448 * 2^(ea-9) = 0.875 * 2^ea
+                e = MAX(-NF8_M2_EXP_BIAS, MIN(127 - NF8_M2_EXP_BIAS, e));
+
+                y[i].sb[g] = (uint8_t)(0x80 | (e + NF8_M2_EXP_BIAS));
+                for (int j = 0; j < gsz; j++) {
+                    qg[j] = ggml_f32_to_e4m3_m2_code(ldexpf(xg[j], -e));
+                }
+            }
+        }
+    }
+}
+
+void dequantize_row_nf8_m2(const block_nf8_m2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk  = QK_NF8_M2;
+    static const int gsz = NF8_M2_GSZ;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        for (int g = 0; g < qk/gsz; g++) {
+            const uint8_t sb  = x[i].sb[g];
+            const uint8_t sb7 = sb & 0x7F;
+            float * yg = y + i*qk + g*gsz;
+
+            if (sb & 0x80) { // escape: e4m3 * 2^k (exact power-of-two multiply)
+                const float d = ggml_nf8_m2_escape_scale_to_f32(sb7);
+                for (int j = 0; j < gsz; j++) {
+                    yg[j] = ggml_e4m3_m2_code_to_f32(x[i].qs[g*gsz + j]) * d;
+                }
+            } else { // fast: pure bit-insertion decode
+                for (int j = 0; j < gsz; j++) {
+                    yg[j] = ggml_nf8_m2_code_to_f32(x[i].qs[g*gsz + j], sb7);
+                }
+            }
+        }
+    }
+}
+
 // GGML_TYPE_MXFP4_M2 (fork-owned gguf-m2 expert plane): identical values to
 // GGML_TYPE_MXFP4, split code/scale planes + 4-bit absolute biased scales.
 // The generic quantizer mirrors quantize_row_mxfp4_ref except that the E8M0
@@ -2480,6 +2616,13 @@ size_t quantize_e4m3_m2(const float * GGML_RESTRICT src, void * GGML_RESTRICT ds
     GGML_ASSERT(n_per_row % QK_E4M3_M2 == 0);
     quantize_row_e4m3_m2_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_E4M3_M2, n_per_row);
+}
+
+size_t quantize_nf8_m2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    GGML_ASSERT(n_per_row % QK_NF8_M2 == 0);
+    quantize_row_nf8_m2_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_NF8_M2, n_per_row);
 }
 
 size_t quantize_mxfp4_m2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -5849,6 +5992,30 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                         if (q[i].pad[j] != 0) {
                             fprintf(stderr, "%s: e4m3_m2 nonzero pad byte at block %zu\n", __func__, i);
                             return false;
+                        }
+                    }
+                }
+            } break;
+
+        case GGML_TYPE_NF8_M2:
+            {
+                // fork gguf-m2 dense plane (second encoding): fast blocks
+                // decode every byte pattern to a finite normal or +-0 (the
+                // assembled f32 exponent field is bounded by construction),
+                // so only escape blocks carry an invariant to check: the
+                // converter/quantizer never emit the two E4M3 NaN codes.
+                const block_nf8_m2 * q = (const block_nf8_m2 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    for (size_t g = 0; g < QK_NF8_M2/NF8_M2_GSZ; ++g) {
+                        if (!(q[i].sb[g] & 0x80)) {
+                            continue;
+                        }
+                        for (size_t j = 0; j < NF8_M2_GSZ; ++j) {
+                            if ((q[i].qs[g*NF8_M2_GSZ + j] & 0x7F) == 0x7F) {
+                                fprintf(stderr, "%s: found e4m3 NaN code in nf8_m2 escape block %zu, group %zu, elem %zu\n",
+                                        __func__, i, g, j);
+                                return false;
+                            }
                         }
                     }
                 }
