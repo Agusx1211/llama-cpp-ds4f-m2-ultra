@@ -120,6 +120,67 @@ void dequantize_bf16_t4(device const bfloat4 * src, short il, thread type4 & reg
 }
 #endif
 
+// GGML_TYPE_E4M3_M2 (fork-owned gguf-m2 dense plane) — decode helpers.
+// Bit-for-bit mirror of ggml_e4m3_m2_code_to_f32/ggml_e4m3_m2_scale_to_f32 in
+// ggml-impl.h. Both are exact: an e4m3 value and its power-of-two scale
+// multiply reproduce the served BF16 value with zero rounding, which is what
+// makes the whole E4M3_M2 path bit-identical to the BF16 kernels it mirrors.
+// The two E4M3 NaN encodings decode to +-480.0f by design (the converter never
+// emits them; branchless decode is faster).
+static inline float e4m3_m2_code_to_f32(uint32_t v) {
+    const uint32_t s  = (v & 0x80u) << 24;
+    const uint32_t em = v & 0x7Fu;
+    // normal (exp field >= 1): (1 + m/8) * 2^(e-7)  ->  f32 bits: exp e+120, mantissa m<<20
+    // denormal (exp field == 0): +-m * 2^-9 (em == m, 0..7)
+    const uint32_t nrm = (em + 960u) << 20; // 960 = 120<<3
+    const uint32_t dnm = as_type<uint32_t>((float) em * 0x1p-9f);
+    return as_type<float>(s | (em >= 8u ? nrm : dnm));
+}
+
+// E8M0 scale byte -> 2^(sc-127); the converter guarantees 1 <= sc <= 254
+static inline float e4m3_m2_scale_to_f32(uint32_t sc) {
+    return as_type<float>(sc << 23);
+}
+
+// il in [0, QK_E4M3_M2/16): which 16-element chunk of the block. All 16
+// elements of a chunk share one scale (128 % 16 == 0). The 16 code bytes are
+// 16-byte aligned (block size 1040 is a multiple of 16, chunk offset is a
+// multiple of 16), so they are fetched as a single uint4.
+template <typename type4x4>
+void dequantize_e4m3_m2(device const block_e4m3_m2 * xb, short il, thread type4x4 & reg) {
+    const uint4 qv = *(device const uint4 *)(xb->qs + 16*il);
+    const float d  = e4m3_m2_scale_to_f32(xb->sc[il/8]);
+
+    float4x4 tmp;
+    FOR_UNROLL (short i = 0; i < 4; i++) {
+        const uint32_t qw = qv[i];
+
+        tmp[i][0] = e4m3_m2_code_to_f32((qw >>  0) & 0xFF)*d;
+        tmp[i][1] = e4m3_m2_code_to_f32((qw >>  8) & 0xFF)*d;
+        tmp[i][2] = e4m3_m2_code_to_f32((qw >> 16) & 0xFF)*d;
+        tmp[i][3] = e4m3_m2_code_to_f32((qw >> 24)       )*d;
+    }
+
+    // exact for every value the converter emits (each is a bf16 value)
+    reg = (type4x4)tmp;
+}
+
+// il in [0, QK_E4M3_M2/4): which 4-element chunk of the block; used by the
+// mul_mv_ext path. The 4 code bytes are 4-byte aligned -> one uint load.
+template <typename type4>
+void dequantize_e4m3_m2_t4(device const block_e4m3_m2 * xb, short il, thread type4 & reg) {
+    const uint32_t qw = *(device const uint32_t *)(xb->qs + 4*il);
+    const float d  = e4m3_m2_scale_to_f32(xb->sc[il/32]);
+
+    float4 tmp;
+    tmp[0] = e4m3_m2_code_to_f32((qw >>  0) & 0xFF)*d;
+    tmp[1] = e4m3_m2_code_to_f32((qw >>  8) & 0xFF)*d;
+    tmp[2] = e4m3_m2_code_to_f32((qw >> 16) & 0xFF)*d;
+    tmp[3] = e4m3_m2_code_to_f32((qw >> 24)       )*d;
+
+    reg = (type4)tmp;
+}
+
 template <typename type4x4>
 void dequantize_q1_0(device const block_q1_0 * xb, short il, thread type4x4 & reg) {
     device const uint8_t * qs = xb->qs;
@@ -4204,6 +4265,13 @@ template [[host_name("kernel_mul_mv_ext_bf16_f32_r1_4")]]   kernel mul_mv_ext_q4
 template [[host_name("kernel_mul_mv_ext_bf16_f32_r1_5")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, bfloat4,      4,  dequantize_bf16_t4>;
 #endif
 
+// fork: E4M3_M2 mirrors the BF16 ext kernels (same r1/nxpsg geometry, same
+// dot()/accumulation order on identical decoded values -> bit-identical output)
+template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_e4m3_m2, 1024, dequantize_e4m3_m2_t4>;
+template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_e4m3_m2, 1024, dequantize_e4m3_m2_t4>;
+template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_e4m3_m2, 1024, dequantize_e4m3_m2_t4>;
+template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_e4m3_m2, 1024, dequantize_e4m3_m2_t4>;
+
 template [[host_name("kernel_mul_mv_ext_q1_0_f32_r1_2")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_q1_0,   128, dequantize_q1_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q1_0_f32_r1_3")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_q1_0,   128, dequantize_q1_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q1_0_f32_r1_4")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_q1_0,   128, dequantize_q1_0_t4>;
@@ -4518,6 +4586,129 @@ template [[host_name("kernel_mul_mv_f16_f16_4")]]   kernel mul_mv_t_t_4 kernel_m
 template [[host_name("kernel_mul_mv_bf16_f32_4")]]  kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, float,  float4>;
 template [[host_name("kernel_mul_mv_bf16_bf16_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, bfloat, bfloat4>;
 #endif
+
+// fork: GGML_TYPE_E4M3_M2 GEMV — a line-by-line mirror of
+// kernel_mul_mv_t_t_4_impl<bfloat, bfloat4, float, float4> above with the
+// bfloat4 loads replaced by e4m3 code loads + exact power-of-two scaling.
+// Identical loop structure, identical dot()/accumulation order and identical
+// reduction on identical decoded values -> BIT-IDENTICAL output vs the BF16
+// kernel (this is the gguf-m2 exactness contract, not an approximation).
+// ne00 % QK_E4M3_M2 == 0 always (ggml block invariant), so the scalar tail of
+// the mirrored kernel is unreachable and omitted.
+template<short NR0, typename args_t>
+void kernel_mul_mv_e4m3_m2_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    const int nb = args.ne00/NB;
+
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const float4 * y4 = (device const float4 *) (src1 + offset1);
+
+    // pointers to src0 rows (block layout)
+    device const block_e4m3_m2 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+
+        ax[row] = (device const block_e4m3_m2 *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+
+    const int ib0 = sgitg*NF + ix;
+
+    float4 yl4[NF4];
+
+    device const float4 * yb4 = y4 + (ib0*NB + il*NF)/4;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        for (short i = 0; i < NF4; ++i) {
+            yl4[i] = yb4[i];
+        }
+
+        const int   p   = ib*NB + il*NF;      // element offset in the row, multiple of 16
+        const int   ibq = p/QK_E4M3_M2;       // block index
+        const short q   = p%QK_E4M3_M2;       // in-block code offset, multiple of 16
+
+        for (short row = 0; row < NR0; row++) {
+            device const block_e4m3_m2 * xb = ax[row] + ibq;
+
+            const uint4 qv = *(device const uint4 *)(xb->qs + q); // 16-B aligned
+            const float d  = e4m3_m2_scale_to_f32(xb->sc[q/128]); // one scale per 128 elems covers all 16
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                const uint32_t qw = qv[i];
+
+                float4 xv;
+                xv[0] = e4m3_m2_code_to_f32((qw >>  0) & 0xFF)*d;
+                xv[1] = e4m3_m2_code_to_f32((qw >>  8) & 0xFF)*d;
+                xv[2] = e4m3_m2_code_to_f32((qw >> 16) & 0xFF)*d;
+                xv[3] = e4m3_m2_code_to_f32((qw >> 24)       )*d;
+
+                sumq += dot(xv, yl4[i]);
+            }
+
+            sumf[row] += sumq;
+        }
+
+        yb4 += NSG*NF*NW/4;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+template<typename args_t>
+void kernel_mul_mv_e4m3_m2_f32_disp(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    switch (args.nr0) {
+        case 2: kernel_mul_mv_e4m3_m2_f32_impl<2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+    }
+}
+
+kernel void kernel_mul_mv_e4m3_m2_f32_4(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_e4m3_m2_f32_disp<constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
 
 template<typename T0, typename T1, typename args_t>
 void kernel_mul_mv_t_t_short_impl(
@@ -11058,6 +11249,10 @@ template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_f16_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, bfloat4x4,     1,     dequantize_bf16,    bfloat, bfloat4x4, float, float2x4>;
+// fork: E4M3_M2 uses the exact bf16 tile pipeline (bfloat staging + simdgroup
+// bfloat mm, identical B-operand conversion), only the A-tile load dequantizes
+// e4m3 codes to the identical bfloat values -> bit-identical vs bf16 mul_mm
+template [[host_name("kernel_mul_mm_e4m3_m2_f32")]] kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, block_e4m3_m2, 64,    dequantize_e4m3_m2, bfloat, bfloat4x4, float, float2x4>;
 #endif
 template [[host_name("kernel_mul_mm_q1_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q1_0,    8,     dequantize_q1_0,    float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q2_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_0,    4,     dequantize_q2_0,    float,  float4x4,  float, float2x4>;

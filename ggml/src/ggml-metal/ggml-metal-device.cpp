@@ -888,6 +888,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     suffix = ne00 % 4 == 0 ? "_4" : "";
                 }
             } break;
+        case GGML_TYPE_E4M3_M2:
+            {
+                // fork: mirrors the F32/F16/BF16 branch above exactly — the
+                // E4M3_M2 GEMV is a bit-exact clone of kernel_mul_mv_bf16_f32_4
+                // and must be dispatched with the same geometry
+                GGML_ASSERT(ne00 % 4 == 0); // ne00 % QK_E4M3_M2 == 0 by block invariant
+                nsg = std::min(4, (ne00 + 127) / 128);
+                nr0 = 2;
+                nr1 = 1;
+                smem = 32*sizeof(float)*nr0;
+                suffix = "_4";
+            } break;
         case GGML_TYPE_Q1_0:
             {
                 nsg = N_SG_Q1_0;

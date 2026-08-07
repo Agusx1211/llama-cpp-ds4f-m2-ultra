@@ -430,7 +430,19 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // upstream types are allocated densely from here (43, 44, ...)
+
+        // Fork-owned M2 Ultra artifact types (the "gguf-m2" format; see
+        // notes/2026-08-07-gguf-m2-artifact-format-design.md). Allocated FAR
+        // above the upstream id range so a future upstream merge can never
+        // reuse an id that has already been written into a gguf-m2 artifact on
+        // disk: a collision would make a stock reader silently reinterpret
+        // packed code bytes, which is the worst possible failure mode. Ids
+        // [90, 99] are reserved for this fork; upstream merges must keep
+        // GGML_TYPE_COUNT above the highest fork id.
+        GGML_TYPE_E4M3_M2 = 90, // gguf-m2 v1 dense plane: OCP E4M3 codes + per-128-elem E8M0 scales
+        // GGML_TYPE_MXFP4_M2 = 91, // reserved: gguf-m2 expert plane (separate workstream)
+        GGML_TYPE_COUNT   = 92,
     };
 
     // precision

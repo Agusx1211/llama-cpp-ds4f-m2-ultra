@@ -381,6 +381,32 @@ static inline uint32_t fp32_to_bits(float f) {
     return fp32.as_bits;
 }
 
+// GGML_TYPE_E4M3_M2 (fork-owned gguf-m2 dense plane) decode helpers.
+// These are the reference semantics that the Metal shader decode mirrors
+// bit-for-bit: e4m3 code -> f32 is exact, and the E8M0 scale multiply is a
+// power-of-two multiply, also exact for every value the converter can emit.
+//
+// Note: the two E4M3 NaN encodings (0x7F/0xFF) intentionally decode to
+// +-480.0f (the natural extension of the normal formula). The converter and
+// the quantizer never emit them, and branchless decode is what the Metal
+// kernels want.
+static inline float ggml_e4m3_m2_code_to_f32(uint8_t v) {
+    const uint32_t sign = ((uint32_t) v & 0x80u) << 24;
+    const uint32_t em   = (uint32_t) v & 0x7Fu; // exponent(4) | mantissa(3)
+    if (em >= 8u) {
+        // normal: (1 + m/8) * 2^(e-7)  ->  f32 exponent field e+120, mantissa m<<20
+        return fp32_from_bits(sign | ((em + 960u) << 20)); // 960 = 120<<3
+    }
+    // denormal/zero: +-m * 2^-9 (em == m here); the or with the sign bit keeps -0.0 exact
+    return fp32_from_bits(sign | fp32_to_bits((float) em * 0x1p-9f));
+}
+
+// E8M0 scale byte -> 2^(sc-127); the converter guarantees 1 <= sc <= 254 so the
+// result is always a normal, nonzero f32 (byte 0 would decode to +0.0f)
+static inline float ggml_e4m3_m2_scale_to_f32(uint8_t sc) {
+    return fp32_from_bits((uint32_t) sc << 23);
+}
+
 static inline float ggml_compute_fp16_to_fp32(ggml_fp16_t h) {
     const uint32_t w = (uint32_t) h << 16;
     const uint32_t sign = w & UINT32_C(0x80000000);
