@@ -668,6 +668,15 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // SSD tier: when set, the state blobs and the checkpoints live in this
+    // file and the in-RAM copies above are empty; only prompt.tokens stays
+    // resident so the best-match scan keeps working across both tiers
+    std::string file;
+    size_t size_disk = 0;
+
+    bool on_disk() const { return !file.empty(); }
+
+    // RAM footprint of the entry (disk entries hold no blobs in RAM)
     size_t size() const {
         size_t res = data.size();
 
@@ -680,9 +689,18 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens,
+                        const std::string & disk_dir, int32_t disk_limit_gib, uint64_t disk_fingerprint) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+
+        this->disk_dir         = disk_dir;
+        this->limit_disk       = disk_limit_gib < 0 ? 0 : 1024ull*1024ull*1024ull*(uint64_t) disk_limit_gib;
+        this->disk_fingerprint = disk_fingerprint;
+
+        if (!this->disk_dir.empty()) {
+            rescan_disk();
+        }
     }
 
     std::list<server_prompt_cache_state> states;
@@ -693,15 +711,35 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // SSD tier (empty disk_dir = disabled); limit_disk in bytes, 0 = no limit
+    std::string disk_dir;
+    size_t      limit_disk       = 0;
+    uint64_t    disk_fingerprint = 0;
+    uint64_t    disk_seq         = 0;
+
     size_t size() const;
 
     size_t n_tokens() const;
+
+    size_t size_disk_total() const;
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    // SSD tier internals
+    bool spill_to_disk(server_prompt_cache_state & state);
+    bool load_from_disk(server_prompt_cache_state & state);
+    void rescan_disk();
+
+    // evict the oldest RAM-resident entry: spill it to the SSD tier when
+    // enabled, drop it otherwise; false if no RAM-resident entry remains
+    bool evict_oldest_ram();
+
+    // erase an entry and unlink its backing file (if any)
+    std::list<server_prompt_cache_state>::iterator drop_entry(std::list<server_prompt_cache_state>::iterator it);
 };
 
 // used exclusively by router mode

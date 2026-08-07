@@ -1598,7 +1598,41 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            // fingerprint for the SSD tier: spilled state files are only valid
+            // for the exact model artifact and context geometry that wrote
+            // them; anything else is deleted on rescan or dropped on load
+            uint64_t fingerprint = 0xcbf29ce484222325ull; // FNV-1a
+            const auto fp_mix = [&fingerprint](const void * p, size_t n) {
+                const uint8_t * b = static_cast<const uint8_t *>(p);
+                for (size_t i = 0; i < n; ++i) {
+                    fingerprint = (fingerprint ^ b[i]) * 0x100000001b3ull;
+                }
+            };
+            {
+                const std::string & path = params_base.model.path;
+                fp_mix(path.data(), path.size());
+
+                std::error_code ec;
+                const uint64_t fsize = std::filesystem::file_size(path, ec);
+                const int64_t  mtime = ec ? 0 : (int64_t) std::filesystem::last_write_time(path, ec).time_since_epoch().count();
+                fp_mix(&fsize, sizeof(fsize));
+                fp_mix(&mtime, sizeof(mtime));
+
+                const uint32_t fp_n_ctx = llama_n_ctx(ctx_tgt);
+                const uint32_t fp_n_seq = llama_n_seq_max(ctx_tgt);
+                const uint8_t  fp_dft   = ctx_dft ? 1 : 0;
+                fp_mix(&fp_n_ctx, sizeof(fp_n_ctx));
+                fp_mix(&fp_n_seq, sizeof(fp_n_seq));
+                fp_mix(&fp_dft,   sizeof(fp_dft));
+            }
+
+            if (!params_base.cache_disk.empty()) {
+                SRV_INF("prompt cache SSD tier enabled: dir = '%s', limit = %d GiB\n",
+                        params_base.cache_disk.c_str(), params_base.cache_disk_limit_gib);
+            }
+
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx,
+                    params_base.cache_disk, params_base.cache_disk_limit_gib, fingerprint);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
