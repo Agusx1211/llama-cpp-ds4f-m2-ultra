@@ -1942,7 +1942,11 @@ private:
 
                 prompt_cache->update();
 
-                SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                // one INFO line per cache consultation: how much of the task's
+                // prefix is available in the selected slot after save/load
+                const size_t n_reusable = ret->prompt.tokens.get_common_prefix(task.tokens);
+                SLT_INF(*ret, "prompt cache: %zu/%d prefix tokens available after save/load (%.2f ms)\n",
+                        n_reusable, (int) task.tokens.size(), (ggml_time_us() - t_start) / 1000.0);
             }
         }
 
@@ -5206,6 +5210,27 @@ private:
                 slot.state = slot.state == SLOT_STATE_DONE_PROMPT_STAGED
                     ? SLOT_STATE_GENERATING_STAGED
                     : SLOT_STATE_GENERATING;
+
+                // Publish the freshly prefilled prompt to the cache so a
+                // concurrent conversation sharing the prefix (e.g. parallel
+                // agents with a common system prompt) restores it instead of
+                // re-prefilling behind this slot's generation. Target-only:
+                // the draft context is not synced to this prompt yet, and a
+                // restore of a target-only entry clears the draft sequence.
+                // alloc() containment dedup makes repeat saves cheap; the
+                // token threshold skips prompts whose re-prefill is cheaper
+                // than the state copy.
+                if (prompt_cache &&
+                        (slot.state == SLOT_STATE_GENERATING || slot.state == SLOT_STATE_GENERATING_STAGED) &&
+                        slot.task->type == SERVER_TASK_TYPE_COMPLETION && !slot.task->is_child() &&
+                        slot.prompt.n_tokens() >= 1024) {
+                    const int64_t t_pub = ggml_time_us();
+                    if (slot.prompt_save(*prompt_cache, /*include_dft=*/false)) {
+                        prompt_cache->update();
+                        SLT_INF(slot, "published prefilled prompt to cache (%d tokens, %.1f ms)\n",
+                                slot.prompt.n_tokens(), (ggml_time_us() - t_pub) / 1000.0);
+                    }
+                }
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
