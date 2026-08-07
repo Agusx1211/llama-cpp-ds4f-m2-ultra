@@ -3354,7 +3354,19 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
             // transactional staging sequence exists to avoid disturbing other
             // decoding survivors, and with a single sequence there are none to
             // disturb. This keeps prompt-cache restore working at -np 1.
-            const bool in_place_safe = dest_empty || cparams.n_seq_max <= 1;
+            //
+            // A PARTIAL_ONLY restore is also safe in place with other live
+            // sequences: it rewrites only the destination's own SWA/recurrent
+            // plane rows (per-stream slices), never another sequence's rows,
+            // and the server loop is serialized so no decode observes the
+            // intermediate state. On failure the existing catch/rollback
+            // clears the destination and the caller re-prefills from scratch.
+            // Required for prompt-reuse checkpoint restores under the elastic
+            // -np 2 vertical while the other lane is mid-decode (a busy lane
+            // leaves no empty staging candidate, and the previous throw made
+            // common_prompt_checkpoint::load_tgt abort the whole server).
+            const bool in_place_safe = dest_empty || cparams.n_seq_max <= 1 ||
+                    (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
             if (!candidate_is_staging && !in_place_safe) {
                 throw std::runtime_error(
                         "transactional DSV4 restore requires an unused sequence staging slot");
