@@ -226,6 +226,51 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
+// GGML_TYPE_E4M3_M2 — fork-owned gguf-m2 v1 dense-plane encoding (M2 Ultra target).
+// One block covers 1024 row elements: 1024 OCP E4M3 (fn) code bytes followed by
+// 8 E8M0 scale bytes (one per 128-element group; value = 2^(sc-127), the
+// converter guarantees 1 <= sc <= 254) and 8 zero pad bytes. The pad keeps
+// sizeof(block) = 1040, a multiple of 16, so with any 16-byte-aligned tensor
+// base every 16-byte group of code bytes is 16-byte aligned for vector loads.
+// Scales are stored per row (rows of the same 128x128 source tile carry
+// identical scale bytes); decode is exact: e4m3 * 2^k in f32/bf16.
+// See notes/2026-08-07-gguf-m2-artifact-format-design.md ("Layout" section).
+#define QK_E4M3_M2 1024
+typedef struct {
+    uint8_t qs[QK_E4M3_M2];     // OCP E4M3 (fn) codes, 1 byte per element
+    uint8_t sc[QK_E4M3_M2/128]; // E8M0 scale per 128-element group
+    uint8_t pad[8];             // zero; keeps the block size a multiple of 16 B
+} block_e4m3_m2;
+static_assert(sizeof(block_e4m3_m2) == QK_E4M3_M2 + QK_E4M3_M2/128 + 8, "wrong e4m3_m2 block size/padding");
+
+// GGML_TYPE_MXFP4_M2 — fork-owned gguf-m2 v1 expert-plane encoding (M2 Ultra
+// target). A repack of GGML_TYPE_MXFP4 with identical values:
+// - The 17-byte interleaved [1 E8M0 scale][16 nibble-packed codes] blocks are
+//   split into planes: one block covers 2048 elements = 64 MXFP4 sub-blocks;
+//   the 64 x 16 code bytes come first (so every sub-block's 16 code bytes are
+//   16-byte aligned for uint2/uint4 loads — measured +17.5-18.8% on the
+//   expert GEMV), followed by 64 scale NIBBLES (32 bytes).
+// - Scales are 4-bit absolute: E8M0 byte = MXFP4_M2_SCALE_BIAS + nibble.
+//   The whole served expert plane (and the drafter's) measures only 9
+//   distinct E8M0 values in [118, 126]; the bias 116 covers [116, 131] with
+//   margin on both sides and the converter fails loudly on anything outside.
+//   The bias is a LAYOUT CONSTANT (not a per-tensor decode parameter) so the
+//   data stays self-describing for to_float/vec_dot, which have no tensor
+//   context. The converter additionally records the bias it packed against in
+//   a per-tensor u32 key (m2.mxfp4_m2.scale_bias.<tensor>) and the loader
+//   refuses artifacts whose recorded bias differs from this constant
+//   (src/llama-model-loader.cpp mirrors the value — keep them in sync).
+// - Nibble order matches the code plane: low nibble = even sub-block.
+// sizeof == 1056, a multiple of 16 -> alignment holds at any block index.
+// See notes/2026-08-07-gguf-m2-artifact-format-design.md ("Layout" section).
+#define QK_MXFP4_M2 2048
+#define MXFP4_M2_SCALE_BIAS 116
+typedef struct {
+    uint8_t qs[QK_MXFP4_M2/2];  // 1024 B: 64 sub-blocks x 16 nibble-packed E2M1 code bytes
+    uint8_t sc[QK_MXFP4_M2/64]; // 32 B: 64 E8M0 scale nibbles (absolute, biased)
+} block_mxfp4_m2;
+static_assert(sizeof(block_mxfp4_m2) == QK_MXFP4_M2/2 + QK_MXFP4_M2/64, "wrong mxfp4_m2 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta

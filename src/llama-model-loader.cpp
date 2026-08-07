@@ -697,6 +697,86 @@ llama_model_loader::llama_model_loader(
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
+    // fork gate: gguf-m2 artifact layout version (see
+    // notes/2026-08-07-gguf-m2-artifact-format-design.md). Fork-owned tensor
+    // encodings may only be interpreted when the artifact declares the exact
+    // layout version this build implements. Silent reinterpretation of packed
+    // code bytes would produce plausible garbage, so both directions fail
+    // loudly. Stock GGUFs (no m2 types, no m2 key) are unaffected.
+    {
+        const uint32_t M2_LAYOUT_VERSION_SUPPORTED = 1;
+
+        bool has_m2_types = false;
+        for (const auto & it : weights_map) {
+            const enum ggml_type t = it.second.tensor->type;
+            if (t == GGML_TYPE_E4M3_M2 || t == GGML_TYPE_MXFP4_M2) {
+                has_m2_types = true;
+                break;
+            }
+        }
+
+        const int kid = gguf_find_key(metadata, "m2.layout.version");
+
+        if (has_m2_types && kid < 0) {
+            throw std::runtime_error(format(
+                "%s: gguf-m2 tensors present but the required 'm2.layout.version' metadata key is missing "
+                "— refusing to interpret fork-owned tensor encodings from an unversioned artifact", __func__));
+        }
+
+        if (kid >= 0) {
+            if (gguf_get_kv_type(metadata, kid) != GGUF_TYPE_UINT32) {
+                throw std::runtime_error(format(
+                    "%s: 'm2.layout.version' has type %s, expected u32", __func__,
+                    gguf_type_name(gguf_get_kv_type(metadata, kid))));
+            }
+            const uint32_t ver = gguf_get_val_u32(metadata, kid);
+            if (ver != M2_LAYOUT_VERSION_SUPPORTED) {
+                throw std::runtime_error(format(
+                    "%s: gguf-m2 artifact has m2.layout.version = %u but this build implements version %u exactly "
+                    "— rebuild or reconvert; refusing to load", __func__, ver, M2_LAYOUT_VERSION_SUPPORTED));
+            }
+            LLAMA_LOG_INFO("%s: gguf-m2 artifact detected (m2.layout.version = %u, m2 tensor types %s)\n",
+                    __func__, ver, has_m2_types ? "present" : "absent");
+        }
+
+        // MXFP4_M2 scale nibbles decode as E8M0 byte = MXFP4_M2_SCALE_BIAS +
+        // nibble, with the bias baked into the kernels as a layout constant
+        // (MXFP4_M2_SCALE_BIAS in ggml/src/ggml-common.h — the data must stay
+        // self-describing because ggml type traits carry no per-tensor
+        // context). The converter records the bias it packed against in a
+        // per-tensor u32 key; refuse to load any artifact whose recorded bias
+        // differs from the constant this build decodes with — a mismatch would
+        // silently rescale every expert weight by a power of two.
+        if (has_m2_types) {
+            const uint32_t M2_MXFP4_M2_SCALE_BIAS = 116; // must equal MXFP4_M2_SCALE_BIAS (ggml-common.h)
+
+            for (const auto & it : weights_map) {
+                if (it.second.tensor->type != GGML_TYPE_MXFP4_M2) {
+                    continue;
+                }
+                const std::string key = "m2.mxfp4_m2.scale_bias." + it.first;
+                const int bkid = gguf_find_key(metadata, key.c_str());
+                if (bkid < 0) {
+                    throw std::runtime_error(format(
+                        "%s: MXFP4_M2 tensor '%s' has no '%s' metadata key — refusing to decode scale nibbles "
+                        "without the converter's recorded bias", __func__, it.first.c_str(), key.c_str()));
+                }
+                if (gguf_get_kv_type(metadata, bkid) != GGUF_TYPE_UINT32) {
+                    throw std::runtime_error(format(
+                        "%s: '%s' has type %s, expected u32", __func__, key.c_str(),
+                        gguf_type_name(gguf_get_kv_type(metadata, bkid))));
+                }
+                const uint32_t bias = gguf_get_val_u32(metadata, bkid);
+                if (bias != M2_MXFP4_M2_SCALE_BIAS) {
+                    throw std::runtime_error(format(
+                        "%s: MXFP4_M2 tensor '%s' was packed against scale bias %u but this build decodes with "
+                        "bias %u — reconvert the artifact or rebuild; refusing to load", __func__,
+                        it.first.c_str(), bias, M2_MXFP4_M2_SCALE_BIAS));
+                }
+            }
+        }
+    }
+
     fver = (enum llama_fver) gguf_get_version(metadata);
 
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",

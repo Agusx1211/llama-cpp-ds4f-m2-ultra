@@ -62,6 +62,14 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_nvfp4_ref(x, y, k);
 }
 
+void quantize_row_e4m3_m2(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_e4m3_m2_ref(x, y, k);
+}
+
+void quantize_row_mxfp4_m2(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp4_m2_ref(x, y, k);
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -324,6 +332,75 @@ void ggml_vec_dot_mxfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
         sumf += d * (sumi1 + sumi2);
     }
     *s = sumf;
+}
+
+// GGML_TYPE_E4M3_M2 (fork-owned gguf-m2 dense plane). Scalar reference
+// implementation: the production consumer is the Metal backend; the CPU path
+// only exists so test-backend-ops has a reference and so CPU fallback stays
+// functional. Accumulates in double for reference quality.
+void ggml_vec_dot_e4m3_m2_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_E4M3_M2 == 0);
+
+    const block_e4m3_m2 * GGML_RESTRICT x = vx;
+    const float         * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_E4M3_M2;
+
+    double sumf = 0.0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int g = 0; g < QK_E4M3_M2/128; ++g) {
+            const float d = ggml_e4m3_m2_scale_to_f32(x[ib].sc[g]);
+
+            for (int j = 0; j < 128; ++j) {
+                const int i = g*128 + j;
+                sumf += (double) (ggml_e4m3_m2_code_to_f32(x[ib].qs[i]) * d) * (double) y[ib*QK_E4M3_M2 + i];
+            }
+        }
+    }
+
+    *s = (float) sumf;
+}
+
+// GGML_TYPE_MXFP4_M2 (fork-owned gguf-m2 expert plane). Scalar reference
+// implementation with f32 activations and double accumulation; the
+// production consumer is the Metal backend.
+void ggml_vec_dot_mxfp4_m2_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_MXFP4_M2 == 0);
+
+    const block_mxfp4_m2 * GGML_RESTRICT x = vx;
+    const float          * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_MXFP4_M2;
+
+    double sumf = 0.0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int sb = 0; sb < QK_MXFP4_M2/QK_MXFP4; ++sb) {
+            const uint8_t e = (uint8_t)(MXFP4_M2_SCALE_BIAS + ((x[ib].sc[sb/2] >> (4*(sb % 2))) & 0x0F));
+            const float   d = GGML_E8M0_TO_FP32_HALF(e);
+
+            const uint8_t * GGML_RESTRICT qs = x[ib].qs + 16*sb;
+            const float   * GGML_RESTRICT ys = y + ib*QK_MXFP4_M2 + sb*QK_MXFP4;
+
+            for (int j = 0; j < QK_MXFP4/2; ++j) {
+                sumf += (double) (kvalues_mxfp4[qs[j] & 0x0F]*d) * (double) ys[j             ];
+                sumf += (double) (kvalues_mxfp4[qs[j] >>   4]*d) * (double) ys[j + QK_MXFP4/2];
+            }
+        }
+    }
+
+    *s = (float) sumf;
 }
 
 // NVFP4: super-block of 64 elements = 4 sub-blocks of 16 = 2 q8_0 blocks

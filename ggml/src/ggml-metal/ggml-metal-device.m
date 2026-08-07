@@ -1761,6 +1761,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+            // fork: E4M3_M2 has plain MUL_MAT kernels only (mirrors of the BF16
+            // kernels; requires bfloat + simdgroup mm for the exact mul_mm path)
+            if (op->src[0]->type == GGML_TYPE_E4M3_M2) {
+                return op->op == GGML_OP_MUL_MAT &&
+                    has_simdgroup_reduction && has_simdgroup_mm && has_bfloat &&
+                    op->src[1]->type == GGML_TYPE_F32;
+            }
             return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET:
         case GGML_OP_CPY:
@@ -1823,7 +1830,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            return op->src[0]->type != GGML_TYPE_NVFP4;
+            // fork: no get_rows kernels for the gguf-m2 types (dense plane is
+            // only ever a MUL_MAT operand, expert plane only a MUL_MAT_ID one)
+            return op->src[0]->type != GGML_TYPE_NVFP4 &&
+                   op->src[0]->type != GGML_TYPE_E4M3_M2 &&
+                   op->src[0]->type != GGML_TYPE_MXFP4_M2;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {

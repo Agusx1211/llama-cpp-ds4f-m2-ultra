@@ -86,8 +86,13 @@ static float dot_product(const float * a1, const float * a2, size_t test_size) {
 static float dot_product_error(const ggml_type_traits * qfns, const ggml_type_traits_cpu * qfns_cpu, size_t test_size, const float * test_data1, const float * test_data2) {
     GGML_UNUSED(qfns);
 
-    std::vector<uint8_t> tmp_q1(2*test_size);
-    std::vector<uint8_t> tmp_q2(2*test_size);
+    // size the buffers from the actual row sizes: a vec_dot_type wider than
+    // 2 bytes/element (e.g. F32, used by the fork's E4M3_M2 reference path)
+    // overflows the historical fixed 2*test_size allocation
+    const auto * vdot_traits = ggml_get_type_traits(qfns_cpu->vec_dot_type);
+
+    std::vector<uint8_t> tmp_q1(test_size/qfns->blck_size*qfns->type_size);
+    std::vector<uint8_t> tmp_q2(test_size/vdot_traits->blck_size*vdot_traits->type_size);
 
     const auto * vdot = ggml_get_type_traits_cpu(qfns_cpu->vec_dot_type);
 
