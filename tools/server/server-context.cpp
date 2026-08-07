@@ -1924,17 +1924,81 @@ private:
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
+            const bool consult_cache = prompt_cache != nullptr && task.type == SERVER_TASK_TYPE_COMPLETION;
+            update_cache = update_cache && consult_cache;
 
-            // cache prompts only for completion tasks
-            update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+            // Zero-copy prefix sharing from a live donor slot. Another slot
+            // (generating or idle) may hold a longer common prefix with the
+            // task than both the selected slot's residue and any cache entry
+            // (e.g. parallel agents with a shared system prompt). Under the
+            // unified KV, seq_cp only tags the donor's cells for the new
+            // sequence: the physical pages are shared and refcounted, later
+            // divergent writes go through the sparse pool's copy-on-write
+            // path, and the serialized scheduler loop makes the donor's state
+            // a consistent snapshot. Donors that are mid-prefill are skipped
+            // (their KV is incomplete). Target-only: the destination draft
+            // sequence is cleared, and speculation re-prefills it.
+            if (task.type == SERVER_TASK_TYPE_COMPLETION && task.id_slot == -1) {
+                server_slot * donor = nullptr;
+                size_t lcp_donor = 0;
+                for (server_slot & other : slots) {
+                    if (other.id == ret->id || other.prompt.tokens.empty() || other.prompt.tokens.has_mtmd) {
+                        continue;
+                    }
+                    if (other.is_processing() &&
+                            other.state != SLOT_STATE_GENERATING && other.state != SLOT_STATE_GENERATING_STAGED) {
+                        continue; // prompt not fully in KV yet
+                    }
+                    const size_t lcp = other.prompt.tokens.get_common_prefix(task.tokens);
+                    if (lcp > lcp_donor) {
+                        lcp_donor = lcp;
+                        donor = &other;
+                    }
+                }
 
-            if (update_cache) {
+                const size_t lcp_self = ret->prompt.tokens.get_common_prefix(task.tokens);
+                if (donor != nullptr && lcp_donor >= 1024 && lcp_donor > lcp_self) {
+                    const int64_t t_share = ggml_time_us();
+
+                    if (update_cache) {
+                        // the displaced residue is still snapshotted first
+                        ret->prompt_save(*prompt_cache);
+                    }
+
+                    ret->prompt_clear();
+                    llama_memory_seq_cp(llama_get_memory(ctx_tgt), donor->id, ret->id, -1, -1);
+
+                    ret->prompt.tokens      = donor->prompt.tokens.clone();
+                    ret->prompt.checkpoints = donor->prompt.checkpoints;
+
+                    SLT_INF(*ret, "shared %zu-token prefix from slot %d via zero-copy seq_cp (%.2f ms, task has %d)\n",
+                            lcp_donor, donor->id, (ggml_time_us() - t_share) / 1000.0, (int) task.tokens.size());
+
+                    if (prompt_cache) {
+                        prompt_cache->update();
+                    }
+
+                    return ret;
+                }
+            }
+
+            // Cache fallback (no live donor beat the resident prefix): always
+            // CONSULT for completion tasks, not only on LRU or low-keep
+            // selections - the published-prefix library may hold a longer
+            // prefix than the selected slot's residue. load() initializes its
+            // baseline from the resident state and only restores a strictly
+            // better entry, so the same-conversation retention fast path is
+            // unaffected. The SAVE stays gated on the displacement conditions
+            // (LRU or f_keep < 0.5) - an every-selection save would serialize
+            // multi-GiB states on each turn of a retained conversation.
+            if (consult_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                if (update_cache) {
+                    ret->prompt_save(*prompt_cache);
+                }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
