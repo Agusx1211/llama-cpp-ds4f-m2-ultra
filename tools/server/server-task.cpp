@@ -1779,13 +1779,27 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
+        // clear the destination sequence before restoring: the transactional
+        // DSV4 restore requires an empty destination (or an empty staging
+        // sequence, which a busy second lane cannot provide under -np 2).
+        // The current slot state is already saved by the preceding
+        // prompt_save, so dropping it here loses nothing.
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
+        if (ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
+        }
+
         {
             auto & data = it_best->data.main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
             if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
+                SRV_ERR("failed to restore state with size %zu - dropping cache entry\n", size);
+
+                // the entry failed to restore once - it will fail again, so
+                // drop it instead of retrying it on every future task
+                states.erase(it_best);
 
                 return false;
             }
@@ -1803,7 +1817,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 const size_t size = data.size();
                 const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
                 if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
+                    SRV_WRN("failed to restore state with size %zu - dropping cache entry\n", size);
+
+                    states.erase(it_best);
 
                     return false;
                 }
@@ -1811,6 +1827,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 data.clear();
                 data.shrink_to_fit();
             }
+            // else: target-only entry (saved from a slot whose speculative
+            // decoding was bypassed). The draft sequence was cleared above, so
+            // the speculative path re-prefills the draft instead of inheriting
+            // stale rows.
         }
 
         prompt = std::move(it_best->prompt);
