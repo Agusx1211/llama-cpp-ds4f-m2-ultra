@@ -114,7 +114,7 @@ static std::vector<float> run_mul_mat(
         const test_shape & s, int64_t n_batch,
         const float * xdata) {
     ggml_init_params ip = {
-        /*.mem_size   =*/ 16*1024,
+        /*.mem_size   =*/ ggml_tensor_overhead()*8 + ggml_graph_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
