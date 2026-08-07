@@ -2125,6 +2125,7 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     const std::string PARAM_START  = "<" + DSML + "parameter";
     const std::string PARAM_END    = "</" + DSML + "parameter>";
     const std::string GEN_PROMPT   = "<｜Assistant｜>";
+    const std::string USER_PROMPT  = "<｜User｜>";
 
     data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs, adjusted_messages);
     data.generation_prompt  = common_chat_template_generation_prompt_impl(tmpl, inputs, adjusted_messages);
@@ -2136,6 +2137,23 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
         DSML,
         THINK_START,
         THINK_END,
+    };
+
+    // Per-role message delimiters. The server uses these to split prefill
+    // batches at turn starts so that the context checkpoint it takes before
+    // each batch has pos_max exactly on a turn boundary, which is where two
+    // conversations that share a system prompt diverge. Without them the
+    // prefill only checkpoints near the end of the prompt and cross-conversation
+    // reuse lands up to a full ubatch below the shared prefix.
+    //
+    // The template emits the system prompt raw (no marker), opens every user
+    // turn with <｜User｜> and every assistant turn with <｜Assistant｜>. Tool
+    // results are deliberately not given their own delimiter: the template
+    // folds a run of tool messages into the surrounding user block, so the
+    // block genuinely starts with <｜User｜> and is a real user-turn boundary.
+    data.message_delimiters = {
+        { COMMON_CHAT_ROLE_ASSISTANT, GEN_PROMPT  },
+        { COMMON_CHAT_ROLE_USER,      USER_PROMPT },
     };
 
     if (inputs.has_continuation()) {
