@@ -440,9 +440,9 @@ extern "C" {
         // packed code bytes, which is the worst possible failure mode. Ids
         // [90, 99] are reserved for this fork; upstream merges must keep
         // GGML_TYPE_COUNT above the highest fork id.
-        GGML_TYPE_E4M3_M2 = 90, // gguf-m2 v1 dense plane: OCP E4M3 codes + per-128-elem E8M0 scales
-        // GGML_TYPE_MXFP4_M2 = 91, // reserved: gguf-m2 expert plane (separate workstream)
-        GGML_TYPE_COUNT   = 92,
+        GGML_TYPE_E4M3_M2  = 90, // gguf-m2 v1 dense plane: OCP E4M3 codes + per-128-elem E8M0 scales
+        GGML_TYPE_MXFP4_M2 = 91, // gguf-m2 v1 expert plane: split-plane MXFP4, 4-bit absolute E8M0 scales
+        GGML_TYPE_COUNT    = 92,
     };
 
     // precision

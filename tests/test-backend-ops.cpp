@@ -11059,21 +11059,46 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_sparse_attention(2, 768, 128));
 
     // Target-shape oracle for the DSV4 prompt-time expert MM path.
-    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 2048, 224, 4096));
-    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 224, 2048));
+    // fork: GGML_TYPE_MXFP4_M2 (gguf-m2 v1 expert plane) runs the same
+    // oracle — its kernels are bit-exact twins of the MXFP4 ones (the strict
+    // bit-identity matrix lives in test-m2-mxfp4.cpp; these are the
+    // cross-backend checks). Its CPU reference path is a deliberate scalar
+    // f32 implementation, so the heavy >=512-token prompt cases stay
+    // MXFP4-only to keep the suite runtime bounded.
+    for (ggml_type ta : { GGML_TYPE_MXFP4, GGML_TYPE_MXFP4_M2 }) {
+        test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 256, 6, false, 2048, 224, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 256, 6, false, 4096, 224, 2048));
+        // DSV4 prompt gate/up pair: both matrix outputs remain externally visible
+        // while Metal shares their identical route map and compact worklist.
+        test_cases.emplace_back(new test_mul_mat_id_fusion(
+                    ta, GGML_TYPE_F32, 256, 6, true, 2048, 224, 4096, 2, false, true));
+        // DSV4 decode down projection with its routed-weight multiply.
+        test_cases.emplace_back(new test_mul_mat_id_fusion(
+                    ta, GGML_TYPE_F32, 256, 6, false, 4096, 1, 2048, 1, true));
+    }
+    // route-distribution edge cases exercise the (type-independent) worklist
+    // map, so they stay MXFP4-only.
     test_cases.emplace_back(new test_mul_mat_id(
                 GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 2048, 224, 4096,
                 mul_mat_id_ids::concentrated));
     test_cases.emplace_back(new test_mul_mat_id(
                 GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 224, 2048,
                 mul_mat_id_ids::tile_boundaries));
-    // DSV4 prompt gate/up pair: both matrix outputs remain externally visible
-    // while Metal shares their identical route map and compact worklist.
+    // fork: MXFP4_M2 decode/small-batch GEMV paths at the real expert shapes,
+    // plus the generic (non-256-expert) geometry a small-expert artifact
+    // would dispatch, plus plain MUL_MAT coverage of the mv/mm twins.
+    for (int n : { 1, 2, 8, 32 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4_M2, GGML_TYPE_F32, 256, 6, false, 2048, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4_M2, GGML_TYPE_F32, 256, 6, false, 4096, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4_M2, GGML_TYPE_F32,  32, 4, false, 1024, n, 2048));
+    }
+    for (int n : { 1, 2, 5, 8, 32 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4_M2, GGML_TYPE_F32, 2048, n, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4_M2, GGML_TYPE_F32, 4096, n, 2048, {1, 1}, {1, 1}));
+    }
     test_cases.emplace_back(new test_mul_mat_id_fusion(
-                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, true, 2048, 224, 4096, 2, false, true));
-    // DSV4 decode down projection with its routed-weight multiply.
-    test_cases.emplace_back(new test_mul_mat_id_fusion(
-                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, 1, 2048, 1, true));
+                GGML_TYPE_MXFP4_M2, GGML_TYPE_F32, 256, 6, false, 4096, 224, 2048, 1, true,
+                false, mul_mat_id_ids::shuffled));
     // DSV4 prompt down projection with signed route weights. These whole-graph
     // cases cover both production route distributions and every target ubatch.
     test_cases.emplace_back(new test_mul_mat_id_fusion(

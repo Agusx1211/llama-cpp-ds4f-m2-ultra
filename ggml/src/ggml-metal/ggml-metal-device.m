@@ -1830,9 +1830,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            // fork: no get_rows kernel for E4M3_M2 (the gguf-m2 dense plane is
-            // only ever a MUL_MAT operand; token_embd stays BF16)
-            return op->src[0]->type != GGML_TYPE_NVFP4 && op->src[0]->type != GGML_TYPE_E4M3_M2;
+            // fork: no get_rows kernels for the gguf-m2 types (dense plane is
+            // only ever a MUL_MAT operand, expert plane only a MUL_MAT_ID one)
+            return op->src[0]->type != GGML_TYPE_NVFP4 &&
+                   op->src[0]->type != GGML_TYPE_E4M3_M2 &&
+                   op->src[0]->type != GGML_TYPE_MXFP4_M2;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {

@@ -3295,7 +3295,8 @@ static bool ggml_metal_op_mul_mat_id_use_dsv4_worklist(const ggml_tensor * op) {
         std::getenv("GGML_METAL_DSV4_MM_TILE_DISABLE") == nullptr;
 
     return enabled &&
-        op->src[0]->type == GGML_TYPE_MXFP4 && op->src[1]->type == GGML_TYPE_F32 &&
+        (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_MXFP4_M2) && // fork: M2 twin kernels
+        op->src[1]->type == GGML_TYPE_F32 &&
         op->src[0]->ne[2] == 256 && op->src[2]->ne[0] == 6 && op->src[2]->ne[1] >= 224 &&
         ((op->src[0]->ne[0] == 4096 && op->src[0]->ne[1] == 2048) ||
          (op->src[0]->ne[0] == 2048 && op->src[0]->ne[1] == 4096));
@@ -3410,7 +3411,8 @@ static ggml_metal_dsv4_down_weight_fusion ggml_metal_op_mul_mat_id_dsv4_down_wei
 
     if (!enabled || !ctx->use_fusion || !token_shape ||
             ggml_metal_device_get_props(ctx->dev)->device_id != GGML_METAL_DEVICE_M2_ULTRA ||
-            op->src[0]->type != GGML_TYPE_MXFP4 || op->src[1]->type != GGML_TYPE_F32 ||
+            (op->src[0]->type != GGML_TYPE_MXFP4 && op->src[0]->type != GGML_TYPE_MXFP4_M2) || // fork: M2 twin kernels
+            op->src[1]->type != GGML_TYPE_F32 ||
             op->src[2]->type != GGML_TYPE_I32 || op->type != GGML_TYPE_F32 ||
             op->src[0]->ne[0] != 2048 || op->src[0]->ne[1] != 4096 ||
             op->src[0]->ne[2] != 256  || op->src[0]->ne[3] != 1 ||
@@ -3483,7 +3485,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     const bool use_dsv4_crossover =
         dsv4_crossover_enabled &&
         props_dev->device_id == GGML_METAL_DEVICE_M2_ULTRA &&
-        op->src[0]->type == GGML_TYPE_MXFP4 && op->src[1]->type == GGML_TYPE_F32 &&
+        (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_MXFP4_M2) && // fork: M2 twin kernels
+        op->src[1]->type == GGML_TYPE_F32 &&
         ne02 == 256 && ne20 == 6 &&
         ((ne00 == 4096 && ne01 == 2048) || (ne00 == 2048 && ne01 == 4096));
 
