@@ -130,14 +130,17 @@ void dequantize_bf16_t4(device const bfloat4 * src, short il, thread type4 & reg
 // Decode strategies, identical values by construction (the table is generated
 // from the ALU formula, incl. the +-480.0 decode of the two NaN encodings).
 // Per-path choices measured on the M2 Ultra (bench-dense, cold-cache chains;
-// numbers in the commit message / design note):
-// - mul_mv:  threadgroup-staged copy of this table (constant-memory gathers
-//   with divergent byte indices serialize; threadgroup gathers do not — same
-//   reason the MXFP4 kernels keep their 16-entry LUT in threadgroup memory).
-// - mul_mm:  constant-memory lookups (no spare threadgroup plumbing in the
-//   shared template; still well ahead of the ALU decode there).
-// - mul_mv_ext: pure-ALU decode (the LUT variants measured slower on that
-//   path — it runs few enough elements per thread that the int ALU hides).
+// numbers in the commit messages / design note):
+// - ALL THREE mat-mul paths (mul_mv, mul_mv_ext, mul_mm) stage this table in
+//   threadgroup memory: constant-memory gathers with divergent byte indices
+//   serialize; threadgroup gathers do not — same reason the MXFP4 kernels
+//   keep their 16-entry LUT in threadgroup memory. Earlier per-path A/Bs that
+//   kept const-memory lookups (mm) or pure-ALU decode (ext) lost 20-25% to
+//   BF16; each path now has a dedicated kernel with a threadgroup LUT (see
+//   kernel_mul_mv_e4m3_m2_f32_impl, kernel_mul_mv_ext_e4m3_m2_f32_impl,
+//   kernel_mul_mm_e4m3_m2).
+// - e4m3_m2_code_to_f32 below is the reference ALU formula the table is
+//   generated from; it has no remaining kernel consumer.
 constexpr constant static float kvalues_e4m3_m2[256] = {
     0.0f, 0x1p-9f, 0x1p-8f, 0x1.8p-8f, 0x1p-7f, 0x1.4p-7f, 0x1.8p-7f, 0x1.cp-7f,
     0x1p-6f, 0x1.2p-6f, 0x1.4p-6f, 0x1.6p-6f, 0x1.8p-6f, 0x1.ap-6f, 0x1.cp-6f, 0x1.ep-6f,
@@ -173,9 +176,44 @@ constexpr constant static float kvalues_e4m3_m2[256] = {
     -0x1p+8f, -0x1.2p+8f, -0x1.4p+8f, -0x1.6p+8f, -0x1.8p+8f, -0x1.ap+8f, -0x1.cp+8f, -0x1.ep+8f
 };
 
-static inline float e4m3_m2_code_to_f32_lutc(uint32_t v) {
-    return kvalues_e4m3_m2[v & 0xFFu];
-}
+// the same 256 decoded values as bf16 BIT PATTERNS (== high 16 bits of the
+// f32 patterns above; every decoded value is exactly bf16-representable).
+// Consumers: the integer-pipe mul_mm decode (DECODE_STYLE >= 2), which
+// applies the power-of-two scale as an exponent-field add.
+constexpr constant static ushort kvalues_e4m3_m2_u16[256] = {
+    0x0000, 0x3B00, 0x3B80, 0x3BC0, 0x3C00, 0x3C20, 0x3C40, 0x3C60,
+    0x3C80, 0x3C90, 0x3CA0, 0x3CB0, 0x3CC0, 0x3CD0, 0x3CE0, 0x3CF0,
+    0x3D00, 0x3D10, 0x3D20, 0x3D30, 0x3D40, 0x3D50, 0x3D60, 0x3D70,
+    0x3D80, 0x3D90, 0x3DA0, 0x3DB0, 0x3DC0, 0x3DD0, 0x3DE0, 0x3DF0,
+    0x3E00, 0x3E10, 0x3E20, 0x3E30, 0x3E40, 0x3E50, 0x3E60, 0x3E70,
+    0x3E80, 0x3E90, 0x3EA0, 0x3EB0, 0x3EC0, 0x3ED0, 0x3EE0, 0x3EF0,
+    0x3F00, 0x3F10, 0x3F20, 0x3F30, 0x3F40, 0x3F50, 0x3F60, 0x3F70,
+    0x3F80, 0x3F90, 0x3FA0, 0x3FB0, 0x3FC0, 0x3FD0, 0x3FE0, 0x3FF0,
+    0x4000, 0x4010, 0x4020, 0x4030, 0x4040, 0x4050, 0x4060, 0x4070,
+    0x4080, 0x4090, 0x40A0, 0x40B0, 0x40C0, 0x40D0, 0x40E0, 0x40F0,
+    0x4100, 0x4110, 0x4120, 0x4130, 0x4140, 0x4150, 0x4160, 0x4170,
+    0x4180, 0x4190, 0x41A0, 0x41B0, 0x41C0, 0x41D0, 0x41E0, 0x41F0,
+    0x4200, 0x4210, 0x4220, 0x4230, 0x4240, 0x4250, 0x4260, 0x4270,
+    0x4280, 0x4290, 0x42A0, 0x42B0, 0x42C0, 0x42D0, 0x42E0, 0x42F0,
+    0x4300, 0x4310, 0x4320, 0x4330, 0x4340, 0x4350, 0x4360, 0x4370,
+    0x4380, 0x4390, 0x43A0, 0x43B0, 0x43C0, 0x43D0, 0x43E0, 0x43F0,
+    0x8000, 0xBB00, 0xBB80, 0xBBC0, 0xBC00, 0xBC20, 0xBC40, 0xBC60,
+    0xBC80, 0xBC90, 0xBCA0, 0xBCB0, 0xBCC0, 0xBCD0, 0xBCE0, 0xBCF0,
+    0xBD00, 0xBD10, 0xBD20, 0xBD30, 0xBD40, 0xBD50, 0xBD60, 0xBD70,
+    0xBD80, 0xBD90, 0xBDA0, 0xBDB0, 0xBDC0, 0xBDD0, 0xBDE0, 0xBDF0,
+    0xBE00, 0xBE10, 0xBE20, 0xBE30, 0xBE40, 0xBE50, 0xBE60, 0xBE70,
+    0xBE80, 0xBE90, 0xBEA0, 0xBEB0, 0xBEC0, 0xBED0, 0xBEE0, 0xBEF0,
+    0xBF00, 0xBF10, 0xBF20, 0xBF30, 0xBF40, 0xBF50, 0xBF60, 0xBF70,
+    0xBF80, 0xBF90, 0xBFA0, 0xBFB0, 0xBFC0, 0xBFD0, 0xBFE0, 0xBFF0,
+    0xC000, 0xC010, 0xC020, 0xC030, 0xC040, 0xC050, 0xC060, 0xC070,
+    0xC080, 0xC090, 0xC0A0, 0xC0B0, 0xC0C0, 0xC0D0, 0xC0E0, 0xC0F0,
+    0xC100, 0xC110, 0xC120, 0xC130, 0xC140, 0xC150, 0xC160, 0xC170,
+    0xC180, 0xC190, 0xC1A0, 0xC1B0, 0xC1C0, 0xC1D0, 0xC1E0, 0xC1F0,
+    0xC200, 0xC210, 0xC220, 0xC230, 0xC240, 0xC250, 0xC260, 0xC270,
+    0xC280, 0xC290, 0xC2A0, 0xC2B0, 0xC2C0, 0xC2D0, 0xC2E0, 0xC2F0,
+    0xC300, 0xC310, 0xC320, 0xC330, 0xC340, 0xC350, 0xC360, 0xC370,
+    0xC380, 0xC390, 0xC3A0, 0xC3B0, 0xC3C0, 0xC3D0, 0xC3E0, 0xC3F0,
+};
 
 static inline float e4m3_m2_code_to_f32(uint32_t v) {
     const uint32_t s  = (v & 0x80u) << 24;
@@ -194,8 +232,8 @@ static inline float e4m3_m2_scale_to_f32(uint32_t sc) {
 
 // il in [0, QK_E4M3_M2/16): which 16-element chunk of the block. All 16
 // elements of a chunk share one scale (128 % 16 == 0). The 16 code bytes are
-// 16-byte aligned (block size 1040 is a multiple of 16, chunk offset is a
-// multiple of 16), so they are fetched as a single uint4.
+// 16-byte aligned, fetched as a single uint4. Consumer: the shared-template
+// probe instantiation kernel_mul_mm_e4m3_m2_f32_tmpl (A/B attribution).
 template <typename type4x4>
 void dequantize_e4m3_m2(device const block_e4m3_m2 * xb, short il, thread type4x4 & reg) {
     const uint4 qv = *(device const uint4 *)(xb->qs + 16*il);
@@ -205,30 +243,14 @@ void dequantize_e4m3_m2(device const block_e4m3_m2 * xb, short il, thread type4x
     FOR_UNROLL (short i = 0; i < 4; i++) {
         const uint32_t qw = qv[i];
 
-        tmp[i][0] = e4m3_m2_code_to_f32_lutc((qw >>  0) & 0xFF)*d;
-        tmp[i][1] = e4m3_m2_code_to_f32_lutc((qw >>  8) & 0xFF)*d;
-        tmp[i][2] = e4m3_m2_code_to_f32_lutc((qw >> 16) & 0xFF)*d;
-        tmp[i][3] = e4m3_m2_code_to_f32_lutc((qw >> 24)       )*d;
+        tmp[i][0] = kvalues_e4m3_m2[(qw >>  0) & 0xFF]*d;
+        tmp[i][1] = kvalues_e4m3_m2[(qw >>  8) & 0xFF]*d;
+        tmp[i][2] = kvalues_e4m3_m2[(qw >> 16) & 0xFF]*d;
+        tmp[i][3] = kvalues_e4m3_m2[(qw >> 24)       ]*d;
     }
 
     // exact for every value the converter emits (each is a bf16 value)
     reg = (type4x4)tmp;
-}
-
-// il in [0, QK_E4M3_M2/4): which 4-element chunk of the block; used by the
-// mul_mv_ext path. The 4 code bytes are 4-byte aligned -> one uint load.
-template <typename type4>
-void dequantize_e4m3_m2_t4(device const block_e4m3_m2 * xb, short il, thread type4 & reg) {
-    const uint32_t qw = *(device const uint32_t *)(xb->qs + 4*il);
-    const float d  = e4m3_m2_scale_to_f32(xb->sc[il/32]);
-
-    float4 tmp;
-    tmp[0] = e4m3_m2_code_to_f32((qw >>  0) & 0xFF)*d;
-    tmp[1] = e4m3_m2_code_to_f32((qw >>  8) & 0xFF)*d;
-    tmp[2] = e4m3_m2_code_to_f32((qw >> 16) & 0xFF)*d;
-    tmp[3] = e4m3_m2_code_to_f32((qw >> 24)       )*d;
-
-    reg = (type4)tmp;
 }
 
 template <typename type4x4>
@@ -4344,12 +4366,208 @@ template [[host_name("kernel_mul_mv_ext_bf16_f32_r1_4")]]   kernel mul_mv_ext_q4
 template [[host_name("kernel_mul_mv_ext_bf16_f32_r1_5")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, bfloat4,      4,  dequantize_bf16_t4>;
 #endif
 
-// fork: E4M3_M2 mirrors the BF16 ext kernels (same r1/nxpsg geometry, same
-// dot()/accumulation order on identical decoded values -> bit-identical output)
-template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_e4m3_m2, 1024, dequantize_e4m3_m2_t4>;
-template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_e4m3_m2, 1024, dequantize_e4m3_m2_t4>;
-template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_e4m3_m2, 1024, dequantize_e4m3_m2_t4>;
-template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_e4m3_m2, 1024, dequantize_e4m3_m2_t4>;
+// fork: GGML_TYPE_E4M3_M2 small-batch GEMV (mul_mv_ext path, speculative-
+// verify batches 2..8 — prod's most common decode step). Dedicated kernel
+// replacing the generic kernel_mul_mv_ext_q4_f32_disp instantiation with
+// dequantize_e4m3_m2_t4, which measured 1.20-1.27x the BF16 ext time: the
+// template already amortizes the decode across the r1ptg batch columns
+// (lx[ch] is decoded once and dotted with every column), so the loss was
+// pure per-element ALU decode cost, not per-column re-decode.
+//
+// Differences vs the generic template, none of which change the math:
+// - the 256-entry decode LUT is staged in threadgroup memory (constant-
+//   memory gathers with divergent byte indices serialize; threadgroup
+//   gathers do not — the same measured effect that picked tg-LUT for the
+//   batch-1 GEMV);
+// - the chunk walk is restructured per 1024-element block so the block's 8
+//   E8M0 scale bytes are fetched once as a single aligned 8-byte load and
+//   expanded from registers (the template refetched a device scale byte for
+//   every 4-element chunk);
+// - code bytes still load as one uint per 4-element chunk (a thread's
+//   consecutive chunks are nxpsg*4 elements apart, so wider code loads
+//   cannot apply without changing the thread-to-chunk assignment, which
+//   bit-identity forbids).
+//
+// BIT-IDENTITY: the thread-to-chunk assignment (tx + m*nxpsg, m ascending),
+// the per-chunk dot() expression, the running-sum order and the
+// simd_shuffle_down reduction tree are copied from the template verbatim,
+// and the decoded float4 values are exactly the BF16 weight values, so the
+// output is bit-identical to kernel_mul_mv_ext_bf16_f32_r1_N (enforced by
+// tests/test-m2-e4m3.cpp for every dense-plane shape at every batch 2..8).
+template<short r1ptg, short nxpsg>
+void kernel_mul_mv_ext_e4m3_m2_f32_impl(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3   tgpig,
+        ushort  tiisg,
+        ushort  sgitg) {
+    // nxpsg is a TEMPLATE literal, not the function constant: every inner
+    // loop bound below must be a front-end compile-time constant so the
+    // unrolled lx[] stays in registers — a function-constant bound leaves
+    // the loop dynamic at AIR time and spills lx[] to stack, which measured
+    // 3-10x SLOWER. The dispatcher branches on FC_mul_mv_nxpsg once.
+    const short NSG   = FC_mul_mv_nsg;
+
+    const short nypsg = (32/nxpsg);
+
+    const short tx = tiisg%nxpsg;
+    const short ty = tiisg/nxpsg;
+
+    const int i01 = tgpig.x*(nypsg*NSG) + nypsg*sgitg + ty;
+    const int i11 = tgpig.y*r1ptg;
+    const int i1m = tgpig.z;
+
+    const int i12 = i1m%FC_mul_mv_ne12;
+    const int i13 = i1m/FC_mul_mv_ne12;
+
+    // stage the decode LUT (all threads participate; no return before the barrier)
+    threadgroup float * lut = (threadgroup float *) shmem;
+    for (short i = 32*sgitg + tiisg; i < 256; i += 32*NSG) {
+        lut[i] = kvalues_e4m3_m2[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint64_t offset0 = i01*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 = i11*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_e4m3_m2 * xb = (device const block_e4m3_m2 *) ((i01 < args.ne01) ? src0 + offset0 : src0);
+
+    device const float4 * y4[r1ptg];
+
+    for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
+        y4[ir1] = (i11 + ir1 < args.ne11) ? (device const float4 *) (src1 + offset1 + ir1*args.nb11) + tx : (device const float4 *) src1;
+    }
+
+    float sumf[r1ptg] = { [ 0 ... r1ptg - 1 ] = 0.0f };
+
+    const int nblk = args.ne00/QK_E4M3_M2;
+
+    for (int ib = 0; ib < nblk; ++ib, ++xb) {
+        // all 8 E8M0 scale bytes of this block in one aligned 8-byte load
+        // (block base is 16-byte aligned, sc sits at offset 1024)
+        const uint2 scb = *(device const uint2 *)(xb->sc);
+
+        // walk the block in groups of 4 chunks per thread (the template's
+        // chpt=4 grouping — 4 code loads in flight per iteration): chunk
+        // cc = tx + (4*g + c)*nxpsg for ascending g, c — exactly the
+        // template's global chunk order. The chunk's 128-element scale byte
+        // comes from the preloaded scb registers (shift/mask), not a device
+        // load. The group loop itself is deliberately NOT unrolled (the
+        // template's outer chunk loop is rolled too): fully unrolling a
+        // whole 1024-element block measured 3-10x slower — straight-line
+        // decode of 32 chunks spills the register file.
+        for (short g = 0; g < 64/nxpsg; ++g) {
+            float4 lx[4];
+            float  ld[4];
+
+            FOR_UNROLL (short c = 0; c < 4; ++c) {
+                const short cc = tx + (4*g + c)*nxpsg;
+
+                const uint32_t qw = *(device const uint32_t *)(xb->qs + 4*cc);
+
+                // unscaled code values; the exact power-of-two scale is folded
+                // into the accumulate below
+                lx[c] = float4(lut[(qw >>  0) & 0xFF],
+                               lut[(qw >>  8) & 0xFF],
+                               lut[(qw >> 16) & 0xFF],
+                               lut[(qw >> 24)       ]);
+
+                const short    si = short(((4*g + c)*nxpsg)/32);
+                const uint32_t sc = ((si < 4 ? scb.x : scb.y) >> (8*(si & 3))) & 0xFFu;
+
+                ld[c] = as_type<float>(sc << 23);
+            }
+
+            FOR_UNROLL (short c = 0; c < 4; ++c) {
+                FOR_UNROLL (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+                    // EXACTNESS: the bf16 weight value is code*d with d a power
+                    // of two, so dot(code*d, y) == d*dot(code, y) bit-exactly
+                    // (power-of-two scaling commutes with every rounding step
+                    // while all intermediates stay in the f32 normal range —
+                    // codes are <= 480, so the unscaled dot cannot overflow,
+                    // and fma(d, t, s) == (d*t) + s since d*t is exact).
+                    // Verified bit-identical vs the BF16 ext kernels by
+                    // tests/test-m2-e4m3.cpp at every shape and batch.
+                    const float t = dot(lx[c], y4[ir1][c*nxpsg]);
+
+                    sumf[ir1] = fma(ld[c], t, sumf[ir1]);
+                }
+            }
+
+            FOR_UNROLL (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+                y4[ir1] += 4*nxpsg;
+            }
+        }
+    }
+
+    // reduce only the threads in each row (verbatim from the template)
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+        if (nxpsg >= 32) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
+        }
+        if (nxpsg >= 16) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  8);
+        }
+        if (nxpsg >= 8) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  4);
+        }
+        if (nxpsg >= 4) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  2);
+        }
+        if (nxpsg >= 2) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  1);
+        }
+    }
+
+    if (tx == 0) {
+        for (short ir1 = 0; ir1 < r1ptg && i11 + ir1 < args.ne11; ++ir1) {
+            device float * dst_f32 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1 + (uint64_t)(i11 + ir1)*args.ne0;
+
+            if (i01 < args.ne01) {
+                dst_f32[i01] = sumf[ir1];
+            }
+        }
+    }
+}
+
+template<short r1ptg>
+kernel void kernel_mul_mv_ext_e4m3_m2_f32_disp(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    // the host only ever sets nxpsg to 16 (ne00 % 256 == 0 and ne11 < 3) or 8
+    // (ne00 % 128 == 0, always true: ne00 % 1024 == 0); the dead branch is
+    // pruned at pipeline specialization
+    if (FC_mul_mv_nxpsg == 16) {
+        kernel_mul_mv_ext_e4m3_m2_f32_impl<r1ptg, 16>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_ext_e4m3_m2_f32_impl<r1ptg,  8>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    }
+}
+
+typedef decltype(kernel_mul_mv_ext_e4m3_m2_f32_disp<2>) mul_mv_ext_e4m3_m2_f32_t;
+
+// r1_6/7/8 have no BF16 counterparts: the stock host maps ne11 in {6,7,8} to
+// two r1_3/r1_4 column groups, which fetches AND decodes every weight twice.
+// For E4M3_M2 the decode is the scarce resource, so the host dispatches one
+// single-pass threadgroup per 6/7/8 columns instead. Bit-identity is
+// unaffected: each output column's accumulation chain involves only its own
+// y row and is independent of which sibling columns share the threadgroup.
+template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_2")]] kernel mul_mv_ext_e4m3_m2_f32_t kernel_mul_mv_ext_e4m3_m2_f32_disp<2>;
+template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_3")]] kernel mul_mv_ext_e4m3_m2_f32_t kernel_mul_mv_ext_e4m3_m2_f32_disp<3>;
+template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_4")]] kernel mul_mv_ext_e4m3_m2_f32_t kernel_mul_mv_ext_e4m3_m2_f32_disp<4>;
+template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_5")]] kernel mul_mv_ext_e4m3_m2_f32_t kernel_mul_mv_ext_e4m3_m2_f32_disp<5>;
+template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_6")]] kernel mul_mv_ext_e4m3_m2_f32_t kernel_mul_mv_ext_e4m3_m2_f32_disp<6>;
+template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_7")]] kernel mul_mv_ext_e4m3_m2_f32_t kernel_mul_mv_ext_e4m3_m2_f32_disp<7>;
+template [[host_name("kernel_mul_mv_ext_e4m3_m2_f32_r1_8")]] kernel mul_mv_ext_e4m3_m2_f32_t kernel_mul_mv_ext_e4m3_m2_f32_disp<8>;
 
 template [[host_name("kernel_mul_mv_ext_q1_0_f32_r1_2")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_q1_0,   128, dequantize_q1_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q1_0_f32_r1_3")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_q1_0,   128, dequantize_q1_0_t4>;
@@ -4748,6 +4966,14 @@ void kernel_mul_mv_e4m3_m2_f32_impl(
             const uint4 qv = *(device const uint4 *)(xb->qs + q); // 16-B aligned
             const float d  = e4m3_m2_scale_to_f32(xb->sc[q/128]); // one scale per 128 elems covers all 16
 
+            // NOTE: a scale-folded variant (unscaled xv, sumf[row] =
+            // fma(d, sumq, sumf[row])) was tried here like in the ext kernel
+            // below; although the fold is exact in real arithmetic (power-of-
+            // two scaling commutes with every rounding step), removing the
+            // per-element *d changed the fast-math lowering of this dot/sum
+            // chain enough to produce ~1e-6-relative diffs vs the BF16 kernel
+            // on 6 of 8 shapes at n=1. The mirror below keeps the multiply,
+            // which empirically compiles to the BF16 kernel's exact shape.
             float sumq = 0.f;
             FOR_UNROLL (short i = 0; i < NF4; ++i) {
                 const uint32_t qw = qv[i];
@@ -4785,6 +5011,7 @@ void kernel_mul_mv_e4m3_m2_f32_disp(
     switch (args.nr0) {
         case 2: kernel_mul_mv_e4m3_m2_f32_impl<2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
         case 4: kernel_mul_mv_e4m3_m2_f32_impl<4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 8: kernel_mul_mv_e4m3_m2_f32_impl<8, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
     }
 }
 
@@ -11467,10 +11694,534 @@ template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_f16_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, bfloat4x4,     1,     dequantize_bf16,    bfloat, bfloat4x4, float, float2x4>;
-// fork: E4M3_M2 uses the exact bf16 tile pipeline (bfloat staging + simdgroup
-// bfloat mm, identical B-operand conversion), only the A-tile load dequantizes
-// e4m3 codes to the identical bfloat values -> bit-identical vs bf16 mul_mm
-template [[host_name("kernel_mul_mm_e4m3_m2_f32")]] kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, block_e4m3_m2, 64,    dequantize_e4m3_m2, bfloat, bfloat4x4, float, float2x4>;
+// fork: dedicated GGML_TYPE_E4M3_M2 GEMM (prefill path). The shared template
+// instantiation with dequantize_e4m3_m2 + the constant-memory LUT measured
+// 1.24-1.25x the BF16 mul_mm time: every threadgroup along the token
+// dimension re-decodes the same 64x32 A tile (ne1/32 redundant decodes at
+// prefill), and the per-element decode (constant-LUT gather + scale multiply
+// + bfloat convert) is the only work the BF16 tile pipeline does not do.
+// This dedicated kernel keeps the template's exact tile geometry and
+// simdgroup flow (bfloat staging of BOTH operands, simdgroup_bfloat8x8
+// multiply-accumulate in the identical ik order -> bit-identical output vs
+// kernel_mul_mm_bf16_f32) and attacks the decode cost twice:
+// - the 256-entry LUT is staged in threadgroup memory (constant-memory
+//   gathers with divergent byte indices serialize; threadgroup gathers do
+//   not — the same measured effect as in the GEMV kernels);
+// - NT1 = 2: one threadgroup processes TWO adjacent 32-column B tiles
+//   against one staged A tile, halving both the per-element decode work and
+//   the device refetch of A (the template refetches + re-decodes A for
+//   every 32-column tile). Each B tile keeps its own mc accumulators and
+//   the per-output-element accumulation order is unchanged.
+// FC_mul_mm_bc_inp is structurally impossible here (ne00 % 1024 == 0 by the
+// E4M3_M2 block invariant), so the unaligned-K branch is omitted. The host
+// sets FC_mul_mm_bc_out against the NT1*32-column granularity.
+// DECODE_STYLE: 0 = threadgroup f32 LUT, 1 = constant-memory f32 LUT,
+// 2 = threadgroup u16 LUT of bf16 bit patterns + integer exponent add,
+// 3 = constant-memory u16 LUT + integer exponent add (SHIPPED DEFAULT —
+// measured winner: no fmul, no f32->bf16 cvt, int-pipe work beside the FP
+// MMA, and no threadgroup LUT bytes so 4 threadgroups/core fit).
+// The u16 styles apply the power-of-two scale by adding (sc-127)<<7 to the
+// bf16 exponent field, with a select keeping +-0 intact — exact for every
+// value the converter can emit, since each nonzero weight is a NORMAL bf16
+// value by construction: the artifact was recovered from served bf16
+// weights, so code*2^k never leaves the normal range; the ggml test
+// quantizer's amax-derived scales satisfy the same property.
+template<short NT1, short DECODE_STYLE>
+kernel void kernel_mul_mm_e4m3_m2(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32; // columns per B tile
+
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    threadgroup bfloat * sa   = (threadgroup bfloat *)(shmem);                         // 64x32 A tile (4096 B)
+    threadgroup bfloat * sb   = (threadgroup bfloat *)(shmem + 4096);                  // NT1 32x32 B tiles (2048 B each)
+    threadgroup float  * lutg = (threadgroup float  *)(shmem + 4096 + NT1*2048);       // 256-entry f32 LUT (1024 B, style 0)
+    threadgroup ushort * lutu = (threadgroup ushort *)(shmem + 4096 + NT1*2048);       // 256-entry bf16-bits LUT (512 B, style 2)
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*(NT1*NR1);
+
+    constant const float * lutc = kvalues_e4m3_m2;
+
+    if (DECODE_STYLE == 0) {
+        // stage the f32 decode LUT once (128 threads, 2 entries each)
+        for (short i = tiitg; i < 256; i += 4*N_SIMDWIDTH) {
+            lutg[i] = kvalues_e4m3_m2[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else if (DECODE_STYLE == 2) {
+        // stage the bf16 bit patterns
+        for (short i = tiitg; i < 256; i += 4*N_SIMDWIDTH) {
+            lutu[i] = kvalues_e4m3_m2_u16[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // DECODE_STYLE == 3 gathers kvalues_e4m3_m2_u16 from constant memory
+    // directly (no staging, no threadgroup LUT bytes)
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+
+    // valid columns per B tile (0 = tile fully out of range; uniform per tg)
+    short nr1[NT1];
+    FOR_UNROLL (short t = 0; t < NT1; ++t) {
+        const int rem = args.ne1 - (r1 + t*NR1);
+        nr1[t] = rem <= 0 ? 0 : (rem < NR1 ? (short) rem : (short) NR1);
+    }
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1; // 0 .. 63
+    const short il0 = (tiitg % NL0);
+
+    short il = il0; // 16-element chunk within the current block, walks 0,2,..,62 (il0=0) / 1,3,..,63 (il0=1)
+
+    const int i12 = im % FC_mul_mm_ne12;
+    const int i13 = im / FC_mul_mm_ne12;
+
+    const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
+
+    device const block_e4m3_m2 * x = (device const block_e4m3_m2 *)(src0 + args.nb01*(r0 + lr0) + offset0);
+
+    const short iy = 8*(tiitg % NL1);
+
+    // per-tile B row, clamped to a VALID row of src1 (for a fully-empty tail
+    // tile this reads garbage that is never stored — keeping the staging and
+    // MMA phases branch-free measured faster than guarding them)
+    device const float * y[NT1];
+    FOR_UNROLL (short t = 0; t < NT1; ++t) {
+        const short lr  = (short)(tiitg/NL1);
+        const int   row = r1 + t*NR1 + lr < args.ne1 ? r1 + t*NR1 + lr : args.ne1 - 1;
+
+        y[t] = (device const float *)(src1
+            + args.nb13*i13
+            + args.nb12*i12
+            + args.nb11*row
+            + args.nb10*iy);
+    }
+
+    simdgroup_bfloat8x8 ma[4];
+    simdgroup_bfloat8x8 mb[2];
+
+    simdgroup_float8x8 mc[8*NT1];
+
+    for (short i = 0; i < 8*NT1; i++){
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        // === A tile: decode 16 e4m3 elements per thread ===
+        const uint4 qv = *(device const uint4 *)(x->qs + 16*il);
+
+        bfloat4x4 temp_a;
+
+        if (DECODE_STYLE >= 2) {
+            // integer path: bf16 bits from the u16 LUT, power-of-two scale
+            // applied as an exponent-field add; +-0 kept by the select
+            const int kk = (int(x->sc[il/8]) - 127) << 7;
+
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                const uint32_t qw = qv[i];
+
+                FOR_UNROLL (short j = 0; j < 4; j++) {
+                    const ushort b = DECODE_STYLE == 2 ? lutu[(qw >> (8*j)) & 0xFF]
+                                                       : kvalues_e4m3_m2_u16[(qw >> (8*j)) & 0xFF];
+
+                    temp_a[i][j] = as_type<bfloat>(ushort((b & 0x7FFF) ? int(b) + kk : int(b)));
+                }
+            }
+        } else {
+            const float d = e4m3_m2_scale_to_f32(x->sc[il/8]);
+
+            float4x4 tmp;
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                const uint32_t qw = qv[i];
+
+                if (DECODE_STYLE == 1) {
+                    tmp[i][0] = lutc[(qw >>  0) & 0xFF]*d;
+                    tmp[i][1] = lutc[(qw >>  8) & 0xFF]*d;
+                    tmp[i][2] = lutc[(qw >> 16) & 0xFF]*d;
+                    tmp[i][3] = lutc[(qw >> 24)       ]*d;
+                } else {
+                    tmp[i][0] = lutg[(qw >>  0) & 0xFF]*d;
+                    tmp[i][1] = lutg[(qw >>  8) & 0xFF]*d;
+                    tmp[i][2] = lutg[(qw >> 16) & 0xFF]*d;
+                    tmp[i][3] = lutg[(qw >> 24)       ]*d;
+                }
+            }
+
+            // convert BEFORE the barrier (exact: every decoded value is a
+            // bf16 value) — the cvts overlap the barrier wait and halve the
+            // registers live across it, like the shared template's dequantize
+            temp_a = (bfloat4x4)tmp;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+
+            const short ib = 8*sx + sy;
+
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        // === B tiles: identical bf16 conversion staging as the bf16 mul_mm ===
+        FOR_UNROLL (short t = 0; t < NT1; ++t) {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+
+            const short ly = (tiitg/NL1)%8;
+
+            const short ib = 4*sx + sy;
+
+            *(threadgroup bfloat2x4 *)(sb + t*(NR1*NK) + 64*ib + 8*ly) = (bfloat2x4)(*((device const float2x4 *) y[t]));
+        }
+
+        il = (il + 2 < 64) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + 1 : x;
+
+        FOR_UNROLL (short t = 0; t < NT1; ++t) {
+            y[t] += NK;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // === outer products: identical ik order per output element; the ma
+        //     loads are shared across the NT1 B tiles ===
+        threadgroup const bfloat * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const bfloat * lsmb = (sb + 2*64*(sgitg/2));
+
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short t = 0; t < NT1; ++t) {
+                FOR_UNROLL (short i = 0; i < 2; i++) {
+                    simdgroup_load(mb[i], lsmb + t*(NR1*NK) + 64*i, 8, 0, false);
+                }
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 8; i++){
+                    simdgroup_multiply_accumulate(mc[8*t + i], mb[i/4], ma[i%4], mc[8*t + i]);
+                }
+            }
+
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NT1*NR1 <= args.ne1)) {
+        // no bounds checks on the output: direct device stores per tile
+        FOR_UNROLL (short t = 0; t < NT1; ++t) {
+            device float * C = (device float *) dst +
+                (r0 + 32*(sgitg &  1)) + \
+                (r1 + t*NR1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
+
+            for (short i = 0; i < 8; i++) {
+                simdgroup_store(mc[8*t + i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+            }
+        }
+    } else {
+        // bounds-checked path: stage each tile through shmem (this clobbers
+        // sa/sb/LUT, all dead by now)
+        for (short t = 0; t < NT1; ++t) {
+            if (nr1[t] == 0) {
+                continue;
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+
+            for (short i = 0; i < 8; i++) {
+                simdgroup_store(mc[8*t + i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (sgitg == 0) {
+                for (int j = tiitg; j < nr1[t]; j += NR1) {
+                    device float  * D  = (device float  *) dst + r0 + (r1 + t*NR1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                    device float4 * D4 = (device float4 *) D;
+
+                    threadgroup float  * C  = ((threadgroup float *) shmem) + (j*NR0);
+                    threadgroup float4 * C4 = (threadgroup float4 *) C;
+
+                    int i = 0;
+                    for (; i < nr0/4; i++) {
+                        *(D4 + i) = *(C4 + i);
+                    }
+
+                    i *= 4;
+                    for (; i < nr0; i++) {
+                        *(D + i) = *(C + i);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// shared-sb variant: TWO 32-column B tiles per threadgroup like NT1=2, but
+// both tiles pass through ONE staged B buffer (sb overwritten between the
+// two MMA phases). Costs 2 extra threadgroup barriers and a second set of
+// A simdgroup_loads per k-slab, but keeps the threadgroup allocation at the
+// template's 6144 B (+LUT), i.e. one more resident threadgroup per core
+// than the two-buffer NT1=2 layout. A/B'd against kernel_mul_mm_e4m3_m2.
+template<short DECODE_STYLE>
+kernel void kernel_mul_mm_e4m3_m2_s(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    constexpr int NT1 = 2;
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32; // columns per B tile
+
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    threadgroup bfloat * sa   = (threadgroup bfloat *)(shmem);                         // 64x32 A tile (4096 B)
+    threadgroup bfloat * sb   = (threadgroup bfloat *)(shmem + 4096);                  // ONE 32x32 B tile (2048 B, shared)
+    threadgroup ushort * lutu = (threadgroup ushort *)(shmem + 4096 + 2048);           // 256-entry bf16-bits LUT (512 B, style 2)
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*(NT1*NR1);
+
+    if (DECODE_STYLE == 2) {
+        for (short i = tiitg; i < 256; i += 4*N_SIMDWIDTH) {
+            lutu[i] = kvalues_e4m3_m2_u16[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+
+    short nr1[NT1];
+    FOR_UNROLL (short t = 0; t < NT1; ++t) {
+        const int rem = args.ne1 - (r1 + t*NR1);
+        nr1[t] = rem <= 0 ? 0 : (rem < NR1 ? (short) rem : (short) NR1);
+    }
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1; // 0 .. 63
+    const short il0 = (tiitg % NL0);
+
+    short il = il0;
+
+    const int i12 = im % FC_mul_mm_ne12;
+    const int i13 = im / FC_mul_mm_ne12;
+
+    const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
+
+    device const block_e4m3_m2 * x = (device const block_e4m3_m2 *)(src0 + args.nb01*(r0 + lr0) + offset0);
+
+    const short iy = 8*(tiitg % NL1);
+
+    device const float * y[NT1];
+    FOR_UNROLL (short t = 0; t < NT1; ++t) {
+        const short lr  = (short)(tiitg/NL1);
+        const int   row = r1 + t*NR1 + lr < args.ne1 ? r1 + t*NR1 + lr : args.ne1 - 1;
+
+        y[t] = (device const float *)(src1
+            + args.nb13*i13
+            + args.nb12*i12
+            + args.nb11*row
+            + args.nb10*iy);
+    }
+
+    simdgroup_bfloat8x8 ma[4];
+    simdgroup_bfloat8x8 mb[2];
+
+    simdgroup_float8x8 mc[8*NT1];
+
+    for (short i = 0; i < 8*NT1; i++){
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        // === A tile decode + BOTH B tiles prefetched into registers ===
+        const uint4 qv = *(device const uint4 *)(x->qs + 16*il);
+
+        bfloat4x4 temp_a;
+        {
+            const int kk = (int(x->sc[il/8]) - 127) << 7;
+
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                const uint32_t qw = qv[i];
+
+                FOR_UNROLL (short j = 0; j < 4; j++) {
+                    const ushort b = DECODE_STYLE == 2 ? lutu[(qw >> (8*j)) & 0xFF]
+                                                       : kvalues_e4m3_m2_u16[(qw >> (8*j)) & 0xFF];
+
+                    temp_a[i][j] = as_type<bfloat>(ushort((b & 0x7FFF) ? int(b) + kk : int(b)));
+                }
+            }
+        }
+
+        const bfloat2x4 by[NT1] = {
+            (bfloat2x4)(*((device const float2x4 *) y[0])),
+            (bfloat2x4)(*((device const float2x4 *) y[1])),
+        };
+
+        const short sxb = (tiitg%NL1);
+        const short syb = (tiitg/NL1)/8;
+        const short lyb = (tiitg/NL1)%8;
+        const short ibb = 4*sxb + syb;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+
+            const short ib = 8*sx + sy;
+
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        il = (il + 2 < 64) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + 1 : x;
+
+        FOR_UNROLL (short t = 0; t < NT1; ++t) {
+            y[t] += NK;
+        }
+
+        FOR_UNROLL (short t = 0; t < NT1; ++t) {
+            // stage tile t into the shared B buffer
+            *(threadgroup bfloat2x4 *)(sb + 64*ibb + 8*lyb) = by[t];
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            threadgroup const bfloat * lsma = (sa + 4*64*(sgitg%2));
+            threadgroup const bfloat * lsmb = (sb + 2*64*(sgitg/2));
+
+            FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 4; i++) {
+                    simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+                }
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 2; i++) {
+                    simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+                }
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 8; i++){
+                    simdgroup_multiply_accumulate(mc[8*t + i], mb[i/4], ma[i%4], mc[8*t + i]);
+                }
+
+                lsma += 8*64;
+                lsmb += 4*64;
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NT1*NR1 <= args.ne1)) {
+        FOR_UNROLL (short t = 0; t < NT1; ++t) {
+            device float * C = (device float *) dst +
+                (r0 + 32*(sgitg &  1)) + \
+                (r1 + t*NR1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
+
+            for (short i = 0; i < 8; i++) {
+                simdgroup_store(mc[8*t + i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+            }
+        }
+    } else {
+        for (short t = 0; t < NT1; ++t) {
+            if (nr1[t] == 0) {
+                continue;
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+
+            for (short i = 0; i < 8; i++) {
+                simdgroup_store(mc[8*t + i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (sgitg == 0) {
+                for (int j = tiitg; j < nr1[t]; j += NR1) {
+                    device float  * D  = (device float  *) dst + r0 + (r1 + t*NR1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                    device float4 * D4 = (device float4 *) D;
+
+                    threadgroup float  * C  = ((threadgroup float *) shmem) + (j*NR0);
+                    threadgroup float4 * C4 = (threadgroup float4 *) C;
+
+                    int i = 0;
+                    for (; i < nr0/4; i++) {
+                        *(D4 + i) = *(C4 + i);
+                    }
+
+                    i *= 4;
+                    for (; i < nr0; i++) {
+                        *(D + i) = *(C + i);
+                    }
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_e4m3_m2<1, 0>) mul_mm_e4m3_m2_t;
+
+// probe: the shared-template instantiation (part-2 ship state), for A/B
+// attribution against the dedicated kernel above
+template [[host_name("kernel_mul_mm_e4m3_m2_f32_tmpl")]]   kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, block_e4m3_m2, 64, dequantize_e4m3_m2, bfloat, bfloat4x4, float, float2x4>;
+
+template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt1")]]     kernel mul_mm_e4m3_m2_t kernel_mul_mm_e4m3_m2<1, 0>;
+template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt2")]]     kernel mul_mm_e4m3_m2_t kernel_mul_mm_e4m3_m2<2, 0>;
+template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt1_cl")]]  kernel mul_mm_e4m3_m2_t kernel_mul_mm_e4m3_m2<1, 1>;
+template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt2_cl")]]  kernel mul_mm_e4m3_m2_t kernel_mul_mm_e4m3_m2<2, 1>;
+template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt1_u16")]]  kernel mul_mm_e4m3_m2_t kernel_mul_mm_e4m3_m2<1, 2>;
+template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt2_u16")]]  kernel mul_mm_e4m3_m2_t kernel_mul_mm_e4m3_m2<2, 2>;
+template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt1_u16c")]] kernel mul_mm_e4m3_m2_t kernel_mul_mm_e4m3_m2<1, 3>;
+template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt2_u16c")]] kernel mul_mm_e4m3_m2_t kernel_mul_mm_e4m3_m2<2, 3>;
+
+typedef decltype(kernel_mul_mm_e4m3_m2_s<2>) mul_mm_e4m3_m2_s_t;
+
+template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt2s_u16")]]  kernel mul_mm_e4m3_m2_s_t kernel_mul_mm_e4m3_m2_s<2>;
+template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt2s_u16c")]] kernel mul_mm_e4m3_m2_s_t kernel_mul_mm_e4m3_m2_s<3>;
 #endif
 template [[host_name("kernel_mul_mm_q1_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q1_0,    8,     dequantize_q1_0,    float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q2_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_0,    4,     dequantize_q2_0,    float,  float4x4,  float, float2x4>;

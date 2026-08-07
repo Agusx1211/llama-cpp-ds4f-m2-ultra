@@ -3133,6 +3133,21 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
                 GGML_ABORT("unsupported ne11");
         };
 
+        // fork: E4M3_M2 dispatches one single-pass threadgroup for ne11 in
+        // {6,7,8} (r1_6/7/8 kernels) instead of two r1_3/r1_4 column groups:
+        // the stock split fetches AND decodes every weight twice, and for
+        // E4M3_M2 the decode is the scarce resource. Only worth it when the
+        // row count keeps the GPU occupied — halving the column groups halves
+        // the resident simds, which measured 1.3-1.5x SLOWER at ne01 <= 8192
+        // (attn_output_b, shexp) but 0.85x at ne01 = 32768 (attn_q_b, the
+        // shape that dominates spec-verify decode). Per-column accumulation
+        // chains are independent of r1ptg, so outputs stay bit-identical to
+        // the BF16 kernels either way (enforced by tests/test-m2-e4m3.cpp at
+        // n = 2..8 on every shape).
+        if (op->src[0]->type == GGML_TYPE_E4M3_M2 && ne11 >= 6 && ne11 <= 8 && ne01 >= 16384) {
+            r1ptg = ne11;
+        }
+
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg);
 
         ggml_metal_kargs_mul_mv_ext args = {
@@ -3164,6 +3179,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+        if (pipeline.smem > 0) {
+            // fork: E4M3_M2 ext kernels stage their decode LUT in threadgroup memory
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+        }
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + r0ptg - 1)/r0ptg), ((ne11 + r1ptg - 1)/r1ptg), ne12*ne13, 32, nsg, 1);
     } else if (
