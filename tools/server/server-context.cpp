@@ -2159,7 +2159,17 @@ private:
                 spans.push_back({ slot.id, pos_frontier, (llama_pos) plan.span_tokens });
             } else {
                 // full-clear admission: quote the whole span against an empty
-                // sequence, exactly like the original uncached vertical.
+                // sequence, exactly like the original uncached vertical. The
+                // displaced conversation is snapshotted first (the idle-slot
+                // cache pass runs only after launch, when this clear has
+                // already destroyed the state) so a later continuation
+                // restores from the cache instead of re-prefilling.
+                if (prompt_cache && slot.prompt.n_tokens() > 0 &&
+                        task.type == SERVER_TASK_TYPE_COMPLETION) {
+                    if (slot.prompt_save(*prompt_cache)) {
+                        prompt_cache->update();
+                    }
+                }
                 slot.prompt_clear();
                 spans.push_back({ slot.id, 0, (llama_pos) plan.span_tokens });
             }
