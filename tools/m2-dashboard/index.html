@@ -3,176 +3,50 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' http://localhost:* http://127.0.0.1:* https://localhost:* https://127.0.0.1:*; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>M2 Ultra operations</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' http://localhost:* http://127.0.0.1:*; img-src 'self' data:; base-uri 'none'; form-action 'none'">
+  <title>M2 llama-server</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <header class="page-header">
-    <div>
-      <p class="eyebrow">DeepSeek V4 Flash · M2 Ultra</p>
-      <h1>Operations</h1>
-    </div>
-    <div class="mode-block">
-      <span id="mode-badge" class="badge badge-fixture">fixture data</span>
-      <span id="connection-status" class="muted">starting</span>
-    </div>
+  <header>
+    <h1>llama-server <span class="dim">·</span> M2 Ultra</h1>
+    <span id="model" class="model" title=""></span>
+    <span id="build" class="dim"></span>
+    <span class="spacer"></span>
+    <span id="status" class="status" role="status">connecting</span>
   </header>
 
+  <form id="key-form" hidden autocomplete="off">
+    <label for="key-input">API key</label>
+    <input id="key-input" type="password" spellcheck="false" autocomplete="off">
+    <button type="submit">Connect</button>
+    <span class="dim">or open with <code>#key=…</code> in the URL — the key stays in memory only</span>
+  </form>
+
   <main>
-    <section class="panel connection-panel" aria-labelledby="connection-title">
-      <div class="panel-heading">
-        <div>
-          <p class="eyebrow">Authenticated gateway or loopback connection</p>
-          <h2 id="connection-title">Live registry and cancel</h2>
-        </div>
-        <button id="fixture-button" type="button">Use fixture</button>
-      </div>
-      <form id="gateway-form" class="gateway-form" autocomplete="off">
-        <label>
-          <span class="metric-label">Admin gateway API key</span>
-          <input id="gateway-api-key" name="gateway-api-key" type="password" required autocomplete="off" spellcheck="false">
-        </label>
-        <button type="submit">Connect this HTTPS gateway</button>
-      </form>
-      <p class="notice">Gateway mode uses this page's exact HTTPS origin. The gateway supplies the operator credential and never accepts a lane from the browser.</p>
-      <form id="live-form" class="credential-form" autocomplete="off">
-        <label>
-          <span class="metric-label">Server URL</span>
-          <input id="server-url" name="server-url" type="url" value="http://127.0.0.1:8080" required spellcheck="false">
-        </label>
-        <label>
-          <span class="metric-label">API key</span>
-          <input id="api-key" name="api-key" type="password" required autocomplete="off" spellcheck="false">
-        </label>
-        <label>
-          <span class="metric-label">Operator token</span>
-          <input id="operator-token" name="operator-token" type="password" minlength="32" maxlength="256" required autocomplete="off" spellcheck="false">
-        </label>
-        <button type="submit">Connect live</button>
-      </form>
-      <p class="notice">Direct mode is loopback-only. Credentials are sent only as headers, retained only in this page's memory, and cleared on disconnect. Live cancel also requires an explicit confirmation, same-site Origin, JSON content type, and CSRF proof header.</p>
-    </section>
+    <section id="tiles" class="tiles" aria-label="throughput and capacity"></section>
 
-    <section aria-label="system summary">
-      <div id="health-strip" class="health-strip"></div>
-    </section>
+    <h2>Slots</h2>
+    <table id="work">
+      <thead>
+        <tr><th>slot</th><th>lane</th><th>request</th><th>phase</th><th class="num">t/s</th><th>progress</th><th class="num">context</th><th class="num">cached</th><th class="num">age</th><th></th></tr>
+      </thead>
+      <tbody id="work-body"></tbody>
+    </table>
+    <p id="lanes" class="lanes"></p>
 
-    <section class="panel refill-panel" aria-labelledby="refill-title">
-      <div class="panel-heading">
-        <div>
-          <p class="eyebrow">Trusted scheduling policy</p>
-          <h2 id="refill-title">Bounded fast refill</h2>
-        </div>
-        <p class="muted">Read-only runtime state · one-member eligibility shown</p>
-      </div>
-      <div id="refill-status" class="refill-strip" aria-live="polite"></div>
-    </section>
-
-    <section class="panel" aria-labelledby="lanes-title">
-      <div class="panel-heading">
-        <div>
-          <p class="eyebrow">Live scheduler</p>
-          <h2 id="lanes-title">Lanes and requests</h2>
-        </div>
-        <p class="muted">Predicted starts are ranges, not promises.</p>
-      </div>
-      <div id="lane-columns" class="lane-grid"></div>
-    </section>
-
-    <div class="two-column">
-      <section class="panel" aria-labelledby="request-title">
-        <div class="panel-heading">
-          <div>
-            <p class="eyebrow">Selected request</p>
-            <h2 id="request-title">Request detail</h2>
-          </div>
-        </div>
-        <div id="request-detail" class="detail-empty">Select a request.</div>
-      </section>
-
-      <section class="panel" aria-labelledby="timeline-title">
-        <div class="panel-heading">
-          <div>
-            <p class="eyebrow">Request registry</p>
-            <h2 id="timeline-title">Transition timeline</h2>
-          </div>
-        </div>
-        <ol id="timeline" class="timeline"></ol>
-      </section>
-    </div>
-
-    <div class="two-column">
-      <section class="panel" aria-labelledby="allocator-title">
-        <div class="panel-heading">
-          <div>
-            <p class="eyebrow">Physical ownership</p>
-            <h2 id="allocator-title">Allocator</h2>
-          </div>
-        </div>
-        <div id="allocator-pools" class="stack"></div>
-      </section>
-
-      <section class="panel" aria-labelledby="cache-title">
-        <div class="panel-heading">
-          <div>
-            <p class="eyebrow">Resident and disk tiers</p>
-            <h2 id="cache-title">Cache</h2>
-          </div>
-        </div>
-        <div id="cache-objects" class="stack"></div>
-      </section>
-    </div>
-
-    <div class="two-column">
-      <section class="panel" aria-labelledby="storage-title">
-        <div class="panel-heading">
-          <div>
-            <p class="eyebrow">Snapshot paths</p>
-            <h2 id="storage-title">Storage</h2>
-          </div>
-        </div>
-        <div id="disk-list" class="stack"></div>
-      </section>
-
-      <section class="panel" aria-labelledby="aux-title">
-        <div class="panel-heading">
-          <div>
-            <p class="eyebrow">Auxiliary systems</p>
-            <h2 id="aux-title">DSpark and capture</h2>
-          </div>
-        </div>
-        <div id="aux-status" class="stack"></div>
-      </section>
-    </div>
-
-    <div class="two-column">
-      <section class="panel" aria-labelledby="events-title">
-        <div class="panel-heading">
-          <div>
-            <p class="eyebrow">Bounded client history</p>
-            <h2 id="events-title">Recent events</h2>
-          </div>
-          <span id="event-sequence" class="monospace muted"></span>
-        </div>
-        <ol id="event-history" class="timeline"></ol>
-      </section>
-
-      <section class="panel" aria-labelledby="intent-title">
-        <div class="panel-heading">
-          <div>
-            <p class="eyebrow">Local drafts only</p>
-            <h2 id="intent-title">Control intents</h2>
-          </div>
-        </div>
-        <p class="notice">Pause, resume, reprioritize, and cache controls remain local drafts. Only the confirmed cancel button in live request detail sends a control request.</p>
-        <ol id="intent-list" class="timeline"></ol>
-      </section>
-    </div>
+    <h2>Recent requests <span id="tail-note" class="dim"></span></h2>
+    <table id="tail">
+      <thead>
+        <tr><th>finished</th><th>slot</th><th class="num">prompt</th><th class="num">cached</th><th class="num">generated</th><th class="num">prefill t/s</th><th class="num">gen t/s</th><th class="num">duration</th></tr>
+      </thead>
+      <tbody id="tail-body"></tbody>
+    </table>
   </main>
 
-  <footer>Loopback admin dashboard · cancel-only live mutation · content reveal disabled · no browser persistence</footer>
+  <footer id="foot" class="dim"></footer>
 
+  <div id="tooltip" class="tooltip" hidden></div>
   <script type="module" src="dashboard.js"></script>
 </body>
 </html>

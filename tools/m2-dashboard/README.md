@@ -1,220 +1,95 @@
-# M2 Ultra admin dashboard playable vertical
+# M2 llama-server operations dashboard
 
-This directory is a dependency-free, static dashboard for the adaptive
-server. It runs against deterministic fixtures by default and can connect to
-the direct single-model server's narrow request-registry admin routes.
+A static, dependency-free page an operator keeps open on a second monitor while
+the M2 Ultra serves DeepSeek V4 Flash. Dark-native, flat, numbers first.
 
-Implemented here:
+On the trusted-LAN deployment the server serves this directory at
+`/m2-dashboard` (`LLAMA_SERVER_TRUST_LAN=1` +
+`LLAMA_SERVER_DASHBOARD_DIR=.../tools/m2-dashboard`); files hot-reload per
+request, so deploying an update is a git merge on the serving worktree.
 
-- versioned snapshot and event validation;
-- immutable snapshot reduction with monotonic event sequencing;
-- Last-Event-ID tracking, gap detection, truthful overflow/slow-client
-  recovery causes, and bounded paced snapshot/stream reconnect attempts;
-- observable retry/error state plus bounded event parsing, schema collections,
-  strings, aggregate JSON bytes/nodes/depth, and the pending-event queue;
-- strict known-field validation and cycle-safe bounded local control parameters;
-- bounded event and timeline history;
-- fixture views for lanes, requests, allocator pools, cache objects, disks,
-  DSpark, capture, and operational history;
-- schema-v2 bounded fast-refill configuration, cohort, cumulative member,
-  deadline, and sampled one-member eligibility status;
-- plain-text rendering and default prompt/output redaction;
-- local pause/resume/reprioritize/cache control-intent drafting without any
-  network mutation;
-- zero-dependency Node tests;
-- an opt-in live adapter using an API bearer and the loopback operator token;
-- bounded authenticated snapshot, resumable SSE, exact-handle request detail,
-  and confirmed cancel-only control views;
-- queue-locked `id:epoch` cancellation with idempotent in-flight handling and
-  fail-closed stale, unknown, and terminal handles;
-- mandatory loopback Origin, JSON content type, custom CSRF proof, and
-  duplicate-security-header rejection for both POST routes;
-- exact narrow CORS plus no-store, no-cache, no-cookie, nosniff, and
-  no-referrer response auditing across authenticated and denied admin calls;
-- source and real-Chromium HTML/script and browser-storage audits; and
-- explicit unavailable markers for metrics not supplied by this vertical.
+## What it shows, and where the data comes from
 
-Not implemented or claimed:
+| View | Source | Notes |
+|---|---|---|
+| Generation / prompt tok/s + 4-min sparklines | `GET /slots`, counter deltas between polls | derived client-side; the server exposes no live per-slot rates |
+| Per-slot rows: phase, live tok/s, progress, context tokens, cached tokens | `GET /slots` | phase = `is_processing` × `n_decoded`; context = resident tokens incl. generated |
+| Lane attribution, request ids, age, queue rows | `GET /internal/admin/dashboard/snapshot` | registry per-request `state`/`output_tokens` lag live decode by design; `/slots` is the live truth |
+| slot ↔ request join | `POST .../request-detail` (bindings) | one call per new request, cached; degrades silently if denied |
+| Cancel button | `POST .../request-control` `{action:"cancel"}` | live mode only, with confirm |
+| KV context meter | `/slots` `n_ctx` (shared unified budget) vs summed resident tokens | |
+| Prefix-cache reuse | `/slots` `n_prompt_tokens_cache` | registry `cache_hit_tokens` stays 0 on prod; do not use it |
+| Recent-requests tail | assembled client-side from `/slots` task transitions | only requests observed while the page is open; `+` marks a partially observed run |
+| Model / build header | `GET /props` once | |
+| KV-pressure counters (footer) | `GET /metrics` when enabled | prod currently runs without `--metrics`; the page degrades to a hint |
 
-- DNS, TLS, reverse-proxy configuration, or trusted lane headers;
-- pause/resume, reprioritization, cache mutation, or content reveal;
-- allocator, cache, disk, DSpark, capture, model, or process telemetry in the
-  live registry-only view;
-- a fresh dashboard/inference impact run for the cancel vertical (the existing
-  read-only target gate remains available under `target/`).
+The page polls `/slots` + the registry snapshot every 2 s (15 s while the tab
+is hidden), backs off exponentially to 30 s on failure, and holds the last
+render dimmed instead of flashing while reconnecting.
+
+## Authentication
+
+Every JSON route sits behind the server API key. Open the page as
+`/m2-dashboard/index.html#key=<api-key>` (bookmarkable; the fragment never
+leaves the browser) or type the key into the inline form after a 401. The key
+lives in page memory only — no cookies, no localStorage — which keeps the
+`target/browser_security_audit_server.py` storage audit meaningful.
+
+Note: with the API-key middleware as deployed, the *static files themselves*
+also 401 without a key, so the browser cannot bootstrap the page from the
+server yet. Candidate one-line server change (deliberately not made here):
+exempt the `/m2-dashboard` mount from the API-key check under
+`LLAMA_SERVER_TRUST_LAN`.
+
+## Development against fixtures
+
+```sh
+cd tools/m2-dashboard
+python3 -m http.server 8812
+# http://localhost:8812/index.html?fixture=replay  – real prod capture (2026-08-07)
+# http://localhost:8812/index.html?fixture=demo    – synthetic busy scene
+```
+
+- `fixtures/replay.json` — untouched interleaved `/slots` + registry snapshot
+  samples recorded from production; `fixtures/props.json` — real `/props`
+  (chat template truncated).
+- `fixtures/demo.json` — synthetic 4-slot scene (regenerate with
+  `node fixtures/make-demo.mjs`).
+- `fixtures/state.json` / `events.json` — registry-schema fixtures used by the
+  retained target-gate parser tests; the UI does not read them.
+
+Fixture replays pre-warm the trackers so sparklines and the tail are populated
+immediately.
+
+## Layout of the code
+
+- `dashboard.js` — transports (live/fixture), poll loop, DOM rendering.
+- `lib/core.mjs` — all pure logic: normalization, phase/rate derivation,
+  request-tail assembly, registry reduction, formatters, sparkline geometry.
+  Node-tested in `tests/core.test.mjs`.
+- `lib/schema.mjs`, `lib/live.mjs`, `lib/sse.mjs` — retained transport/parser
+  modules used by the target gate probe (`target/live-probe.mjs`) and its host
+  tests, not by the UI.
+- `target/` — the inference-overhead target gate (see `TARGET_GATE.md`).
 
 ## Test
 
 ```sh
 cd tools/m2-dashboard
 npm test
+python3 -m unittest discover -s target -p 'test_*.py'
 ```
 
-The tests use only Node's built-in test runner and standard library.
+Node's built-in runner only; no dependencies.
 
-The test-only `target/browser_security_audit_server.py` serves the unchanged
-dashboard, a bounded live mock, and a storage-report page for a real-browser
-audit. Set disposable sentinel credentials, run it on loopback, load fixture
-and live modes in Chromium, then visit `/__audit/storage.html`. A passing report
-has empty local/session storage, cookies, IndexedDB databases, CacheStorage
-keys, and service-worker registrations; at least one authenticated API request;
-`credentials_correct: true`; and `secret_in_url: false`. The mock records only
-those bounded outcomes, never credential values. The visible hostile fixture
-also names a same-origin image sentinel: `html_injection_requested: false`
-proves Chromium did not parse the attacker-controlled text as HTML even though
-the production CSP would block its inline handler. The audit page intentionally
-uses script and is not a production dashboard asset.
+## Metrics that would help but are not exposed today
 
-## Fixture preview
+Candidates for tiny server-side additions (none implemented here):
 
-Serve the repository or this directory with any static HTTP server, then open
-`index.html`. For example:
-
-```sh
-cd tools/m2-dashboard
-python3 -m http.server 8080
-```
-
-The page initially fetches `fixtures/state.json` and `fixtures/events.json`.
-Fixture mode performs no state-changing requests: its control buttons only
-create a bounded local intent preview. In live mode, only request cancellation
-is wired; all other controls remain visibly local drafts.
-
-## Live detail and cancel view
-
-Configure the direct server with an API key, an operator token of 32-256 bytes,
-and localhost CORS. The operator token also controls trusted benchmark lanes,
-so keep it distinct from the API bearer and never expose it to ordinary
-clients:
-
-```sh
-export LLAMA_API_KEY='replace-with-api-key'
-export LLAMA_SERVER_TRUSTED_SCHEDULING_TOKEN='replace-with-32-or-more-random-bytes'
-export LLAMA_SERVER_TRUSTED_FAST_REFILL_MAX_MEMBERS=4
-export LLAMA_SERVER_TRUSTED_FAST_REFILL_WINDOW_MS=30000
-
-llama-server ... \
-  --api-key "$LLAMA_API_KEY" \
-  --cors-origins localhost \
-  --no-cors-credentials \
-  --cors-methods 'GET, POST' \
-  --cors-headers 'Authorization, Content-Type, X-Llama-Dashboard-CSRF, X-Llama-Trusted-Scheduling-Token, Last-Event-ID'
-```
-
-The disabled ambient credentials and exact CORS method/header lists are
-required for a dashboard served from a different loopback port. The dashboard
-uses `credentials: "omit"` and sends its two explicit credentials only as
-headers, so cookies and browser client certificates need no CORS permission.
-The narrow lists keep unused methods out of the browser surface; in particular,
-browsers do not treat `Authorization` as covered by a wildcard
-`Access-Control-Allow-Headers` response.
-
-Serve this directory from the same loopback hostname as llama-server. Ports
-may differ; hostnames must not. For example:
-
-```sh
-cd tools/m2-dashboard
-python3 -m http.server 8081 --bind 127.0.0.1
-```
-
-Open `http://127.0.0.1:8081/`, enter the llama-server URL, API key, and
-operator token, then choose **Connect live**. Credentials are sent only in
-headers with browser credentials omitted, stay only in JavaScript memory, are
-cleared from the form immediately, and are cleared from the adapter on
-disconnect/page exit. They are never placed in a URL or browser storage.
-
-The two refill variables are optional and the policy is disabled by default.
-When both are valid, the compact **Bounded fast refill** card shows the runtime
-configuration, current cohort, cumulative used/remaining fast members, and the
-sampled monotonic deadline. `Initial selection` is the cohort's initial
-selection phase; it is not the refill window. `One member: eligible at sample`
-means at least one new independent fast member fit the fast-dominant cohort's
-width and bounded window at the latest server sample. A same-fast request family
-may use more width when demand, quota, and cohort capacity all permit it, so the
-field is neither a family-size limit nor an admission promise. The browser
-counts the sampled remaining time down from receipt and never reopens it without
-a newer server sample. This removes indefinitely stale open status but cannot
-remove snapshot or SSE transport latency; the label therefore remains explicitly
-sampled rather than claiming current eligibility.
-
-The four live endpoints are:
-
-```text
-GET /internal/admin/dashboard/snapshot
-GET /internal/admin/dashboard/events  (Last-Event-ID header)
-POST /internal/admin/dashboard/request-detail
-POST /internal/admin/dashboard/request-control
-```
-
-All four require normal API-key middleware plus the operator header, reject
-non-loopback and cross-site browser ingress, reject lane/tag headers and query
-parameters, and are disabled when the operator token is absent. The POST routes
-additionally require an explicit loopback `Origin`, `Content-Type:
-application/json`, and `X-Llama-Dashboard-CSRF: 1`; each body is capped at 4
-KiB and duplicate security headers are rejected before header-map collapse.
-Router mode does not proxy these endpoints.
-
-Request identity is the canonical `id:epoch` string from the registry. Detail
-returns bounded registry metadata and explicitly empty, unretained content.
-Control accepts exactly `{"action":"cancel","request_id":"id:epoch"}`. The
-queue validates that full handle under its mutation lock before reusing the
-existing durable cancellation path. A second cancel while the same bound
-request is already cancelling is idempotent; stale, unknown, or terminal
-handles cannot mutate state. An accepted operator cancellation also publishes
-one `503 unavailable_error` with the fixed message `request cancelled by
-dashboard operator` to the original completion waiter, so a non-streaming
-client terminates instead of hanging after its slot is released.
-
-The dependency-free target probe starts its own long completion against an
-already-running direct server configured with the localhost CORS flags above.
-It verifies allowed loopback and denied remote preflights, the complete
-credentialed request-header allow-list, no-store/nosniff/no-referrer/no-cookie
-admin responses, API-only/operator-only/wrong-credential/query/classification/
-CSRF/origin/content-type denials, and absence of credential reflection in
-response bodies and headers. It then discovers its new bound `id:epoch`,
-validates redacted detail and stale-handle rejection, cancels that exact
-generation, checks contiguous lifecycle events, and submits a fresh completion
-afterward:
-
-```sh
-export M2_DASHBOARD_BASE_URL=http://127.0.0.1:18130
-export M2_DASHBOARD_ORIGIN=http://127.0.0.1:8081
-export LLAMA_SERVER_BENCH_TRACE_CAPACITY=4096
-python3 tools/m2-dashboard/target/admin_cancel_probe.py
-```
-
-It uses the same `LLAMA_API_KEY` and
-`LLAMA_SERVER_TRUSTED_SCHEDULING_TOKEN` environment credentials as the server.
-The trace-capacity variable must be present when the server starts: the probe
-uses a unique authenticated benchmark tag to bind its client request to the
-registry's exact runtime ID and refuses to select an unrelated concurrent
-request.
-Run it only against a disposable validation server: the discovered request is
-cancelled intentionally.
-
-Selecting a live request fetches its detail. **Cancel live request** presents a
-request-specific browser confirmation before POSTing. Pause/resume,
-reprioritization, and cache actions remain local drafts. Snapshot/event payloads
-contain numeric registry facts, permit counts, refill state, lifecycle reasons,
-and redacted request identities only. The strict client contract is schema
-version 2.
-
-## Client recovery contract
-
-`AdminStateClient` still accepts two injected stream-state functions:
-
-```text
-getSnapshot() -> immutable versioned snapshot
-openEvents({ lastEventId, onOpen, onEvent, onDisconnect }) -> close function
-```
-
-The live event adapter connects to authenticated SSE and honors
-`Last-Event-ID`. A reconnect resumes from the reducer's last accepted event
-ID. A server cursor rejection, gap, explicit overflow, malformed event, schema
-mismatch, or local slow-consumer overflow discards queued deltas and fetches a
-fresh snapshot before reopening the stream. Snapshot and stream-open failures
-use finite retry schedules and expose the latest failure in client state.
-
-Control intent objects for unfinished actions remain intentionally
-transport-free. The live adapter separately exposes bounded `getRequestDetail`
-and `cancelRequest` calls; no generic mutation dispatcher exists.
+- per-slot draft acceptance (`n_draft_accepted` / `n_draft_total` exist in
+  `server_slot` but are not in `/slots`);
+- prompt-cache tier occupancy: RAM-tier bytes, SSD-tier bytes/entries
+  (`server_prompt_cache` tracks them internally);
+- host RSS / memory pressure;
+- `--metrics` on the prod start script would light up the KV-pressure footer
+  (deployment change, not a code change).
