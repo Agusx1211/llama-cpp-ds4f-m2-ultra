@@ -5748,6 +5748,32 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
             } break;
+        case GGML_TYPE_E4M3_M2:
+            {
+                // fork gguf-m2 dense plane: no NaN codes, E8M0 scale bytes in
+                // [1, 254], zero pad (the converter guarantees all three)
+                const block_e4m3_m2 * q = (const block_e4m3_m2 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    for (size_t j = 0; j < QK_E4M3_M2; ++j) {
+                        if ((q[i].qs[j] & 0x7F) == 0x7F) {
+                            fprintf(stderr, "%s: found e4m3 NaN code at block %zu, elem %zu\n", __func__, i, j);
+                            return false;
+                        }
+                    }
+                    for (size_t j = 0; j < QK_E4M3_M2/128; ++j) {
+                        if (q[i].sc[j] < 1 || q[i].sc[j] > 254) {
+                            fprintf(stderr, "%s: e4m3_m2 scale byte %u out of [1,254] at block %zu\n", __func__, q[i].sc[j], i);
+                            return false;
+                        }
+                    }
+                    for (size_t j = 0; j < sizeof(q[i].pad); ++j) {
+                        if (q[i].pad[j] != 0) {
+                            fprintf(stderr, "%s: e4m3_m2 nonzero pad byte at block %zu\n", __func__, i);
+                            return false;
+                        }
+                    }
+                }
+            } break;
 
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
