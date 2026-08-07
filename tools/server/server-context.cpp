@@ -2080,17 +2080,18 @@ private:
                 return result;
             }
 
-            // Reuse the slot's resident KV only when the new prompt is a pure
-            // extension of the retained/restored prompt (the dominant agent
-            // continuation pattern). The admission span below stays the full
-            // [0, span) range either way: the Metal sparse planner prices
-            // already-mapped, unshared rows at zero pages, so a reuse quote is
-            // naturally a top-up while the ticket still covers every row the
-            // prefill (including a checkpoint restore) may rewrite. Anything
-            // other than a pure extension keeps the exact full-clear geometry:
-            // DSV4 cannot trim a divergent tail, and a divergent-prefix
-            // prefill frees and re-decodes rows in ways the quote cannot see
-            // in advance.
+            // Reuse the slot's resident KV for continuations instead of the
+            // unconditional clear. The admission API requires spans to start
+            // at the sequence frontier (seq_pos_max + 1, enforced by
+            // llama_context::kv_admission_prepare_ranges), so a reuse span
+            // covers only the new suffix [frontier, span_end). Rows the
+            // prefill touches below the frontier (a checkpoint-restore
+            // landing plus its bounded backfill) are handled by the ordinary
+            // per-batch reservation path until the batch enters the armed
+            // span. Reuse is kept only when the prefill landing - predicted
+            // by mirroring its n_past logic (server-context.cpp ~4289-4383) -
+            // is provably benign; anything else keeps the exact full-clear
+            // geometry.
             const size_t n_prompt_res = slot.prompt.tokens.size();
             const size_t n_lcp = n_prompt_res > 0 ? slot.prompt.tokens.get_common_prefix(task.tokens) : 0;
 
@@ -2104,18 +2105,6 @@ private:
                     task.params.cache_prompt;
 
             if (reuse_resident) {
-                // Predict where the prefill will land by mirroring its logic
-                // (n_past block around server-context.cpp:4289-4383). Reuse is
-                // kept only when the landing is provably benign:
-                // - checkpoint window applies (pos_min >= thold): a covering
-                //   checkpoint must exist, so the prefill restores it and
-                //   re-decodes at most the checkpoint-to-task delta. Without
-                //   one the prefill would reset to n_past = 0 and re-decode
-                //   the full span while resident rows are freed mid-flight -
-                //   strictly worse than clearing here.
-                // - otherwise the divergent tail must fit the bounded rs
-                //   rollback window or the tail trim at the prefill would
-                //   abort (DSV4 has no general partial seq_rm).
                 const llama_pos pos_next = slot.prompt.tokens.pos_next(n_lcp);
                 const llama_pos pos_min_thold = std::max(0, pos_next - n_swa);
                 const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -2123,23 +2112,22 @@ private:
                 if (pos_min < 0) {
                     reuse_resident = false;
                 } else if (pos_min >= pos_min_thold) {
+                    // the prefill checkpoint block will run: it restores the
+                    // newest covering checkpoint or resets to zero. Reuse only
+                    // when a covering checkpoint exists - a reset would
+                    // re-decode the full span with resident rows freed
+                    // mid-flight, strictly worse than clearing here.
                     reuse_resident = std::any_of(
                             slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
                             [&](const common_prompt_checkpoint & cur) {
                                 return cur.pos_max <= pos_next && (cur.pos_min < pos_min_thold || cur.pos_min == 0);
                             });
                 } else {
+                    // no checkpoint pass: the tail trim at the prefill must
+                    // fit the bounded rs rollback window (DSV4 has no general
+                    // partial seq_rm)
                     reuse_resident = (int64_t) (n_prompt_res - n_lcp) <= (int64_t) llama_n_rs_seq(ctx_tgt);
                 }
-            }
-
-            if (reuse_resident) {
-                SLT_INF(slot, "elastic admission reuses %zu resident prefix tokens (%zu resident, task has %d)\n",
-                        n_lcp, n_prompt_res, (int) task.n_tokens());
-            } else {
-                // full-clear admission: quote the whole span against an empty
-                // sequence, exactly like the original uncached vertical.
-                slot.prompt_clear();
             }
 
             const auto plan = server_dsv4_plan_admission(
@@ -2157,7 +2145,24 @@ private:
                 result.status = admission_gate_status::rejected;
                 return result;
             }
-            spans.push_back({ slot.id, 0, (llama_pos) plan.span_tokens });
+
+            // the reuse span must start at the resident frontier and still
+            // contain new rows; otherwise fall back to the full clear
+            const llama_pos pos_frontier = reuse_resident ? slot.prompt.tokens.pos_next() : 0;
+            if (reuse_resident && (llama_pos) plan.span_tokens <= pos_frontier) {
+                reuse_resident = false;
+            }
+
+            if (reuse_resident) {
+                SLT_INF(slot, "elastic admission reuses resident prefix: lcp=%zu resident=%zu frontier=%d task=%d span_end=%zu\n",
+                        n_lcp, n_prompt_res, (int) pos_frontier, (int) task.n_tokens(), (size_t) plan.span_tokens);
+                spans.push_back({ slot.id, pos_frontier, (llama_pos) plan.span_tokens });
+            } else {
+                // full-clear admission: quote the whole span against an empty
+                // sequence, exactly like the original uncached vertical.
+                slot.prompt_clear();
+                spans.push_back({ slot.id, 0, (llama_pos) plan.span_tokens });
+            }
         }
 
         for (server_slot * active : active_continuations) {
