@@ -3007,7 +3007,7 @@ bool llama_kv_cache_dsv4::collect_admission_ranges(
         size_t n_spans,
         std::vector<dsv4_sparse_range> & ranges,
         llama_dsv4_batch_quote & quote) const {
-    if (aggregate_compressed || spans == nullptr || n_spans == 0 || n_spans > 2) {
+    if (aggregate_compressed || spans == nullptr || n_spans == 0 || n_spans > n_seq_max) {
         return false;
     }
 
