@@ -474,6 +474,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-m2-e4m3.cpp) # fork: gguf-m2 E4M3_M2 bit-exactness vs BF16 kernels
 if (UNIX)
     llama_build_and_test(test-dsv4-indexed-concat-contract.cpp)
 endif()

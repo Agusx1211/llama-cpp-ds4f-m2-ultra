@@ -4795,6 +4795,10 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    # Fork-owned M2 Ultra artifact types (gguf-m2); ids [90, 99] reserved far
+    # above the upstream range so upstream growth can never collide with data
+    # already written into gguf-m2 artifacts.
+    E4M3_M2 = 90
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4980,6 +4984,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.E4M3_M2: (1024, 1024 + 8 + 8),  # gguf-m2 v1 dense plane: 1024 e4m3 codes + 8 E8M0 scales + 8 pad
 }
 
 

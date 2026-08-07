@@ -416,6 +416,98 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
     }
 }
 
+// GGML_TYPE_E4M3_M2 (fork-owned gguf-m2 dense plane)
+//
+// Encode a finite f32 with |x| <= 448 to the nearest OCP E4M3 (fn) code,
+// round-to-nearest-even. The caller guarantees the magnitude bound by its
+// scale choice, so the NaN code (E=15, M=7) is never produced.
+static uint8_t ggml_f32_to_e4m3_m2_code(float x) {
+    const uint8_t sign = signbit(x) ? 0x80 : 0x00;
+    const float a = fabsf(x);
+
+    if (a < 0x1p-6f) {
+        // denormal range: value = m * 2^-9, m in 0..7 (m == 8 promotes to the
+        // smallest normal, 2^-6 = E=1, M=0)
+        const int m = (int) rintf(a * 0x1p9f);
+        return sign | (uint8_t) m; // m == 8 -> 0x08 == (E=1, M=0), still correct
+    }
+
+    int e;
+    const float f = frexpf(a, &e); // a = f * 2^e, f in [0.5, 1)
+    int E = e - 1 + 7;             // value = (1 + M/8) * 2^(E-7), 2f in [1, 2)
+    int M = (int) rintf((2.0f*f - 1.0f) * 8.0f);
+    if (M == 8) {
+        M = 0;
+        E += 1;
+    }
+    if (E > 15 || (E == 15 && M == 7)) {
+        // can only be reached by |x| in (464, inf); clamp to the max finite 448
+        E = 15;
+        M = 6;
+    }
+    return sign | (uint8_t)(E << 3) | (uint8_t) M;
+}
+
+void quantize_row_e4m3_m2_ref(const float * GGML_RESTRICT x, block_e4m3_m2 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_E4M3_M2;
+    static const int gsz = 128;             // elements per E8M0 scale
+    static const int ng  = QK_E4M3_M2/128;  // scale groups per block
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        for (int g = 0; g < ng; g++) {
+            const float * xb = x + i*qk + g*gsz;
+
+            float amax = 0.0f;
+            for (int j = 0; j < gsz; j++) {
+                amax = MAX(amax, fabsf(xb[j]));
+            }
+
+            // smallest e with amax <= 448 * 2^e (so codes never overflow),
+            // clamped so the E8M0 byte stays in [1, 254]
+            int e = 0;
+            if (amax > 0.0f) {
+                int ea;
+                const float ma = frexpf(amax, &ea); // amax = ma * 2^ea, ma in [0.5, 1)
+                e = (ma <= 0.875f) ? ea - 9 : ea - 8; // 448 * 2^(ea-9) = 0.875 * 2^ea
+                e = MAX(-126, MIN(127, e));
+            }
+
+            y[i].sc[g] = (uint8_t)(e + 127);
+
+            for (int j = 0; j < gsz; j++) {
+                y[i].qs[g*gsz + j] = ggml_f32_to_e4m3_m2_code(ldexpf(xb[j], -e));
+            }
+        }
+
+        memset(y[i].pad, 0, sizeof(y[i].pad));
+    }
+}
+
+void dequantize_row_e4m3_m2(const block_e4m3_m2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_E4M3_M2;
+    static const int gsz = 128;
+    static const int ng  = QK_E4M3_M2/128;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        for (int g = 0; g < ng; g++) {
+            const float d = ggml_e4m3_m2_scale_to_f32(x[i].sc[g]);
+            float * yb = y + i*qk + g*gsz;
+
+            for (int j = 0; j < gsz; j++) {
+                yb[j] = ggml_e4m3_m2_code_to_f32(x[i].qs[g*gsz + j]) * d;
+            }
+        }
+    }
+}
+
 void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK1_0;
 
@@ -2309,6 +2401,13 @@ size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     GGML_UNUSED(quant_weights);
     quantize_row_nvfp4_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
+}
+
+size_t quantize_e4m3_m2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    GGML_ASSERT(n_per_row % QK_E4M3_M2 == 0);
+    quantize_row_e4m3_m2_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_E4M3_M2, n_per_row);
 }
 
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)

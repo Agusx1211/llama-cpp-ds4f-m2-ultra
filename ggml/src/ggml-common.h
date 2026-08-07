@@ -226,6 +226,23 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
+// GGML_TYPE_E4M3_M2 — fork-owned gguf-m2 v1 dense-plane encoding (M2 Ultra target).
+// One block covers 1024 row elements: 1024 OCP E4M3 (fn) code bytes followed by
+// 8 E8M0 scale bytes (one per 128-element group; value = 2^(sc-127), the
+// converter guarantees 1 <= sc <= 254) and 8 zero pad bytes. The pad keeps
+// sizeof(block) = 1040, a multiple of 16, so with any 16-byte-aligned tensor
+// base every 16-byte group of code bytes is 16-byte aligned for vector loads.
+// Scales are stored per row (rows of the same 128x128 source tile carry
+// identical scale bytes); decode is exact: e4m3 * 2^k in f32/bf16.
+// See notes/2026-08-07-gguf-m2-artifact-format-design.md ("Layout" section).
+#define QK_E4M3_M2 1024
+typedef struct {
+    uint8_t qs[QK_E4M3_M2];     // OCP E4M3 (fn) codes, 1 byte per element
+    uint8_t sc[QK_E4M3_M2/128]; // E8M0 scale per 128-element group
+    uint8_t pad[8];             // zero; keeps the block size a multiple of 16 B
+} block_e4m3_m2;
+static_assert(sizeof(block_e4m3_m2) == QK_E4M3_M2 + QK_E4M3_M2/128 + 8, "wrong e4m3_m2 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
