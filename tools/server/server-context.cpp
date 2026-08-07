@@ -2093,17 +2093,49 @@ private:
             // in advance.
             const size_t n_prompt_res = slot.prompt.tokens.size();
             const size_t n_lcp = n_prompt_res > 0 ? slot.prompt.tokens.get_common_prefix(task.tokens) : 0;
-            const bool reuse_resident =
+
+            bool reuse_resident =
                     family_slots.size() == 1 &&
                     n_lcp > 0 &&
-                    n_lcp == n_prompt_res &&
+                    n_lcp <= n_prompt_res &&
                     n_lcp < (size_t) task.n_tokens() &&
                     !slot.prompt.tokens.has_mtmd &&
                     task.params.n_cache_reuse == 0 &&
                     task.params.cache_prompt;
+
             if (reuse_resident) {
-                SLT_INF(slot, "elastic admission reuses %zu resident prefix tokens (task has %d)\n",
-                        n_lcp, (int) task.n_tokens());
+                // Predict where the prefill will land by mirroring its logic
+                // (n_past block around server-context.cpp:4289-4383). Reuse is
+                // kept only when the landing is provably benign:
+                // - checkpoint window applies (pos_min >= thold): a covering
+                //   checkpoint must exist, so the prefill restores it and
+                //   re-decodes at most the checkpoint-to-task delta. Without
+                //   one the prefill would reset to n_past = 0 and re-decode
+                //   the full span while resident rows are freed mid-flight -
+                //   strictly worse than clearing here.
+                // - otherwise the divergent tail must fit the bounded rs
+                //   rollback window or the tail trim at the prefill would
+                //   abort (DSV4 has no general partial seq_rm).
+                const llama_pos pos_next = slot.prompt.tokens.pos_next(n_lcp);
+                const llama_pos pos_min_thold = std::max(0, pos_next - n_swa);
+                const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+
+                if (pos_min < 0) {
+                    reuse_resident = false;
+                } else if (pos_min >= pos_min_thold) {
+                    reuse_resident = std::any_of(
+                            slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                            [&](const common_prompt_checkpoint & cur) {
+                                return cur.pos_max <= pos_next && (cur.pos_min < pos_min_thold || cur.pos_min == 0);
+                            });
+                } else {
+                    reuse_resident = (int64_t) (n_prompt_res - n_lcp) <= (int64_t) llama_n_rs_seq(ctx_tgt);
+                }
+            }
+
+            if (reuse_resident) {
+                SLT_INF(slot, "elastic admission reuses %zu resident prefix tokens (%zu resident, task has %d)\n",
+                        n_lcp, n_prompt_res, (int) task.n_tokens());
             } else {
                 // full-clear admission: quote the whole span against an empty
                 // sequence, exactly like the original uncached vertical.
