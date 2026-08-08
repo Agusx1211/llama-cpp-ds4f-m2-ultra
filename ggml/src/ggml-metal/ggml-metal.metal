@@ -8574,6 +8574,19 @@ constant bool FC_flash_attn_ext_vec_blocked [[function_constant(FC_FLASH_ATTN_EX
 // mask) and no ALiBi.
 constant int32_t FC_flash_attn_ext_vec_nh [[function_constant(FC_FLASH_ATTN_EXT_VEC + 25)]];
 
+// How the mask-skip specialization above decides whether a group of NE cache
+// items is live.
+//   false: rescan the NE threadgroup-memory slots per group, in both the Q*K^T
+//          and the P*V loop - 2*C threadgroup loads per lane per KV chunk on
+//          top of the 2*(DK4+DV4)/NL device loads that do the actual work.
+//   true:  one simd_ballot per predicate per chunk. Lane i already holds the
+//          mask (and later the softmax weight) of cache item i, so the whole
+//          C-wide liveness bitmap is one instruction and each group test is a
+//          shift and a mask. The skip decisions are identical, so this is
+//          bit-identical; it is a function constant only so the two can be
+//          A/B'd on one binary (GGML_FA_MSKIP_BALLOT=0).
+constant bool FC_flash_attn_ext_vec_mskip_ballot [[function_constant(FC_FLASH_ATTN_EXT_VEC + 26)]];
+
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -8616,8 +8629,7 @@ kernel void kernel_flash_attn_ext_vec(
 #define NS10 (FC_flash_attn_ext_vec_ns10)
 #define NS20 (FC_flash_attn_ext_vec_ns20)
 
-    // total SIMDgroups in the threadgroup: NSG key streams x NH query heads.
-    // The host only ever selects NH > 1 together with NSG == 1.
+    // total SIMDgroups in the threadgroup: NSG key streams x NH query heads
     const short NTG = NSG*NH;
 
     // The threadgroup's NTG SIMDgroups are laid out head-major:
@@ -8775,6 +8787,15 @@ kernel void kernel_flash_attn_ext_vec(
                 continue;
             }
 
+            // liveness bitmap of the C cache items of this chunk: bit i is set
+            // when item i is not masked. Lane i holds sm[i], so this is one
+            // instruction for the whole chunk (see FC_..._mskip_ballot).
+            uint amk = ~0u;
+            uint avk = ~0u;
+            if (FC_flash_attn_ext_vec_sparse_mask && FC_flash_attn_ext_vec_mskip_ballot) {
+                amk = (uint) ((simd_vote::vote_t) simd_ballot(sm[tiisg] > -MAXHALF));
+            }
+
             // Q*K^T
             {
                 device      const k4_t * pk4 = (device const k4_t *) (k + ic*args.nb11);
@@ -8789,9 +8810,13 @@ kernel void kernel_flash_attn_ext_vec(
                 FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                     bool active = true;
                     if (FC_flash_attn_ext_vec_sparse_mask) {
-                        active = false;
-                        FOR_UNROLL (short ii = 0; ii < NE; ++ii) {
-                            active |= sm[cc*NE + ii] > -MAXHALF;
+                        if (FC_flash_attn_ext_vec_mskip_ballot) {
+                            active = ((amk >> (cc*NE)) & ((1u << NE) - 1)) != 0;
+                        } else {
+                            active = false;
+                            FOR_UNROLL (short ii = 0; ii < NE; ++ii) {
+                                active |= sm[cc*NE + ii] > -MAXHALF;
+                            }
                         }
                     }
 
@@ -8887,6 +8912,13 @@ kernel void kernel_flash_attn_ext_vec(
                 // the P matrix from the paper (Q rows, C columns)
                 ss[tiisg] = vs;
 
+                // liveness bitmap for the P*V loop: strictly stronger than the
+                // mask bitmap, because a visible key whose logit is far below
+                // the running max underflows to exactly zero
+                if (FC_flash_attn_ext_vec_sparse_mask && FC_flash_attn_ext_vec_mskip_ballot) {
+                    avk = (uint) ((simd_vote::vote_t) simd_ballot(vs != 0.0f));
+                }
+
                 // O = diag(ms)*O
                 if ((DV4/NL % NW == 0) || ty == 0) {
                     FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
@@ -8914,9 +8946,13 @@ kernel void kernel_flash_attn_ext_vec(
                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                         bool active = true;
                         if (FC_flash_attn_ext_vec_sparse_mask) {
-                            active = false;
-                            FOR_UNROLL (short jj = 0; jj < NE; ++jj) {
-                                active |= ss[cc*NE + jj] != 0.0f;
+                            if (FC_flash_attn_ext_vec_mskip_ballot) {
+                                active = ((avk >> (cc*NE)) & ((1u << NE) - 1)) != 0;
+                            } else {
+                                active = false;
+                                FOR_UNROLL (short jj = 0; jj < NE; ++jj) {
+                                    active |= ss[cc*NE + jj] != 0.0f;
+                                }
                             }
                         }
                         if (!active) {
@@ -8931,9 +8967,13 @@ kernel void kernel_flash_attn_ext_vec(
                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                         bool active = true;
                         if (FC_flash_attn_ext_vec_sparse_mask) {
-                            active = false;
-                            FOR_UNROLL (short jj = 0; jj < NE; ++jj) {
-                                active |= ss[cc*NE + jj] != 0.0f;
+                            if (FC_flash_attn_ext_vec_mskip_ballot) {
+                                active = ((avk >> (cc*NE)) & ((1u << NE) - 1)) != 0;
+                            } else {
+                                active = false;
+                                FOR_UNROLL (short jj = 0; jj < NE; ++jj) {
+                                    active |= ss[cc*NE + jj] != 0.0f;
+                                }
                             }
                         }
                         if (!active) {

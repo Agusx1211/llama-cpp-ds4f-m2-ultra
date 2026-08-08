@@ -279,6 +279,10 @@ struct arm {
 // like-for-like reference at the production head count.
 #define NOMSKIP "GGML_METAL_DSV4_FA_MASK_SKIP_DISABLE=1"
 
+// the head/KV-head sweeps fall out of the DSV4 signature that pins nsg = 1, so
+// they would silently run with two key streams; pin it back.
+#define NSG1 "GGML_FA_NSG_MAX=1"
+
 static const arm g_arms[] = {
     { "nh=1",      { nullptr,           nullptr }, 64,  1 },
     { "nh=2",      { "GGML_FA_NHPTG=2", nullptr }, 64,  1 },
@@ -286,14 +290,17 @@ static const arm g_arms[] = {
     { "nh=8",      { "GGML_FA_NHPTG=8", nullptr }, 64,  1 },
     { "nomskip",   { NOMSKIP,           nullptr }, 64,  1 },
     { "nomsk/nh4", { NOMSKIP, "GGML_FA_NHPTG=4" }, 64,  1 },
-    { "kvh=64",    { NOMSKIP,           nullptr }, 64, 64 },
+    { "kvh=64",    { NOMSKIP,           NSG1    }, 64, 64 },
     { "nomsk/nh8", { NOMSKIP, "GGML_FA_NHPTG=8" }, 64,  1 },
-    { "heads=1",   { NOMSKIP,           nullptr },  1,  1 },
-    { "heads=2",   { NOMSKIP,           nullptr },  2,  1 },
-    { "heads=4",   { NOMSKIP,           nullptr },  4,  1 },
-    { "heads=8",   { NOMSKIP,           nullptr },  8,  1 },
-    { "heads=16",  { NOMSKIP,           nullptr }, 16,  1 },
-    { "heads=32",  { NOMSKIP,           nullptr }, 32,  1 },
+    // the pre-ballot mask-skip implementation: per-group rescan of threadgroup
+    // memory in both the Q*K^T and the P*V loop
+    { "mskip/scan",{ "GGML_FA_MSKIP_BALLOT=0", nullptr }, 64,  1 },
+    { "heads=1",   { NOMSKIP,           NSG1    },  1,  1 },
+    { "heads=2",   { NOMSKIP,           NSG1    },  2,  1 },
+    { "heads=4",   { NOMSKIP,           NSG1    },  4,  1 },
+    { "heads=8",   { NOMSKIP,           NSG1    },  8,  1 },
+    { "heads=16",  { NOMSKIP,           NSG1    }, 16,  1 },
+    { "heads=32",  { NOMSKIP,           NSG1    }, 32,  1 },
 };
 
 static const int g_n_arms = (int) (sizeof(g_arms)/sizeof(g_arms[0]));

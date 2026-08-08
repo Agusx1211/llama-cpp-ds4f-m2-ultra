@@ -4307,6 +4307,21 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             }
         }
 
+        // GGML_FA_NSG_MAX=<n>: cap the key-stream split. Measurement knob only -
+        // the DSV4 decode signature already pins nsg = 1, but a head-count or
+        // KV-head sweep falls out of that signature and would silently switch to
+        // nsg = 2, which is not the geometry it is being compared against.
+        {
+            static const int32_t nsg_max = []() {
+                const char * s = std::getenv("GGML_FA_NSG_MAX");
+                return s ? atoi(s) : 0;
+            }();
+
+            if (nsg_max > 0 && nsg > nsg_max) {
+                nsg = nsg_max;
+            }
+        }
+
         // Split-K regrouping: nwg*nsg is the number of independent key streams,
         // i.e. the primary parallelism of the kernel. Moving streams from
         // workgroups into SIMDgroups of the same threadgroup keeps that product
