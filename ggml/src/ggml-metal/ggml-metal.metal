@@ -4972,7 +4972,7 @@ void kernel_mul_mv_t_t_disp(
         ushort tiisg,
         ushort sgitg) {
     switch (args.nr0) {
-      //case 1: kernel_mul_mv_t_t_impl<T0, T1, 1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 1: kernel_mul_mv_t_t_impl<T0, T1, 1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break; // fork: row-starved grids (ggml_metal_mv_nr0_starved)
         case 2: kernel_mul_mv_t_t_impl<T0, T1, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
       //case 3: kernel_mul_mv_t_t_impl<T0, T1, 3, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
       //case 4: kernel_mul_mv_t_t_impl<T0, T1, 4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
@@ -5096,7 +5096,7 @@ void kernel_mul_mv_t_t_4_disp(
         ushort tiisg,
         ushort sgitg) {
     switch (args.nr0) {
-      //case 1: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 1: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break; // fork: row-starved grids (ggml_metal_mv_nr0_starved)
         case 2: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
       //case 3: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 3, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
       //case 4: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
@@ -6981,11 +6981,50 @@ static inline uint top_k_radix_tg_exclusive_scan(
     return before + local;
 }
 
+// Pivot tie-break policies. The DSV4 indexer row is ReLU'd upstream
+// (index_score.relu_() in DeepSeek's own inference/model.py), so every row the
+// indexer scored <= 0 collapses onto exactly 0.0f and the pivot tie group is
+// routinely thousands of elements wide. torch.topk gives no guarantee about
+// which equal elements it returns either, so there is no reference behaviour to
+// reproduce here - the choice is ours and it is a modelling decision, not a
+// fidelity one.
+//
+//   ASC  keeps the tied rows with the smallest source indices (oldest keys);
+//   DESC keeps the largest source indices (most recent keys). For single-token
+//        decode the query sits at the end of the sequence, so DESC is also the
+//        "tied keys nearest the query" policy;
+//   HASH keeps a deterministic pseudo-random subset - an unbiased sample of the
+//        tie mass, which is what the pre-fix arrival-order code was doing in
+//        expectation, minus the nondeterminism.
+//
+// All three are strict total orders and therefore equally reproducible.
+#define GGML_TOP_K_TIE_ASC  0
+#define GGML_TOP_K_TIE_DESC 1
+#define GGML_TOP_K_TIE_HASH 2
+
+// lowbias32 finalizer. Only the *source index* is hashed - deliberately not the
+// query row or the batch position - so the retained set stays a pure function
+// of the score row, i.e. invariant to ubatch splitting, speculative draft
+// length and prompt-cache reuse, exactly like ASC and DESC.
+static inline uint top_k_tie_hash(uint x) {
+    x += 0x9e3779b9u;
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
 // DSV4's Lightning Indexer selects 512 entries from a much longer score row.
 // A full bitonic sort spends most of its time ordering entries that are thrown
 // away. Find the exact 512th score with an MSD radix selection, collect that
 // partition, then sort only the retained 512 indices.
-template <ushort radix_bits>
+//
+// `tie_policy` (one of the GGML_TOP_K_TIE_* above) selects which members of the
+// pivot tie group survive the quota; it is chosen at pipeline-creation time
+// from LLAMA_DSV4_TOPK_TIE (asc|desc|hash, default asc).
+template <ushort radix_bits, ushort tie_policy>
 kernel void kernel_top_k_radix_f32_i32_impl(
         constant ggml_metal_kargs_argsort & args,
         device const char    * src0,
@@ -7006,6 +7045,8 @@ kernel void kernel_top_k_radix_f32_i32_impl(
     threadgroup uint group_totals[16];
     threadgroup uint n_greater;
     threadgroup uint n_equal;
+    threadgroup uint n_hit;
+    threadgroup uint n_miss;
     threadgroup int32_t selected[n_top];
 
     const int i01 = tgpig.x;
@@ -7099,9 +7140,17 @@ kernel void kernel_top_k_radix_f32_i32_impl(
     //
     // Instead: give every thread one contiguous index range, take a threadgroup
     // exclusive prefix sum of its per-range counts, and write the strictly
-    // greater elements followed by the tied elements in ascending source-index
+    // greater elements followed by the tied elements in a fixed source-index
     // order. The retained set and its order then depend only on the row's
     // values and indices.
+    //
+    // Which end of the tie group the quota is filled from is a free parameter,
+    // and it is not obviously neutral: the tie group is "every row the indexer
+    // scored <= 0", which collapses mildly-negative and strongly-negative
+    // candidates into one indistinguishable mass. `tie_desc == false` fills the
+    // quota with the *oldest* such rows, `tie_desc == true` with the most
+    // recent ones. Recency is a strong prior in attention, so the two are
+    // measured against each other (notes/2026-08-08-topk-tiebreak-policy.md).
     selected[tiitg] = 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -7122,9 +7171,54 @@ kernel void kernel_top_k_radix_f32_i32_impl(
     const uint off_gt = top_k_radix_tg_exclusive_scan(cnt_gt, tiitg, ntg.x, group_totals, &n_greater);
     const uint off_eq = top_k_radix_tg_exclusive_scan(cnt_eq, tiitg, ntg.x, group_totals, &n_equal);
 
+    // HASH only: one extra counting pass over the tie group. The quota is
+    // `n_top - n_greater` of `n_equal` tied elements, so an element is admitted
+    // when its index hash falls below thr = quota/n_equal * 2^32 - a uniform
+    // random subset. The count of admitted elements is binomial around the
+    // quota rather than exactly equal to it, so the residual (typically ~4% of
+    // the 512 slots) is trimmed from, or topped up with, the tie group in
+    // ascending index order. That residual is the one biased part of this arm.
+    uint off_hit  = 0;
+    uint off_miss = 0;
+    uint hash_thr = 0;
+    if (tie_policy == GGML_TOP_K_TIE_HASH) {
+        const uint quota = n_greater < n_top ? n_top - n_greater : 0u;
+        hash_thr = n_equal == 0 || quota >= n_equal
+            ? 0xffffffffu
+            : (uint) (((ulong) quota << 32)/(ulong) n_equal);
+
+        uint cnt_hit  = 0;
+        uint cnt_miss = 0;
+        for (uint i = lo; i < hi; ++i) {
+            const uint bits = as_type<uint>(row[i]);
+            const uint key = bits ^ (uint(int(bits) >> 31) | 0x80000000u);
+            if (key == prefix) {
+                if (top_k_tie_hash(i) < hash_thr) {
+                    ++cnt_hit;
+                } else {
+                    ++cnt_miss;
+                }
+            }
+        }
+
+        off_hit  = top_k_radix_tg_exclusive_scan(cnt_hit,  tiitg, ntg.x, group_totals, &n_hit);
+        off_miss = top_k_radix_tg_exclusive_scan(cnt_miss, tiitg, ntg.x, group_totals, &n_miss);
+    }
+
     {
         uint p_gt = off_gt;
-        uint p_eq = n_greater + off_eq;
+        // ASC:  the tie group is laid down in ascending source-index order
+        //       starting at n_greater, so the quota keeps its first entries.
+        // DESC: the entry with ascending tie-rank r goes to
+        //       n_greater + (n_equal-1-r), i.e. the same slots in descending
+        //       source-index order, so the quota keeps the largest indices.
+        // HASH: hash-admitted entries occupy the slots first, non-admitted
+        //       entries follow; both runs in ascending source-index order.
+        // All three are one contiguous run of reads per thread and cost the
+        // same; only HASH pays for the extra counting pass above.
+        uint r_eq   = off_eq;
+        uint r_hit  = off_hit;
+        uint r_miss = off_miss;
         for (uint i = lo; i < hi; ++i) {
             const uint bits = as_type<uint>(row[i]);
             const uint key = bits ^ (uint(int(bits) >> 31) | 0x80000000u);
@@ -7134,18 +7228,30 @@ kernel void kernel_top_k_radix_f32_i32_impl(
                 }
                 ++p_gt;
             } else if (key == prefix) {
+                uint p_eq;
+                if (tie_policy == GGML_TOP_K_TIE_DESC) {
+                    p_eq = n_greater + (n_equal - 1 - r_eq);
+                } else if (tie_policy == GGML_TOP_K_TIE_HASH) {
+                    p_eq = top_k_tie_hash(i) < hash_thr
+                        ? n_greater + r_hit++
+                        : n_greater + n_hit + r_miss++;
+                } else {
+                    p_eq = n_greater + r_eq;
+                }
                 if (p_eq < n_top) {
                     selected[p_eq] = (int32_t) i;
                 }
-                ++p_eq;
+                ++r_eq;
             }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Restore TOP_K's descending-order contract for the retained partition.
-    // Ties are broken by ascending source index so the comparison is a strict
+    // Ties are broken by source index - descending under DESC to match the
+    // selection policy, ascending otherwise - so the comparison is a strict
     // total order and the sorting network has exactly one valid output.
+    constexpr bool tie_desc = tie_policy == GGML_TOP_K_TIE_DESC;
     const int col = tiitg;
     for (int k = 2; k <= n_top; k *= 2) {
         for (int j = k/2; j > 0; j /= 2) {
@@ -7155,8 +7261,8 @@ kernel void kernel_top_k_radix_f32_i32_impl(
                 const int   idx_r = selected[ixj];
                 const float lhs = row[idx_l];
                 const float rhs = row[idx_r];
-                const bool  before_l = lhs > rhs || (lhs == rhs && idx_l < idx_r);
-                const bool  before_r = rhs > lhs || (rhs == lhs && idx_r < idx_l);
+                const bool  before_l = lhs > rhs || (lhs == rhs && (tie_desc ? idx_l > idx_r : idx_l < idx_r));
+                const bool  before_r = rhs > lhs || (rhs == lhs && (tie_desc ? idx_r > idx_l : idx_r < idx_l));
                 if (((col & k) == 0 && before_r) || ((col & k) != 0 && before_l)) {
                     SWAP(selected[col], selected[ixj]);
                 }
@@ -7169,13 +7275,28 @@ kernel void kernel_top_k_radix_f32_i32_impl(
     dst[col] = selected[col];
 }
 
-typedef decltype(kernel_top_k_radix_f32_i32_impl<4>) top_k_radix_f32_i32_t;
+typedef decltype(kernel_top_k_radix_f32_i32_impl<4, GGML_TOP_K_TIE_ASC>) top_k_radix_f32_i32_t;
 
+// oldest-first tie-break (LLAMA_DSV4_TOPK_TIE=asc, the default)
 template [[host_name("kernel_top_k_radix_f32_i32")]]
-kernel top_k_radix_f32_i32_t kernel_top_k_radix_f32_i32_impl<4>;
+kernel top_k_radix_f32_i32_t kernel_top_k_radix_f32_i32_impl<4, GGML_TOP_K_TIE_ASC>;
 
 template [[host_name("kernel_top_k_radix8_f32_i32")]]
-kernel decltype(kernel_top_k_radix_f32_i32_impl<8>) kernel_top_k_radix_f32_i32_impl<8>;
+kernel top_k_radix_f32_i32_t kernel_top_k_radix_f32_i32_impl<8, GGML_TOP_K_TIE_ASC>;
+
+// newest-first tie-break (LLAMA_DSV4_TOPK_TIE=desc)
+template [[host_name("kernel_top_k_radix_f32_i32_tdesc")]]
+kernel top_k_radix_f32_i32_t kernel_top_k_radix_f32_i32_impl<4, GGML_TOP_K_TIE_DESC>;
+
+template [[host_name("kernel_top_k_radix8_f32_i32_tdesc")]]
+kernel top_k_radix_f32_i32_t kernel_top_k_radix_f32_i32_impl<8, GGML_TOP_K_TIE_DESC>;
+
+// unbiased deterministic-pseudo-random tie-break (LLAMA_DSV4_TOPK_TIE=hash)
+template [[host_name("kernel_top_k_radix_f32_i32_thash")]]
+kernel top_k_radix_f32_i32_t kernel_top_k_radix_f32_i32_impl<4, GGML_TOP_K_TIE_HASH>;
+
+template [[host_name("kernel_top_k_radix8_f32_i32_thash")]]
+kernel top_k_radix_f32_i32_t kernel_top_k_radix_f32_i32_impl<8, GGML_TOP_K_TIE_HASH>;
 
 typedef void (argsort_merge_t)(
         constant   ggml_metal_kargs_argsort_merge & args,

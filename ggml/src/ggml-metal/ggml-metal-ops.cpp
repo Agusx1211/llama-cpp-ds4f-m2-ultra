@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <cmath>
 
@@ -68,9 +69,15 @@ struct ggml_metal_op {
         this->idx_end         = idx_end;
         this->use_fusion      = use_fusion;
         this->use_concurrency = use_concurrency;
-        this->use_capture     = use_capture;
+        // [TAG_CB_ERROR_SCAN] use_capture only gates the per-node debug groups
+        // in ggml_metal_op_encode(); GGML_METAL_CB_ERROR_INFO=1 wants them too,
+        // because they become the debug signposts attached to a failed command
+        // buffer's per-encoder error info and are what names the faulting op.
+        this->use_capture     = use_capture || ggml_metal_cb_error_info_enabled();
         this->debug_graph     = debug_graph;
         this->debug_fusion    = debug_fusion;
+        this->kprof_stride    = ggml_metal_kprof_stride();
+        this->kprof_count     = 0;
         this->gf              = gf;
 
         idxs.reserve(gf->n_nodes);
@@ -98,6 +105,12 @@ struct ggml_metal_op {
     ggml_tensor * node(int i) const {
         assert(i >= 0 && i < (int) idxs.size());
         return ggml_graph_node(gf, idxs[i]);
+    }
+
+    // raw graph index of the i-th non-empty node (used by GGML_METAL_KPROF)
+    int raw_idx(int i) const {
+        assert(i >= 0 && i < (int) idxs.size());
+        return idxs[i];
     }
 
     bool can_fuse(int i0, const ggml_op * ops, int n_ops) const {
@@ -207,6 +220,10 @@ struct ggml_metal_op {
 
     int debug_graph;
     int debug_fusion;
+
+    // GGML_METAL_KPROF
+    int kprof_stride = 0;
+    int kprof_count  = 0;
 
 private:
     ggml_cgraph * gf;
@@ -642,7 +659,36 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     return n_fuse;
 }
 
+// GGML_METAL_KPROF: nodes that never dispatch anything - splitting the encoder
+// in front of them would burn a counter slot on an empty compute pass.
+static bool ggml_metal_op_is_noop(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_TRANSPOSE:
+        case GGML_OP_PERMUTE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
+    if (ctx->kprof_stride > 0 && !ggml_metal_op_is_noop(ctx->node(idx)->op)) {
+        if (ctx->kprof_count % ctx->kprof_stride == 0) {
+            ggml_metal_encoder_kprof_split(ctx->enc, ctx->raw_idx(idx));
+
+            // a new compute pass is a full execution barrier, so the concurrency
+            // tracker must start over
+            if (ctx->mem_ranges) {
+                ggml_mem_ranges_reset(ctx->mem_ranges);
+            }
+        }
+
+        ctx->kprof_count++;
+    }
+
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
@@ -5918,7 +5964,31 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
         const bool dsv4_top_k_radix8 = dsv4_top_k_radix8_enabled &&
             ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->device_id ==
                 GGML_METAL_DEVICE_M2_ULTRA;
-        auto pipeline = ggml_metal_library_get_pipeline_top_k_radix(lib, dsv4_top_k_radix8);
+
+        // Pivot tie-break policy for the DSV4 Lightning Indexer selection. The
+        // indexer row is ReLU'd, so the pivot is routinely exactly 0.0f and the
+        // tie group spans thousands of compressed rows: "asc" (the default)
+        // fills the quota with the oldest tied rows, "desc" with the most
+        // recent ones, "hash" with a deterministic unbiased sample. All three
+        // are deterministic. Read once - the kernel choice must not vary within
+        // a process or across the graph.
+        static const int dsv4_top_k_tie_policy = []() {
+            const char * s = std::getenv("LLAMA_DSV4_TOPK_TIE");
+            int policy = 0;
+            if (s != nullptr) {
+                if      (std::strcmp(s, "asc")  == 0) policy = 0;
+                else if (std::strcmp(s, "desc") == 0) policy = 1;
+                else if (std::strcmp(s, "hash") == 0) policy = 2;
+                else {
+                    GGML_LOG_WARN("%s: LLAMA_DSV4_TOPK_TIE='%s' is not asc|desc|hash; using asc\n", __func__, s);
+                }
+            }
+            static const char * const desc[3] = { "asc (oldest tied keys)", "desc (newest tied keys)", "hash (unbiased sample)" };
+            GGML_LOG_INFO("%s: DSV4 top-k pivot tie-break = %s\n", __func__, desc[policy]);
+            return policy;
+        }();
+
+        auto pipeline = ggml_metal_library_get_pipeline_top_k_radix(lib, dsv4_top_k_radix8, dsv4_top_k_tie_policy);
         GGML_ASSERT(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) >= 512);
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);

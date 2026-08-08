@@ -977,6 +977,81 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+// fork: number of simdgroups that actually have work in the shared GEMV
+// kernel family (kernel_mul_mv_t_t{,_4}, kernel_mul_mv_e4m3_m2_f32_4,
+// kernel_mul_mv_nf8_m2_f32_4).
+//
+// Those kernels partition a row into NB=32-element blocks and hand each
+// simdgroup NF consecutive blocks per round:
+//
+//     ib0 = sgitg*NF + ix;  for (ib = ib0; ib < ne00/NB; ib += NSG*NF)
+//
+// so simdgroup `s` executes the loop body zero times whenever
+// s*NF >= ne00/NB, i.e. whenever s >= ne00/(NB*NF). Upstream sizes the
+// threadgroup as min(4, ceil(ne00/128)), which is only correct for
+// NB*NF = 128; the _4 kernels use NF = 16 (span 512 elements) and the
+// scalar kernels NF = 8 (span 256), so every row shorter than 4 spans gets
+// idle simdgroups.
+//
+// On DSV4 Flash this is not a corner case: attn_q_b is [1024 x 32768]
+// e4m3_m2 and is the single largest GEMV in a decode step (43 dispatches,
+// 34.1 MiB of weights each). With ne00 = 1024 the _4 kernel needs 2
+// simdgroups and is handed 4, so half of every threadgroup's threads never
+// issue a load and the kernel sustains only ~354 GB/s where the same kernel
+// on longer rows reaches 540 GB/s.
+//
+// Shrinking the threadgroup is bit-identical by construction: the mapping
+// from simdgroup index to blocks is unchanged (the loop stride NSG*NF only
+// matters when more than one round runs, and a row that needs fewer than
+// NSG spans runs exactly one round), and the dropped simdgroups contributed
+// an exact 0.0f to helper_mv_reduce_and_write's fixed 32-slot simd_sum,
+// which zeroes every slot before the partials are written.
+// fork: NR0 rows are handled by one threadgroup, so the grid is
+// ceil(ne01/NR0) threadgroups. On shapes with very few rows that leaves most
+// of the 60-core GPU idle: DSV4's hyper-connection mixers are
+// f32 [16384 x 24], i.e. 12 threadgroups at NR0=2, and the decode census
+// measures them at 119 GB/s (1.19 ms/step for the 86 dispatches). Dropping to
+// one row per threadgroup doubles the grid on exactly those shapes.
+//
+// Bit-identical: each row's partial sums live in their own sumf[] slot and
+// their own reduction slab, so the accumulation order of a row does not
+// depend on how many other rows share its threadgroup.
+static int ggml_metal_mv_nr0_starved(int nr0, int ne01) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * v = getenv("GGML_MV_NR0_LEGACY");
+        mode = (v && atoi(v) != 0) ? 1 : 0;
+    }
+
+    if (mode == 1 || nr0 <= 1) {
+        return nr0;
+    }
+
+    // 60 GPU cores; below ~1 threadgroup per core the grid, not the memory
+    // system, is the limit
+    if ((ne01 + nr0 - 1)/nr0 < 64) {
+        return 1;
+    }
+
+    return nr0;
+}
+
+static int ggml_metal_mv_nsg(int ne00, int span, int nsg_max) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * v = getenv("GGML_MV_NSG_LEGACY");
+        mode = (v && atoi(v) != 0) ? 1 : 0;
+    }
+
+    if (mode == 1) {
+        return std::min(nsg_max, (ne00 + 127) / 128);
+    }
+
+    const int nsg = (ne00 + span - 1) / span;
+
+    return std::max(1, std::min(nsg_max, nsg));
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -1007,11 +1082,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     nr1 = 1;
                     suffix = "_short";
                 } else {
-                    nsg = std::min(4, (ne00 + 127) / 128);
-                    nr0 = 2;
+                    // fork: NF is 16 in the _4 kernel and 8 in the scalar one,
+                    // so a simdgroup spans 512 resp. 256 elements of the row
+                    suffix = ne00 % 4 == 0 ? "_4" : "";
+                    nsg = ggml_metal_mv_nsg(ne00, ne00 % 4 == 0 ? 512 : 256, 4);
+                    nr0 = ggml_metal_mv_nr0_starved(2, ne01);
                     nr1 = 1;
                     smem = 32*sizeof(float)*nr0;
-                    suffix = ne00 % 4 == 0 ? "_4" : "";
                 }
             } break;
         case GGML_TYPE_E4M3_M2:
@@ -1022,7 +1099,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 // an extra 256-float region: the kernel stages its decode LUT
                 // in threadgroup memory after the reduction area.
                 GGML_ASSERT(ne00 % 4 == 0); // ne00 % QK_E4M3_M2 == 0 by block invariant
-                nsg = std::min(4, (ne00 + 127) / 128);
+                nsg = ggml_metal_mv_nsg(ne00, 512, 4); // NF = 16 -> 512 elems/simdgroup
+                // fork: A/B knob for the NR0 sweep (bit-identical in every
+                // value - per-row accumulation order is NR0-independent).
+                // Default stays 4; see the note below.
                 nr0 = 4; // 2 in the BF16 original; 4 halves the per-threadgroup
                          // fixed costs (LUT staging, reduce) and shares each
                          // activation load across 4 rows. Per-row accumulation
@@ -1035,6 +1115,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 // 1.31x: the longer 8-row serial loop per thread loses more
                 // than the halved fixed costs buy. The kernel keeps its
                 // case-8 dispatch for future experiments; the host stays at 4.
+                {
+                    const char * v = getenv("GGML_MV_NR0_E4M3");
+                    if (v) {
+                        const int r = atoi(v);
+                        if (r == 2 || r == 4 || r == 8) {
+                            nr0 = r;
+                        }
+                    }
+                }
                 nr1 = 1;
                 smem = 32*sizeof(float)*nr0 + 256*sizeof(float);
                 suffix = "_4";
@@ -1047,7 +1136,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 // NF8_M2 kernel stages NO decode LUT — the decode is pure
                 // bit-insertion — so smem carries only the reduction area.
                 GGML_ASSERT(ne00 % 4 == 0); // ne00 % QK_NF8_M2 == 0 by block invariant
-                nsg = std::min(4, (ne00 + 127) / 128);
+                nsg = ggml_metal_mv_nsg(ne00, 512, 4); // NF = 16 -> 512 elems/simdgroup
                 nr0 = 4;
                 nr1 = 1;
                 smem = 32*sizeof(float)*nr0;
@@ -1631,8 +1720,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k(ggml_metal
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_radix(ggml_metal_library_t lib, bool radix8) {
-    const char * name = radix8 ? "kernel_top_k_radix8_f32_i32" : "kernel_top_k_radix_f32_i32";
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_radix(ggml_metal_library_t lib, bool radix8, int tie_policy) {
+    // six variants: {radix-4, radix-8} x {oldest-first, newest-first,
+    // hash-sampled pivot tie-break}. See kernel_top_k_radix_f32_i32_impl and
+    // LLAMA_DSV4_TOPK_TIE.
+    static const char * const names[2][3] = {
+        { "kernel_top_k_radix_f32_i32",  "kernel_top_k_radix_f32_i32_tdesc",  "kernel_top_k_radix_f32_i32_thash"  },
+        { "kernel_top_k_radix8_f32_i32", "kernel_top_k_radix8_f32_i32_tdesc", "kernel_top_k_radix8_f32_i32_thash" },
+    };
+    GGML_ASSERT(tie_policy >= 0 && tie_policy < 3);
+    const char * name = names[radix8 ? 1 : 0][tie_policy];
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);

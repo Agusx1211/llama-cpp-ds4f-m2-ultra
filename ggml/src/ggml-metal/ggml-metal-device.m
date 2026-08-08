@@ -674,33 +674,277 @@ struct ggml_metal_encoder_profile_barrier_command {
     uint8_t opcode;
 };
 
+//
+// GGML_METAL_KPROF - per-segment GPU timestamps via stage-boundary counter sampling
+//
+
+// the device caps one counter sample buffer at 32768 B = 4096 timestamps = 2048
+// segments (measured: newCounterSampleBufferWithDescriptor rejects anything
+// larger with "Expected range: 8 -> 32768"), so a batch chains several of them
+#define GGML_METAL_KPROF_SEG_PER_SB 2048
+#define GGML_METAL_KPROF_MAX_SB     32
+#define GGML_METAL_KPROF_MAX_SEGMENTS (GGML_METAL_KPROF_SEG_PER_SB*GGML_METAL_KPROF_MAX_SB)
+
+struct ggml_metal_kprof_batch {
+    id<MTLCounterSampleBuffer> sb[GGML_METAL_KPROF_MAX_SB];
+    int    n_sb;
+    int  * nodes;   // raw graph node index that starts each segment
+    int    n_seg;
+    int    cap;
+    struct ggml_metal_kprof_batch * next;
+};
+
+static id<MTLCounterSampleBuffer> ggml_metal_kprof_new_sb(id<MTLDevice> dev) {
+    id<MTLCounterSampleBuffer> sb = nil;
+
+    @autoreleasepool {
+        MTLCounterSampleBufferDescriptor * d = [[MTLCounterSampleBufferDescriptor alloc] init];
+
+        for (id<MTLCounterSet> cs in [dev counterSets]) {
+            if ([[cs name] isEqualToString:MTLCommonCounterSetTimestamp]) {
+                d.counterSet = cs;
+                break;
+            }
+        }
+
+        d.sampleCount = 2*GGML_METAL_KPROF_SEG_PER_SB;
+        d.storageMode = MTLStorageModeShared;
+        d.label       = @"ggml-kprof";
+
+        NSError * err = nil;
+        sb = d.counterSet ? [dev newCounterSampleBufferWithDescriptor:d error:&err] : nil;
+
+        if (!sb) {
+            fprintf(stderr, "%s: kprof: newCounterSampleBuffer failed (%s)\n", __func__,
+                    err ? [[err localizedDescription] UTF8String] : "no timestamp counter set");
+        }
+
+        [d release];
+    }
+
+    return sb;
+}
+
+static struct {
+    int    stride;          // 0 = disabled
+    bool   initialized;
+    _Atomic int seq;        // monotonically increasing flush sequence
+    struct ggml_metal_kprof_batch * pending;
+    pthread_mutex_t mtx;
+} g_kprof = {
+    /*.stride      =*/ 0,
+    /*.initialized =*/ false,
+    /*.seq         =*/ 0,
+    /*.pending     =*/ NULL,
+    /*.mtx         =*/ PTHREAD_MUTEX_INITIALIZER,
+};
+
+int ggml_metal_kprof_stride(void) {
+    if (!g_kprof.initialized) {
+        // benign race: every writer computes the same value
+        const char * v = getenv("GGML_METAL_KPROF");
+        g_kprof.stride      = v ? atoi(v) : 0;
+        if (g_kprof.stride < 0) {
+            g_kprof.stride = 0;
+        }
+        g_kprof.initialized = true;
+    }
+
+    return g_kprof.stride;
+}
+
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
 
     // Points to thread-local profiling state only while an opt-in recording
     // scope is active. It does not retain any Metal object.
     struct ggml_metal_encoder_profile_tls * profile;
+
+    // kprof state (NULL/nil unless GGML_METAL_KPROF is active)
+    id<MTLCommandBuffer> cmd_buf;
+    bool concurrent;
+    struct ggml_metal_kprof_batch * kprof;
 };
+
+static void ggml_metal_encoder_kprof_begin(ggml_metal_encoder_t encoder, int raw_node_idx) {
+    struct ggml_metal_kprof_batch * b = encoder->kprof;
+
+    const int isb = b->n_seg / GGML_METAL_KPROF_SEG_PER_SB;
+    const int islot = b->n_seg % GGML_METAL_KPROF_SEG_PER_SB;
+
+    if (b->n_seg < b->cap && islot == 0 && isb == b->n_sb) {
+        id<MTLCounterSampleBuffer> sb = ggml_metal_kprof_new_sb([encoder->cmd_buf device]);
+        if (sb) {
+            b->sb[b->n_sb++] = sb;
+        }
+    }
+
+    @autoreleasepool {
+        if (b->n_seg >= b->cap || isb >= b->n_sb) {
+            // out of slots: fall back to a plain pass so encoding still completes
+            if (encoder->concurrent) {
+                encoder->obj = [encoder->cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
+            } else {
+                encoder->obj = [encoder->cmd_buf computeCommandEncoder];
+            }
+            [encoder->obj retain];
+            return;
+        }
+
+        MTLComputePassDescriptor * desc = [MTLComputePassDescriptor computePassDescriptor];
+
+        desc.dispatchType = encoder->concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+
+        desc.sampleBufferAttachments[0].sampleBuffer               = b->sb[isb];
+        desc.sampleBufferAttachments[0].startOfEncoderSampleIndex  = 2*islot + 0;
+        desc.sampleBufferAttachments[0].endOfEncoderSampleIndex    = 2*islot + 1;
+
+        b->nodes[b->n_seg] = raw_node_idx;
+        b->n_seg++;
+
+        encoder->obj = [encoder->cmd_buf computeCommandEncoderWithDescriptor:desc];
+        [encoder->obj retain];
+    }
+}
+
+int ggml_metal_encoder_kprof_split(ggml_metal_encoder_t encoder, int raw_node_idx) {
+    if (encoder->kprof == NULL) {
+        return -1;
+    }
+
+    [encoder->obj endEncoding];
+    [encoder->obj release];
+
+    const int seg = encoder->kprof->n_seg;
+
+    ggml_metal_encoder_kprof_begin(encoder, raw_node_idx);
+
+    return seg;
+}
+
+void ggml_metal_kprof_flush(void) {
+    if (ggml_metal_kprof_stride() == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_kprof.mtx);
+    struct ggml_metal_kprof_batch * head = g_kprof.pending;
+    g_kprof.pending = NULL;
+    pthread_mutex_unlock(&g_kprof.mtx);
+
+    if (head == NULL) {
+        return;
+    }
+
+    const int seq = g_kprof.seq++;
+
+    int ibatch = 0;
+
+    while (head) {
+        struct ggml_metal_kprof_batch * b = head;
+        head = b->next;
+        const int batch = ibatch++;
+
+        for (int isb = 0; isb < b->n_sb; ++isb) {
+            const int seg0 = isb*GGML_METAL_KPROF_SEG_PER_SB;
+            const int nseg = MIN(b->n_seg - seg0, GGML_METAL_KPROF_SEG_PER_SB);
+
+            if (nseg <= 0) {
+                break;
+            }
+
+            NSData * data = [b->sb[isb] resolveCounterRange:NSMakeRange(0, 2*nseg)];
+
+            if (data && [data length] >= 2*(NSUInteger)nseg*sizeof(MTLCounterResultTimestamp)) {
+                const MTLCounterResultTimestamp * ts = (const MTLCounterResultTimestamp *) [data bytes];
+
+                for (int i = 0; i < nseg; ++i) {
+                    const uint64_t t0 = ts[2*i + 0].timestamp;
+                    const uint64_t t1 = ts[2*i + 1].timestamp;
+
+                    if (t0 == MTLCounterErrorValue || t1 == MTLCounterErrorValue || t1 < t0) {
+                        continue;
+                    }
+
+                    fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"seg\":%d,\"node\":%d,\"t0\":%llu,\"ns\":%llu}\n",
+                            seq, batch, seg0 + i, b->nodes[seg0 + i],
+                            (unsigned long long) t0, (unsigned long long) (t1 - t0));
+                }
+            } else {
+                fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"error\":\"resolve failed\",\"sb\":%d,\"n_seg\":%d}\n",
+                        seq, batch, isb, nseg);
+            }
+
+            [b->sb[isb] release];
+        }
+
+        free(b->nodes);
+        free(b);
+    }
+
+    fflush(stderr);
+}
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
 
-    if (concurrent) {
-        res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
-    } else {
-        res->obj = [cmd_buf computeCommandEncoder];
+    res->cmd_buf    = cmd_buf;
+    res->concurrent = concurrent;
+
+    if (ggml_metal_kprof_stride() > 0) {
+        struct ggml_metal_kprof_batch * b = calloc(1, sizeof(struct ggml_metal_kprof_batch));
+
+        b->cap   = GGML_METAL_KPROF_MAX_SEGMENTS;
+        b->nodes = calloc(b->cap, sizeof(int));
+        b->n_seg = 0;
+        b->n_sb  = 0;
+
+        res->kprof = b;
+
+        ggml_metal_encoder_kprof_begin(res, -1);
+
+        if (b->n_sb == 0) {
+            // counter sample buffers unavailable: kprof_begin already opened a
+            // plain compute pass, so only the bookkeeping has to be undone
+            free(b->nodes);
+            free(b);
+            res->kprof = NULL;
+        }
+
+        res->profile = ggml_metal_encoder_profile.enabled ? &ggml_metal_encoder_profile : NULL;
+
+        return res;
+    }
+
+    {
+        if (concurrent) {
+            res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
+        } else {
+            res->obj = [cmd_buf computeCommandEncoder];
+        }
+
+        [res->obj retain];
     }
 
     res->profile = ggml_metal_encoder_profile.enabled ? &ggml_metal_encoder_profile : NULL;
-
-    [res->obj retain];
 
     return res;
 }
 
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
+    if (encoder->kprof) {
+        struct ggml_metal_kprof_batch * b = encoder->kprof;
+
+        pthread_mutex_lock(&g_kprof.mtx);
+        b->next = g_kprof.pending;
+        g_kprof.pending = b;
+        pthread_mutex_unlock(&g_kprof.mtx);
+
+        encoder->kprof = NULL;
+    }
+
     [encoder->obj release];
     free(encoder);
 }
@@ -874,6 +1118,8 @@ static void ggml_metal_dummy_work(ggml_metal_device_t dev) {
 
             [encoder endEncoding];
         }
+
+        ggml_metal_cmd_buf_watch("residency-dummy", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
 
         [cmd_buf commit];
         [buf release];
@@ -1285,6 +1531,164 @@ void * ggml_metal_device_get_obj(ggml_metal_device_t dev) {
 
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev) {
     return dev->mtl_queue;
+}
+
+// [TAG_CB_ERROR_SCAN] see ggml-metal-device.h
+bool ggml_metal_cb_error_info_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * v = getenv("GGML_METAL_CB_ERROR_INFO");
+        enabled = (v != NULL && atoi(v) != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+// [TAG_CB_ERROR_SCAN]
+static const char * ggml_metal_cmd_buf_status_str(MTLCommandBufferStatus status) {
+    switch (status) {
+        case MTLCommandBufferStatusNotEnqueued: return "not-enqueued";
+        case MTLCommandBufferStatusEnqueued:    return "enqueued";
+        case MTLCommandBufferStatusCommitted:   return "committed";
+        case MTLCommandBufferStatusScheduled:   return "scheduled";
+        case MTLCommandBufferStatusCompleted:   return "completed";
+        case MTLCommandBufferStatusError:       return "error";
+    }
+
+    return "unknown";
+}
+
+static atomic_int_least64_t g_cmd_buf_seq         = 0;
+static atomic_int_least64_t g_cmd_buf_n_failures  = 0;
+
+int64_t ggml_metal_cmd_buf_n_failures(void) {
+    return atomic_load_explicit(&g_cmd_buf_n_failures, memory_order_relaxed);
+}
+
+// [TAG_CB_ERROR_SCAN] see ggml-metal-device.h
+bool ggml_metal_cmd_buf_check(const char * origin, int idx, int64_t seq, ggml_metal_cmd_buf_t cmd_buf_raw) {
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+    if (cmd_buf == nil) {
+        return true;
+    }
+
+    const MTLCommandBufferStatus status = [cmd_buf status];
+    if (status == MTLCommandBufferStatusCompleted) {
+        return true;
+    }
+
+    const int64_t n_prev = atomic_fetch_add_explicit(&g_cmd_buf_n_failures, 1, memory_order_relaxed);
+
+    GGML_LOG_ERROR("ggml_metal_cmd_buf: error: %s command buffer %d (submission #%lld) failed with status %d (%s)%s\n",
+            origin, idx, (long long) seq, (int) status, ggml_metal_cmd_buf_status_str(status),
+            n_prev == 0 ? " <- FIRST failure observed on this device" : "");
+
+    NSError * error = [cmd_buf error];
+    if (error == nil) {
+        GGML_LOG_ERROR("ggml_metal_cmd_buf: error:   no NSError attached; if an earlier submission failed, this one is a victim, not the cause\n");
+        return false;
+    }
+
+    GGML_LOG_ERROR("ggml_metal_cmd_buf: error:   %s (domain %s, code %ld)\n",
+            [[error localizedDescription] UTF8String],
+            [[error domain] UTF8String],
+            (long) [error code]);
+
+    NSError * underlying = [error userInfo][NSUnderlyingErrorKey];
+    if (underlying != nil) {
+        GGML_LOG_ERROR("ggml_metal_cmd_buf: error:   underlying: %s (domain %s, code %ld)\n",
+                [[underlying localizedDescription] UTF8String],
+                [[underlying domain] UTF8String],
+                (long) [underlying code]);
+    }
+
+    // Per-encoder execution status; only populated under GGML_METAL_CB_ERROR_INFO=1.
+    if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, visionOS 1.0, *)) {
+        NSArray<id<MTLCommandBufferEncoderInfo>> * infos = [error userInfo][MTLCommandBufferEncoderInfoErrorKey];
+        for (id<MTLCommandBufferEncoderInfo> info in infos) {
+            const char * state = "unknown";
+            switch ([info errorState]) {
+                case MTLCommandEncoderErrorStateUnknown:   state = "unknown";   break;
+                case MTLCommandEncoderErrorStateCompleted: state = "completed"; break;
+                case MTLCommandEncoderErrorStateAffected:  state = "affected";  break;
+                case MTLCommandEncoderErrorStatePending:   state = "pending";   break;
+                case MTLCommandEncoderErrorStateFaulted:   state = "FAULTED";   break;
+            }
+
+            GGML_LOG_ERROR("ggml_metal_cmd_buf: error:   encoder '%s': %s\n",
+                    [info label] ? [[info label] UTF8String] : "(unlabeled)", state);
+
+            for (NSString * signpost in [info debugSignposts]) {
+                GGML_LOG_ERROR("ggml_metal_cmd_buf: error:     signpost: %s\n", [signpost UTF8String]);
+            }
+        }
+    }
+
+    return false;
+}
+
+// [TAG_CB_ERROR_SCAN] see ggml-metal-device.h
+// GGML_METAL_CB_TRACE=1: log every command buffer's origin, submission number,
+// host latency from watch to completion, and GPU start/end. This is how queue
+// depth becomes visible: a command buffer that waits seconds behind a
+// multi-second graph command buffer on the shared serial queue is killed by the
+// GPU watchdog (kIOGPUCommandBufferCallbackErrorTimeout).
+static bool ggml_metal_cb_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * v = getenv("GGML_METAL_CB_TRACE");
+        enabled = (v != NULL && atoi(v) != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+int64_t ggml_metal_cmd_buf_watch(const char * origin, int idx, ggml_metal_cmd_buf_t cmd_buf_raw) {
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+    if (cmd_buf == nil) {
+        return -1;
+    }
+
+    const int64_t seq   = atomic_fetch_add_explicit(&g_cmd_buf_seq, 1, memory_order_relaxed);
+    const int64_t t_sub = ggml_time_us();
+    const bool    trace = ggml_metal_cb_trace_enabled();
+
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        const bool ok = ggml_metal_cmd_buf_check(origin, idx, seq, cb);
+
+        if (!ok || trace) {
+            const double gpu_start = [cb GPUStartTime];
+            const double gpu_end   = [cb GPUEndTime];
+
+            GGML_LOG_ERROR("ggml_metal_cmd_buf: %s %-16s #%-6lld idx %4d: host %8.1f ms from submit to completion, GPU %8.3f ms (start %.6f end %.6f)\n",
+                    ok ? "trace:" : "error:", origin, (long long) seq, idx,
+                    (ggml_time_us() - t_sub)/1000.0,
+                    (gpu_end - gpu_start)*1000.0, gpu_start, gpu_end);
+        }
+    }];
+
+    return seq;
+}
+
+// [TAG_QUEUE_DRAIN] see ggml-metal-device.h for why this exists
+void ggml_metal_device_queue_drain(ggml_metal_device_t dev) {
+    if (dev == NULL || dev->mtl_queue == nil) {
+        return;
+    }
+
+    @autoreleasepool {
+        // retained references: the barrier itself must not depend on anything
+        // staying alive, and it encodes no commands anyway
+        id<MTLCommandBuffer> cmd_buf = [dev->mtl_queue commandBuffer];
+        if (cmd_buf == nil) {
+            return;
+        }
+
+        // an empty barrier can only fail by inheriting a queue that is already
+        // poisoned, which locates the fault before this point in time
+        ggml_metal_cmd_buf_watch("queue-drain", 0, cmd_buf);
+
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+    }
 }
 
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev) {
@@ -2433,12 +2837,60 @@ static void ggml_metal_sparse_submit(
     id<MTLHeap> heap = (id<MTLHeap>) buf->sparse_heap;
     id<MTLBuffer> metal = buf->buffers[0].metal;
 
+    // [TAG_SPARSE_WATCHDOG]
+    // Wait for the legacy queue to be idle before committing the bridge.
+    //
+    // The bridge below is a three-hop round trip: `before` signals the shared
+    // event on the legacy queue, the MTL4 queue waits for it, remaps tiles and
+    // signals back, and `after` waits for that second signal before running its
+    // zero-fill/COW blits. Every hop is a GPU-side wait, so the two legacy
+    // command buffers are alive from the moment they are committed until the
+    // whole round trip finishes.
+    //
+    // The host does not run in lockstep with the GPU: llama_decode() updates
+    // the KV memory - which is what calls this function - for chunk N+1 while
+    // chunk N's graph is still executing. A 2048-token DeepSeek V4 Flash
+    // prefill ubatch is *one* command buffer holding 5.5-6.2 s of GPU work
+    // (measured; that is simply what ~350 t/s prefill means at ub 2048), and
+    // this queue is serial. The bridge therefore could not start for ~6 s,
+    // which is past Metal's GPU watchdog: the driver killed it with
+    // kIOGPUCommandBufferCallbackErrorTimeout at exactly 5002.9 ms, and every
+    // later submission on the queue then reported
+    // kIOGPUCommandBufferCallbackErrorSubmissionsIgnored - the "command buffer
+    // failed with status 5" fault that killed target-only long prefills at a
+    // fixed 6144 tokens and the 2048-chunk-with-live-generators shape.
+    //
+    // Draining first costs the host the overlap between mapping/encoding chunk
+    // N+1 and executing chunk N (tens of ms against seconds of GPU work), and
+    // in exchange the bridge is always committed to an empty queue and runs in
+    // microseconds. It is a no-op during decode, where the caller has already
+    // synchronized to sample. Note that the bridge already forces this
+    // serialization on the GPU - the mapping must follow all earlier graph work
+    // - so nothing that used to overlap still does; the wait only moves to the
+    // host, where the watchdog does not apply.
+    // GGML_METAL_SPARSE_BRIDGE_DRAIN_DISABLE=1 restores the pre-fix behaviour.
+    // It exists to re-demonstrate the fault (and as a rollback lever), not as a
+    // supported configuration: without the drain, long prefills fault the GPU.
+    static int drain_disabled = -1;
+    if (drain_disabled < 0) {
+        const char * v = getenv("GGML_METAL_SPARSE_BRIDGE_DRAIN_DISABLE");
+        drain_disabled = (v != NULL && atoi(v) != 0) ? 1 : 0;
+        if (drain_disabled) {
+            GGML_LOG_WARN("%s: GGML_METAL_SPARSE_BRIDGE_DRAIN_DISABLE=1: the sparse mapping bridge will be committed behind in-flight graph work; long prefills are expected to fault the GPU watchdog\n", __func__);
+        }
+    }
+
+    if (!drain_disabled) {
+        ggml_metal_device_queue_drain(buf->dev);
+    }
+
     // Mapping changes must follow all earlier graph work and precede all later
     // graph work on the backend's legacy queue. Shared events bridge that queue
     // with the MTL4 queue that owns placement-sparse mapping operations.
     const uint64_t before_value = ++buf->sparse_event_value;
     id<MTLCommandBuffer> before = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
     [before encodeSignalEvent:event value:before_value];
+    ggml_metal_cmd_buf_watch("sparse-before", 0, before); // [TAG_CB_ERROR_SCAN]
     [before commit];
 
     [sparse_queue waitForEvent:event value:before_value];
@@ -2481,6 +2933,8 @@ static void ggml_metal_sparse_submit(
 
         [blit endEncoding];
     }
+
+    ggml_metal_cmd_buf_watch("sparse-after", (int) n_writes, after); // [TAG_CB_ERROR_SCAN]
 
     [after commit];
 }
@@ -3896,6 +4350,28 @@ bool ggml_metal_buffer_sparse_unmap(
 }
 
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
+    // [TAG_QUEUE_DRAIN]
+    // Everything below destroys GPU-visible state: it releases the MTLBuffers,
+    // ends residency for their allocations, hands the placement-sparse heap
+    // back, and - for shared buffers, which is what every compute buffer on
+    // this box is - vm_deallocate()s the host pages the GPU reads directly.
+    // Graph command buffers are created with
+    // commandBufferWithUnretainedReferences, so none of that is refcounted by
+    // the driver: doing it while any command buffer that touches this buffer is
+    // still in flight is a hard GPU fault (status 5, with every later buffer on
+    // the queue reported as kIOGPUCommandBufferCallbackErrorSubmissionsIgnored).
+    //
+    // Callers cannot be relied on to have drained the GPU. The one that started
+    // this investigation is ggml_backend_sched_alloc_splits()'s runtime graph
+    // reallocation (ggml-backend.cpp): it calls ggml_backend_synchronize() on
+    // every backend before ggml_gallocr_reserve_n() frees the old compute
+    // buffers, but ggml_backend_synchronize() maps to the *context*-level
+    // ggml_metal_synchronize(), which cannot see work submitted straight to the
+    // shared device queue. Drain the queue here instead - this is the last
+    // point at which the buffer still exists, so it is the one place where the
+    // guarantee can be made unconditionally.
+    ggml_metal_device_queue_drain(buf->dev);
+
     ggml_metal_device_rsets_rm(buf->dev, buf->rset);
 
     ggml_metal_buffer_rset_free(buf);
@@ -3965,6 +4441,8 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
             [encoder endEncoding];
         }
 
+        ggml_metal_cmd_buf_watch("buffer-memset", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
+
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
     }
@@ -4013,8 +4491,9 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
             [encoder endEncoding];
         }
 
+        ggml_metal_cmd_buf_watch("buffer-set", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
+
         [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-                             // TODO: can check for errors here
             GGML_UNUSED(cb);
 
             dispatch_semaphore_signal(completion_semaphore);
@@ -4089,6 +4568,8 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
             [encoder endEncoding];
         }
 
+        ggml_metal_cmd_buf_watch("buffer-get", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
+
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
 
@@ -4135,6 +4616,8 @@ bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml
             [encoder endEncoding];
         }
 
+        ggml_metal_cmd_buf_watch("buffer-cpy", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
+
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
     }
@@ -4167,6 +4650,8 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
 
             [encoder endEncoding];
         }
+
+        ggml_metal_cmd_buf_watch("buffer-clear", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
