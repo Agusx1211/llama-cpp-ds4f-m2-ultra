@@ -1733,8 +1733,136 @@ static void common_dsv4_zero_row_scan(const struct ggml_tensor * k, const char *
 static int  common_dsv4_zero_scan_budget = 0;
 static long common_dsv4_zero_scan_seen   = 0;
 
+// ---------------------------------------------------------------------------
+// LLAMA_DSV4_COMP_WRITE_AUDIT=<n>: audit the compressed-KV write itself.
+//
+// csa_k_write-<il> / lid_k_write-<il> are the GGML_OP_SET_ROWS nodes that store
+// the compressor output into the compressed K cache (llama_kv_cache::cpy_k via
+// llama_kv_cache_dsv4_comp_context::cpy_k). Observing the node AFTER it has run
+// answers three separate questions in one place, per prefill ubatch:
+//
+//   src_zero  how many of the rows being written are identically zero, i.e.
+//             whether the compressor produced anything at all for this ubatch
+//   dst_zero  how many of the destination rows are identically zero right after
+//             the store, i.e. whether the store landed
+//   head_zero how many of the first `head` rows of the whole cache plane are
+//             identically zero right after the store, i.e. whether rows written
+//             by an EARLIER ubatch are still there
+//
+// The defect under investigation is that compressed rows [0, n_ubatch/ratio)
+// read back as zero at decode. head_zero across consecutive prefill ubatches
+// localises that to "never written" vs "written and later lost".
+//
+// Diagnostic only: forces a scheduler split and several host readbacks per
+// audited node.
+// ---------------------------------------------------------------------------
+
+static int  common_dsv4_write_audit_budget = 0;
+static long common_dsv4_write_audit_seen   = 0;
+static int  common_dsv4_write_audit_layer  = 2;   // first CSA layer of DSV4 Flash
+
+static bool common_dsv4_write_audit_name(const char * name) {
+    char want[64];
+    snprintf(want, sizeof(want), "csa_k_write-%d", common_dsv4_write_audit_layer);
+    if (strcmp(name, want) == 0) {
+        return true;
+    }
+    snprintf(want, sizeof(want), "lid_k_write-%d", common_dsv4_write_audit_layer);
+    return strcmp(name, want) == 0;
+}
+
+static int64_t common_dsv4_count_zero_rows(
+        const struct ggml_tensor * t, int64_t n_rows, int64_t row_stride_nb, int64_t n_elem,
+        const std::vector<int64_t> * idxs, int64_t * first_nonzero) {
+    std::vector<ggml_fp16_t> row((size_t) n_elem);
+    int64_t n_zero = 0;
+    if (first_nonzero) {
+        *first_nonzero = -1;
+    }
+    for (int64_t i = 0; i < n_rows; ++i) {
+        const int64_t r = idxs ? (*idxs)[(size_t) i] : i;
+        if (r < 0) {
+            continue;
+        }
+        ggml_backend_tensor_get(t, row.data(), (size_t) r*row_stride_nb, row.size()*sizeof(ggml_fp16_t));
+        bool z = true;
+        for (int64_t j = 0; j < n_elem; ++j) {
+            if (ggml_fp16_to_fp32(row[(size_t) j]) != 0.0f) { z = false; break; }
+        }
+        if (z) {
+            ++n_zero;
+        } else if (first_nonzero && *first_nonzero < 0) {
+            *first_nonzero = i;
+        }
+    }
+    return n_zero;
+}
+
+static void common_dsv4_comp_write_audit(struct ggml_tensor * t) {
+    const struct ggml_tensor * dst  = t->src[0];
+    const struct ggml_tensor * src  = t->src[1];
+    const struct ggml_tensor * idxt = t->src[2];
+
+    if (dst == nullptr || src == nullptr || idxt == nullptr ||
+            dst->type != GGML_TYPE_F16 || src->type != GGML_TYPE_F16 ||
+            idxt->type != GGML_TYPE_I64) {
+        return;
+    }
+
+    const int64_t n_write = idxt->ne[0];
+    const int64_t n_elem  = src->ne[0];
+    if (n_write <= 0 || n_elem <= 0 || n_elem != dst->ne[0]) {
+        return;
+    }
+
+    std::vector<int64_t> idxs((size_t) n_write);
+    ggml_backend_tensor_get(idxt, idxs.data(), 0, idxs.size()*sizeof(int64_t));
+
+    int64_t idx_min = idxs[0], idx_max = idxs[0];
+    for (int64_t i = 1; i < n_write; ++i) {
+        idx_min = std::min(idx_min, idxs[(size_t) i]);
+        idx_max = std::max(idx_max, idxs[(size_t) i]);
+    }
+
+    int64_t src_first_nz = -1;
+    const int64_t src_zero = common_dsv4_count_zero_rows(
+            src, n_write, (int64_t) src->nb[1], n_elem, nullptr, &src_first_nz);
+
+    int64_t dst_first_nz = -1;
+    const int64_t dst_zero = common_dsv4_count_zero_rows(
+            dst, n_write, (int64_t) dst->nb[1], n_elem, &idxs, &dst_first_nz);
+
+    // leading rows of the whole plane, capped so the readback stays bounded
+    const int64_t head = std::min<int64_t>(dst->ne[1], 4096);
+    int64_t head_first_nz = -1;
+    const int64_t head_zero = common_dsv4_count_zero_rows(
+            dst, head, (int64_t) dst->nb[1], n_elem, nullptr, &head_first_nz);
+
+    fprintf(stderr, "COMPWRITE name=%s n_write=%lld n_elem=%lld idx=[%lld,%lld] "
+            "src_zero=%lld src_first_nz=%lld dst_zero=%lld dst_first_nz=%lld "
+            "head=%lld head_zero=%lld head_first_nz=%lld plane_rows=%lld\n",
+            t->name, (long long) n_write, (long long) n_elem,
+            (long long) idx_min, (long long) idx_max,
+            (long long) src_zero, (long long) src_first_nz,
+            (long long) dst_zero, (long long) dst_first_nz,
+            (long long) head, (long long) head_zero, (long long) head_first_nz,
+            (long long) dst->ne[1]);
+}
+
 static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     GGML_UNUSED(user_data);
+
+    const bool want_write_audit =
+        common_dsv4_write_audit_seen < common_dsv4_write_audit_budget &&
+        t->op == GGML_OP_SET_ROWS && common_dsv4_write_audit_name(t->name);
+    if (want_write_audit) {
+        if (ask) {
+            return true;
+        }
+        common_dsv4_comp_write_audit(t);
+        ++common_dsv4_write_audit_seen;
+        return true;
+    }
 
     // LLAMA_DSV4_ZERO_ROW_SCAN=<n>: scan the compressed CSA K plane directly.
     // csa_comp_k-<il> is named by llama_model_deepseek4::graph and is the same
@@ -2002,10 +2130,19 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     if (cparams.cb_eval == nullptr) {
         const char * census = std::getenv("LLAMA_DSV4_TOPK_CENSUS");
         const char * zscan  = std::getenv("LLAMA_DSV4_ZERO_ROW_SCAN");
+        const char * waudit = std::getenv("LLAMA_DSV4_COMP_WRITE_AUDIT");
         if (zscan != nullptr && std::atoi(zscan) > 0) {
             common_dsv4_zero_scan_budget = std::atoi(zscan);
         }
-        if ((census != nullptr && std::atoi(census) > 0) || common_dsv4_zero_scan_budget > 0) {
+        if (waudit != nullptr && std::atoi(waudit) > 0) {
+            common_dsv4_write_audit_budget = std::atoi(waudit);
+            const char * wlayer = std::getenv("LLAMA_DSV4_COMP_WRITE_AUDIT_LAYER");
+            if (wlayer != nullptr) {
+                common_dsv4_write_audit_layer = std::atoi(wlayer);
+            }
+        }
+        if ((census != nullptr && std::atoi(census) > 0) || common_dsv4_zero_scan_budget > 0 ||
+                common_dsv4_write_audit_budget > 0) {
             common_dsv4_topk_census_budget = census != nullptr ? std::atoi(census) : 0;
             cparams.cb_eval               = common_dsv4_topk_census_cb;
             cparams.cb_eval_user_data     = nullptr;

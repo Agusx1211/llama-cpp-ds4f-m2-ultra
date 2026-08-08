@@ -1372,8 +1372,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
             cb(kv_comp_csa_state, "csa_state_compress_rot", il);
         }
 
-        ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(ctx0,
-                    kv_comp_csa_state, inp_dsv4->get_csa().state_write_idxs, il));
+        ggml_tensor * csa_k_write = inp_dsv4->mctx->get_csa()->cpy_k(ctx0,
+                    kv_comp_csa_state, inp_dsv4->get_csa().state_write_idxs, il);
+        cb(csa_k_write, "csa_k_write", il);
+        ggml_build_forward_expand(gf, csa_k_write);
 
         ggml_tensor * csa_snapshot_source_kv = ggml_concat(ctx0,
                 csa_restored.kv, csa_state_kv, 1);
@@ -1441,8 +1443,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
             cb(kv_comp_lid_state, "lid_state_compress_rot", il);
         }
 
-        ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(ctx0,
-                    kv_comp_lid_state, inp_dsv4->get_lid().state_write_idxs, il));
+        ggml_tensor * lid_k_write = inp_dsv4->mctx->get_lid()->cpy_k(ctx0,
+                    kv_comp_lid_state, inp_dsv4->get_lid().state_write_idxs, il);
+        cb(lid_k_write, "lid_k_write", il);
+        ggml_build_forward_expand(gf, lid_k_write);
 
         ggml_tensor * lid_snapshot_source_kv = ggml_concat(ctx0,
                 lid_restored.kv, lid_state_kv, 1);
