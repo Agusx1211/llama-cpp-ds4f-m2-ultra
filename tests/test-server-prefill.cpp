@@ -22,6 +22,10 @@ void require(bool condition, const char * message) {
     }
 }
 
+// Ownership/fairness mechanics are policy-independent. They are exercised
+// against the legacy (pre-priority) chunk budgets so that the small-chunk
+// interleaving path stays covered; the prefill-priority policy has its own
+// dedicated tests below.
 coordinator_config small_config(uint32_t max_lease_chunks = 4) {
     coordinator_config config;
     config.alignment_tokens           = 4;
@@ -29,6 +33,7 @@ coordinator_config small_config(uint32_t max_lease_chunks = 4) {
     config.active_decode_chunk_tokens = 6;
     config.active_fast_chunk_tokens   = 4;
     config.max_lease_chunks           = max_lease_chunks;
+    config.prefill_priority           = false;
     return config;
 }
 
@@ -67,6 +72,7 @@ void test_token_budgets_are_independent_and_aligned() {
     config.idle_chunk_tokens          = 16;
     config.active_decode_chunk_tokens = 8;
     config.active_fast_chunk_tokens   = 4;
+    config.prefill_priority           = false;
     coordinator owner(config);
 
     require(static_cast<bool>(owner.select_owner({ request(1, server_scheduler::lane::low, 1) })),
@@ -851,6 +857,92 @@ void test_late_fast_arrival_has_finite_committed_token_bound() {
             "active fast decode bounds each later mixed prefill chunk");
 }
 
+// [TAG_PREFILL_PRIORITY]
+void test_prefill_priority_keeps_full_chunks_under_active_decode() {
+    coordinator_config config;
+    config.alignment_tokens           = 4;
+    config.idle_chunk_tokens          = 16;
+    config.active_decode_chunk_tokens = 8;
+    config.active_fast_chunk_tokens   = 4;
+    require(config.prefill_priority, "prefill priority is the shipped default");
+    require(config.priority_chunk_tokens == 0, "the shipped default caps the priority chunk only at the idle budget");
+    require(config.priority_yields_to_fast, "the shipped default keeps yielding to a fast-lane generator");
+
+    coordinator owner(config);
+    require(static_cast<bool>(owner.select_owner({ request(1, server_scheduler::lane::low, 1) })),
+            "select priority owner");
+
+    require(owner.limit_chunk(1, 0, 32, 32, {}).end_token == 16, "an idle chunk is unchanged by prefill priority");
+    require(owner.limit_chunk(1, 0, 32, 32, { true, server_scheduler::lane::low }).end_token == 16,
+            "a low-lane generator no longer shrinks the prefill chunk");
+    require(owner.limit_chunk(1, 0, 32, 32, { true, server_scheduler::lane::normal }).end_token == 16,
+            "a normal-lane generator no longer shrinks the prefill chunk");
+    require(owner.limit_chunk(1, 0, 32, 32, { true, server_scheduler::lane::fast }).end_token == 4,
+            "prefill still yields to a fast-lane generator by default");
+
+    // The batch-space clamp and anchor alignment are unaffected by the policy.
+    require(owner.limit_chunk(1, 0, 32, 10, { true, server_scheduler::lane::normal }).end_token == 8,
+            "a priority chunk is still clamped to the available batch space and aligned down");
+    require(owner.limit_chunk(1, 0, 32, 3, { true, server_scheduler::lane::normal }).end_token == 3,
+            "a batch too small for the next anchor still makes progress");
+}
+
+void test_prefill_priority_knobs_select_the_three_policies() {
+    coordinator_config base;
+    base.alignment_tokens           = 4;
+    base.idle_chunk_tokens          = 16;
+    base.active_decode_chunk_tokens = 8;
+    base.active_fast_chunk_tokens   = 4;
+
+    const decode_activity normal_decode = { true, server_scheduler::lane::normal };
+    const decode_activity fast_decode   = { true, server_scheduler::lane::fast };
+
+    // Rollback lever: identical to the pre-priority behavior.
+    {
+        coordinator_config config = base;
+        config.prefill_priority   = false;
+        coordinator owner(config);
+        require(static_cast<bool>(owner.select_owner({ request(1, server_scheduler::lane::low, 1) })), "select owner");
+        require(owner.limit_chunk(1, 0, 32, 32, normal_decode).end_token == 8, "rollback restores the 8-token cap");
+        require(owner.limit_chunk(1, 0, 32, 32, fast_decode).end_token == 4, "rollback restores the fast cap");
+        require(owner.limit_chunk(1, 0, 32, 32, {}).end_token == 16, "rollback leaves the idle budget alone");
+    }
+
+    // Sweep lever: an explicit cap on the priority chunk.
+    {
+        coordinator_config config    = base;
+        config.priority_chunk_tokens = 12;
+        coordinator owner(config);
+        require(static_cast<bool>(owner.select_owner({ request(1, server_scheduler::lane::low, 1) })), "select owner");
+        require(owner.limit_chunk(1, 0, 32, 32, normal_decode).end_token == 12, "the priority chunk cap is honored");
+        require(owner.limit_chunk(1, 0, 32, 32, {}).end_token == 16, "the priority cap does not touch idle chunks");
+    }
+
+    // Fast-lane opt-in: priority applies to every lane.
+    {
+        coordinator_config config      = base;
+        config.priority_yields_to_fast = false;
+        coordinator owner(config);
+        require(static_cast<bool>(owner.select_owner({ request(1, server_scheduler::lane::low, 1) })), "select owner");
+        require(owner.limit_chunk(1, 0, 32, 32, fast_decode).end_token == 16,
+                "opting in stops prefill from yielding to a fast-lane generator");
+    }
+
+    // A priority chunk larger than the idle budget is a configuration error
+    // rather than a silent promotion of the idle cap.
+    {
+        coordinator_config config    = base;
+        config.priority_chunk_tokens = base.idle_chunk_tokens + 1;
+        bool rejected                = false;
+        try {
+            coordinator owner(config);
+        } catch (const std::invalid_argument &) {
+            rejected = true;
+        }
+        require(rejected, "a priority chunk above the idle budget is rejected");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -870,6 +962,8 @@ int main() {
         { "three cohort round robin",             test_three_cohort_round_robin_survives_arrival_and_removal      },
         { "weighted cross lane service",          test_weighted_cross_lane_service_is_bounded_and_work_conserving },
         { "late fast committed-token bound",      test_late_fast_arrival_has_finite_committed_token_bound         },
+        { "prefill priority full chunks",         test_prefill_priority_keeps_full_chunks_under_active_decode     },
+        { "prefill priority policy knobs",        test_prefill_priority_knobs_select_the_three_policies           },
     };
 
     try {
