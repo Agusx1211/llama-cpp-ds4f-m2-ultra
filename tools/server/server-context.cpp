@@ -2274,22 +2274,42 @@ private:
             const size_t n_prompt_res = slot.prompt.tokens.size();
             const size_t n_lcp = n_prompt_res > 0 ? slot.prompt.tokens.get_common_prefix(task.tokens) : 0;
 
-            bool reuse_resident =
-                    family_slots.size() == 1 &&
-                    n_lcp > 0 &&
-                    n_lcp <= n_prompt_res &&
-                    n_lcp < (size_t) task.n_tokens() &&
-                    !slot.prompt.tokens.has_mtmd &&
-                    task.params.n_cache_reuse == 0 &&
-                    task.params.cache_prompt;
+            // Mirror the prefill landing exactly, including the full-match
+            // case [TAG_PROMPT_LOGITS]: a task fully covered by the resident
+            // prefix (n_lcp == task.n_tokens()) re-decodes its last token, so
+            // it lands one position earlier and the checkpoint threshold gets
+            // the same extra -1 the prefill applies. This shape is the
+            // production agent fanout: a second conversation forked from a
+            // still-generating donor's context IS exactly the shared prefix,
+            // and excluding it silently re-prefilled the whole context.
+            const bool full_match = n_lcp > 0 && n_lcp == (size_t) task.n_tokens();
+            const size_t n_landing = full_match ? n_lcp - 1 : n_lcp;
 
-            if (reuse_resident) {
+            // reasons are logged on the clear path below - the silent
+            // full-clear of live residue is what hid the fanout regression
+            const char * no_reuse_reason = nullptr;
+            bool reuse_resident = false;
+            llama_pos pos_min = -1;
+            llama_pos pos_min_thold = -1;
+            if (family_slots.size() != 1) {
+                no_reuse_reason = "family admission keeps the full-clear geometry";
+            } else if (n_prompt_res == 0) {
+                no_reuse_reason = "no resident tokens";
+            } else if (n_landing == 0) {
+                no_reuse_reason = "no usable common prefix";
+            } else if (slot.prompt.tokens.has_mtmd) {
+                no_reuse_reason = "resident tokens include mtmd chunks";
+            } else if (task.params.n_cache_reuse != 0) {
+                no_reuse_reason = "n_cache_reuse requested";
+            } else if (!task.params.cache_prompt) {
+                no_reuse_reason = "cache_prompt disabled";
+            } else {
                 const llama_pos pos_next = slot.prompt.tokens.pos_next(n_lcp);
-                const llama_pos pos_min_thold = std::max(0, pos_next - n_swa);
-                const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                pos_min_thold = std::max(0, pos_next - n_swa - (full_match ? 1 : 0));
+                pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
 
                 if (pos_min < 0) {
-                    reuse_resident = false;
+                    no_reuse_reason = "resident sequence has no cells";
                 } else if (pos_min >= pos_min_thold) {
                     // the prefill checkpoint block will run: it restores the
                     // newest covering checkpoint or resets to zero. Reuse only
@@ -2301,11 +2321,17 @@ private:
                             [&](const common_prompt_checkpoint & cur) {
                                 return cur.pos_max <= pos_next && (cur.pos_min < pos_min_thold || cur.pos_min == 0);
                             });
+                    if (!reuse_resident) {
+                        no_reuse_reason = "no checkpoint covers the landing";
+                    }
                 } else {
                     // no checkpoint pass: the tail trim at the prefill must
                     // fit the bounded rs rollback window (DSV4 has no general
                     // partial seq_rm)
-                    reuse_resident = (int64_t) (n_prompt_res - n_lcp) <= (int64_t) llama_n_rs_seq(ctx_tgt);
+                    reuse_resident = (int64_t) (n_prompt_res - n_landing) <= (int64_t) llama_n_rs_seq(ctx_tgt);
+                    if (!reuse_resident) {
+                        no_reuse_reason = "resident tail exceeds the rs rollback window";
+                    }
                 }
             }
 
@@ -2365,6 +2391,16 @@ private:
                 // cache pass runs only after launch, when this clear has
                 // already destroyed the state) so a later continuation
                 // restores from the cache instead of re-prefilling.
+                if (n_prompt_res > 0) {
+                    // never discard live residue silently - this branch hid
+                    // the agent-fanout full-re-prefill regression
+                    SLT_INF(slot, "elastic admission clears resident KV: %s "
+                            "(lcp=%zu landing=%zu resident=%zu task=%d pos_min=%d thold=%d ckpts=%zu n_rs=%d)\n",
+                            no_reuse_reason != nullptr ? no_reuse_reason : "unknown",
+                            n_lcp, n_landing, n_prompt_res, (int) task.n_tokens(),
+                            (int) pos_min, (int) pos_min_thold,
+                            slot.prompt.checkpoints.size(), (int) llama_n_rs_seq(ctx_tgt));
+                }
                 if (prompt_cache && slot.prompt.n_tokens() > 0 &&
                         task.type == SERVER_TASK_TYPE_COMPLETION) {
                     if (slot.prompt_save(*prompt_cache)) {
