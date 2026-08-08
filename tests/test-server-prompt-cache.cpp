@@ -80,18 +80,6 @@ void write_file(const std::string & path, const std::vector<uint8_t> & data) {
     require(bool(out), "write_file: write failed for " + path);
 }
 
-std::string only_lcpc_file(const std::string & dir) {
-    std::string res;
-    for (const auto & entry : std::filesystem::directory_iterator(dir)) {
-        if (entry.path().extension() == ".lcpc") {
-            require(res.empty(), "more than one .lcpc file in " + dir);
-            res = entry.path().string();
-        }
-    }
-    require(!res.empty(), "no .lcpc file in " + dir);
-    return res;
-}
-
 size_t count_files(const std::string & dir) {
     size_t n = 0;
     for (const auto & entry : std::filesystem::directory_iterator(dir)) {
