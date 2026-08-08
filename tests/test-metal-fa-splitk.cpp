@@ -353,13 +353,13 @@ struct arm {
 };
 
 static const arm g_arms[] = {
-    { "base(nwg=32,interleaved)", { "GGML_FA_NWG_FIT_DISABLE=1", "GGML_FA_TMP_INTERLEAVED=1", nullptr, nullptr }, true  },
-    { "fit(interleaved)",         { "GGML_FA_TMP_INTERLEAVED=1", nullptr, nullptr, nullptr },                     true  },
-    { "blocked(no fit)",          { "GGML_FA_NWG_FIT_DISABLE=1", nullptr, nullptr, nullptr },                     true  },
-    { "default(fit+blk/down)",    { nullptr, nullptr, nullptr, nullptr },                                         true  },
-    { "blocked/assoc=xor",        { "GGML_FA_RED_ASSOC=xor", nullptr, nullptr, nullptr },                          false },
-    { "split-nsg=2",              { "GGML_FA_SPLIT_NSG=2", nullptr, nullptr, nullptr },                           false },
-    { "split-nsg=4",              { "GGML_FA_SPLIT_NSG=4", nullptr, nullptr, nullptr },                           false },
+    { "base(nwg=32)",       { "GGML_FA_NWG_FIT_DISABLE=1", nullptr, nullptr, nullptr },                    true  },
+    { "default(fit)",       { nullptr, nullptr, nullptr, nullptr },                                        true  },
+    { "blocked",            { "GGML_FA_TMP_BLOCKED=1", "GGML_FA_NWG_FIT_DISABLE=1", nullptr, nullptr },    false },
+    { "blocked+fit",        { "GGML_FA_TMP_BLOCKED=1", nullptr, nullptr, nullptr },                        false },
+    { "blocked/assoc=xor",  { "GGML_FA_TMP_BLOCKED=1", "GGML_FA_RED_ASSOC=xor", nullptr, nullptr },        false },
+    { "split-nsg=2",        { "GGML_FA_SPLIT_NSG=2", nullptr, nullptr, nullptr },                          false },
+    { "split-nsg=4",        { "GGML_FA_SPLIT_NSG=4", nullptr, nullptr, nullptr },                          false },
 };
 
 static const int g_n_arms = (int) (sizeof(g_arms)/sizeof(g_arms[0]));

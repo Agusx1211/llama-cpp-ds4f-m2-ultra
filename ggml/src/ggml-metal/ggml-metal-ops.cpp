@@ -4369,8 +4369,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             }
         }
 
-        // [NWG][DV4] partial layout (coalesced stores + coalesced reducer loads)
-        static const bool fa_blocked = std::getenv("GGML_FA_TMP_INTERLEAVED") == nullptr;
+        // [NWG][DV4] partial layout: coalesced stores, at the price of a
+        // reducer that needs threadgroup memory and three extra barriers.
+        // Measured slower or neutral at every geometry the DSV4 decode graph
+        // uses and not bit-identical, so it is opt-in - see the lane note.
+        static const bool fa_blocked = std::getenv("GGML_FA_TMP_BLOCKED") != nullptr;
 
         const bool blocked = fa_blocked && nwg > 1;
 
@@ -4384,7 +4387,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                                  ((uint64_t) nsg << 8)   | ((uint64_t) dsv4_sparse_mask << 1) | (uint64_t) blocked;
             if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
                 seen.push_back(key);
-                GGML_LOG_INFO("FAGEOM ne11=%d ne01=%d ne02=%d dk=%d dv=%d nchunks=%d nwg=%d nsg=%d mskip=%d blk=%d tmp_bytes=%d\n",
+                // stderr rather than GGML_LOG_INFO: llama-server installs its
+                // own ggml log callback and ggml's INFO level does not reach
+                // the server log
+                fprintf(stderr, "FAGEOM ne11=%d ne01=%d ne02=%d dk=%d dv=%d nchunks=%d nwg=%d nsg=%d mskip=%d blk=%d tmp_bytes=%d\n",
                         (int) ne11, (int) ne01, (int) ne02, (int) ne00, (int) ne20,
                         (int) ((ne11 + ncpsg - 1)/ncpsg), (int) nwg, (int) nsg,
                         (int) dsv4_sparse_mask, (int) blocked,
