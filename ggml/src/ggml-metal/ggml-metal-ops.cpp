@@ -68,7 +68,11 @@ struct ggml_metal_op {
         this->idx_end         = idx_end;
         this->use_fusion      = use_fusion;
         this->use_concurrency = use_concurrency;
-        this->use_capture     = use_capture;
+        // [TAG_CB_ERROR_SCAN] use_capture only gates the per-node debug groups
+        // in ggml_metal_op_encode(); GGML_METAL_CB_ERROR_INFO=1 wants them too,
+        // because they become the debug signposts attached to a failed command
+        // buffer's per-encoder error info and are what names the faulting op.
+        this->use_capture     = use_capture || ggml_metal_cb_error_info_enabled();
         this->debug_graph     = debug_graph;
         this->debug_fusion    = debug_fusion;
         this->gf              = gf;

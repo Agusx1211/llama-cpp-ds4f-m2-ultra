@@ -1287,6 +1287,16 @@ void * ggml_metal_device_get_queue(ggml_metal_device_t dev) {
     return dev->mtl_queue;
 }
 
+// [TAG_CB_ERROR_SCAN] see ggml-metal-device.h
+bool ggml_metal_cb_error_info_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * v = getenv("GGML_METAL_CB_ERROR_INFO");
+        enabled = (v != NULL && atoi(v) != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev) {
     return dev->library;
 }

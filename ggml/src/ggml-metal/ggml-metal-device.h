@@ -292,6 +292,15 @@ ggml_metal_device_t ggml_metal_device_get(int device);
 void * ggml_metal_device_get_obj  (ggml_metal_device_t dev); // id<MTLDevice>
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQueue>
 
+// [TAG_CB_ERROR_SCAN]
+// GGML_METAL_CB_ERROR_INFO=1: create graph command buffers with
+// MTLCommandBufferErrorOptionEncoderExecutionStatus and push a debug group per
+// encoded node, so that a failed command buffer's NSError carries per-encoder
+// execution state and signposts naming the op that faulted. Opt-in: it adds
+// driver bookkeeping to every command buffer and a debug-group push/pop per
+// node.
+bool ggml_metal_cb_error_info_enabled(void);
+
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev);
 
 void ggml_metal_device_rsets_add(ggml_metal_device_t dev, ggml_metal_rset_t rset);
