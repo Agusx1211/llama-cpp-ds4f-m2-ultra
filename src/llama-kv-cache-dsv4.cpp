@@ -3392,7 +3392,7 @@ llama_kv_cache_dsv4::admission_consume_status llama_kv_cache_dsv4::consume_admis
 
         if (resident != 1 && !remap_enabled) {
             if (dsv4_admission_debug()) {
-                LLAMA_LOG_INFO("%s: DSV4 admission mapping was dropped after arm (resident=%d ranges=%zu);"
+                LLAMA_LOG_WARN("%s: DSV4 admission mapping was dropped after arm (resident=%d ranges=%zu);"
                         " re-map disabled, this batch's compressed KV will be lost\n",
                         __func__, resident, ranges.size());
             }
@@ -3403,7 +3403,7 @@ llama_kv_cache_dsv4::admission_consume_status llama_kv_cache_dsv4::consume_admis
             const bool remapped = reserve_status == dsv4_sparse_transaction::SUCCESS &&
                     remap.commit_ranges() == GGML_METAL_SPARSE_RESERVATION_OK;
             if (dsv4_admission_debug()) {
-                LLAMA_LOG_INFO("%s: DSV4 admission mapping was dropped after arm; re-map %s"
+                LLAMA_LOG_WARN("%s: DSV4 admission mapping was dropped after arm; re-map %s"
                         " (ranges=%zu sparse_ranges=%zu)\n",
                         __func__, remapped ? "ok" : "FAILED",
                         ranges.size(), remap.sparse_range_count());
@@ -3416,7 +3416,7 @@ llama_kv_cache_dsv4::admission_consume_status llama_kv_cache_dsv4::consume_admis
                 return ADMISSION_NO_MATCH;
             }
         } else if (dsv4_admission_debug()) {
-            LLAMA_LOG_INFO("%s: DSV4 admission mapping intact (resident=%d ranges=%zu)\n",
+            LLAMA_LOG_WARN("%s: DSV4 admission mapping intact (resident=%d ranges=%zu)\n",
                     __func__, resident, ranges.size());
         }
 

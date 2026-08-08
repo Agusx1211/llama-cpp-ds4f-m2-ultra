@@ -1673,6 +1673,12 @@ static long common_dsv4_topk_census_seen   = 0;
 // compressed KV itself: the LID and CSA planes are written by the same plan
 // (plans_csa / plans_lid in llama-kv-cache-dsv4.cpp share state_write_idxs), so
 // they must either both carry the rows or both miss them.
+// LLAMA_DSV4_ZERO_ROW_SCAN_MIN_ROWS: raise the >=1024-row gate below. At deep
+// context most prefill ubatches already expose a >=1024-row plane, so the scan
+// budget is consumed long before decode; setting this to roughly the prompt's
+// compressed-row count keeps the budget for the planes that answer the question.
+static int64_t common_dsv4_zero_scan_min_rows = 1024;
+
 static void common_dsv4_zero_row_scan(const struct ggml_tensor * k, const char * tag,
         int64_t n_rows, int64_t row_stride_nb, int64_t n_elem) {
     if (k == nullptr || k->type != GGML_TYPE_F16 || n_rows <= 0 || n_elem <= 0) {
@@ -1685,7 +1691,7 @@ static void common_dsv4_zero_row_scan(const struct ggml_tensor * k, const char *
     // they are ever written. Only a plane wide enough to be the accumulated
     // cache (>= 1024 rows, i.e. past the top-k radix routing threshold too) can
     // answer that, because by then the first ubatch is long committed.
-    if (n_rows < 1024) {
+    if (n_rows < common_dsv4_zero_scan_min_rows) {
         return;
     }
     // hard cap the readback: this is a diagnostic, not a hot path
@@ -1774,7 +1780,11 @@ static bool common_dsv4_write_audit_name(const char * name) {
 static int64_t common_dsv4_count_zero_rows(
         const struct ggml_tensor * t, int64_t n_rows, int64_t row_stride_nb, int64_t n_elem,
         const std::vector<int64_t> * idxs, int64_t * first_nonzero) {
-    std::vector<ggml_fp16_t> row((size_t) n_elem);
+    // byte-wise test so the same helper serves the F32 compressor output and
+    // the F16 cache plane; a row of -0.0 counts as written, which is what the
+    // question ("did the store land") actually asks
+    const size_t row_bytes = (size_t) n_elem*ggml_type_size(t->type);
+    std::vector<uint8_t> row(row_bytes);
     int64_t n_zero = 0;
     if (first_nonzero) {
         *first_nonzero = -1;
@@ -1784,10 +1794,10 @@ static int64_t common_dsv4_count_zero_rows(
         if (r < 0) {
             continue;
         }
-        ggml_backend_tensor_get(t, row.data(), (size_t) r*row_stride_nb, row.size()*sizeof(ggml_fp16_t));
+        ggml_backend_tensor_get(t, row.data(), (size_t) r*row_stride_nb, row_bytes);
         bool z = true;
-        for (int64_t j = 0; j < n_elem; ++j) {
-            if (ggml_fp16_to_fp32(row[(size_t) j]) != 0.0f) { z = false; break; }
+        for (size_t j = 0; j < row_bytes; ++j) {
+            if (row[j] != 0) { z = false; break; }
         }
         if (z) {
             ++n_zero;
@@ -1803,9 +1813,11 @@ static void common_dsv4_comp_write_audit(struct ggml_tensor * t) {
     const struct ggml_tensor * src  = t->src[1];
     const struct ggml_tensor * idxt = t->src[2];
 
+    // The compressor output is F32 in the compute graph and the compressed K
+    // cache is F16, so the two sides of the store have different types.
     if (dst == nullptr || src == nullptr || idxt == nullptr ||
-            dst->type != GGML_TYPE_F16 || src->type != GGML_TYPE_F16 ||
-            idxt->type != GGML_TYPE_I64) {
+            dst->type != GGML_TYPE_F16 || idxt->type != GGML_TYPE_I64 ||
+            (src->type != GGML_TYPE_F16 && src->type != GGML_TYPE_F32)) {
         return;
     }
 
@@ -1878,7 +1890,7 @@ static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * 
             return true;
         }
         const bool csa_pooled = t->ne[1] > 1;
-        if ((csa_pooled ? t->ne[1] : t->ne[2]) < 1024) {
+        if ((csa_pooled ? t->ne[1] : t->ne[2]) < common_dsv4_zero_scan_min_rows) {
             return true;   // too narrow to be informative; do not spend budget
         }
         // csa_comp_k is [n_embd, 1, n_csa, n_stream] (non-indexed) or
@@ -1932,7 +1944,7 @@ static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * 
     if (k_pool != nullptr && common_dsv4_zero_scan_seen < common_dsv4_zero_scan_budget) {
         const bool pooled = seg != nullptr;
         const int64_t k_rows = pooled ? k_pool->ne[1] : k_pool->ne[2];
-        if (k_rows >= 1024) {
+        if (k_rows >= common_dsv4_zero_scan_min_rows) {
             common_dsv4_zero_row_scan(k_pool, "lid", k_rows,
                     (int64_t) (pooled ? k_pool->nb[1] : k_pool->nb[2]),
                     k_pool->ne[0]);
@@ -2133,6 +2145,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         const char * waudit = std::getenv("LLAMA_DSV4_COMP_WRITE_AUDIT");
         if (zscan != nullptr && std::atoi(zscan) > 0) {
             common_dsv4_zero_scan_budget = std::atoi(zscan);
+            const char * zmin = std::getenv("LLAMA_DSV4_ZERO_ROW_SCAN_MIN_ROWS");
+            if (zmin != nullptr && std::atoll(zmin) > 0) {
+                common_dsv4_zero_scan_min_rows = std::atoll(zmin);
+            }
         }
         if (waudit != nullptr && std::atoi(waudit) > 0) {
             common_dsv4_write_audit_budget = std::atoi(waudit);
