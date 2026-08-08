@@ -1264,6 +1264,89 @@ static bool test_dsv4_admission_lifecycle(size_t seed, ggml_backend_dev_t dev) {
     return true;
 }
 
+// Number of compressed K rows in [0, n_rows) of `cache` that carry any non-zero
+// byte, on the cache's first layer. Used to assert that a batch's compressed KV
+// actually reached the cache rather than being written into unmapped sparse
+// pages, where Metal discards the store and the read returns zero.
+static int64_t dsv4_count_written_comp_rows(llama_kv_cache * cache, int64_t n_rows) {
+    const auto layers = cache->get_layer_ids();
+    if (layers.empty() || n_rows <= 0) {
+        return -1;
+    }
+
+    ggml_tensor * k = cache->get_k_storage(layers.front());
+    if (k == nullptr || n_rows > k->ne[1]) {
+        return -1;
+    }
+
+    std::vector<uint8_t> row((size_t) k->nb[1]);
+    int64_t written = 0;
+    for (int64_t r = 0; r < n_rows; ++r) {
+        ggml_backend_tensor_get(k, row.data(), (size_t) r*k->nb[1], row.size());
+        if (std::any_of(row.begin(), row.end(), [](uint8_t b) { return b != 0; })) {
+            ++written;
+        }
+    }
+    return written;
+}
+
+// [TAG_DSV4_ADMISSION_REMAP] regression.
+//
+// llama-server arms the admission ticket at task launch, and arm_admission()
+// commits (maps) the reservation immediately. The slot then starts its prompt
+// and issues seq_rm(seq, pos_next, -1) with pos_next == 0, which takes the
+// full-clear path and unmaps the whole per-stream range of the compressed
+// caches - destroying the mapping the admission just made. Before the fix,
+// consume_admission() still reported ADMISSION_COMMITTED (its ticket had
+// already been freed, so its second commit was a no-op), the per-batch
+// reservation was skipped, and the batch's compressed K rows were written into
+// unmapped pages and read back as zero.
+//
+// Reproduce that exact order and require the rows to be present.
+static bool test_dsv4_admission_clear_before_first_batch(size_t seed, ggml_backend_dev_t dev) {
+    if (!dsv4_test_has_elastic_pages(dev, 2)) {
+        return true;
+    }
+
+    scoped_env_override disable_aggregate("LLAMA_DSV4_AGGREGATE_POOL_DISABLE", "1");
+    scoped_env_override clear_force_aggregate("LLAMA_DSV4_AGGREGATE_POOL_FORCE", nullptr);
+    dsv4_test_context test(seed, dev, 2, true, 16, 1, 512, 16);
+    auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(test.lctx.get()));
+    GGML_ASSERT(memory != nullptr && !memory->is_aggregate_compressed());
+
+    const uint32_t n_prompt = 16;   // 4 CSA/LID rows at the 4:1 compress ratio
+    const int64_t  n_rows   = n_prompt/4;   // DSV4_CSA_RATIO
+
+    const llama_kv_admission_span span = { 0, 0, (llama_pos) n_prompt };
+    llama_kv_admission_quote quote = {};
+    llama_kv_admission_ticket * ticket = nullptr;
+    GGML_ASSERT(llama_kv_admission_reserve_ranges(test.lctx.get(), &span, 1, &quote, &ticket) ==
+            LLAMA_KV_ADMISSION_FEASIBLE);
+    GGML_ASSERT(ticket != nullptr && llama_kv_admission_arm(ticket));
+
+    // exactly what llama-server does at prompt start (server-context.cpp:
+    // `slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1)`)
+    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(test.lctx.get()), 0, 0, -1));
+
+    const auto tokens = get_tokens(n_prompt, 128, seed + 91);
+    test.clear_batch();
+    for (uint32_t pos = 0; pos < n_prompt; ++pos) {
+        test.add(tokens[pos], pos, { 0 });
+    }
+    test.decode("admission consumed after prompt-start clear");
+    llama_kv_admission_free(ticket);
+
+    const int64_t csa_written = dsv4_count_written_comp_rows(memory->get_csa(), n_rows);
+    const int64_t lid_written = dsv4_count_written_comp_rows(memory->get_lid(), n_rows);
+    GGML_ASSERT(csa_written == n_rows &&
+            "compressed CSA rows of the first admitted batch were not written");
+    GGML_ASSERT(lid_written == n_rows &&
+            "compressed LID rows of the first admitted batch were not written");
+
+    llama_memory_clear(llama_get_memory(test.lctx.get()), true);
+    return true;
+}
+
 static bool test_dsv4_admission_api_contract(size_t seed, ggml_backend_dev_t dev) {
     if (dsv4_test_has_elastic_pages(dev, 2)) {
         return true;
@@ -2369,6 +2452,7 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     all_ok = test_dsv4_elastic_borrow(seed, dev) && all_ok;
     all_ok = test_dsv4_physical_pressure(seed, dev) && all_ok;
     all_ok = test_dsv4_admission_lifecycle(seed, dev) && all_ok;
+    all_ok = test_dsv4_admission_clear_before_first_batch(seed, dev) && all_ok;
     all_ok = test_dsv4_admission_api_contract(seed, dev) && all_ok;
     for (const parallel_case & test_case : cases) {
         const dsv4_parallel_result parallel = run_dsv4_parallel(
