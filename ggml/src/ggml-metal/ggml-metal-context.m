@@ -751,6 +751,10 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
         }
     }
 
+    // GGML_METAL_KPROF: every command buffer of the graph has completed, so the
+    // counter sample buffers recorded during encoding can now be resolved
+    ggml_metal_kprof_flush();
+
     // release any completed extra command buffers
     if (ctx->cmd_bufs_ext.count > 0) {
         for (size_t i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
@@ -957,6 +961,64 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     ggml_metal_device_rsets_keep_alive(ctx->dev);
 
     GGML_METAL_HP_MARK(hp_keepalive);
+
+    // GGML_METAL_KPROF: dump the static shape of every graph the profiler sees
+    // once (keyed by graph uid). The KPROF timing records only carry raw node
+    // indices; this is what turns them into a per-kernel attribution.
+    if (ggml_metal_kprof_stride() > 0) {
+        static uint64_t kprof_dumped_uids[64] = { 0 };
+        static int      kprof_n_dumped = 0;
+
+        // marker so each KPROF flush in the log can be attributed to the graph
+        // that produced it (stderr writes from graph_compute and from
+        // synchronize are both on the calling thread, so log order is exact)
+        fprintf(stderr, "KPROFS {\"uid\":%llu,\"n_nodes\":%d,\"n_cb\":%d}\n",
+                (unsigned long long) gf->uid, gf->n_nodes, ctx->n_cb);
+
+        bool dumped = false;
+        for (int i = 0; i < kprof_n_dumped; ++i) {
+            if (kprof_dumped_uids[i] == gf->uid) {
+                dumped = true;
+                break;
+            }
+        }
+
+        if (!dumped && kprof_n_dumped < 64) {
+            kprof_dumped_uids[kprof_n_dumped++] = gf->uid;
+
+            for (int i = 0; i < gf->n_nodes; ++i) {
+                const struct ggml_tensor * n = gf->nodes[i];
+
+                fprintf(stderr, "KPROFG {\"uid\":%llu,\"i\":%d,\"op\":\"%s\",\"name\":\"%s\",\"t\":\"%s\""
+                        ",\"ne\":[%lld,%lld,%lld,%lld],\"b\":%llu,\"src\":[",
+                        (unsigned long long) gf->uid, i, ggml_op_name(n->op), n->name,
+                        ggml_type_name(n->type),
+                        (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3],
+                        (unsigned long long) ggml_nbytes(n));
+
+                bool first = true;
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    const struct ggml_tensor * src = n->src[s];
+                    if (!src) {
+                        continue;
+                    }
+
+                    fprintf(stderr, "%s{\"name\":\"%s\",\"t\":\"%s\",\"ne\":[%lld,%lld,%lld,%lld],\"b\":%llu}",
+                            first ? "" : ",", src->name, ggml_type_name(src->type),
+                            (long long) src->ne[0], (long long) src->ne[1],
+                            (long long) src->ne[2], (long long) src->ne[3],
+                            (unsigned long long) ggml_nbytes(src));
+                    first = false;
+                }
+
+                fprintf(stderr, "],\"op_params\":[%d,%d,%d,%d]}\n",
+                        (int) n->op_params[0], (int) n->op_params[1],
+                        (int) n->op_params[2], (int) n->op_params[3]);
+            }
+
+            fflush(stderr);
+        }
+    }
 
     // submit the ggml compute graph to the GPU by creating command buffers and encoding the ops in them
     // the first n_nodes_0 are encoded and submitted for processing directly by the calling thread

@@ -674,33 +674,277 @@ struct ggml_metal_encoder_profile_barrier_command {
     uint8_t opcode;
 };
 
+//
+// GGML_METAL_KPROF - per-segment GPU timestamps via stage-boundary counter sampling
+//
+
+// the device caps one counter sample buffer at 32768 B = 4096 timestamps = 2048
+// segments (measured: newCounterSampleBufferWithDescriptor rejects anything
+// larger with "Expected range: 8 -> 32768"), so a batch chains several of them
+#define GGML_METAL_KPROF_SEG_PER_SB 2048
+#define GGML_METAL_KPROF_MAX_SB     32
+#define GGML_METAL_KPROF_MAX_SEGMENTS (GGML_METAL_KPROF_SEG_PER_SB*GGML_METAL_KPROF_MAX_SB)
+
+struct ggml_metal_kprof_batch {
+    id<MTLCounterSampleBuffer> sb[GGML_METAL_KPROF_MAX_SB];
+    int    n_sb;
+    int  * nodes;   // raw graph node index that starts each segment
+    int    n_seg;
+    int    cap;
+    struct ggml_metal_kprof_batch * next;
+};
+
+static id<MTLCounterSampleBuffer> ggml_metal_kprof_new_sb(id<MTLDevice> dev) {
+    id<MTLCounterSampleBuffer> sb = nil;
+
+    @autoreleasepool {
+        MTLCounterSampleBufferDescriptor * d = [[MTLCounterSampleBufferDescriptor alloc] init];
+
+        for (id<MTLCounterSet> cs in [dev counterSets]) {
+            if ([[cs name] isEqualToString:MTLCommonCounterSetTimestamp]) {
+                d.counterSet = cs;
+                break;
+            }
+        }
+
+        d.sampleCount = 2*GGML_METAL_KPROF_SEG_PER_SB;
+        d.storageMode = MTLStorageModeShared;
+        d.label       = @"ggml-kprof";
+
+        NSError * err = nil;
+        sb = d.counterSet ? [dev newCounterSampleBufferWithDescriptor:d error:&err] : nil;
+
+        if (!sb) {
+            fprintf(stderr, "%s: kprof: newCounterSampleBuffer failed (%s)\n", __func__,
+                    err ? [[err localizedDescription] UTF8String] : "no timestamp counter set");
+        }
+
+        [d release];
+    }
+
+    return sb;
+}
+
+static struct {
+    int    stride;          // 0 = disabled
+    bool   initialized;
+    _Atomic int seq;        // monotonically increasing flush sequence
+    struct ggml_metal_kprof_batch * pending;
+    pthread_mutex_t mtx;
+} g_kprof = {
+    /*.stride      =*/ 0,
+    /*.initialized =*/ false,
+    /*.seq         =*/ 0,
+    /*.pending     =*/ NULL,
+    /*.mtx         =*/ PTHREAD_MUTEX_INITIALIZER,
+};
+
+int ggml_metal_kprof_stride(void) {
+    if (!g_kprof.initialized) {
+        // benign race: every writer computes the same value
+        const char * v = getenv("GGML_METAL_KPROF");
+        g_kprof.stride      = v ? atoi(v) : 0;
+        if (g_kprof.stride < 0) {
+            g_kprof.stride = 0;
+        }
+        g_kprof.initialized = true;
+    }
+
+    return g_kprof.stride;
+}
+
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
 
     // Points to thread-local profiling state only while an opt-in recording
     // scope is active. It does not retain any Metal object.
     struct ggml_metal_encoder_profile_tls * profile;
+
+    // kprof state (NULL/nil unless GGML_METAL_KPROF is active)
+    id<MTLCommandBuffer> cmd_buf;
+    bool concurrent;
+    struct ggml_metal_kprof_batch * kprof;
 };
+
+static void ggml_metal_encoder_kprof_begin(ggml_metal_encoder_t encoder, int raw_node_idx) {
+    struct ggml_metal_kprof_batch * b = encoder->kprof;
+
+    const int isb = b->n_seg / GGML_METAL_KPROF_SEG_PER_SB;
+    const int islot = b->n_seg % GGML_METAL_KPROF_SEG_PER_SB;
+
+    if (b->n_seg < b->cap && islot == 0 && isb == b->n_sb) {
+        id<MTLCounterSampleBuffer> sb = ggml_metal_kprof_new_sb([encoder->cmd_buf device]);
+        if (sb) {
+            b->sb[b->n_sb++] = sb;
+        }
+    }
+
+    @autoreleasepool {
+        if (b->n_seg >= b->cap || isb >= b->n_sb) {
+            // out of slots: fall back to a plain pass so encoding still completes
+            if (encoder->concurrent) {
+                encoder->obj = [encoder->cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
+            } else {
+                encoder->obj = [encoder->cmd_buf computeCommandEncoder];
+            }
+            [encoder->obj retain];
+            return;
+        }
+
+        MTLComputePassDescriptor * desc = [MTLComputePassDescriptor computePassDescriptor];
+
+        desc.dispatchType = encoder->concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+
+        desc.sampleBufferAttachments[0].sampleBuffer               = b->sb[isb];
+        desc.sampleBufferAttachments[0].startOfEncoderSampleIndex  = 2*islot + 0;
+        desc.sampleBufferAttachments[0].endOfEncoderSampleIndex    = 2*islot + 1;
+
+        b->nodes[b->n_seg] = raw_node_idx;
+        b->n_seg++;
+
+        encoder->obj = [encoder->cmd_buf computeCommandEncoderWithDescriptor:desc];
+        [encoder->obj retain];
+    }
+}
+
+int ggml_metal_encoder_kprof_split(ggml_metal_encoder_t encoder, int raw_node_idx) {
+    if (encoder->kprof == NULL) {
+        return -1;
+    }
+
+    [encoder->obj endEncoding];
+    [encoder->obj release];
+
+    const int seg = encoder->kprof->n_seg;
+
+    ggml_metal_encoder_kprof_begin(encoder, raw_node_idx);
+
+    return seg;
+}
+
+void ggml_metal_kprof_flush(void) {
+    if (ggml_metal_kprof_stride() == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_kprof.mtx);
+    struct ggml_metal_kprof_batch * head = g_kprof.pending;
+    g_kprof.pending = NULL;
+    pthread_mutex_unlock(&g_kprof.mtx);
+
+    if (head == NULL) {
+        return;
+    }
+
+    const int seq = g_kprof.seq++;
+
+    int ibatch = 0;
+
+    while (head) {
+        struct ggml_metal_kprof_batch * b = head;
+        head = b->next;
+        const int batch = ibatch++;
+
+        for (int isb = 0; isb < b->n_sb; ++isb) {
+            const int seg0 = isb*GGML_METAL_KPROF_SEG_PER_SB;
+            const int nseg = MIN(b->n_seg - seg0, GGML_METAL_KPROF_SEG_PER_SB);
+
+            if (nseg <= 0) {
+                break;
+            }
+
+            NSData * data = [b->sb[isb] resolveCounterRange:NSMakeRange(0, 2*nseg)];
+
+            if (data && [data length] >= 2*(NSUInteger)nseg*sizeof(MTLCounterResultTimestamp)) {
+                const MTLCounterResultTimestamp * ts = (const MTLCounterResultTimestamp *) [data bytes];
+
+                for (int i = 0; i < nseg; ++i) {
+                    const uint64_t t0 = ts[2*i + 0].timestamp;
+                    const uint64_t t1 = ts[2*i + 1].timestamp;
+
+                    if (t0 == MTLCounterErrorValue || t1 == MTLCounterErrorValue || t1 < t0) {
+                        continue;
+                    }
+
+                    fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"seg\":%d,\"node\":%d,\"t0\":%llu,\"ns\":%llu}\n",
+                            seq, batch, seg0 + i, b->nodes[seg0 + i],
+                            (unsigned long long) t0, (unsigned long long) (t1 - t0));
+                }
+            } else {
+                fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"error\":\"resolve failed\",\"sb\":%d,\"n_seg\":%d}\n",
+                        seq, batch, isb, nseg);
+            }
+
+            [b->sb[isb] release];
+        }
+
+        free(b->nodes);
+        free(b);
+    }
+
+    fflush(stderr);
+}
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
 
-    if (concurrent) {
-        res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
-    } else {
-        res->obj = [cmd_buf computeCommandEncoder];
+    res->cmd_buf    = cmd_buf;
+    res->concurrent = concurrent;
+
+    if (ggml_metal_kprof_stride() > 0) {
+        struct ggml_metal_kprof_batch * b = calloc(1, sizeof(struct ggml_metal_kprof_batch));
+
+        b->cap   = GGML_METAL_KPROF_MAX_SEGMENTS;
+        b->nodes = calloc(b->cap, sizeof(int));
+        b->n_seg = 0;
+        b->n_sb  = 0;
+
+        res->kprof = b;
+
+        ggml_metal_encoder_kprof_begin(res, -1);
+
+        if (b->n_sb == 0) {
+            // counter sample buffers unavailable: kprof_begin already opened a
+            // plain compute pass, so only the bookkeeping has to be undone
+            free(b->nodes);
+            free(b);
+            res->kprof = NULL;
+        }
+
+        res->profile = ggml_metal_encoder_profile.enabled ? &ggml_metal_encoder_profile : NULL;
+
+        return res;
+    }
+
+    {
+        if (concurrent) {
+            res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
+        } else {
+            res->obj = [cmd_buf computeCommandEncoder];
+        }
+
+        [res->obj retain];
     }
 
     res->profile = ggml_metal_encoder_profile.enabled ? &ggml_metal_encoder_profile : NULL;
-
-    [res->obj retain];
 
     return res;
 }
 
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
+    if (encoder->kprof) {
+        struct ggml_metal_kprof_batch * b = encoder->kprof;
+
+        pthread_mutex_lock(&g_kprof.mtx);
+        b->next = g_kprof.pending;
+        g_kprof.pending = b;
+        pthread_mutex_unlock(&g_kprof.mtx);
+
+        encoder->kprof = NULL;
+    }
+
     [encoder->obj release];
     free(encoder);
 }
