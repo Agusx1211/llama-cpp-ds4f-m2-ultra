@@ -3838,6 +3838,55 @@ private:
     };
 #endif
 
+    // Progress heartbeat for stall-based run expiry. A successfully decoded
+    // batch view is proof of forward progress for every request with tokens
+    // in it: prefill ubatches, sampled generation tokens, and spec-decode
+    // verify batches (draft + sampled tokens) all pass through the same
+    // decode() call, so one hook covers every advancement kind, including
+    // draft acceptance (the verify batch precedes acceptance in
+    // post_decode()). Bound requests parked in prompt-phase waiting states
+    // are also touched: prefill COMPUTE is serialized behind the prefill
+    // owner, so a slot in STARTED / WAIT_OTHER / PROCESSING_PROMPT can
+    // legitimately sit without batch tokens for a whole 280K-token owner
+    // prefill (throttled to ~215 t/s by the prefill-TBT budget -> tens of
+    // minutes); while the engine demonstrably advances, those requests are
+    // waiting their turn, not hung. GENERATING slots must earn their
+    // heartbeat with real decoded tokens.
+    void notify_decode_progress(int32_t off, int32_t n_tokens) {
+        std::vector<int> id_tasks;
+        id_tasks.reserve(slots.size());
+        const auto add_task = [&id_tasks](int id_task) {
+            if (id_task >= 0 && std::find(id_tasks.begin(), id_tasks.end(), id_task) == id_tasks.end()) {
+                id_tasks.push_back(id_task);
+            }
+        };
+
+        int32_t prev_id_slot = -1;
+        for (int32_t i = off; i < off + n_tokens; ++i) {
+            const int32_t id_slot = batch.tokens[i].id_slot;
+            if (id_slot == prev_id_slot) {
+                continue; // slot spans are contiguous; skip duplicate lookups
+            }
+            prev_id_slot = id_slot;
+            server_slot * slot = get_slot_by_id(id_slot);
+            if (slot != nullptr && slot->is_processing() && slot->task) {
+                add_task(slot->task->id);
+            }
+        }
+
+        for (const auto & slot : slots) {
+            if (!slot.is_processing() || !slot.task) {
+                continue;
+            }
+            if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_WAIT_OTHER ||
+                slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                add_task(slot.task->id);
+            }
+        }
+
+        queue_tasks.notify_progress(id_tasks);
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -3957,6 +4006,11 @@ private:
                     if (prefill_batch) {
                         GGML_ASSERT(prefill_batch.record_decoded_view(off, n_tokens));
                     }
+
+                    // stall-based run expiry: record forward progress for the
+                    // requests this view advanced (and for bound requests
+                    // waiting behind the serialized prefill owner)
+                    notify_decode_progress(off, n_tokens);
 
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;

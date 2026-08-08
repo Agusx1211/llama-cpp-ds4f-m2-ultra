@@ -157,7 +157,12 @@ struct server_task {
         // Zero selects the durable runtime's bounded server default. These are
         // trusted server-side durations and are never read from client JSON.
         uint64_t queue_timeout_us = 0;
+        // Absolute run backstop for a bound request (total runtime cap).
         uint64_t run_timeout_us   = 0;
+        // Stall threshold for progress-based run expiry: a bound request is
+        // expired when its slot records no forward progress (decoded token,
+        // accepted draft tokens, prefill ubatch) for this long.
+        uint64_t run_stall_timeout_us = 0;
     } scheduling;
 
     int id = -1; // to be filled by server_queue

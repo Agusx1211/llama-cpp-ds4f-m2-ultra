@@ -96,6 +96,9 @@ request_runtime::request_runtime(runtime_config config) :
                                                                     config.default_queue_timeout_us),
     default_run_timeout_us(config.default_run_timeout_us == 0 ? runtime_config::run_timeout_default_us :
                                                                 config.default_run_timeout_us),
+    default_run_stall_timeout_us(config.default_run_stall_timeout_us == 0 ?
+                                         runtime_config::run_stall_timeout_default_us :
+                                         config.default_run_stall_timeout_us),
     overload_retry_after_seconds(bounded_retry_after(config.overload_retry_after_seconds)) {
     const bool valid_fast_refill =
         config.fast_refill_max_members_per_epoch >= runtime_config::fast_refill_min_members &&
@@ -175,6 +178,8 @@ admission_result request_runtime::admit(const request_metadata & request, bool s
     next.queue_deadline_us = deadline_from(
         request.arrival_us, request.queue_timeout_us == 0 ? default_queue_timeout_us : request.queue_timeout_us);
     next.run_timeout_us = request.run_timeout_us == 0 ? default_run_timeout_us : request.run_timeout_us;
+    next.run_stall_timeout_us =
+        request.run_stall_timeout_us == 0 ? default_run_stall_timeout_us : request.run_stall_timeout_us;
 
     request_registration registration;
     registration.id                 = request.id;
@@ -491,11 +496,16 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
 expiration request_runtime::expire(std::map<uint64_t, record>::iterator it, deadline_kind kind, uint64_t at_us) {
     record &   request = it->second;
     expiration result  = { request.metadata.id, kind, !request.bindings.empty() };
-    const auto reason  = kind == deadline_kind::queue ? server_request_registry::reason_code::queue_timeout :
-                                                        server_request_registry::reason_code::run_timeout;
+    if (kind == deadline_kind::run_stall && at_us > request.last_progress_us) {
+        result.stalled_for_us = at_us - request.last_progress_us;
+    }
+    const auto reason = kind == deadline_kind::queue     ? server_request_registry::reason_code::queue_timeout :
+                        kind == deadline_kind::run_stall ? server_request_registry::reason_code::run_stall :
+                                                           server_request_registry::reason_code::run_timeout;
     if (!registry.mark_timeout_expired(request.handle, reason, at_us)) {
         return {};
     }
+    request.timeout_reason = reason;
     request.terminal = lifecycle::timed_out;
     if (request.scheduler_queued) {
         if (!scheduler.cancel(request.metadata.id).completed) {
@@ -513,20 +523,37 @@ expiration request_runtime::expire(std::map<uint64_t, record>::iterator it, dead
     return result;
 }
 
+// Single source of truth for which deadline governs a live request. Queued
+// work keeps the arrival-anchored queue deadline. Running work (run phase
+// started at first bind) expires on STALL - the gap since the slot last
+// advanced - with the absolute run cap as the outer backstop. When both run
+// bounds are due at once the cap wins: it is the harder guarantee and its
+// message names the policy that ultimately bounded the request.
+expiration request_runtime::planned_expiration_of(const record & request, uint64_t at_us) const {
+    const bool run_started = request.run_deadline_us != 0;
+    if (!run_started) {
+        if (at_us < request.queue_deadline_us) {
+            return {};
+        }
+        return { request.metadata.id, deadline_kind::queue, !request.bindings.empty() };
+    }
+    if (at_us >= request.run_deadline_us) {
+        return { request.metadata.id, deadline_kind::run, !request.bindings.empty() };
+    }
+    const uint64_t stall_deadline_us = deadline_from(request.last_progress_us, request.run_stall_timeout_us);
+    if (at_us < stall_deadline_us) {
+        return {};
+    }
+    return { request.metadata.id, deadline_kind::run_stall, !request.bindings.empty(),
+             at_us - request.last_progress_us };
+}
+
 expiration request_runtime::expiration_due(uint64_t request_id, uint64_t at_us) const {
     const auto it = records.find(request_id);
     if (it == records.end() || it->second.terminal != lifecycle::completed) {
         return {};
     }
-    const record & request     = it->second;
-    const bool     run_started = request.run_deadline_us != 0;
-    const uint64_t deadline    = run_started ? request.run_deadline_us : request.queue_deadline_us;
-    if (at_us < deadline) {
-        return {};
-    }
-    return { request.metadata.id,
-             run_started ? deadline_kind::run : deadline_kind::queue,
-             !request.bindings.empty() };
+    return planned_expiration_of(it->second, at_us);
 }
 
 std::vector<expiration> request_runtime::expirations_due(uint64_t at_us) const {
@@ -572,12 +599,11 @@ expiration request_runtime::expire_if_due(std::map<uint64_t, record>::iterator i
     if (request.terminal != lifecycle::completed) {
         return {};
     }
-    const bool     run_started = request.run_deadline_us != 0;
-    const uint64_t deadline    = run_started ? request.run_deadline_us : request.queue_deadline_us;
-    if (at_us < deadline) {
+    const expiration planned = planned_expiration_of(request, at_us);
+    if (planned.request_id == 0) {
         return {};
     }
-    return expire(it, run_started ? deadline_kind::run : deadline_kind::queue, at_us);
+    return expire(it, planned.kind, at_us);
 }
 
 bool request_runtime::mark_deferred(
@@ -624,7 +650,20 @@ bool request_runtime::bind_slot(uint64_t request_id, slot_id slot, uint64_t at_u
     it->second.permit = record::permit_state::bound;
     ++permit_counts.bound[lane_index(it->second.metadata.lane)];
     if (it->second.run_deadline_us == 0) {
-        it->second.run_deadline_us = deadline_from(at_us, it->second.run_timeout_us);
+        it->second.run_deadline_us  = deadline_from(at_us, it->second.run_timeout_us);
+        it->second.last_progress_us = at_us;
+    }
+    return true;
+}
+
+bool request_runtime::note_progress(uint64_t request_id, uint64_t at_us) {
+    const auto it = records.find(request_id);
+    if (it == records.end() || it->second.terminal != lifecycle::completed ||
+        it->second.run_deadline_us == 0) {
+        return false;
+    }
+    if (at_us > it->second.last_progress_us) {
+        it->second.last_progress_us = at_us;
     }
     return true;
 }
@@ -667,7 +706,10 @@ bool request_runtime::release_bound_slot(std::map<uint64_t, record>::iterator it
     const auto lease    = std::find_if(bindings.begin(), bindings.end(),
                                        [slot](const binding_lease & value) { return value.slot == slot; });
     const auto unbind_reason =
-        request.terminal == lifecycle::timed_out ? server_request_registry::reason_code::run_timeout :
+        request.terminal == lifecycle::timed_out ?
+                (request.timeout_reason != server_request_registry::reason_code::none ?
+                         request.timeout_reason :
+                         server_request_registry::reason_code::run_timeout) :
         request.terminal == lifecycle::cancelled ? request.cancel_reason :
                                                    server_request_registry::reason_code::yielded;
     if (lease == bindings.end() || !registry.unbind(*lease, unbind_reason, at_us)) {
