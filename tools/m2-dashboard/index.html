@@ -13,6 +13,11 @@
     <span id="model" class="model" title=""></span>
     <span id="build" class="dim"></span>
     <span class="spacer"></span>
+    <nav id="tabs" class="tabs" aria-label="views">
+      <button type="button" data-view="live" class="active">Live</button>
+      <button type="button" data-view="timeline">Timeline</button>
+      <button type="button" data-view="cache">Cache</button>
+    </nav>
     <span id="status" class="status" role="status">connecting</span>
   </header>
 
@@ -24,24 +29,62 @@
   </form>
 
   <main>
-    <section id="tiles" class="tiles" aria-label="throughput and capacity"></section>
+    <div id="view-live" class="view">
+      <section id="tiles" class="tiles" aria-label="throughput and capacity"></section>
 
-    <h2>Slots</h2>
-    <table id="work">
-      <thead>
-        <tr><th>slot</th><th>lane</th><th>request</th><th>phase</th><th class="num">t/s</th><th>progress</th><th class="num">context</th><th class="num">cached</th><th class="num">age</th><th></th></tr>
-      </thead>
-      <tbody id="work-body"></tbody>
-    </table>
-    <p id="lanes" class="lanes"></p>
+      <h2>Slots</h2>
+      <table id="work">
+        <thead>
+          <tr><th>slot</th><th>lane</th><th>request</th><th>phase</th><th class="num">t/s</th><th>progress</th><th class="num">context</th><th class="num">cached</th><th class="num">age</th><th></th></tr>
+        </thead>
+        <tbody id="work-body"></tbody>
+      </table>
+      <p id="lanes" class="lanes"></p>
 
-    <h2>Recent requests <span id="tail-note" class="dim"></span></h2>
-    <table id="tail">
-      <thead>
-        <tr><th>finished</th><th>slot</th><th class="num">prompt</th><th class="num">cached</th><th class="num">generated</th><th class="num">prefill t/s</th><th class="num">gen t/s</th><th class="num">duration</th></tr>
-      </thead>
-      <tbody id="tail-body"></tbody>
-    </table>
+      <h2>Recent requests <span id="tail-note" class="dim"></span></h2>
+      <table id="tail">
+        <thead>
+          <tr><th>finished</th><th>slot</th><th class="num">prompt</th><th class="num">cached</th><th class="num">generated</th><th class="num">prefill t/s</th><th class="num">gen t/s</th><th class="num">duration</th></tr>
+        </thead>
+        <tbody id="tail-body"></tbody>
+      </table>
+    </div>
+
+    <div id="view-timeline" class="view" hidden>
+      <div class="controls">
+        <span class="dim">scale</span>
+        <div id="tl-scales" class="seg-buttons" role="group" aria-label="time scale">
+          <button type="button" data-scale="wall" class="active" title="shared wall-clock axis: shows what ran at the same time">wall clock</button>
+          <button type="button" data-scale="fit" title="each request normalized to its own duration: shows where its time went, equally readable at 2 s and 40 min">per request</button>
+        </div>
+        <span id="tl-window-group" class="controls-group">
+          <span class="dim">window</span>
+          <div id="tl-windows" class="seg-buttons" role="group" aria-label="time window">
+            <button type="button" data-win="auto" class="active">auto</button>
+            <button type="button" data-win="120000">2m</button>
+            <button type="button" data-win="600000">10m</button>
+            <button type="button" data-win="3600000">1h</button>
+            <button type="button" data-win="all">all</button>
+          </div>
+        </span>
+        <span class="spacer"></span>
+        <span id="tl-note" class="dim"></span>
+      </div>
+      <div id="tl-legend" class="legend" aria-hidden="false"></div>
+      <div id="tl-axis" class="tl-axis"></div>
+      <div id="timeline" class="timeline" aria-label="request timelines"></div>
+    </div>
+
+    <div id="view-cache" class="view" hidden>
+      <section id="cache-tiles" class="tiles" aria-label="prompt cache tiers"></section>
+      <h2>Entries <span id="cache-note" class="dim"></span></h2>
+      <table id="cache-table">
+        <thead>
+          <tr><th>id</th><th>tier</th><th class="num">tokens</th><th class="num">size</th><th class="num">age</th><th class="num">last hit</th><th class="num">hits</th><th>file</th></tr>
+        </thead>
+        <tbody id="cache-body"></tbody>
+      </table>
+    </div>
   </main>
 
   <footer id="foot" class="dim"></footer>

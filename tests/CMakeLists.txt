@@ -143,9 +143,17 @@ llama_build_and_test(
     ${PROJECT_SOURCE_DIR}/tools/server/server-request-runtime.cpp
     ${PROJECT_SOURCE_DIR}/tools/server/server-request-registry.cpp
     ${PROJECT_SOURCE_DIR}/tools/server/server-scheduler.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-dashboard-bus.cpp
 )
 target_include_directories(test-server-request-runtime PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_compile_features(test-server-request-runtime PRIVATE cxx_std_17)
+
+llama_build_and_test(
+    test-server-dashboard-bus.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-dashboard-bus.cpp
+)
+target_include_directories(test-server-dashboard-bus PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-dashboard-bus PRIVATE cxx_std_17)
 
 llama_build_and_test(
     test-server-prefill.cpp

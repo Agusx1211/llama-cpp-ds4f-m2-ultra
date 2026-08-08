@@ -19,6 +19,8 @@ add_library(${TARGET} STATIC
     server-admission.h
     server-admin-dashboard.cpp
     server-admin-dashboard.h
+    server-dashboard-bus.cpp
+    server-dashboard-bus.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp

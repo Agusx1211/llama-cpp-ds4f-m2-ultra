@@ -1,5 +1,7 @@
 #include "server-request-runtime.h"
 
+#include "server-dashboard-bus.h"
+
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -870,6 +872,19 @@ bool request_runtime::finish(std::map<uint64_t, record>::iterator it,
     const auto handle = it->second.handle;
     if (!registry.mark_terminal(handle, terminal, reason, at_us) || !registry.remove_terminal(handle, reason, at_us)) {
         return false;
+    }
+    // m2-dashboard: finish() is the single terminal choke point (completion,
+    // cancel, timeout/stall, failure all land here), so one emit covers every
+    // terminal transition with the exact registry reason
+    {
+        server_dashboard::event ev;
+        ev.kind       = server_dashboard::event_kind::terminal;
+        ev.at_us      = at_us;
+        ev.request_id = it->second.metadata.id;
+        ev.lane       = static_cast<uint8_t>(it->second.metadata.lane);
+        ev.code       = static_cast<uint16_t>(reason);
+        ev.a          = static_cast<int64_t>(terminal);
+        server_dashboard::instance().emit(ev);
     }
     release_permit(it->second);
     records.erase(it);
