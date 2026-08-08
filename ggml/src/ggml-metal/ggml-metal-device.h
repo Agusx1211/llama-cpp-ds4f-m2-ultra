@@ -323,6 +323,39 @@ void ggml_metal_device_queue_drain(ggml_metal_device_t dev);
 // node.
 bool ggml_metal_cb_error_info_enabled(void);
 
+// [TAG_CB_ERROR_SCAN]
+// Inspect a command buffer that the GPU has finished with and, if it did not
+// complete, log a detailed report: origin, sequence number, status, NSError
+// domain/code/description, underlying error and (under
+// GGML_METAL_CB_ERROR_INFO=1) per-encoder execution state and signposts.
+// Returns true when the buffer completed successfully.
+//
+// `origin` must outlive the call (use a string literal). `seq` is the sequence
+// number returned by ggml_metal_cmd_buf_watch, or -1 when unknown.
+bool ggml_metal_cmd_buf_check(const char * origin, int idx, int64_t seq, ggml_metal_cmd_buf_t cmd_buf);
+
+// [TAG_CB_ERROR_SCAN]
+// Attach a completion handler that runs ggml_metal_cmd_buf_check as soon as the
+// GPU finishes with this buffer, and return the global submission sequence
+// number assigned to it.
+//
+// This is what makes a fault attributable. A single MTLCommandQueue is shared
+// by every ggml_metal_t on the device *and* by producers that belong to no
+// context at all - the placement-sparse mapping before/after pair, the
+// residency-set dummy work, the queue-drain barrier. Only some of those are
+// ever status-checked, and ggml_metal_graph_compute() replaces the previous
+// graph's command buffers without inspecting them when nothing synchronized in
+// between. When the GPU faults, every command buffer behind the culprit reports
+// kIOGPUCommandBufferCallbackErrorSubmissionsIgnored, so a fault whose culprit
+// is never inspected is indistinguishable from one with no culprit at all - the
+// state two investigations of the target-only prefill fault got stuck in.
+// Checking at completion time makes the first failure in *time* order visible
+// no matter who submitted it or whether anyone waits for it.
+int64_t ggml_metal_cmd_buf_watch(const char * origin, int idx, ggml_metal_cmd_buf_t cmd_buf);
+
+// Number of command buffer failures observed so far by ggml_metal_cmd_buf_check.
+int64_t ggml_metal_cmd_buf_n_failures(void);
+
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev);
 
 void ggml_metal_device_rsets_add(ggml_metal_device_t dev, ggml_metal_rset_t rset);

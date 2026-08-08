@@ -875,6 +875,8 @@ static void ggml_metal_dummy_work(ggml_metal_device_t dev) {
             [encoder endEncoding];
         }
 
+        ggml_metal_cmd_buf_watch("residency-dummy", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
+
         [cmd_buf commit];
         [buf release];
     }
@@ -1297,6 +1299,105 @@ bool ggml_metal_cb_error_info_enabled(void) {
     return enabled != 0;
 }
 
+// [TAG_CB_ERROR_SCAN]
+static const char * ggml_metal_cmd_buf_status_str(MTLCommandBufferStatus status) {
+    switch (status) {
+        case MTLCommandBufferStatusNotEnqueued: return "not-enqueued";
+        case MTLCommandBufferStatusEnqueued:    return "enqueued";
+        case MTLCommandBufferStatusCommitted:   return "committed";
+        case MTLCommandBufferStatusScheduled:   return "scheduled";
+        case MTLCommandBufferStatusCompleted:   return "completed";
+        case MTLCommandBufferStatusError:       return "error";
+    }
+
+    return "unknown";
+}
+
+static atomic_int_least64_t g_cmd_buf_seq         = 0;
+static atomic_int_least64_t g_cmd_buf_n_failures  = 0;
+
+int64_t ggml_metal_cmd_buf_n_failures(void) {
+    return atomic_load_explicit(&g_cmd_buf_n_failures, memory_order_relaxed);
+}
+
+// [TAG_CB_ERROR_SCAN] see ggml-metal-device.h
+bool ggml_metal_cmd_buf_check(const char * origin, int idx, int64_t seq, ggml_metal_cmd_buf_t cmd_buf_raw) {
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+    if (cmd_buf == nil) {
+        return true;
+    }
+
+    const MTLCommandBufferStatus status = [cmd_buf status];
+    if (status == MTLCommandBufferStatusCompleted) {
+        return true;
+    }
+
+    const int64_t n_prev = atomic_fetch_add_explicit(&g_cmd_buf_n_failures, 1, memory_order_relaxed);
+
+    GGML_LOG_ERROR("ggml_metal_cmd_buf: error: %s command buffer %d (submission #%lld) failed with status %d (%s)%s\n",
+            origin, idx, (long long) seq, (int) status, ggml_metal_cmd_buf_status_str(status),
+            n_prev == 0 ? " <- FIRST failure observed on this device" : "");
+
+    NSError * error = [cmd_buf error];
+    if (error == nil) {
+        GGML_LOG_ERROR("ggml_metal_cmd_buf: error:   no NSError attached; if an earlier submission failed, this one is a victim, not the cause\n");
+        return false;
+    }
+
+    GGML_LOG_ERROR("ggml_metal_cmd_buf: error:   %s (domain %s, code %ld)\n",
+            [[error localizedDescription] UTF8String],
+            [[error domain] UTF8String],
+            (long) [error code]);
+
+    NSError * underlying = [error userInfo][NSUnderlyingErrorKey];
+    if (underlying != nil) {
+        GGML_LOG_ERROR("ggml_metal_cmd_buf: error:   underlying: %s (domain %s, code %ld)\n",
+                [[underlying localizedDescription] UTF8String],
+                [[underlying domain] UTF8String],
+                (long) [underlying code]);
+    }
+
+    // Per-encoder execution status; only populated under GGML_METAL_CB_ERROR_INFO=1.
+    if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, visionOS 1.0, *)) {
+        NSArray<id<MTLCommandBufferEncoderInfo>> * infos = [error userInfo][MTLCommandBufferEncoderInfoErrorKey];
+        for (id<MTLCommandBufferEncoderInfo> info in infos) {
+            const char * state = "unknown";
+            switch ([info errorState]) {
+                case MTLCommandEncoderErrorStateUnknown:   state = "unknown";   break;
+                case MTLCommandEncoderErrorStateCompleted: state = "completed"; break;
+                case MTLCommandEncoderErrorStateAffected:  state = "affected";  break;
+                case MTLCommandEncoderErrorStatePending:   state = "pending";   break;
+                case MTLCommandEncoderErrorStateFaulted:   state = "FAULTED";   break;
+            }
+
+            GGML_LOG_ERROR("ggml_metal_cmd_buf: error:   encoder '%s': %s\n",
+                    [info label] ? [[info label] UTF8String] : "(unlabeled)", state);
+
+            for (NSString * signpost in [info debugSignposts]) {
+                GGML_LOG_ERROR("ggml_metal_cmd_buf: error:     signpost: %s\n", [signpost UTF8String]);
+            }
+        }
+    }
+
+    return false;
+}
+
+// [TAG_CB_ERROR_SCAN] see ggml-metal-device.h
+int64_t ggml_metal_cmd_buf_watch(const char * origin, int idx, ggml_metal_cmd_buf_t cmd_buf_raw) {
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+    if (cmd_buf == nil) {
+        return -1;
+    }
+
+    const int64_t seq = atomic_fetch_add_explicit(&g_cmd_buf_seq, 1, memory_order_relaxed);
+
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        ggml_metal_cmd_buf_check(origin, idx, seq, cb);
+    }];
+
+    return seq;
+}
+
 // [TAG_QUEUE_DRAIN] see ggml-metal-device.h for why this exists
 void ggml_metal_device_queue_drain(ggml_metal_device_t dev) {
     if (dev == NULL || dev->mtl_queue == nil) {
@@ -1310,6 +1411,10 @@ void ggml_metal_device_queue_drain(ggml_metal_device_t dev) {
         if (cmd_buf == nil) {
             return;
         }
+
+        // an empty barrier can only fail by inheriting a queue that is already
+        // poisoned, which locates the fault before this point in time
+        ggml_metal_cmd_buf_watch("queue-drain", 0, cmd_buf);
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
@@ -2468,6 +2573,7 @@ static void ggml_metal_sparse_submit(
     const uint64_t before_value = ++buf->sparse_event_value;
     id<MTLCommandBuffer> before = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
     [before encodeSignalEvent:event value:before_value];
+    ggml_metal_cmd_buf_watch("sparse-before", 0, before); // [TAG_CB_ERROR_SCAN]
     [before commit];
 
     [sparse_queue waitForEvent:event value:before_value];
@@ -2510,6 +2616,8 @@ static void ggml_metal_sparse_submit(
 
         [blit endEncoding];
     }
+
+    ggml_metal_cmd_buf_watch("sparse-after", (int) n_writes, after); // [TAG_CB_ERROR_SCAN]
 
     [after commit];
 }
@@ -4016,6 +4124,8 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
             [encoder endEncoding];
         }
 
+        ggml_metal_cmd_buf_watch("buffer-memset", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
+
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
     }
@@ -4064,8 +4174,9 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
             [encoder endEncoding];
         }
 
+        ggml_metal_cmd_buf_watch("buffer-set", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
+
         [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-                             // TODO: can check for errors here
             GGML_UNUSED(cb);
 
             dispatch_semaphore_signal(completion_semaphore);
@@ -4140,6 +4251,8 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
             [encoder endEncoding];
         }
 
+        ggml_metal_cmd_buf_watch("buffer-get", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
+
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
 
@@ -4186,6 +4299,8 @@ bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml
             [encoder endEncoding];
         }
 
+        ggml_metal_cmd_buf_watch("buffer-cpy", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
+
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
     }
@@ -4218,6 +4333,8 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
 
             [encoder endEncoding];
         }
+
+        ggml_metal_cmd_buf_watch("buffer-clear", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
