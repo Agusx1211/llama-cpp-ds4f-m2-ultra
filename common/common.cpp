@@ -1667,8 +1667,89 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 static int  common_dsv4_topk_census_budget = 0;
 static long common_dsv4_topk_census_seen   = 0;
 
+// Scan the leading rows of a compressed K plane and report every maximal run of
+// identically-zero rows. Used to establish whether a zero block seen in the
+// indexer score row is an indexer-only artifact or genuine missing data in the
+// compressed KV itself: the LID and CSA planes are written by the same plan
+// (plans_csa / plans_lid in llama-kv-cache-dsv4.cpp share state_write_idxs), so
+// they must either both carry the rows or both miss them.
+static void common_dsv4_zero_row_scan(const struct ggml_tensor * k, const char * tag,
+        int64_t n_rows, int64_t row_stride_nb, int64_t n_elem) {
+    if (k == nullptr || k->type != GGML_TYPE_F16 || n_rows <= 0 || n_elem <= 0) {
+        return;
+    }
+    // hard cap the readback: this is a diagnostic, not a hot path
+    const int64_t max_bytes = 4*1024*1024;
+    if (n_rows*n_elem*(int64_t) sizeof(ggml_fp16_t) > max_bytes) {
+        n_rows = max_bytes/(n_elem*(int64_t) sizeof(ggml_fp16_t));
+    }
+
+    std::vector<ggml_fp16_t> row((size_t) n_elem);
+    std::string runs;
+    int64_t n_zero = 0, first_nz = -1, run_start = -1, n_runs = 0;
+    char buf[64];
+    for (int64_t i = 0; i < n_rows; ++i) {
+        ggml_backend_tensor_get(k, row.data(), (size_t) i*row_stride_nb, row.size()*sizeof(ggml_fp16_t));
+        bool z = true;
+        for (int64_t j = 0; j < n_elem; ++j) {
+            if (ggml_fp16_to_fp32(row[(size_t) j]) != 0.0f) { z = false; break; }
+        }
+        if (z) {
+            ++n_zero;
+            if (run_start < 0) { run_start = i; ++n_runs; }
+        } else {
+            if (first_nz < 0) first_nz = i;
+            if (run_start >= 0) {
+                if (n_runs <= 8) {
+                    snprintf(buf, sizeof(buf), "%s%lld-%lld", runs.empty() ? "" : ",",
+                            (long long) run_start, (long long) (i - 1));
+                    runs += buf;
+                }
+                run_start = -1;
+            }
+        }
+    }
+    if (run_start >= 0 && n_runs <= 8) {
+        snprintf(buf, sizeof(buf), "%s%lld-%lld", runs.empty() ? "" : ",",
+                (long long) run_start, (long long) (n_rows - 1));
+        runs += buf;
+    }
+    fprintf(stderr, "ZEROROWSCAN tag=%s name=%s scanned=%lld n_elem=%lld n_zero=%lld "
+            "n_runs=%lld first_nonzero=%lld runs=[%s]\n",
+            tag, k->name, (long long) n_rows, (long long) n_elem, (long long) n_zero,
+            (long long) n_runs, (long long) first_nz, runs.c_str());
+}
+
+static int  common_dsv4_zero_scan_budget = 0;
+static long common_dsv4_zero_scan_seen   = 0;
+
 static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     GGML_UNUSED(user_data);
+
+    // LLAMA_DSV4_ZERO_ROW_SCAN=<n>: scan the compressed CSA K plane directly.
+    // csa_comp_k-<il> is named by llama_model_deepseek4::graph and is the same
+    // compressed rows the Lightning Indexer selects over, so a zero block that
+    // appears in BOTH planes is missing compressed KV, while a zero block that
+    // appears only in the indexer plane is an indexer-write defect.
+    const bool want_csa =
+        common_dsv4_zero_scan_seen < common_dsv4_zero_scan_budget &&
+        t->type == GGML_TYPE_F16 && t->ne[0] > 0 &&
+        strncmp(t->name, "csa_comp_k", 10) == 0;
+    if (want_csa) {
+        if (ask) {
+            return true;
+        }
+        // csa_comp_k is [n_embd, 1, n_csa, n_stream] (non-indexed) or
+        // [n_embd, pool_rows] (indexed); rows are nb[2] apart in the former and
+        // nb[1] apart in the latter.
+        const bool pooled = t->ne[1] > 1;
+        common_dsv4_zero_row_scan(t, "csa",
+                pooled ? t->ne[1] : t->ne[2],
+                (int64_t) (pooled ? t->nb[1] : t->nb[2]),
+                t->ne[0]);
+        ++common_dsv4_zero_scan_seen;
+        return true;
+    }
 
     const struct ggml_tensor * s = t->src[0];
 
@@ -1679,7 +1760,8 @@ static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * 
     const bool want =
         t->op == GGML_OP_TOP_K && t->ne[0] == 512 &&
         s != nullptr && s->type == GGML_TYPE_F32 && s->ne[0] > 1024 && s->ne[1] <= 8 &&
-        common_dsv4_topk_census_seen < common_dsv4_topk_census_budget;
+        (common_dsv4_topk_census_seen < common_dsv4_topk_census_budget ||
+         common_dsv4_zero_scan_seen   < common_dsv4_zero_scan_budget);
 
     if (ask) {
         return want;
@@ -1701,6 +1783,18 @@ static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * 
     if (s->op == GGML_OP_LIGHTNING_INDEXER) {
         k_pool = s->src[1];
         seg    = s->src[4];
+    }
+
+    // one direct scan of the indexer K plane per budgeted node, with the right
+    // row stride for whichever layout is live: [n_embd, pool_rows] when indexed,
+    // [n_embd, 1, n_kv, n_stream] otherwise
+    if (k_pool != nullptr && common_dsv4_zero_scan_seen < common_dsv4_zero_scan_budget) {
+        const bool pooled = seg != nullptr;
+        common_dsv4_zero_row_scan(k_pool, "lid",
+                pooled ? k_pool->ne[1] : k_pool->ne[2],
+                (int64_t) (pooled ? k_pool->nb[1] : k_pool->nb[2]),
+                k_pool->ne[0]);
+        ++common_dsv4_zero_scan_seen;
     }
 
     std::vector<int32_t> seg_ids;
@@ -1836,6 +1930,9 @@ static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * 
         // so the layer is recoverable; only the target has a Lightning Indexer
         // (src/models/dflash.cpp, the DSpark drafter, has no top-k at all), so
         // every census line below is the target's.
+        if (common_dsv4_topk_census_seen >= common_dsv4_topk_census_budget) {
+            continue;   // zero-row-scan-only mode
+        }
         fprintf(stderr,
                 "TOPKCENSUS src=%s ne00=%lld ne01=%lld row=%lld pivot=%.9g "
                 "n_gt=%lld n_eq=%lld tie_slots=%lld n_pos=%lld n_neg=%lld n_inf=%lld "
@@ -1889,8 +1986,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // one host readback per indexer selection, so it is very slow.
     if (cparams.cb_eval == nullptr) {
         const char * census = std::getenv("LLAMA_DSV4_TOPK_CENSUS");
-        if (census != nullptr && std::atoi(census) > 0) {
-            common_dsv4_topk_census_budget = std::atoi(census);
+        const char * zscan  = std::getenv("LLAMA_DSV4_ZERO_ROW_SCAN");
+        if (zscan != nullptr && std::atoi(zscan) > 0) {
+            common_dsv4_zero_scan_budget = std::atoi(zscan);
+        }
+        if ((census != nullptr && std::atoi(census) > 0) || common_dsv4_zero_scan_budget > 0) {
+            common_dsv4_topk_census_budget = census != nullptr ? std::atoi(census) : 0;
             cparams.cb_eval               = common_dsv4_topk_census_cb;
             cparams.cb_eval_user_data     = nullptr;
         }
