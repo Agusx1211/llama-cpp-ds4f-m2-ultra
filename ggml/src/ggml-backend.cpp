@@ -1575,6 +1575,18 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
 
+        // A runtime reallocation frees and re-creates every compute buffer that
+        // grew, in the middle of a request. When it happens because the graph
+        // outgrew its reservation (rather than because scheduling moved nodes
+        // between backends) it is silent in release builds, and it used to be
+        // the trigger for a Metal buffer-lifetime fault - see
+        // notes/2026-08-08-metal-realloc-safety.md. Make it visible: it is rare
+        // by construction, and when it is not, the reservation is wrong.
+        if (!backend_ids_changed) {
+            GGML_LOG_WARN("%s: graph outgrew its reservation - reallocating compute buffers at runtime (nodes = %d, leafs = %d)\n",
+                    __func__, sched->graph.n_nodes, sched->graph.n_leafs);
+        }
+
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
         for (int i = 0; i < sched->n_backends; i++) {

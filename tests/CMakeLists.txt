@@ -384,6 +384,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         target_compile_definitions(test-metal-sparse-reservation PRIVATE
             GGML_TEST_METAL_SPARSE_RESERVATION)
     endif()
+    llama_build_and_test(test-metal-top-k-determinism.cpp)
+    llama_build_and_test(test-metal-buffer-lifetime.cpp)
     llama_build_and_test(test-metal-private-readback.cpp)
     if (TARGET ggml-metal AND NOT GGML_BACKEND_DL)
         target_link_libraries(test-metal-private-readback PRIVATE ggml-metal)

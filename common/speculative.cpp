@@ -48,6 +48,22 @@ static bool spec_host_prof_enabled() {
     return en;
 }
 
+// env: LLAMA_SPEC_TRACE=1 - per-drafting-step determinism trace. Emits one
+// `SPECTRACE draft` line per sequence per draft cycle on stderr carrying the
+// drafter's *observable state readout* (the per-position confidences that
+// DSpark's Markov head produces) alongside the sampled draft ids. Two runs of
+// the same request on the same server state must produce byte-identical
+// SPECTRACE streams; the first differing line localizes the leak to the draft
+// context (confidences differ at equal n_past/id_last) or to the target
+// (confidences equal, acceptance differs).
+static bool spec_trace_enabled() {
+    static const bool en = []() {
+        const char * v = std::getenv("LLAMA_SPEC_TRACE");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return en;
+}
+
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
@@ -1276,6 +1292,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     result.push_back(id);
                 }
+            }
+
+            if (spec_trace_enabled()) {
+                const float * conf = llama_get_embeddings_nextn(ctx_dft);
+                std::string line = string_format(
+                        "SPECTRACE draft seq=%d n_past=%d id_last=%d n_blk=%d n=%zu ids=[",
+                        (int) seq_id, (int) dp.n_past, (int) dp.id_last, (int) n_block_tokens, result.size());
+                for (size_t i = 0; i < result.size(); ++i) {
+                    line += string_format(i ? ",%d" : "%d", (int) result[i]);
+                }
+                line += "] conf=[";
+                for (int32_t i = 0; i < n_block_tokens; ++i) {
+                    const float c = conf ? conf[(size_t) (beg + i) * n_embd_dec] : 0.0f;
+                    uint32_t bits = 0;
+                    std::memcpy(&bits, &c, sizeof(bits));
+                    line += string_format(i ? ",%08x" : "%08x", bits);
+                }
+                line += "]";
+                fprintf(stderr, "%s\n", line.c_str());
             }
 
             if (result.size() < (size_t) params.n_min) {

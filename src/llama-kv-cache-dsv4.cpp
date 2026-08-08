@@ -234,13 +234,31 @@ static int dsv4_sparse_unmap_tensor_range(
     return unmap ? unmap(tensor, offset, size) : 0;
 }
 
+// env: LLAMA_DSV4_DEBUG_ZERO_CLEARED_SEQ=1 - diagnostic seam for the
+// deep-context determinism investigation. A cleared DSV4 sequence normally
+// *unmaps* its sparse pages, so the next request that writes those rows is
+// handed recycled physical pages carrying the previous tenant's bytes, while
+// the very first request in a process gets pages the driver zero-fills. Any
+// read of a row that the current request has not written therefore produces
+// different results on a cold and a warm slot. With this knob the clear
+// memsets instead of unmapping and additionally zeroes the raw base/SWA K
+// streams, i.e. a warm slot is made byte-identical to a cold one.
+static bool dsv4_debug_zero_cleared_seq() {
+    static const bool en = []() {
+        const char * v = getenv("LLAMA_DSV4_DEBUG_ZERO_CLEARED_SEQ");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return en;
+}
+
 static void dsv4_clear_tensor_stream(ggml_tensor * tensor, uint32_t stream) {
     GGML_ASSERT(ggml_is_contiguous(tensor));
     GGML_ASSERT(tensor->ne[3] == 1);
     GGML_ASSERT(stream < (uint32_t) tensor->ne[2]);
 
     const size_t stream_size = tensor->nb[2];
-    const bool page_aligned = stream_size % (64*1024) == 0 &&
+    const bool page_aligned = !dsv4_debug_zero_cleared_seq() &&
+            stream_size % (64*1024) == 0 &&
             (uintptr_t) tensor->data % (64*1024) == 0;
     const int sparse = page_aligned ? dsv4_sparse_unmap_tensor_range(
             tensor, stream*stream_size, stream_size) : 0;
@@ -3492,6 +3510,18 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 
         if (res) {
             clear_compressed(seq_id, true);
+
+            // diagnostic only - see dsv4_debug_zero_cleared_seq()
+            if (dsv4_debug_zero_cleared_seq() && seq_id >= 0) {
+                for (llama_kv_cache * raw : { kv_raw->get_base(), kv_raw->get_swa() }) {
+                    if (raw == nullptr || (uint32_t) seq_id >= raw->get_n_stream()) {
+                        continue;
+                    }
+                    for (uint32_t il : raw->get_layer_ids()) {
+                        dsv4_clear_tensor_stream(raw->get_k_storage(il), (uint32_t) seq_id);
+                    }
+                }
+            }
         }
 
         return res;

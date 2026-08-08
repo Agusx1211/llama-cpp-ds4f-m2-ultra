@@ -6946,6 +6946,41 @@ kernel void kernel_argsort_f32_i32(
 template [[host_name("kernel_argsort_f32_i32_asc")]]  kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_ASC>;
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_DESC>;
 
+// Threadgroup-wide exclusive prefix sum over one value per thread. Returns this
+// thread's exclusive prefix; `*total` receives the sum over all `nthreads`
+// threads. `group_totals` needs nthreads/32 entries. Used by the deterministic
+// top-k compaction below, where the result must not depend on arrival order.
+static inline uint top_k_radix_tg_exclusive_scan(
+        uint value,
+        ushort tiitg,
+        ushort nthreads,
+        threadgroup uint * group_totals,
+        threadgroup uint * total) {
+    const uint   local       = simd_prefix_exclusive_sum(value);
+    const uint   group_total = simd_sum(value);
+    const ushort sg          = tiitg/32;
+
+    if ((tiitg & 31) == 0) {
+        group_totals[sg] = group_total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint before = 0;
+    for (ushort g = 0; g < sg; ++g) {
+        before += group_totals[g];
+    }
+    if (tiitg == 0) {
+        uint sum = 0;
+        for (ushort g = 0; g < nthreads/32; ++g) {
+            sum += group_totals[g];
+        }
+        *total = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    return before + local;
+}
+
 // DSV4's Lightning Indexer selects 512 entries from a much longer score row.
 // A full bitonic sort spends most of its time ordering entries that are thrown
 // away. Find the exact 512th score with an MSD radix selection, collect that
@@ -6963,10 +6998,14 @@ kernel void kernel_top_k_radix_f32_i32_impl(
     constexpr ushort n_top = 512;
 
     threadgroup atomic_uint histogram[radix];
-    threadgroup atomic_uint n_selected;
     threadgroup uint prefix;
     threadgroup uint rank;
-    threadgroup uint group_totals[8];
+    // 8 entries are enough for the radix-8 digit ranking (256 threads = 8
+    // SIMDgroups); the deterministic compaction below scans all 512 threads
+    // and therefore needs 16.
+    threadgroup uint group_totals[16];
+    threadgroup uint n_greater;
+    threadgroup uint n_equal;
     threadgroup int32_t selected[n_top];
 
     const int i01 = tgpig.x;
@@ -7044,44 +7083,81 @@ kernel void kernel_top_k_radix_f32_i32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (tiitg == 0) {
-        atomic_store_explicit(&n_selected, 0u, memory_order_relaxed);
-    }
+    // The radix walk leaves `prefix` = the key of the n_top-th largest element,
+    // so #{key > prefix} < n_top <= #{key >= prefix}: the retained set always
+    // contains every strictly-greater element plus a *subset* of the elements
+    // that tie with the pivot. That subset must be chosen deterministically.
+    //
+    // The DeepSeek V4 Lightning Indexer feeds this kernel a ReLU'd score row, so
+    // the pivot tie group is routinely thousands of elements wide (every
+    // compressed row the indexer scored exactly 0). Appending both groups in
+    // atomic arrival order therefore made *which* compressed keys the sparse
+    // attention reads a function of GPU thread scheduling, i.e. the same prompt
+    // in the same server state produced different logits on every run once the
+    // compressed cache exceeded 1024 rows (~4k prompt tokens - the point where
+    // ggml_metal_op_top_k switches from the bitonic path to this one).
+    //
+    // Instead: give every thread one contiguous index range, take a threadgroup
+    // exclusive prefix sum of its per-range counts, and write the strictly
+    // greater elements followed by the tied elements in ascending source-index
+    // order. The retained set and its order then depend only on the row's
+    // values and indices.
+    selected[tiitg] = 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int i = tiitg; i < args.ne00; i += ntg.x) {
-        const uint bits = as_type<uint>(row[i]);
-        const uint key = bits ^ (uint(int(bits) >> 31) | 0x80000000u);
-        if (key > prefix) {
-            const uint pos = atomic_fetch_add_explicit(&n_selected, 1u, memory_order_relaxed);
-            if (pos < n_top) {
-                selected[pos] = i;
-            }
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint n_row       = (uint) args.ne00;
+    const uint per_thread  = (n_row + ntg.x - 1)/ntg.x;
+    const uint lo          = min(n_row, (uint) tiitg*per_thread);
+    const uint hi          = min(n_row, lo + per_thread);
 
-    for (int i = tiitg; i < args.ne00; i += ntg.x) {
+    uint cnt_gt = 0;
+    uint cnt_eq = 0;
+    for (uint i = lo; i < hi; ++i) {
         const uint bits = as_type<uint>(row[i]);
         const uint key = bits ^ (uint(int(bits) >> 31) | 0x80000000u);
-        if (key == prefix) {
-            const uint pos = atomic_fetch_add_explicit(&n_selected, 1u, memory_order_relaxed);
-            if (pos < n_top) {
-                selected[pos] = i;
+        cnt_gt += key >  prefix ? 1u : 0u;
+        cnt_eq += key == prefix ? 1u : 0u;
+    }
+
+    const uint off_gt = top_k_radix_tg_exclusive_scan(cnt_gt, tiitg, ntg.x, group_totals, &n_greater);
+    const uint off_eq = top_k_radix_tg_exclusive_scan(cnt_eq, tiitg, ntg.x, group_totals, &n_equal);
+
+    {
+        uint p_gt = off_gt;
+        uint p_eq = n_greater + off_eq;
+        for (uint i = lo; i < hi; ++i) {
+            const uint bits = as_type<uint>(row[i]);
+            const uint key = bits ^ (uint(int(bits) >> 31) | 0x80000000u);
+            if (key > prefix) {
+                if (p_gt < n_top) {
+                    selected[p_gt] = (int32_t) i;
+                }
+                ++p_gt;
+            } else if (key == prefix) {
+                if (p_eq < n_top) {
+                    selected[p_eq] = (int32_t) i;
+                }
+                ++p_eq;
             }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Restore TOP_K's descending-order contract for the retained partition.
+    // Ties are broken by ascending source index so the comparison is a strict
+    // total order and the sorting network has exactly one valid output.
     const int col = tiitg;
     for (int k = 2; k <= n_top; k *= 2) {
         for (int j = k/2; j > 0; j /= 2) {
             const int ixj = col ^ j;
             if (ixj > col) {
-                const float lhs = row[selected[col]];
-                const float rhs = row[selected[ixj]];
-                if (((col & k) == 0 && lhs < rhs) || ((col & k) != 0 && lhs > rhs)) {
+                const int   idx_l = selected[col];
+                const int   idx_r = selected[ixj];
+                const float lhs = row[idx_l];
+                const float rhs = row[idx_r];
+                const bool  before_l = lhs > rhs || (lhs == rhs && idx_l < idx_r);
+                const bool  before_r = rhs > lhs || (rhs == lhs && idx_r < idx_l);
+                if (((col & k) == 0 && before_r) || ((col & k) != 0 && before_l)) {
                     SWAP(selected[col], selected[ixj]);
                 }
             }
