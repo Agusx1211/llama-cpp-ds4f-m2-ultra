@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cinttypes>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -576,7 +578,30 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+// env: LLAMA_HOST_PROFILE=1 - per-step host-overhead attribution (see
+// src/llama-context.cpp). The GPU wait inside llama_synchronize is reported
+// separately as an "op":"sync" record, so smpl total minus nested sync waits
+// is the pure host sampling cost.
+static bool smpl_host_prof_enabled() {
+    static const bool en = []() {
+        const char * v = std::getenv("LLAMA_HOST_PROFILE");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return en;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    const int64_t hp_t0 = smpl_host_prof_enabled() ? ggml_time_us() : 0;
+    struct hp_emit_t {
+        int64_t t0;
+        ~hp_emit_t() {
+            if (t0) {
+                const int64_t t1 = ggml_time_us();
+                fprintf(stderr, "HOSTPROF {\"op\":\"smpl\",\"t\":%" PRId64 ",\"tot\":%" PRId64 "}\n", t1, t1 - t0);
+            }
+        }
+    } hp_emit { hp_t0 };
+
     llama_synchronize(ctx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
