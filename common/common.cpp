@@ -1678,6 +1678,16 @@ static void common_dsv4_zero_row_scan(const struct ggml_tensor * k, const char *
     if (k == nullptr || k->type != GGML_TYPE_F16 || n_rows <= 0 || n_elem <= 0) {
         return;
     }
+    // Skip the narrow views the early prefill ubatches expose. The compressed
+    // plane a prefill ubatch reads is only GGML_PAD(n_visible, 256) rows wide,
+    // and the FIRST ubatch's rows are still being produced by the very graph
+    // being scanned - reading them as zero there says nothing about whether
+    // they are ever written. Only a plane wide enough to be the accumulated
+    // cache (>= 1024 rows, i.e. past the top-k radix routing threshold too) can
+    // answer that, because by then the first ubatch is long committed.
+    if (n_rows < 1024) {
+        return;
+    }
     // hard cap the readback: this is a diagnostic, not a hot path
     const int64_t max_bytes = 4*1024*1024;
     if (n_rows*n_elem*(int64_t) sizeof(ggml_fp16_t) > max_bytes) {
@@ -1739,13 +1749,16 @@ static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * 
         if (ask) {
             return true;
         }
+        const bool csa_pooled = t->ne[1] > 1;
+        if ((csa_pooled ? t->ne[1] : t->ne[2]) < 1024) {
+            return true;   // too narrow to be informative; do not spend budget
+        }
         // csa_comp_k is [n_embd, 1, n_csa, n_stream] (non-indexed) or
         // [n_embd, pool_rows] (indexed); rows are nb[2] apart in the former and
         // nb[1] apart in the latter.
-        const bool pooled = t->ne[1] > 1;
         common_dsv4_zero_row_scan(t, "csa",
-                pooled ? t->ne[1] : t->ne[2],
-                (int64_t) (pooled ? t->nb[1] : t->nb[2]),
+                csa_pooled ? t->ne[1] : t->ne[2],
+                (int64_t) (csa_pooled ? t->nb[1] : t->nb[2]),
                 t->ne[0]);
         ++common_dsv4_zero_scan_seen;
         return true;
@@ -1790,11 +1803,13 @@ static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * 
     // [n_embd, 1, n_kv, n_stream] otherwise
     if (k_pool != nullptr && common_dsv4_zero_scan_seen < common_dsv4_zero_scan_budget) {
         const bool pooled = seg != nullptr;
-        common_dsv4_zero_row_scan(k_pool, "lid",
-                pooled ? k_pool->ne[1] : k_pool->ne[2],
-                (int64_t) (pooled ? k_pool->nb[1] : k_pool->nb[2]),
-                k_pool->ne[0]);
-        ++common_dsv4_zero_scan_seen;
+        const int64_t k_rows = pooled ? k_pool->ne[1] : k_pool->ne[2];
+        if (k_rows >= 1024) {
+            common_dsv4_zero_row_scan(k_pool, "lid", k_rows,
+                    (int64_t) (pooled ? k_pool->nb[1] : k_pool->nb[2]),
+                    k_pool->ne[0]);
+            ++common_dsv4_zero_scan_seen;
+        }
     }
 
     std::vector<int32_t> seg_ids;
