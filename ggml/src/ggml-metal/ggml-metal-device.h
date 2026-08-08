@@ -292,6 +292,28 @@ ggml_metal_device_t ggml_metal_device_get(int device);
 void * ggml_metal_device_get_obj  (ggml_metal_device_t dev); // id<MTLDevice>
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQueue>
 
+// [TAG_QUEUE_DRAIN]
+// Block until every command buffer previously submitted to the device's single
+// shared command queue has finished executing.
+//
+// ggml_metal_synchronize() is a *context*-level operation: it waits on the last
+// command buffer that one ggml_metal_t enqueued and status-checks the buffers
+// that context owns. Several producers submit to the same dev->mtl_queue
+// without ever passing through a context - the placement-sparse mapping
+// before/after pair with its zero-fill/COW blit, the residency-set dummy work,
+// the buffer set/get/clear blits, and any other ggml_metal_t that shares the
+// device. A context-level synchronize therefore cannot prove that the GPU is
+// idle, which matters whenever host memory backing a Metal buffer is about to
+// be released: graph command buffers are created with
+// commandBufferWithUnretainedReferences, so the driver holds no reference that
+// would keep a freed allocation alive.
+//
+// Command buffers on one MTLCommandQueue execute in enqueue/commit order, so
+// committing an empty command buffer and waiting for it drains everything that
+// was already submitted, whoever submitted it. This needs no enumeration of the
+// producers and stays correct when a new one is added.
+void ggml_metal_device_queue_drain(ggml_metal_device_t dev);
+
 // [TAG_CB_ERROR_SCAN]
 // GGML_METAL_CB_ERROR_INFO=1: create graph command buffers with
 // MTLCommandBufferErrorOptionEncoderExecutionStatus and push a debug group per

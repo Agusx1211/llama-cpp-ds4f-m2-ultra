@@ -1297,6 +1297,25 @@ bool ggml_metal_cb_error_info_enabled(void) {
     return enabled != 0;
 }
 
+// [TAG_QUEUE_DRAIN] see ggml-metal-device.h for why this exists
+void ggml_metal_device_queue_drain(ggml_metal_device_t dev) {
+    if (dev == NULL || dev->mtl_queue == nil) {
+        return;
+    }
+
+    @autoreleasepool {
+        // retained references: the barrier itself must not depend on anything
+        // staying alive, and it encodes no commands anyway
+        id<MTLCommandBuffer> cmd_buf = [dev->mtl_queue commandBuffer];
+        if (cmd_buf == nil) {
+            return;
+        }
+
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+    }
+}
+
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev) {
     return dev->library;
 }
@@ -3906,6 +3925,28 @@ bool ggml_metal_buffer_sparse_unmap(
 }
 
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
+    // [TAG_QUEUE_DRAIN]
+    // Everything below destroys GPU-visible state: it releases the MTLBuffers,
+    // ends residency for their allocations, hands the placement-sparse heap
+    // back, and - for shared buffers, which is what every compute buffer on
+    // this box is - vm_deallocate()s the host pages the GPU reads directly.
+    // Graph command buffers are created with
+    // commandBufferWithUnretainedReferences, so none of that is refcounted by
+    // the driver: doing it while any command buffer that touches this buffer is
+    // still in flight is a hard GPU fault (status 5, with every later buffer on
+    // the queue reported as kIOGPUCommandBufferCallbackErrorSubmissionsIgnored).
+    //
+    // Callers cannot be relied on to have drained the GPU. The one that started
+    // this investigation is ggml_backend_sched_alloc_splits()'s runtime graph
+    // reallocation (ggml-backend.cpp): it calls ggml_backend_synchronize() on
+    // every backend before ggml_gallocr_reserve_n() frees the old compute
+    // buffers, but ggml_backend_synchronize() maps to the *context*-level
+    // ggml_metal_synchronize(), which cannot see work submitted straight to the
+    // shared device queue. Drain the queue here instead - this is the last
+    // point at which the buffer still exists, so it is the one place where the
+    // guarantee can be made unconditionally.
+    ggml_metal_device_queue_drain(buf->dev);
+
     ggml_metal_device_rsets_rm(buf->dev, buf->rset);
 
     ggml_metal_buffer_rset_free(buf);
