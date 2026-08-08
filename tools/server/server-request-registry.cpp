@@ -35,6 +35,7 @@ bool valid_reason(reason_code value) {
         case reason_code::server_cancel:
         case reason_code::queue_timeout:
         case reason_code::run_timeout:
+        case reason_code::run_stall:
         case reason_code::completed:
         case reason_code::request_failed:
             return true;
