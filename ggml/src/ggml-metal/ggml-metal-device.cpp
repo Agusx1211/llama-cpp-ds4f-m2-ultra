@@ -1006,6 +1006,36 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 // NSG spans runs exactly one round), and the dropped simdgroups contributed
 // an exact 0.0f to helper_mv_reduce_and_write's fixed 32-slot simd_sum,
 // which zeroes every slot before the partials are written.
+// fork: NR0 rows are handled by one threadgroup, so the grid is
+// ceil(ne01/NR0) threadgroups. On shapes with very few rows that leaves most
+// of the 60-core GPU idle: DSV4's hyper-connection mixers are
+// f32 [16384 x 24], i.e. 12 threadgroups at NR0=2, and the decode census
+// measures them at 119 GB/s (1.19 ms/step for the 86 dispatches). Dropping to
+// one row per threadgroup doubles the grid on exactly those shapes.
+//
+// Bit-identical: each row's partial sums live in their own sumf[] slot and
+// their own reduction slab, so the accumulation order of a row does not
+// depend on how many other rows share its threadgroup.
+static int ggml_metal_mv_nr0_starved(int nr0, int ne01) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * v = getenv("GGML_MV_NR0_LEGACY");
+        mode = (v && atoi(v) != 0) ? 1 : 0;
+    }
+
+    if (mode == 1 || nr0 <= 1) {
+        return nr0;
+    }
+
+    // 60 GPU cores; below ~1 threadgroup per core the grid, not the memory
+    // system, is the limit
+    if ((ne01 + nr0 - 1)/nr0 < 64) {
+        return 1;
+    }
+
+    return nr0;
+}
+
 static int ggml_metal_mv_nsg(int ne00, int span, int nsg_max) {
     static int mode = -1;
     if (mode < 0) {
@@ -1056,7 +1086,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     // so a simdgroup spans 512 resp. 256 elements of the row
                     suffix = ne00 % 4 == 0 ? "_4" : "";
                     nsg = ggml_metal_mv_nsg(ne00, ne00 % 4 == 0 ? 512 : 256, 4);
-                    nr0 = 2;
+                    nr0 = ggml_metal_mv_nr0_starved(2, ne01);
                     nr1 = 1;
                     smem = 32*sizeof(float)*nr0;
                 }
