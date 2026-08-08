@@ -75,6 +75,8 @@ struct ggml_metal_op {
         this->use_capture     = use_capture || ggml_metal_cb_error_info_enabled();
         this->debug_graph     = debug_graph;
         this->debug_fusion    = debug_fusion;
+        this->kprof_stride    = ggml_metal_kprof_stride();
+        this->kprof_count     = 0;
         this->gf              = gf;
 
         idxs.reserve(gf->n_nodes);
@@ -102,6 +104,12 @@ struct ggml_metal_op {
     ggml_tensor * node(int i) const {
         assert(i >= 0 && i < (int) idxs.size());
         return ggml_graph_node(gf, idxs[i]);
+    }
+
+    // raw graph index of the i-th non-empty node (used by GGML_METAL_KPROF)
+    int raw_idx(int i) const {
+        assert(i >= 0 && i < (int) idxs.size());
+        return idxs[i];
     }
 
     bool can_fuse(int i0, const ggml_op * ops, int n_ops) const {
@@ -211,6 +219,10 @@ struct ggml_metal_op {
 
     int debug_graph;
     int debug_fusion;
+
+    // GGML_METAL_KPROF
+    int kprof_stride = 0;
+    int kprof_count  = 0;
 
 private:
     ggml_cgraph * gf;
@@ -646,7 +658,36 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     return n_fuse;
 }
 
+// GGML_METAL_KPROF: nodes that never dispatch anything - splitting the encoder
+// in front of them would burn a counter slot on an empty compute pass.
+static bool ggml_metal_op_is_noop(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_TRANSPOSE:
+        case GGML_OP_PERMUTE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
+    if (ctx->kprof_stride > 0 && !ggml_metal_op_is_noop(ctx->node(idx)->op)) {
+        if (ctx->kprof_count % ctx->kprof_stride == 0) {
+            ggml_metal_encoder_kprof_split(ctx->enc, ctx->raw_idx(idx));
+
+            // a new compute pass is a full execution barrier, so the concurrency
+            // tracker must start over
+            if (ctx->mem_ranges) {
+                ggml_mem_ranges_reset(ctx->mem_ranges);
+            }
+        }
+
+        ctx->kprof_count++;
+    }
+
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
