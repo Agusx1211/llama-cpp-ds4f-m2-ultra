@@ -298,6 +298,18 @@ struct server_slot {
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
+    // Provenance of the residue currently sitting in this slot, recorded by
+    // slot selection so that a subsequent admission full-clear can report
+    // exactly what it is throwing away. The prompt-cache consult and the
+    // zero-copy donor share both run in get_available_slot, BEFORE
+    // prepare_dsv4_admission decides whether the residue is reusable, so a
+    // clear can discard a prefix that was just paid for (SSD read, RAM-tier
+    // restore, or seq_cp). "none" means the residue predates this selection.
+    enum class residue_origin { none, donor_share, cache_restore };
+    residue_origin residue_from   = residue_origin::none;
+    size_t         residue_tokens = 0;   // prefix tokens the install produced
+    double         residue_ms     = 0.0; // wall cost of the install
+
     // generation props
     int32_t n_ctx       = 0;  // context size per slot
     int32_t n_keep      = 0;
@@ -1145,6 +1157,15 @@ private:
     uint64_t traced_prefill_end_token = 0;
     bool traced_prefill_yield_boundary = false;
 
+    // Cost of admission full-clears that discarded a prefix the SAME admission
+    // had just restored (prompt-cache load or zero-copy donor share). The
+    // consult runs in get_available_slot before prepare_dsv4_admission decides,
+    // so this is work paid for and thrown away; the running totals make it
+    // measurable ahead of any reordering of consult vs. admission.
+    uint64_t n_admission_clear_wasted_events = 0;
+    uint64_t n_admission_clear_wasted_tokens = 0;
+    double   t_admission_clear_wasted_ms     = 0.0;
+
     struct staged_publication {
         int                      id_task = -1;
         int                      id_slot = -1;
@@ -1989,6 +2010,12 @@ private:
             const bool consult_cache = prompt_cache != nullptr && task.type == SERVER_TASK_TYPE_COMPLETION;
             update_cache = update_cache && consult_cache;
 
+            // fresh selection: any residue provenance recorded below belongs
+            // to THIS admission, so an admission clear can attribute the waste
+            ret->residue_from   = server_slot::residue_origin::none;
+            ret->residue_tokens = 0;
+            ret->residue_ms     = 0.0;
+
             // Zero-copy prefix sharing from a live donor slot. Another slot
             // (generating or idle) may hold a longer common prefix with the
             // task than both the selected slot's residue and any cache entry
@@ -2033,8 +2060,14 @@ private:
                     ret->prompt.tokens      = donor->prompt.tokens.clone();
                     ret->prompt.checkpoints = donor->prompt.checkpoints;
 
+                    const double share_ms = (ggml_time_us() - t_share) / 1000.0;
+
+                    ret->residue_from   = server_slot::residue_origin::donor_share;
+                    ret->residue_tokens = lcp_donor;
+                    ret->residue_ms     = share_ms;
+
                     SLT_INF(*ret, "shared %zu-token prefix from slot %d via zero-copy seq_cp (%.2f ms, task has %d)\n",
-                            lcp_donor, donor->id, (ggml_time_us() - t_share) / 1000.0, (int) task.tokens.size());
+                            lcp_donor, donor->id, share_ms, (int) task.tokens.size());
 
                     {
                         server_dashboard::event ev;
@@ -2084,8 +2117,16 @@ private:
                 // one INFO line per cache consultation: how much of the task's
                 // prefix is available in the selected slot after save/load
                 const size_t n_reusable = ret->prompt.tokens.get_common_prefix(task.tokens);
+                const double consult_ms = (ggml_time_us() - t_start) / 1000.0;
+
+                if (n_reusable > 0) {
+                    ret->residue_from   = server_slot::residue_origin::cache_restore;
+                    ret->residue_tokens = n_reusable;
+                    ret->residue_ms     = consult_ms;
+                }
+
                 SLT_INF(*ret, "prompt cache: %zu/%d prefix tokens available after save/load (%.2f ms)\n",
-                        n_reusable, (int) task.tokens.size(), (ggml_time_us() - t_start) / 1000.0);
+                        n_reusable, (int) task.tokens.size(), consult_ms);
 
                 {
                     const auto & report = prompt_cache->dash_last_load;
@@ -2098,7 +2139,7 @@ private:
                     ev.b          = (int64_t) report.n_bytes;
                     ev.c          = (int64_t) task.tokens.size();
                     ev.d          = -1;
-                    ev.f          = (ggml_time_us() - t_start) / 1000.0;
+                    ev.f          = consult_ms;
                     server_dashboard::instance().emit(ev);
                 }
             }
@@ -2285,23 +2326,40 @@ private:
             const bool full_match = n_lcp > 0 && n_lcp == (size_t) task.n_tokens();
             const size_t n_landing = full_match ? n_lcp - 1 : n_lcp;
 
-            // reasons are logged on the clear path below - the silent
-            // full-clear of live residue is what hid the fanout regression
+            // Reasons are logged on the clear path below - the silent
+            // full-clear of live residue is what hid the fanout regression.
+            // no_reuse_code is a STABLE machine-readable token (consumers
+            // outside the server, e.g. the dashboard's clear_code, bind to it
+            // and must not have to parse prose); no_reuse_reason is the human
+            // gloss. The complete token set is exactly:
+            //   family_geometry, no_resident, no_common_prefix, mtmd,
+            //   n_cache_reuse, cache_prompt_off, no_cells, no_checkpoint,
+            //   rs_window, unknown
+            // "no_resident" never reaches the log line (cold slot, nothing to
+            // discard) and "unknown" is an unreachable belt-and-braces value;
+            // both are listed so the enumeration is closed.
+            const char * no_reuse_code   = nullptr;
             const char * no_reuse_reason = nullptr;
             bool reuse_resident = false;
             llama_pos pos_min = -1;
             llama_pos pos_min_thold = -1;
             if (family_slots.size() != 1) {
+                no_reuse_code   = "family_geometry";
                 no_reuse_reason = "family admission keeps the full-clear geometry";
             } else if (n_prompt_res == 0) {
+                no_reuse_code   = "no_resident";
                 no_reuse_reason = "no resident tokens";
             } else if (n_landing == 0) {
+                no_reuse_code   = "no_common_prefix";
                 no_reuse_reason = "no usable common prefix";
             } else if (slot.prompt.tokens.has_mtmd) {
+                no_reuse_code   = "mtmd";
                 no_reuse_reason = "resident tokens include mtmd chunks";
             } else if (task.params.n_cache_reuse != 0) {
+                no_reuse_code   = "n_cache_reuse";
                 no_reuse_reason = "n_cache_reuse requested";
             } else if (!task.params.cache_prompt) {
+                no_reuse_code   = "cache_prompt_off";
                 no_reuse_reason = "cache_prompt disabled";
             } else {
                 const llama_pos pos_next = slot.prompt.tokens.pos_next(n_lcp);
@@ -2309,6 +2367,7 @@ private:
                 pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
 
                 if (pos_min < 0) {
+                    no_reuse_code   = "no_cells";
                     no_reuse_reason = "resident sequence has no cells";
                 } else if (pos_min >= pos_min_thold) {
                     // the prefill checkpoint block will run: it restores the
@@ -2322,6 +2381,7 @@ private:
                                 return cur.pos_max <= pos_next && (cur.pos_min < pos_min_thold || cur.pos_min == 0);
                             });
                     if (!reuse_resident) {
+                        no_reuse_code   = "no_checkpoint";
                         no_reuse_reason = "no checkpoint covers the landing";
                     }
                 } else {
@@ -2330,6 +2390,7 @@ private:
                     // partial seq_rm)
                     reuse_resident = (int64_t) (n_prompt_res - n_landing) <= (int64_t) llama_n_rs_seq(ctx_tgt);
                     if (!reuse_resident) {
+                        no_reuse_code   = "rs_window";
                         no_reuse_reason = "resident tail exceeds the rs rollback window";
                     }
                 }
@@ -2384,6 +2445,10 @@ private:
                 if ((llama_pos) plan.span_tokens > pos_frontier) {
                     spans.push_back({ slot.id, pos_frontier, (llama_pos) plan.span_tokens });
                 }
+                // provenance consumed: the restore was kept, nothing wasted
+                slot.residue_from   = server_slot::residue_origin::none;
+                slot.residue_tokens = 0;
+                slot.residue_ms     = 0.0;
             } else {
                 // full-clear admission: quote the whole span against an empty
                 // sequence, exactly like the original uncached vertical. The
@@ -2392,14 +2457,36 @@ private:
                 // already destroyed the state) so a later continuation
                 // restores from the cache instead of re-prefilling.
                 if (n_prompt_res > 0) {
-                    // never discard live residue silently - this branch hid
-                    // the agent-fanout full-re-prefill regression
-                    SLT_INF(slot, "elastic admission clears resident KV: %s "
-                            "(lcp=%zu landing=%zu resident=%zu task=%d pos_min=%d thold=%d ckpts=%zu n_rs=%d)\n",
+                    // Never discard live residue silently - this branch hid
+                    // the agent-fanout full-re-prefill regression. When the
+                    // residue was installed by THIS admission's slot selection
+                    // (prompt-cache restore or zero-copy donor share, both of
+                    // which run in get_available_slot before this decision) the
+                    // clear also throws away work that was just paid for, so
+                    // account for it: wasted_restore=<origin>:<tokens>/<ms> plus
+                    // a running total, which is what makes the "restore then
+                    // discard" cost measurable without a scheduler refactor.
+                    const char * origin =
+                            slot.residue_from == server_slot::residue_origin::donor_share   ? "donor_share"   :
+                            slot.residue_from == server_slot::residue_origin::cache_restore ? "cache_restore" : "none";
+
+                    if (slot.residue_from != server_slot::residue_origin::none) {
+                        n_admission_clear_wasted_events += 1;
+                        n_admission_clear_wasted_tokens += slot.residue_tokens;
+                        t_admission_clear_wasted_ms     += slot.residue_ms;
+                    }
+
+                    SLT_INF(slot, "elastic admission clears resident KV: clear_code=%s (%s) "
+                            "(lcp=%zu landing=%zu resident=%zu task=%d pos_min=%d thold=%d ckpts=%zu n_rs=%d) "
+                            "wasted_restore=%s:%zu tok/%.2f ms (total %" PRIu64 " events / %" PRIu64 " tok / %.0f ms)\n",
+                            no_reuse_code   != nullptr ? no_reuse_code   : "unknown",
                             no_reuse_reason != nullptr ? no_reuse_reason : "unknown",
                             n_lcp, n_landing, n_prompt_res, (int) task.n_tokens(),
                             (int) pos_min, (int) pos_min_thold,
-                            slot.prompt.checkpoints.size(), (int) llama_n_rs_seq(ctx_tgt));
+                            slot.prompt.checkpoints.size(), (int) llama_n_rs_seq(ctx_tgt),
+                            origin, slot.residue_tokens, slot.residue_ms,
+                            n_admission_clear_wasted_events, n_admission_clear_wasted_tokens,
+                            t_admission_clear_wasted_ms);
                 }
                 if (prompt_cache && slot.prompt.n_tokens() > 0 &&
                         task.type == SERVER_TASK_TYPE_COMPLETION) {
@@ -2457,6 +2544,11 @@ private:
                     ev.d          = (int64_t) plan.span_tokens;
                     dash_pending.push_back(ev);
                 }
+
+                // provenance consumed (accounted above if it was wasted)
+                slot.residue_from   = server_slot::residue_origin::none;
+                slot.residue_tokens = 0;
+                slot.residue_ms     = 0.0;
             }
         }
 
