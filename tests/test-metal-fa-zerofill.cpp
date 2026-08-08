@@ -17,29 +17,44 @@
 // precede the threadgroup barrier); for the last SIMDgroup it runs past the
 // threadgroup memory the host actually declared, which is undefined behaviour.
 //
-// Part 1 of this test mirrors that arithmetic for every instantiation the
-// kernel ships and requires the shipped bound to keep every store inside the
-// slot. It is the check that would have caught the original defect and that
-// catches a future change to NE, NL or the shared-memory layout.
+// Part 0 reads ggml-metal.metal itself, because the arithmetic below is only a
+// model of the kernel and a model cannot notice that the thing it models has
+// changed. It requires (a) the zero-fill loop to still carry a bound against
+// DV4 - delete the guard and this fails, which parts 1 and 2 do not, since the
+// surplus stores are zeros landing in a region that is being zeroed anyway and
+// are therefore invisible to any output comparison - and (b) the set of shipped
+// <DK, DV, NE> instantiations to be exactly the set part 1 checks, so a new
+// head size cannot be added without re-deriving the bound for it.
+//
+// Part 1 mirrors that arithmetic for every instantiation the kernel ships and
+// requires the shipped bound to keep every store inside the slot. It is the
+// check that would have caught the original defect and that catches a future
+// change to NE, NL or the shared-memory layout.
 //
 // Part 2 runs flash attention at the four affected head sizes on Metal and
 // compares against the CPU backend, at one, two and four key-stream
 // SIMDgroups, so the geometries where the overflow was reachable are exercised
 // end to end.
 //
-// Skips itself with status 0 when no Metal device is present.
+// Skips part 2 with status 0 when no Metal device is present. Parts 0 and 1 are
+// pure host arithmetic and text inspection and always run.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <random>
+#include <set>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #undef assert
@@ -79,6 +94,90 @@ static const vec_inst g_inst[] = {
 };
 
 static const int g_n_inst = (int) (sizeof(g_inst)/sizeof(g_inst[0]));
+
+// ------------------------------------------------------------------- part 0
+// GGML_METAL_SOURCE_PATH is set by tests/CMakeLists.txt.
+
+static std::string strip_ws(const std::string & s) {
+    std::string r;
+    for (char c : s) {
+        if (!std::isspace((unsigned char) c)) {
+            r += c;
+        }
+    }
+    return r;
+}
+
+// the text of kernel_flash_attn_ext_vec's accumulator zero-fill, i.e. what sits
+// between the "zero out so" and "zero out shared memory SH" markers
+static bool zero_fill_body(const std::string & src, std::string & out) {
+    const size_t a = src.find("// zero out so");
+    if (a == std::string::npos) {
+        return false;
+    }
+    const size_t b = src.find("// zero out shared memory SH", a);
+    if (b == std::string::npos) {
+        return false;
+    }
+    out = src.substr(a, b - a);
+    return true;
+}
+
+// every `kernel_flash_attn_ext_vec<...>` template instantiation declared with a
+// [[host_name(...)]], as its trailing <DK, DV, NE> triple
+static std::set<std::vector<int>> shipped_instantiations(const std::string & src) {
+    std::set<std::vector<int>> res;
+
+    std::istringstream is(src);
+    std::string line;
+    while (std::getline(is, line)) {
+        if (line.find("host_name(\"kernel_flash_attn_ext_vec_") == std::string::npos) {
+            continue;
+        }
+        // the instantiation itself, not kernel_flash_attn_ext_vec_reduce<...>
+        const size_t a = line.find("kernel_flash_attn_ext_vec<");
+        if (a == std::string::npos) {
+            continue;
+        }
+        const size_t b = line.rfind('>');
+        if (b == std::string::npos || b < a) {
+            continue;
+        }
+
+        // the last three comma-separated template arguments are DK, DV, NE
+        std::vector<std::string> args;
+        std::string cur;
+        for (size_t i = a + std::strlen("kernel_flash_attn_ext_vec<"); i < b; ++i) {
+            if (line[i] == ',') {
+                args.push_back(cur);
+                cur.clear();
+            } else {
+                cur += line[i];
+            }
+        }
+        args.push_back(cur);
+
+        if (args.size() < 3) {
+            continue;
+        }
+
+        std::vector<int> triple;
+        bool numeric = true;
+        for (size_t i = args.size() - 3; i < args.size(); ++i) {
+            const std::string t = strip_ws(args[i]);
+            if (t.empty() || t.find_first_not_of("0123456789") != std::string::npos) {
+                numeric = false;
+                break;
+            }
+            triple.push_back(std::atoi(t.c_str()));
+        }
+        if (numeric) {
+            res.insert(triple);
+        }
+    }
+
+    return res;
+}
 
 static ggml_backend_t metal_backend_init() {
     ggml_backend_load_all();
@@ -152,6 +251,90 @@ static void run_fa(ggml_backend_t backend, int dk, int dv, int64_t kv, int64_t n
 
 int main() {
     bool ok = true;
+
+    // ---------------------------------------------------------------- part 0
+    {
+        const char * path = GGML_METAL_SOURCE_PATH;
+
+        std::ifstream f(path, std::ios::binary);
+        if (!f) {
+            std::printf("FAIL: cannot open the Metal source at %s\n", path);
+            return 1;
+        }
+        std::stringstream ss;
+        ss << f.rdbuf();
+        const std::string src = ss.str();
+
+        std::string body;
+        if (!zero_fill_body(src, body)) {
+            std::printf("FAIL: could not locate the accumulator zero-fill in %s "
+                    "(the '// zero out so' / '// zero out shared memory SH' markers moved)\n", path);
+            return 1;
+        }
+
+        // The store must be bounded by DV4. Without the bound the surplus
+        // stores are dead zeros, so no output comparison can see them - this
+        // text check is the only thing standing between a refactor and the
+        // out-of-bounds threadgroup write coming back.
+        //
+        // The loop header is itself `i < DV4/NL`, so a bare "< DV4" search
+        // matches the unbounded form too; what marks the bound is a comparison
+        // against DV4 that is not the `DV4/NL` trip count.
+        const std::string flat = strip_ws(body);
+
+        bool bounded = false;
+        for (size_t p = flat.find("<DV4"); p != std::string::npos; p = flat.find("<DV4", p + 1)) {
+            const size_t after = p + 4;
+            if (after >= flat.size() || flat[after] != '/') {
+                bounded = true;
+                break;
+            }
+        }
+
+        if (!bounded) {
+            std::printf("FAIL: the zero-fill in %s is no longer bounded by DV4 - the surplus stores are "
+                    "dead, so nothing else in this test or any output comparison can see them:\n%s\n",
+                    path, body.c_str());
+            return 1;
+        }
+
+        // the instantiation list this test checks must be the one that ships
+        const std::set<std::vector<int>> shipped = shipped_instantiations(src);
+        if (shipped.empty()) {
+            std::printf("FAIL: found no kernel_flash_attn_ext_vec instantiations in %s\n", path);
+            return 1;
+        }
+
+        std::set<std::vector<int>> known;
+        for (int i = 0; i < g_n_inst; ++i) {
+            known.insert({ g_inst[i].dk, g_inst[i].dv, g_inst[i].ne });
+        }
+
+        for (const auto & t : shipped) {
+            if (known.count(t) == 0) {
+                std::printf("FAIL: ggml-metal.metal ships kernel_flash_attn_ext_vec<..., %d, %d, %d> "
+                        "which this test does not check - add it to g_inst and re-derive its bound\n",
+                        t[0], t[1], t[2]);
+                ok = false;
+            }
+        }
+        for (const auto & t : known) {
+            if (shipped.count(t) == 0) {
+                std::printf("FAIL: this test checks <%d, %d, %d> but ggml-metal.metal no longer ships it "
+                        "- drop it from g_inst\n", t[0], t[1], t[2]);
+                ok = false;
+            }
+        }
+
+        std::printf("kernel source: %s\n", path);
+        std::printf("  zero-fill is bounded by DV4, %d instantiation(s) shipped and checked\n\n",
+                (int) shipped.size());
+
+        if (!ok) {
+            std::puts("metal fa zero-fill test FAILED (source)");
+            return 1;
+        }
+    }
 
     // ---------------------------------------------------------------- part 1
     std::printf("accumulator zero-fill bounds (NW = %d)\n", NW);

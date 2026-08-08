@@ -387,6 +387,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-metal-top-k-determinism.cpp)
     llama_build_and_test(test-metal-fa-splitk.cpp)
     llama_build_and_test(test-metal-fa-zerofill.cpp)
+    # part 0 inspects the kernel source itself: the bound it checks guards a
+    # store whose only observable effect is out of bounds, so no output
+    # comparison can catch its removal.
+    target_compile_definitions(test-metal-fa-zerofill PRIVATE
+        GGML_METAL_SOURCE_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal/ggml-metal.metal")
     llama_build_and_test(test-metal-fa-mqa.cpp)
     llama_build_and_test(test-metal-buffer-lifetime.cpp)
     llama_build_and_test(test-metal-private-readback.cpp)
