@@ -3375,9 +3375,11 @@ llama_kv_cache_dsv4::admission_consume_status llama_kv_cache_dsv4::consume_admis
         // and it costs one reservation per request. If it cannot be re-made,
         // report NO_MATCH so the caller falls back to the ordinary per-batch
         // reservation, which is the same path every subsequent batch uses.
+        const bool remap_enabled = dsv4_admission_remap_enabled();
+
         int resident = 1;
         std::vector<dsv4_sparse_range> ranges;
-        if (dsv4_admission_remap_enabled()) {
+        if (remap_enabled || dsv4_admission_debug()) {
             llama_dsv4_batch_quote probe_quote = {};
             if (collect_admission_ranges(entry.spans.data(), entry.spans.size(), ranges, probe_quote)) {
                 // 1 = every page mapped and exclusively owned, 0 = not, -1 =
@@ -3388,7 +3390,13 @@ llama_kv_cache_dsv4::admission_consume_status llama_kv_cache_dsv4::consume_admis
             }
         }
 
-        if (resident != 1) {
+        if (resident != 1 && !remap_enabled) {
+            if (dsv4_admission_debug()) {
+                LLAMA_LOG_INFO("%s: DSV4 admission mapping was dropped after arm (resident=%d ranges=%zu);"
+                        " re-map disabled, this batch's compressed KV will be lost\n",
+                        __func__, resident, ranges.size());
+            }
+        } else if (resident != 1) {
             dsv4_sparse_transaction remap;
             llama_dsv4_batch_quote remap_quote = {};
             const auto reserve_status = remap.reserve_ranges(ranges, remap_quote);
