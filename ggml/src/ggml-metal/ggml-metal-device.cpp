@@ -977,6 +977,51 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+// fork: number of simdgroups that actually have work in the shared GEMV
+// kernel family (kernel_mul_mv_t_t{,_4}, kernel_mul_mv_e4m3_m2_f32_4,
+// kernel_mul_mv_nf8_m2_f32_4).
+//
+// Those kernels partition a row into NB=32-element blocks and hand each
+// simdgroup NF consecutive blocks per round:
+//
+//     ib0 = sgitg*NF + ix;  for (ib = ib0; ib < ne00/NB; ib += NSG*NF)
+//
+// so simdgroup `s` executes the loop body zero times whenever
+// s*NF >= ne00/NB, i.e. whenever s >= ne00/(NB*NF). Upstream sizes the
+// threadgroup as min(4, ceil(ne00/128)), which is only correct for
+// NB*NF = 128; the _4 kernels use NF = 16 (span 512 elements) and the
+// scalar kernels NF = 8 (span 256), so every row shorter than 4 spans gets
+// idle simdgroups.
+//
+// On DSV4 Flash this is not a corner case: attn_q_b is [1024 x 32768]
+// e4m3_m2 and is the single largest GEMV in a decode step (43 dispatches,
+// 34.1 MiB of weights each). With ne00 = 1024 the _4 kernel needs 2
+// simdgroups and is handed 4, so half of every threadgroup's threads never
+// issue a load and the kernel sustains only ~354 GB/s where the same kernel
+// on longer rows reaches 540 GB/s.
+//
+// Shrinking the threadgroup is bit-identical by construction: the mapping
+// from simdgroup index to blocks is unchanged (the loop stride NSG*NF only
+// matters when more than one round runs, and a row that needs fewer than
+// NSG spans runs exactly one round), and the dropped simdgroups contributed
+// an exact 0.0f to helper_mv_reduce_and_write's fixed 32-slot simd_sum,
+// which zeroes every slot before the partials are written.
+static int ggml_metal_mv_nsg(int ne00, int span, int nsg_max) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * v = getenv("GGML_MV_NSG_LEGACY");
+        mode = (v && atoi(v) != 0) ? 1 : 0;
+    }
+
+    if (mode == 1) {
+        return std::min(nsg_max, (ne00 + 127) / 128);
+    }
+
+    const int nsg = (ne00 + span - 1) / span;
+
+    return std::max(1, std::min(nsg_max, nsg));
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -1007,11 +1052,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     nr1 = 1;
                     suffix = "_short";
                 } else {
-                    nsg = std::min(4, (ne00 + 127) / 128);
+                    // fork: NF is 16 in the _4 kernel and 8 in the scalar one,
+                    // so a simdgroup spans 512 resp. 256 elements of the row
+                    suffix = ne00 % 4 == 0 ? "_4" : "";
+                    nsg = ggml_metal_mv_nsg(ne00, ne00 % 4 == 0 ? 512 : 256, 4);
                     nr0 = 2;
                     nr1 = 1;
                     smem = 32*sizeof(float)*nr0;
-                    suffix = ne00 % 4 == 0 ? "_4" : "";
                 }
             } break;
         case GGML_TYPE_E4M3_M2:
@@ -1022,7 +1069,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 // an extra 256-float region: the kernel stages its decode LUT
                 // in threadgroup memory after the reduction area.
                 GGML_ASSERT(ne00 % 4 == 0); // ne00 % QK_E4M3_M2 == 0 by block invariant
-                nsg = std::min(4, (ne00 + 127) / 128);
+                nsg = ggml_metal_mv_nsg(ne00, 512, 4); // NF = 16 -> 512 elems/simdgroup
                 nr0 = 4; // 2 in the BF16 original; 4 halves the per-threadgroup
                          // fixed costs (LUT staging, reduce) and shares each
                          // activation load across 4 rows. Per-row accumulation
@@ -1047,7 +1094,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 // NF8_M2 kernel stages NO decode LUT — the decode is pure
                 // bit-insertion — so smem carries only the reduction area.
                 GGML_ASSERT(ne00 % 4 == 0); // ne00 % QK_NF8_M2 == 0 by block invariant
-                nsg = std::min(4, (ne00 + 127) / 128);
+                nsg = ggml_metal_mv_nsg(ne00, 512, 4); // NF = 16 -> 512 elems/simdgroup
                 nr0 = 4;
                 nr1 = 1;
                 smem = 32*sizeof(float)*nr0;
