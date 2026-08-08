@@ -3,10 +3,13 @@
 #include "common.h"
 #include "llama.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <string>
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -702,6 +705,124 @@ struct server_prompt_cache_state {
     }
 };
 
+//
+// SSD tier ("prompt cache disk tier") file format and identity
+//
+// One `.lcpc` file per spilled prompt state. A file holds the prompt tokens (so
+// the index can be rebuilt at startup), the serialized target *and* draft
+// sequence states, and the context checkpoints. Byte order is the host order of
+// the target machine (M2 Ultra).
+//
+// Two independent guards decide whether a file may be restored:
+//
+//   1. `version` - the schema of the file itself. Bump PCACHE_DISK_VERSION for
+//      any layout change here; old files are then rejected and deleted.
+//   2. `fingerprint` - the identity of everything the *payload* depends on
+//      (model artifacts, state-serialization ABI, KV representation, layout
+//      sensitive runtime parameters). See server_prompt_cache_fingerprint().
+//
+// Integrity is checked with two hashes: `hash_header` covers the header itself
+// (so a garbage header can never drive an allocation) and `hash_payload` covers
+// every byte after it. rescan_disk() verifies the header hash plus all declared
+// lengths against the real file size; the payload hash is verified by
+// load_from_disk(), which is the only path that actually reads the blobs.
+
+static constexpr uint32_t PCACHE_DISK_MAGIC   = 0x4350434Cu; // "LCPC"
+
+// v1: unversioned fingerprint, no checksums, no bounds checks (2026-08-07)
+// v2: fingerprint schema v2, header+payload hashes, checked lengths, atomic
+//     temp-file publication (2026-08-08)
+static constexpr uint32_t PCACHE_DISK_VERSION = 2u;
+
+struct pcache_disk_header {
+    uint32_t magic;         // PCACHE_DISK_MAGIC
+    uint32_t version;       // PCACHE_DISK_VERSION
+    uint64_t fingerprint;   // server_prompt_cache_fingerprint()
+    uint64_t size_main;     // bytes of serialized target sequence state
+    uint64_t size_drft;     // bytes of serialized draft sequence state (0 = none)
+    uint64_t n_tokens;      // prompt tokens stored before the state blobs
+    uint64_t n_checkpoints; // context checkpoints stored after the state blobs
+    uint64_t size_payload;  // bytes after this header; must equal file_size - sizeof(header)
+    uint64_t hash_payload;  // hash over those size_payload bytes
+    uint64_t hash_header;   // hash over the preceding bytes of this header (must stay last)
+};
+
+static_assert(sizeof(pcache_disk_header) == 72, "pcache_disk_header must stay packed and stable");
+
+// Hard ceilings applied to every file-controlled length *before* it is used to
+// size an allocation. They are deliberately far above any healthy value: the
+// tight bound is always "must fit in the bytes this file actually has", these
+// only stop a pathological header from being believed at all.
+static constexpr uint64_t PCACHE_MAX_TOKENS      = 1ull << 24;       //  16.7 M tokens
+static constexpr uint64_t PCACHE_MAX_BLOB_BYTES  = 64ull << 30;      //  64 GiB per blob
+static constexpr uint64_t PCACHE_MAX_CHECKPOINTS = 4096ull;          //  vs. n_ctx_checkpoints (default 32)
+static constexpr uint64_t PCACHE_MAX_FILE_BYTES  = 512ull << 30;     //  512 GiB per entry
+
+// Fast non-cryptographic hash used for both header and payload integrity. This
+// is an accident/truncation detector on a local cache directory, not a defense
+// against a crafted collision. It is on the spill and restore hot paths, so it
+// processes 32 bytes per iteration with four independent lanes.
+uint64_t server_pcache_hash(const void * data, size_t size, uint64_t seed = 0);
+
+// Integrity hash of a header: covers every byte before `hash_header`. Exposed so
+// tests can build deliberately hostile-but-well-sealed files.
+uint64_t server_pcache_header_hash(const pcache_disk_header & hdr);
+
+// Everything the serialized state depends on. Anything that changes the bytes
+// llama_state_seq_get_data_ext() produces, or changes how they are interpreted
+// on restore, belongs in here - a value that is missing is a value that cannot
+// invalidate a stale `.lcpc` file.
+struct server_prompt_cache_fingerprint_inputs {
+    // schema/ABI generation
+    uint32_t schema_version    = PCACHE_DISK_VERSION;       // this file format
+    uint32_t state_seq_version = LLAMA_STATE_SEQ_VERSION;   // upstream container version
+    uint32_t state_seq_layout  = LLAMA_STATE_SEQ_LAYOUT_M2; // fork payload layout generation
+    uint32_t session_version   = LLAMA_SESSION_VERSION;     // upstream whole-context version
+
+    // model artifact identity; `probe` is a cheap content hash over the head and
+    // tail of the file, which catches an in-place edit that preserved both the
+    // size and the mtime (a plain rebuild of the same artifact does not)
+    struct artifact {
+        std::string path;
+        uint64_t    size  = 0;
+        int64_t     mtime = 0;
+        uint64_t    probe = 0;
+        uint8_t     present = 0;
+    };
+
+    artifact model_tgt;
+    artifact model_dft; // present = 0 when speculative decoding runs without a draft model
+
+    // KV representation: the state blobs are raw KV cell payloads, so the cache
+    // types and the unified/SWA layout decide how they must be read back
+    int32_t kv_type_k_tgt = 0;
+    int32_t kv_type_v_tgt = 0;
+    int32_t kv_type_k_dft = 0;
+    int32_t kv_type_v_dft = 0;
+    int32_t flash_attn_type = 0;
+    uint8_t kv_unified = 0;
+    uint8_t swa_full   = 0;
+
+    // layout-sensitive runtime geometry
+    uint32_t n_ctx_tgt     = 0;
+    uint32_t n_seq_max_tgt = 0;
+    uint32_t n_ctx_dft     = 0;
+    uint32_t n_seq_max_dft = 0;
+    int32_t  n_parallel    = 0;
+
+    // speculative configuration: it sizes the draft context's recurrent state
+    // (need_n_rs_seq) and decides what goes into each checkpoint's data_spec
+    std::vector<int32_t> spec_types;
+    int32_t spec_n_max = 0;
+};
+
+// Stable 64-bit identity of the inputs above (FNV-1a over a canonical encoding).
+uint64_t server_prompt_cache_fingerprint(const server_prompt_cache_fingerprint_inputs & in);
+
+// Cheap content probe for a model artifact: hashes the first and last 64 KiB
+// together with the size. Returns 0 when the file cannot be read.
+uint64_t server_prompt_cache_file_probe(const std::string & path);
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens,
                         const std::string & disk_dir, int32_t disk_limit_gib, uint64_t disk_fingerprint) {
@@ -711,6 +832,12 @@ struct server_prompt_cache {
         this->disk_dir         = disk_dir;
         this->limit_disk       = disk_limit_gib < 0 ? 0 : 1024ull*1024ull*1024ull*(uint64_t) disk_limit_gib;
         this->disk_fingerprint = disk_fingerprint;
+
+        // a stored prompt can never be longer than the context it was captured
+        // from; keep the admission bound separate from the (mutable, softened)
+        // eviction limit so file parsing has a fixed ceiling
+        this->disk_max_tokens = limit_tokens > 0 ? std::min<uint64_t>(limit_tokens, PCACHE_MAX_TOKENS)
+                                                 : PCACHE_MAX_TOKENS;
 
         if (!this->disk_dir.empty()) {
             rescan_disk();
@@ -730,6 +857,7 @@ struct server_prompt_cache {
     size_t      limit_disk       = 0;
     uint64_t    disk_fingerprint = 0;
     uint64_t    disk_seq         = 0;
+    uint64_t    disk_max_tokens  = PCACHE_MAX_TOKENS; // upper bound on a file's declared n_tokens
 
     size_t size() const;
 

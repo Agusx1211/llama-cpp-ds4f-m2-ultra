@@ -185,6 +185,11 @@ target_include_directories(test-server-admin-dashboard PRIVATE
 target_link_libraries(test-server-admin-dashboard PRIVATE server-context)
 target_compile_features(test-server-admin-dashboard PRIVATE cxx_std_17)
 
+llama_build_and_test(test-server-prompt-cache.cpp)
+target_include_directories(test-server-prompt-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_link_libraries(test-server-prompt-cache PRIVATE server-context)
+target_compile_features(test-server-prompt-cache PRIVATE cxx_std_17)
+
 llama_build_and_test(test-server-queue-runtime.cpp)
 target_include_directories(test-server-queue-runtime PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_link_libraries(test-server-queue-runtime PRIVATE server-context)
@@ -386,6 +391,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     endif()
     llama_build_and_test(test-metal-top-k-determinism.cpp)
     llama_build_and_test(test-metal-fa-splitk.cpp)
+    llama_build_and_test(test-metal-fa-zerofill.cpp)
+    # part 0 inspects the kernel source itself: the bound it checks guards a
+    # store whose only observable effect is out of bounds, so no output
+    # comparison can catch its removal.
+    target_compile_definitions(test-metal-fa-zerofill PRIVATE
+        GGML_METAL_SOURCE_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal/ggml-metal.metal")
+    llama_build_and_test(test-metal-fa-mqa.cpp)
     llama_build_and_test(test-metal-buffer-lifetime.cpp)
     llama_build_and_test(test-metal-private-readback.cpp)
     if (TARGET ggml-metal AND NOT GGML_BACKEND_DL)
@@ -488,6 +500,8 @@ llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-m2-e4m3.cpp) # fork: gguf-m2 E4M3_M2 bit-exactness vs BF16 kernels
 llama_build_and_test(test-m2-mxfp4.cpp) # fork: gguf-m2 MXFP4_M2 bit-exactness vs MXFP4 kernels
 llama_build_and_test(test-m2-nf8.cpp) # fork: gguf-m2 NF8_M2 bit-exactness vs BF16 kernels (incl. escape blocks)
+llama_build_and_test(test-m2-layout-gate.cpp) # fork: gguf-m2 artifact layout gate (src/llama-m2-layout.h)
+target_include_directories(test-m2-layout-gate PRIVATE ${PROJECT_SOURCE_DIR}/src)
 if (UNIX)
     llama_build_and_test(test-dsv4-indexed-concat-contract.cpp)
 endif()

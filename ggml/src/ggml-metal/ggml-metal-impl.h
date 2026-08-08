@@ -116,6 +116,12 @@
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
 
+// query heads batched into one vector flash-attention threadgroup, so that the
+// MQA-shared K/V rows are pulled across the memory fabric once per group rather
+// than once per head. Override at runtime with GGML_FA_NHPTG=<n>.
+// See ggml_metal_op_flash_attn_ext and notes/2026-08-08-fa-mqa-head-batching.md
+#define GGML_METAL_FA_NHPTG_DEFAULT 1
+
 #define OP_LIGHTNING_INDEXER_DK    128
 #define OP_LIGHTNING_INDEXER_NH     64
 #define OP_LIGHTNING_INDEXER_NHPTG   8

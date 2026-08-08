@@ -18,9 +18,17 @@ What it does (see notes/2026-08-07-gguf-m2-artifact-format-design.md):
   byte falls outside the nibble window the conversion aborts (the window is
   a layout constant validated against the measured census; never clamp).
 - Passes every other tensor through byte-identical.
-- Writes the required `m2.layout.version = 1` (u32) gate metadata plus a
-  layout hash, and 16 KiB-aligns every tensor's data (Metal sparse-pool /
-  MTLIO page size).
+- Writes the layout gate metadata — `m2.layout.version` (u32),
+  `m2.layout.description` (every layout constant this run packed against) and
+  `m2.layout.hash` (sha256 of the description) — and 16 KiB-aligns every
+  tensor's data (Metal sparse-pool / MTLIO page size). The loader enforces all
+  three; src/llama-m2-layout.h rebuilds the description from the constants the
+  kernels decode with and refuses any artifact that does not match, so a layout
+  change cannot be absorbed silently by forgetting to bump the version.
+- Publishes atomically: the artifact is written as `<name>.m2.gguf.partial`
+  and renamed into place only after a successful fsync. An interrupted run
+  never leaves a final-looking artifact, and never destroys the artifact it
+  was replacing.
 
 The output is a single file (input split.* metadata is dropped) and must be
 named *.m2.gguf.
@@ -36,6 +44,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -527,7 +536,20 @@ def main() -> int:
     arch_field = readers[0].fields.get("general.architecture")
     arch = arch_field.contents() if arch_field is not None else "unknown"
 
-    writer = GGUFWriter(args.output if not args.dry_run else Path("/dev/null"), arch, use_temp_file=False)
+    # The artifact is ~140 GiB and takes minutes to write. Write it under a
+    # name that cannot be mistaken for a finished conversion and publish it
+    # with a rename, which is atomic within a directory: an interrupted run
+    # then leaves `<name>.m2.gguf.partial`, never a final-looking artifact, and
+    # a re-conversion that dies partway no longer destroys the artifact it was
+    # replacing (the previous output survives untouched until the rename).
+    out_final = Path(args.output)
+    out_tmp = out_final.with_name(out_final.name + ".partial")
+
+    if not args.dry_run and out_tmp.exists():
+        logger.info(f"removing a partial artifact from an earlier run: {out_tmp}")
+        out_tmp.unlink()
+
+    writer = GGUFWriter(out_tmp if not args.dry_run else Path("/dev/null"), arch, use_temp_file=False)
     writer.add_custom_alignment(16384)  # Metal sparse-pool / MTLIO page size
 
     # copy metadata from the first shard; drop split bookkeeping (single file)
@@ -677,6 +699,15 @@ def main() -> int:
         n_done += 1
 
     writer.close()
+
+    # publish: flush the artifact to stable storage, then rename it into place.
+    # Until this point nothing named *.m2.gguf exists for the loader to find.
+    if not args.dry_run:
+        tt = time.time()
+        with open(out_tmp, "rb+") as f:
+            os.fsync(f.fileno())
+        os.replace(out_tmp, out_final)
+        logger.info(f"published {out_final} (fsync + atomic rename, {time.time()-tt:.1f}s)")
 
     logger.info(f"done in {time.time()-t_start:.0f}s: {bytes_in/2**30:.3f} GiB in -> "
                 f"{bytes_out/2**30:.3f} GiB out (tensor data, before alignment padding), "

@@ -1800,32 +1800,76 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            // fingerprint for the SSD tier: spilled state files are only valid
-            // for the exact model artifact and context geometry that wrote
-            // them; anything else is deleted on rescan or dropped on load
-            uint64_t fingerprint = 0xcbf29ce484222325ull; // FNV-1a
-            const auto fp_mix = [&fingerprint](const void * p, size_t n) {
-                const uint8_t * b = static_cast<const uint8_t *>(p);
-                for (size_t i = 0; i < n; ++i) {
-                    fingerprint = (fingerprint ^ b[i]) * 0x100000001b3ull;
-                }
-            };
+            // fingerprint for the SSD tier: a spilled `.lcpc` file carries the
+            // serialized target *and* draft sequence states, so it is only
+            // valid for the exact pair of model artifacts, the exact state
+            // serialization ABI, the exact KV representation and the exact
+            // layout-sensitive geometry that wrote it. Anything else must miss:
+            // stale files are dropped on rescan and refused on load.
+            // See server_prompt_cache_fingerprint_inputs in server-task.h.
+            uint64_t fingerprint = 0;
             {
-                const std::string & path = params_base.model.path;
-                fp_mix(path.data(), path.size());
+                server_prompt_cache_fingerprint_inputs fp;
 
-                std::error_code ec;
-                const uint64_t fsize = std::filesystem::file_size(path, ec);
-                const int64_t  mtime = ec ? 0 : (int64_t) std::filesystem::last_write_time(path, ec).time_since_epoch().count();
-                fp_mix(&fsize, sizeof(fsize));
-                fp_mix(&mtime, sizeof(mtime));
+                const auto fill_artifact = [](server_prompt_cache_fingerprint_inputs::artifact & a,
+                                              const std::string & path) {
+                    a.present = 1;
+                    a.path    = path;
 
-                const uint32_t fp_n_ctx = llama_n_ctx(ctx_tgt);
-                const uint32_t fp_n_seq = llama_n_seq_max(ctx_tgt);
-                const uint8_t  fp_dft   = ctx_dft ? 1 : 0;
-                fp_mix(&fp_n_ctx, sizeof(fp_n_ctx));
-                fp_mix(&fp_n_seq, sizeof(fp_n_seq));
-                fp_mix(&fp_dft,   sizeof(fp_dft));
+                    std::error_code ec_size;
+                    std::error_code ec_time;
+
+                    a.size  = (uint64_t) std::filesystem::file_size(path, ec_size);
+                    a.mtime = (int64_t)  std::filesystem::last_write_time(path, ec_time).time_since_epoch().count();
+
+                    if (ec_size) {
+                        a.size = 0;
+                    }
+                    if (ec_time) {
+                        a.mtime = 0;
+                    }
+
+                    // cheap head+tail content probe: catches an artifact that
+                    // was rewritten in place while keeping its size and mtime
+                    a.probe = server_prompt_cache_file_probe(path);
+                };
+
+                fill_artifact(fp.model_tgt, params_base.model.path);
+
+                // the draft *identity*, not merely its existence: swapping the
+                // drafter (as this deployment did for the 0731 checkpoint) must
+                // invalidate every file that holds a draft sequence state
+                if (ctx_dft != nullptr) {
+                    fill_artifact(fp.model_dft, params_base.speculative.draft.mparams.path);
+                }
+
+                fp.kv_type_k_tgt   = (int32_t) params_base.cache_type_k;
+                fp.kv_type_v_tgt   = (int32_t) params_base.cache_type_v;
+                fp.kv_type_k_dft   = (int32_t) params_base.speculative.draft.cache_type_k;
+                fp.kv_type_v_dft   = (int32_t) params_base.speculative.draft.cache_type_v;
+                fp.flash_attn_type = (int32_t) params_base.flash_attn_type;
+                fp.kv_unified      = params_base.kv_unified ? 1 : 0;
+                fp.swa_full        = params_base.swa_full   ? 1 : 0;
+
+                fp.n_ctx_tgt     = llama_n_ctx(ctx_tgt);
+                fp.n_seq_max_tgt = llama_n_seq_max(ctx_tgt);
+                fp.n_ctx_dft     = ctx_dft ? llama_n_ctx(ctx_dft)     : 0;
+                fp.n_seq_max_dft = ctx_dft ? llama_n_seq_max(ctx_dft) : 0;
+                fp.n_parallel    = params_base.n_parallel;
+
+                fp.spec_types.reserve(params_base.speculative.types.size());
+                for (const auto type : params_base.speculative.types) {
+                    fp.spec_types.push_back((int32_t) type);
+                }
+                fp.spec_n_max = params_base.speculative.draft.n_max;
+
+                fingerprint = server_prompt_cache_fingerprint(fp);
+
+                SRV_INF("prompt cache fingerprint: %016llx (schema v%u, state-seq v%u/layout %u, tgt '%s', dft '%s')\n",
+                        (unsigned long long) fingerprint,
+                        (unsigned) fp.schema_version, (unsigned) fp.state_seq_version, (unsigned) fp.state_seq_layout,
+                        fp.model_tgt.path.c_str(),
+                        fp.model_dft.present ? fp.model_dft.path.c_str() : "(none)");
             }
 
             if (!params_base.cache_disk.empty()) {

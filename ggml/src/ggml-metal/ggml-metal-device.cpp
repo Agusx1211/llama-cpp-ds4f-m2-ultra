@@ -1927,7 +1927,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         bool    has_kvpad,
         int32_t nsg,
         int32_t nwg,
-        bool    blocked) {
+        bool    blocked,
+        int32_t nh) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -1955,7 +1956,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             dk,
             dv);
 
-    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_mskip=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d_blk=%d",
+    // GGML_FA_MSKIP_BALLOT=0 restores the per-group threadgroup-memory rescan
+    // that the mask-skip specialization used before the simd_ballot bitmap.
+    // Measurement knob only: the skip decisions, and therefore the output, are
+    // identical either way.
+    static const bool mskip_ballot = []() {
+        const char * s = std::getenv("GGML_FA_MSKIP_BALLOT");
+        return !(s && atoi(s) == 0);
+    }();
+
+    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_mskip=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d_blk=%d_nh=%d_bal=%d",
             base,
             has_mask,
             has_sinks,
@@ -1965,7 +1975,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             sparse_mask,
             ns10,
             ns20,
-            nsg, nwg, blocked);
+            nsg, nwg, blocked, nh, mskip_ballot);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1984,6 +1994,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         ggml_metal_cv_set_int32(cv, nwg,  FC_FLASH_ATTN_EXT_VEC + 23);
 
         ggml_metal_cv_set_bool(cv, blocked, FC_FLASH_ATTN_EXT_VEC + 24);
+
+        ggml_metal_cv_set_int32(cv, nh, FC_FLASH_ATTN_EXT_VEC + 25);
+
+        ggml_metal_cv_set_bool(cv, mskip_ballot, FC_FLASH_ATTN_EXT_VEC + 26);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
