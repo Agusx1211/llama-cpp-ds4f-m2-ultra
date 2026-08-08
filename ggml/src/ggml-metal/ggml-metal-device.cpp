@@ -1720,8 +1720,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k(ggml_metal
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_radix(ggml_metal_library_t lib, bool radix8) {
-    const char * name = radix8 ? "kernel_top_k_radix8_f32_i32" : "kernel_top_k_radix_f32_i32";
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_radix(ggml_metal_library_t lib, bool radix8, int tie_policy) {
+    // six variants: {radix-4, radix-8} x {oldest-first, newest-first,
+    // hash-sampled pivot tie-break}. See kernel_top_k_radix_f32_i32_impl and
+    // LLAMA_DSV4_TOPK_TIE.
+    static const char * const names[2][3] = {
+        { "kernel_top_k_radix_f32_i32",  "kernel_top_k_radix_f32_i32_tdesc",  "kernel_top_k_radix_f32_i32_thash"  },
+        { "kernel_top_k_radix8_f32_i32", "kernel_top_k_radix8_f32_i32_tdesc", "kernel_top_k_radix8_f32_i32_thash" },
+    };
+    GGML_ASSERT(tie_policy >= 0 && tie_policy < 3);
+    const char * name = names[radix8 ? 1 : 0][tie_policy];
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
