@@ -1809,9 +1809,11 @@ static int64_t common_dsv4_count_zero_rows(
 }
 
 static void common_dsv4_comp_write_audit(struct ggml_tensor * t) {
-    const struct ggml_tensor * dst  = t->src[0];
-    const struct ggml_tensor * src  = t->src[1];
-    const struct ggml_tensor * idxt = t->src[2];
+    // GGML_OP_SET_ROWS src order is (data, idxs, destination) - see the note in
+    // ggml_set_rows(); the node itself is a view of the destination.
+    const struct ggml_tensor * src  = t->src[0];
+    const struct ggml_tensor * idxt = t->src[1];
+    const struct ggml_tensor * dst  = t->src[2];
 
     // The compressor output is F32 in the compute graph and the compressed K
     // cache is F16, so the two sides of the store have different types.
