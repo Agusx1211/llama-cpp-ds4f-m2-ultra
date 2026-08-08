@@ -123,7 +123,13 @@ struct runtime_config {
     // stuck clients are still bounded by the run deadline and by
     // disconnect-driven task cancellation.
     static constexpr uint64_t queue_timeout_default_us  = 10ULL * 60 * 1000 * 1000;
-    static constexpr uint64_t run_timeout_default_us    = 10ULL * 60 * 1000 * 1000;
+    // 30 min: a single agent turn on a hard task can think for >12k tokens,
+    // which at 4-lane-contended decode (~15-25 t/s, spec disabled at >1
+    // active) legitimately exceeds 10 minutes. Measured 2026-08-08: the
+    // 10-min default killed long turns mid-decode ("request run deadline
+    // expired"), and the kill is silent for clients that don't retry
+    // error-stops. The deadline still bounds genuinely hung requests.
+    static constexpr uint64_t run_timeout_default_us    = 30ULL * 60 * 1000 * 1000;
     static constexpr size_t   fast_refill_min_members   = 3;
     static constexpr size_t   fast_refill_max_members   = 16;
     static constexpr uint64_t fast_refill_min_window_us = 1000;
