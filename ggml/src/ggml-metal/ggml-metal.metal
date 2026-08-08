@@ -8650,8 +8650,20 @@ kernel void kernel_flash_attn_ext_vec(
     }
 
     // zero out so
+    // note: so4 has already been advanced by tiisg, so lane t stores float4
+    //       slots t, t + NL, ..., t + (DV4/NL - 1)*NL of this SIMDgroup's
+    //       accumulator. Only lanes 0..NL-1 ever accumulate into it and every
+    //       read is bounded by DV4, so the stores from higher lanes are dead -
+    //       but the highest of them, (NW-1) + (DV4/NL - 1)*NL, leaves the
+    //       PAD(DV,128)/4-wide slot by 16 float4 = 256 B for dk96/dv96,
+    //       dk192/dv128, dk320/dv256 and dk576/dv512. Inside the threadgroup
+    //       that lands in the next SIMDgroup's accumulator; for the last
+    //       SIMDgroup it runs past the threadgroup memory the host declared.
+    //       See tests/test-metal-fa-zerofill.cpp.
     for (short i = 0; i < DV4/NL; ++i) {
-        so4[i*NL] = (o4_t) 0.0f;
+        if (tiisg + i*NL < DV4) {
+            so4[i*NL] = (o4_t) 0.0f;
+        }
     }
 
     // zero out shared memory SH
