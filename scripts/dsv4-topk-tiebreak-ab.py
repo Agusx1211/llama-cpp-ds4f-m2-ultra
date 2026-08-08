@@ -106,6 +106,9 @@ def build_needle_prompt(total_chars, needles, question):
 def needle_probes(depth, n_positions):
     """One single-needle probe per relative depth, plus two multi-needle ones."""
     chars = DEPTHS[depth]
+    # capped: 6 relative depths is enough to separate early from late, and each
+    # 37k probe costs ~2 min of a shared M2 window
+    n_positions = min(n_positions, 6)
     probes = []
     for j in range(n_positions):
         frac = j/(n_positions - 1) if n_positions > 1 else 0.5
