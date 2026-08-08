@@ -32,6 +32,18 @@ static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
 
+// Host-overhead profiler (LLAMA_HOST_PROFILE=1). Sub-phase attribution of the
+// per-decode DSV4 sparse page reservation, which llama_context reports as the
+// "pre" phase. Disabled cost is one predicted branch on a function-local
+// static; see src/llama-context.cpp for the record format.
+static bool dsv4_hp_enabled() {
+    static const bool enabled = []() {
+        const char * v = getenv("LLAMA_HOST_PROFILE");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return enabled;
+}
+
 static std::atomic<uint32_t> dsv4_test_pressure_count = 0;
 static std::atomic<uint64_t> dsv4_test_cow_source_ranges      = 0;
 static std::atomic<uint64_t> dsv4_test_cow_destination_ranges = 0;
@@ -356,6 +368,50 @@ static bool dsv4_sparse_append_slot(
     return dsv4_sparse_append_k_rows(kv, std::move(rows), family, ranges);
 }
 
+// Steady-state decode writes into pages that are already mapped and privately
+// owned, so the sparse reservation it performs is a no-op that still costs
+// O(virtual pages in the pool) to plan. This probe answers "no reservation
+// needed" in O(pages in the ranges); see
+// ggml_metal_buffers_sparse_ranges_resident for why skipping is exact.
+// Returns 1 (skip), 0 (reserve) or -1 (probe unavailable / invalid).
+static int dsv4_sparse_ranges_resident(const std::vector<dsv4_sparse_range> & ranges) {
+    static const bool disabled = []() {
+        const char * v = getenv("LLAMA_DSV4_SPARSE_RESIDENT_DISABLE");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    if (disabled || ranges.empty()) {
+        return -1;
+    }
+
+    using resident_fn = int (*)(ggml_tensor * const *, const size_t *, const size_t *, size_t);
+
+    resident_fn resident = nullptr;
+    for (const auto & range : ranges) {
+        resident = (resident_fn) dsv4_backend_proc(
+                range.tensor, "ggml_backend_metal_dsv4_sparse_ranges_resident");
+        if (resident != nullptr) {
+            break;
+        }
+    }
+    if (resident == nullptr) {
+        return -1;
+    }
+
+    std::vector<ggml_tensor *> tensors;
+    std::vector<size_t>        offsets;
+    std::vector<size_t>        sizes;
+    tensors.reserve(ranges.size());
+    offsets.reserve(ranges.size());
+    sizes.reserve(ranges.size());
+    for (const auto & range : ranges) {
+        tensors.push_back(range.tensor);
+        offsets.push_back(range.offset);
+        sizes.push_back(range.size);
+    }
+
+    return resident(tensors.data(), offsets.data(), sizes.data(), tensors.size());
+}
+
 using dsv4_sparse_quote_fn   = ggml_metal_sparse_reservation_result (*)(ggml_tensor * const *,
                                                                       const size_t *,
                                                                       const size_t *,
@@ -427,6 +483,16 @@ private:
             const std::vector<dsv4_sparse_range> & ranges,
             llama_dsv4_batch_quote & result,
             bool reserve_ticket) {
+        const bool hp = dsv4_hp_enabled();
+        int64_t    hp_t = hp ? ggml_time_us() : 0;
+        const auto hp_mark = [hp, &hp_t](int64_t & acc) {
+            if (hp) {
+                const int64_t t = ggml_time_us();
+                acc += t - hp_t;
+                hp_t = t;
+            }
+        };
+
         n_ranges = ranges.size();
         if (reserve_ticket && dsv4_test_page_delta_audit_enabled.load(std::memory_order_relaxed)) {
             audit_state = std::make_unique<dsv4_sparse_transaction_audit_state>();
@@ -474,6 +540,8 @@ private:
             phase = PHASE_PROC_LOOKUP;
             return ERROR;
         }
+
+        hp_mark(hp_proc);
 
         std::vector<ggml_tensor *> tensors;
         std::vector<size_t> offsets;
@@ -545,14 +613,21 @@ private:
             }
         }
 
+        hp_mark(hp_usage);
+
         std::vector<ggml_metal_sparse_pool_quote> pools(ranges.size());
         size_t n_pools = 0;
         size_t limiting_pool = SIZE_MAX;
+
+        hp_mark(hp_pools);
+
         const auto status = reserve_ticket ? reserve(
                 tensors.data(), offsets.data(), sizes.data(), tensors.size(),
                 pools.data(), pools.size(), &n_pools, &limiting_pool, &ticket) : quote(
                 tensors.data(), offsets.data(), sizes.data(), tensors.size(),
                 pools.data(), pools.size(), &n_pools, &limiting_pool);
+        hp_mark(hp_call);
+
         backend_status = status;
         ticket_issued = ticket != nullptr;
         n_quoted_pools = n_pools;
@@ -604,6 +679,8 @@ private:
             }
         }
         result.feasible = status == GGML_METAL_SPARSE_RESERVATION_OK;
+
+        hp_mark(hp_acct);
 
         // Consume the test fault only after the real backend has produced a
         // valid quote and ticket. Returning pressure here exercises the same
@@ -676,6 +753,17 @@ public:
     size_t shared_family_pool_count() const {
         return n_shared_family_pools;
     }
+
+    size_t quoted_pool_count() const {
+        return n_quoted_pools;
+    }
+
+    // host-overhead profiler accumulators (LLAMA_HOST_PROFILE=1), microseconds
+    int64_t hp_proc  = 0; // backend proc-address lookups
+    int64_t hp_usage = 0; // per-range tensor -> pool usage snapshots
+    int64_t hp_pools = 0; // per-call quote/usage output vector allocation
+    int64_t hp_call  = 0; // the Metal sparse quote/reserve call itself
+    int64_t hp_acct  = 0; // per-pool family accounting
 
 private:
     void finish_audit(bool committed_value, bool cancelled_value) {
@@ -4601,19 +4689,41 @@ void llama_kv_cache_dsv4_context::rollback_aggregate_pool() {
 }
 
 bool llama_kv_cache_dsv4_context::reserve_batch_ranges() {
+    const bool hp = dsv4_hp_enabled();
+    const int64_t hp_t0 = hp ? ggml_time_us() : 0;
+    int64_t hp_t = hp_t0;
+    int64_t hp_adm = 0, hp_aggr = 0, hp_cow = 0, hp_coll = 0;
+    int64_t hp_resv = 0, hp_comm = 0, hp_copy = 0;
+    const auto hp_mark = [hp, &hp_t](int64_t & acc) {
+        if (hp) {
+            const int64_t t = ggml_time_us();
+            acc += t - hp_t;
+            hp_t = t;
+        }
+    };
+
     const auto admission_status = kv->consume_admission(ubatches, last_batch_quote, last_pressure_family_mask);
     if (admission_status == llama_kv_cache_dsv4::ADMISSION_COMMITTED) {
         batch_ranges_reserved = true;
+        if (hp) {
+            const int64_t t1 = ggml_time_us();
+            fprintf(stderr, "HOSTPROF {\"op\":\"pref\",\"t\":%" PRId64 ",\"tot\":%" PRId64
+                    ",\"path\":\"admitted\",\"nub\":%zu}\n", t1, t1 - hp_t0, ubatches.size());
+        }
         return true;
     }
     if (admission_status == llama_kv_cache_dsv4::ADMISSION_ERROR) {
         return false;
     }
 
+    hp_mark(hp_adm);
+
     std::vector<llama_dsv4_comp_allocation> cow_allocations;
     if (!reserve_aggregate_pool(cow_allocations)) {
         return false;
     }
+
+    hp_mark(hp_aggr);
 
     std::vector<dsv4_sparse_range> ranges;
     uint64_t                       cow_source_ranges      = 0;
@@ -4652,13 +4762,47 @@ bool llama_kv_cache_dsv4_context::reserve_batch_ranges() {
         }
     }
 
+    hp_mark(hp_cow);
+
     if (!collect_batch_ranges(ranges)) {
         rollback_aggregate_pool();
         return false;
     }
 
+    hp_mark(hp_coll);
+
+    // Fast path. With no COW allocation pending and every target page already
+    // mapped and exclusively owned, the reservation below would quote
+    // required_pages = 0 and its commit would perform no mapping operation, no
+    // generation bump and no net accounting change - while still paying the
+    // planner's full scan of the pool's virtual and physical page tables,
+    // twice (quote and commit re-quote), on every decode step. Skipping it is
+    // observationally identical.
+    //
+    // The test seams are excluded: the page-delta audit expects a transaction
+    // to observe, and an injected physical-pressure fault is consumed inside
+    // the reservation.
+    if (cow_allocations.empty() &&
+            !dsv4_test_page_delta_audit_enabled.load(std::memory_order_relaxed) &&
+            dsv4_test_pressure_count.load(std::memory_order_relaxed) == 0 &&
+            dsv4_sparse_ranges_resident(ranges) > 0) {
+        batch_ranges_reserved = true;
+        if (hp) {
+            hp_mark(hp_resv);
+            const int64_t t1 = ggml_time_us();
+            fprintf(stderr, "HOSTPROF {\"op\":\"pref\",\"t\":%" PRId64 ",\"tot\":%" PRId64
+                    ",\"path\":\"resident\",\"nub\":%zu,\"nr\":%zu"
+                    ",\"adm\":%" PRId64 ",\"aggr\":%" PRId64 ",\"cow\":%" PRId64
+                    ",\"coll\":%" PRId64 ",\"resv\":%" PRId64 "}\n",
+                    t1, t1 - hp_t0, ubatches.size(), ranges.size(),
+                    hp_adm, hp_aggr, hp_cow, hp_coll, hp_resv);
+        }
+        return true;
+    }
+
     dsv4_sparse_transaction reservation;
     const auto reserve_status = reservation.reserve_ranges(ranges, last_batch_quote);
+    hp_mark(hp_resv);
     if (cow_source_ranges > 0) {
         dsv4_test_cow_source_ranges.fetch_add(cow_source_ranges, std::memory_order_relaxed);
         dsv4_test_cow_destination_ranges.fetch_add(cow_destination_ranges, std::memory_order_relaxed);
@@ -4690,6 +4834,8 @@ bool llama_kv_cache_dsv4_context::reserve_batch_ranges() {
         return false;
     }
 
+    hp_mark(hp_comm);
+
     for (const llama_dsv4_comp_allocation & allocation : cow_allocations) {
         if (allocation.family == llama_dsv4_comp_family::c4) {
             dsv4_copy_pool_segment(kv->get_csa(), allocation.source_segment, allocation.destination_segment,
@@ -4703,6 +4849,23 @@ bool llama_kv_cache_dsv4_context::reserve_batch_ranges() {
     }
 
     batch_ranges_reserved = true;
+
+    if (hp) {
+        hp_mark(hp_copy);
+        const int64_t t1 = ggml_time_us();
+        fprintf(stderr, "HOSTPROF {\"op\":\"pref\",\"t\":%" PRId64 ",\"tot\":%" PRId64
+                ",\"path\":\"reserve\",\"nub\":%zu,\"nr\":%zu,\"nsr\":%zu,\"npool\":%zu"
+                ",\"adm\":%" PRId64 ",\"aggr\":%" PRId64 ",\"cow\":%" PRId64 ",\"coll\":%" PRId64
+                ",\"resv\":%" PRId64 ",\"comm\":%" PRId64 ",\"copy\":%" PRId64
+                ",\"r_proc\":%" PRId64 ",\"r_usage\":%" PRId64 ",\"r_pools\":%" PRId64
+                ",\"r_call\":%" PRId64 ",\"r_acct\":%" PRId64 "}\n",
+                t1, t1 - hp_t0, ubatches.size(), ranges.size(),
+                reservation.sparse_range_count(), reservation.quoted_pool_count(),
+                hp_adm, hp_aggr, hp_cow, hp_coll, hp_resv, hp_comm, hp_copy,
+                reservation.hp_proc, reservation.hp_usage, reservation.hp_pools,
+                reservation.hp_call, reservation.hp_acct);
+    }
+
     return true;
 }
 

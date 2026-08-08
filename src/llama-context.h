@@ -414,6 +414,31 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // env: LLAMA_HOST_PROFILE=1 - per-decode-step host-overhead attribution.
+    // Scratch for one decode()/encode() call; phases are accumulated by
+    // process_ubatch() and the extraction block, then emitted as one JSONL
+    // line on stderr (prefix "HOSTPROF"). Near-zero cost when disabled: a
+    // single bool test per hook.
+    struct host_prof_call {
+        int64_t balloc    = 0; // balloc->init
+        int64_t mupd      = 0; // memory_update (shifts/copies)
+        int64_t mctx_init = 0; // memory->init_batch (incl. DSV4 plan build)
+        int64_t preflight = 0; // mctx->preflight (physical page reservation)
+        int64_t outres    = 0; // output_reserve
+        int64_t apply     = 0; // mctx->apply
+        int64_t reuse_chk = 0; // graph_params + can_reuse check
+        int64_t build     = 0; // model.build_graph (reuse miss only)
+        int64_t alloc     = 0; // ggml_backend_sched_alloc_graph (reuse miss only)
+        int64_t set_inp   = 0; // res->set_inputs
+        int64_t gcomp     = 0; // graph_compute host wall (Metal encode+submit)
+        int64_t extract   = 0; // logits/embd/nextn/sampling async-copy setup
+        int32_t n_ubatch  = 0;
+        int32_t n_reuse   = 0; // ubatches that hit graph reuse
+        void reset() { *this = host_prof_call(); }
+    };
+    host_prof_call hp;
+    bool hp_enabled = false;
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;
