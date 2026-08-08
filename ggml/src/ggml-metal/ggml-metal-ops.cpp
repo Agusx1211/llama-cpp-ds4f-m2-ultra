@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <cmath>
 
@@ -5918,7 +5919,31 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
         const bool dsv4_top_k_radix8 = dsv4_top_k_radix8_enabled &&
             ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->device_id ==
                 GGML_METAL_DEVICE_M2_ULTRA;
-        auto pipeline = ggml_metal_library_get_pipeline_top_k_radix(lib, dsv4_top_k_radix8);
+
+        // Pivot tie-break policy for the DSV4 Lightning Indexer selection. The
+        // indexer row is ReLU'd, so the pivot is routinely exactly 0.0f and the
+        // tie group spans thousands of compressed rows: "asc" (the default)
+        // fills the quota with the oldest tied rows, "desc" with the most
+        // recent ones, "hash" with a deterministic unbiased sample. All three
+        // are deterministic. Read once - the kernel choice must not vary within
+        // a process or across the graph.
+        static const int dsv4_top_k_tie_policy = []() {
+            const char * s = std::getenv("LLAMA_DSV4_TOPK_TIE");
+            int policy = 0;
+            if (s != nullptr) {
+                if      (std::strcmp(s, "asc")  == 0) policy = 0;
+                else if (std::strcmp(s, "desc") == 0) policy = 1;
+                else if (std::strcmp(s, "hash") == 0) policy = 2;
+                else {
+                    GGML_LOG_WARN("%s: LLAMA_DSV4_TOPK_TIE='%s' is not asc|desc|hash; using asc\n", __func__, s);
+                }
+            }
+            static const char * const desc[3] = { "asc (oldest tied keys)", "desc (newest tied keys)", "hash (unbiased sample)" };
+            GGML_LOG_INFO("%s: DSV4 top-k pivot tie-break = %s\n", __func__, desc[policy]);
+            return policy;
+        }();
+
+        auto pipeline = ggml_metal_library_get_pipeline_top_k_radix(lib, dsv4_top_k_radix8, dsv4_top_k_tie_policy);
         GGML_ASSERT(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) >= 512);
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);

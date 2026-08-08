@@ -20,6 +20,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <regex>
@@ -1629,6 +1630,83 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+// ---------------------------------------------------------------------------
+// DSV4 Lightning Indexer top-k census (LLAMA_DSV4_TOPK_CENSUS=<n>)
+//
+// The indexer score row is ReLU'd upstream, so every compressed row the indexer
+// scored <= 0 collapses onto exactly 0.0f. Once fewer than 512 rows carry a
+// strictly positive score, the 512th-largest value *is* 0.0f and the kernel has
+// to pick an arbitrary subset of that zero mass - which is what the
+// LLAMA_DSV4_TOPK_TIE policy decides. This census reports, per selection:
+//
+//   n_gt       rows scoring strictly above the pivot (always retained)
+//   n_eq       width of the pivot tie group
+//   tie_slots  512 - n_gt, i.e. how many of the 512 outputs the policy chose
+//
+// If tie_slots is ~0 the policy cannot matter; if it is a large fraction of
+// 512 the policy is a real modelling decision.
+// ---------------------------------------------------------------------------
+
+static int  common_dsv4_topk_census_budget = 0;
+static long common_dsv4_topk_census_seen   = 0;
+
+static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    GGML_UNUSED(user_data);
+
+    const struct ggml_tensor * s = t->src[0];
+
+    // only the DSV4 indexer selection: TOP_K, k == 512, and long enough to take
+    // the radix path (ggml_metal_op_top_k routes ne0 == 512 && ne00 > 1024).
+    // ne01 is the number of query positions in the batch; prefill ubatches make
+    // the score tensor hundreds of MB, so census only the decode/verify shapes.
+    const bool want =
+        t->op == GGML_OP_TOP_K && t->ne[0] == 512 &&
+        s != nullptr && s->type == GGML_TYPE_F32 && s->ne[0] > 1024 && s->ne[1] <= 8 &&
+        common_dsv4_topk_census_seen < common_dsv4_topk_census_budget;
+
+    if (ask) {
+        return want;
+    }
+    if (!want) {
+        return true;
+    }
+
+    const int64_t ne00 = s->ne[0];
+    const int64_t ne01 = s->ne[1];
+
+    std::vector<float> row((size_t) ne00);
+    for (int64_t r = 0; r < ne01; ++r) {
+        ggml_backend_tensor_get(s, row.data(), (size_t) r*s->nb[1], (size_t) ne00*sizeof(float));
+
+        std::vector<float> tmp = row;
+        std::nth_element(tmp.begin(), tmp.begin() + 511, tmp.end(), std::greater<float>());
+        const float pivot = tmp[511];
+
+        int64_t n_gt = 0, n_eq = 0, n_pos = 0, n_neg = 0, n_inf = 0;
+        for (int64_t i = 0; i < ne00; ++i) {
+            const float v = row[(size_t) i];
+            if      (v >  pivot) ++n_gt;
+            else if (v == pivot) ++n_eq;
+            if      (v >  0.0f)  ++n_pos;
+            else if (v <  0.0f)  { ++n_neg; if (std::isinf(v)) ++n_inf; }
+        }
+
+        // src is named lid_score_masked-<il> by llama_model_deepseek4::graph,
+        // so the layer is recoverable; only the target has a Lightning Indexer
+        // (src/models/dflash.cpp, the DSpark drafter, has no top-k at all), so
+        // every census line below is the target's.
+        fprintf(stderr,
+                "TOPKCENSUS src=%s ne00=%lld ne01=%lld row=%lld pivot=%.9g "
+                "n_gt=%lld n_eq=%lld tie_slots=%lld n_pos=%lld n_neg=%lld n_inf=%lld\n",
+                s->name, (long long) ne00, (long long) ne01, (long long) r, (double) pivot,
+                (long long) n_gt, (long long) n_eq, (long long) (512 - n_gt),
+                (long long) n_pos, (long long) n_neg, (long long) n_inf);
+    }
+
+    ++common_dsv4_topk_census_seen;
+    return true;
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
@@ -1655,6 +1733,21 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    // LLAMA_DSV4_TOPK_CENSUS=<n>: census of the DeepSeek V4 Lightning Indexer's
+    // top-k selection, for at most <n> nodes. Answers the only question that
+    // decides whether the pivot tie-break policy can matter at all: how wide
+    // the exact-0.0f tie group is, and how many of the 512 selected slots have
+    // to be filled from it. Diagnostic only - it forces one scheduler split and
+    // one host readback per indexer selection, so it is very slow.
+    if (cparams.cb_eval == nullptr) {
+        const char * census = std::getenv("LLAMA_DSV4_TOPK_CENSUS");
+        if (census != nullptr && std::atoi(census) > 0) {
+            common_dsv4_topk_census_budget = std::atoi(census);
+            cparams.cb_eval               = common_dsv4_topk_census_cb;
+            cparams.cb_eval_user_data     = nullptr;
+        }
+    }
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
