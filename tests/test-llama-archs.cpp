@@ -1171,8 +1171,20 @@ static bool test_dsv4_admission_lifecycle(size_t seed, ggml_backend_dev_t dev) {
     GGML_ASSERT(ticket != nullptr);
     GGML_ASSERT(llama_kv_admission_arm(ticket));
     llama_kv_admission_free(ticket);
-    GGML_ASSERT(dsv4_usage_snapshot_equal(baseline, memory->memory_usage_snapshot()) &&
+    // Since 41b969a5e ("commit elastic admission reservation at arm time"),
+    // arm_admission() commits the sparse reservation immediately, so the
+    // admitted span's pages are MAPPED from here on and the usage snapshot is
+    // legitimately above baseline. This assertion predates that commit
+    // (461097099) and has been failing ever since - which is also why the
+    // arm-then-clear defect this file's
+    // test_dsv4_admission_clear_before_first_batch now covers went unnoticed.
+    // The invariant that still holds is that no *reservation* is leaked, and
+    // that a logical clear releases the mapping.
+    GGML_ASSERT(memory->memory_usage_snapshot().sparse_total.reserved_pages == 0 &&
             "armed prefill cancellation leaked reserved pages");
+    llama_memory_clear(llama_get_memory(test.lctx.get()), true);
+    GGML_ASSERT(dsv4_usage_footprint_equal(baseline, memory->memory_usage_snapshot()) &&
+            "armed prefill cancellation did not release its mapping on clear");
 
     // Admit a fresh sequence beside the exact next position of an already
     // populated sequence. The two ranges must remain one reservation so the
