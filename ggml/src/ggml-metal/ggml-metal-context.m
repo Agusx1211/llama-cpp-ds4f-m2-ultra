@@ -893,6 +893,20 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+// Host-overhead profiler (LLAMA_HOST_PROFILE=1). Splits the host wall time of
+// ggml_metal_graph_compute - reported by llama_context as the "gcomp" phase -
+// into command-buffer setup, the main-thread node prefix encode, and the
+// dispatch_apply that encodes the remainder. See src/llama-context.cpp for the
+// record format.
+static bool ggml_metal_hp_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * v = getenv("LLAMA_HOST_PROFILE");
+        enabled = (v != NULL && atoi(v) != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
@@ -919,8 +933,16 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     // number of threads in addition to the main thread
     const int n_cb = ctx->n_cb;
 
+    const bool    hp    = ggml_metal_hp_enabled();
+    const int64_t hp_t0 = hp ? ggml_time_us() : 0;
+    int64_t       hp_t  = hp_t0;
+    int64_t       hp_keepalive = 0, hp_cb0 = 0, hp_main = 0, hp_cbs = 0, hp_rest = 0;
+#define GGML_METAL_HP_MARK(acc) do { if (hp) { const int64_t _t = ggml_time_us(); (acc) += _t - hp_t; hp_t = _t; } } while (0)
+
     // keep the memory wired
     ggml_metal_device_rsets_keep_alive(ctx->dev);
+
+    GGML_METAL_HP_MARK(hp_keepalive);
 
     // submit the ggml compute graph to the GPU by creating command buffers and encoding the ops in them
     // the first n_nodes_0 are encoded and submitted for processing directly by the calling thread
@@ -1005,7 +1027,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
             [cmd_buf enqueue];
 
+            GGML_METAL_HP_MARK(hp_cb0);
+
             ctx->encode_async(n_cb);
+
+            GGML_METAL_HP_MARK(hp_main);
         }
 
         // remember the command buffer for the next iteration
@@ -1033,7 +1059,20 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             }
         }
 
+        GGML_METAL_HP_MARK(hp_cbs);
+
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+
+        GGML_METAL_HP_MARK(hp_rest);
+
+        if (hp) {
+            fprintf(stderr, "HOSTPROF {\"op\":\"gcmp\",\"t\":%" PRId64 ",\"tot\":%" PRId64
+                    ",\"nodes\":%d,\"n0\":%d,\"ncb\":%d,\"npcb\":%d"
+                    ",\"keep\":%" PRId64 ",\"cb0\":%" PRId64 ",\"main\":%" PRId64
+                    ",\"cbs\":%" PRId64 ",\"rest\":%" PRId64 "}\n",
+                    hp_t, hp_t - hp_t0, gf->n_nodes, ctx->n_nodes_0, n_cb, ctx->n_nodes_per_cb,
+                    hp_keepalive, hp_cb0, hp_main, hp_cbs, hp_rest);
+        }
 
         if (ctx->dsv4_encode_profile_active) {
             const int64_t graph_host_us = ggml_time_us() - profile_graph_start_us;
@@ -1114,6 +1153,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
     return GGML_STATUS_SUCCESS;
 }
+#undef GGML_METAL_HP_MARK
 
 void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     //const int64_t t_start = ggml_time_us();
