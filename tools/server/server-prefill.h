@@ -21,6 +21,30 @@ struct coordinator_config {
     uint32_t active_decode_chunk_tokens = 256;
     uint32_t active_fast_chunk_tokens   = 128;
 
+    // [TAG_PREFILL_PRIORITY]
+    // On the M2 Ultra DSV4 vertical a decode ubatch inserted into a prefill
+    // iteration costs a fixed ~0.47 s of deep-context weight sweep no matter
+    // how large the prefill chunk it rides with is. Shrinking the chunk under
+    // active decode therefore multiplies that fixed cost instead of amortizing
+    // it: measured 196-211 t/s of prefill against 300-310 t/s solo while the
+    // generators still only reached 0.9-1.8 t/s each - both sides lose. With
+    // priority_chunk_tokens = idle_chunk_tokens the same interleaved shape
+    // measures 299.8 t/s (97% of solo). The generators' remaining trickle is
+    // metered against prefill progress by the server loop, not here.
+    //
+    // prefill_priority = false restores the pre-priority behavior exactly.
+    // priority_chunk_tokens = 0 means "no extra cap", i.e. the full
+    // idle_chunk_tokens budget; a non-zero value caps the priority chunk and
+    // exists so the chunk size can be swept without rebuilding.
+    bool     prefill_priority      = true;
+    uint32_t priority_chunk_tokens = 0;
+
+    // The fast lane is an explicit interactive-latency contract, so a
+    // generating fast-lane slot keeps the small-chunk behavior by default and
+    // prefill yields to it. Only the lane of a *generating* slot matters here;
+    // the lane of the prefilling request never shrinks its own chunk.
+    bool priority_yields_to_fast = true;
+
     // A cohort normally keeps a multi-chunk lease. At an aligned committed
     // boundary this limit gives another waiting cohort a deterministic turn.
     uint32_t max_lease_chunks = 4;

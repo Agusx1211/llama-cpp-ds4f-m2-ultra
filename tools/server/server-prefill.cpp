@@ -190,6 +190,7 @@ coordinator::coordinator(coordinator_config config) : cfg(config) {
     if (cfg.alignment_tokens == 0 || cfg.idle_chunk_tokens == 0 || cfg.active_decode_chunk_tokens == 0 ||
         cfg.active_fast_chunk_tokens == 0 || cfg.max_lease_chunks == 0 ||
         cfg.active_decode_chunk_tokens > cfg.idle_chunk_tokens ||
+        cfg.priority_chunk_tokens > cfg.idle_chunk_tokens ||
         cfg.active_fast_chunk_tokens > cfg.active_decode_chunk_tokens ||
         std::any_of(cfg.lane_weights.begin(), cfg.lane_weights.end(), [](uint32_t weight) { return weight == 0; })) {
         throw std::invalid_argument("invalid server prefill coordinator configuration");
@@ -281,9 +282,18 @@ chunk_limit coordinator::limit_chunk(uint64_t                request_id,
 
     uint64_t budget = std::min<uint64_t>(available_batch_tokens, cfg.idle_chunk_tokens);
     if (activity.active) {
-        budget = std::min<uint64_t>(budget, cfg.active_decode_chunk_tokens);
-        if (activity.highest_lane == server_scheduler::lane::fast) {
-            budget = std::min<uint64_t>(budget, cfg.active_fast_chunk_tokens);
+        // [TAG_PREFILL_PRIORITY] Active decode shrinks the chunk only when
+        // prefill priority is off, or when the highest generating lane is the
+        // fast lane and the configuration yields to it.
+        const bool fast   = activity.highest_lane == server_scheduler::lane::fast;
+        const bool yields = !cfg.prefill_priority || (fast && cfg.priority_yields_to_fast);
+        if (yields) {
+            budget = std::min<uint64_t>(budget, cfg.active_decode_chunk_tokens);
+            if (fast) {
+                budget = std::min<uint64_t>(budget, cfg.active_fast_chunk_tokens);
+            }
+        } else if (cfg.priority_chunk_tokens != 0) {
+            budget = std::min<uint64_t>(budget, cfg.priority_chunk_tokens);
         }
     }
 

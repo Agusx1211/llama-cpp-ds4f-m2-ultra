@@ -32,6 +32,7 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <thread>
 #include <filesystem>
@@ -93,6 +94,82 @@ static const bool SERVER_DSV4_ADMISSION_VERTICAL = []() {
     const char * env = std::getenv("LLAMA_DSV4_ADMISSION_VERTICAL");
     return env != nullptr && env[0] == '1' && env[1] == '\0';
 }();
+
+static bool server_env_flag(const char * name, bool fallback) {
+    const char * env = std::getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        return fallback;
+    }
+    return !(env[0] == '0' && env[1] == '\0');
+}
+
+static uint32_t server_env_u32(const char * name, uint32_t fallback) {
+    const char * env = std::getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        return fallback;
+    }
+    char *              end    = nullptr;
+    const unsigned long parsed = std::strtoul(env, &end, 10);
+    if (end == env || *end != '\0' || parsed > std::numeric_limits<uint32_t>::max()) {
+        return fallback;
+    }
+    return (uint32_t) parsed;
+}
+
+// [TAG_PREFILL_PRIORITY]
+// Prefill priority on the M2 Ultra DSV4 vertical.
+//
+// The problem: while any slot generates, the prefill coordinator used to cap
+// chunks at active_decode_chunk_tokens (256; 128 under a fast-lane generator)
+// instead of idle_chunk_tokens (2048), and every iteration additionally
+// carried the generators' decode tokens, which DSV4 executes as separate
+// deep-context ubatches. Measured cost model on this box: a decode ubatch
+// inserted into a prefill iteration costs a FIXED ~0.47 s and yields ~2.3
+// accepted tokens, while 256 tokens of prefill cost ~0.82 s. The small chunk
+// therefore does not buy decode anything extra - it only multiplies how many
+// times the fixed decode tax is paid per prefilled token. The result is
+// lose-lose: 196-211 t/s of prefill against 300-310 t/s solo, with generators
+// still stuck at 0.9-1.8 t/s.
+//
+// The fix has two parts:
+//  1. the chunk stays full-size under active decode (server_prefill::
+//     coordinator_config::prefill_priority), so the fixed decode tax is
+//     amortized over 1920-2048 tokens instead of 256 - measured 299.8 t/s,
+//     97% of solo;
+//  2. the generators' remaining trickle is metered against PREFILL PROGRESS
+//     (one decode step every N committed prefill chunks), not wall clock. A
+//     wall-clock throttle was tried first (LLAMA_SERVER_DECODE_KEEPALIVE_TPS,
+//     lane admission-reuse-fix) and measured a no-op: the interval it must
+//     exceed to have any effect is the iteration period, which is itself set
+//     by the chunk size the throttle is trying to control. Prefill progress
+//     has no such circularity.
+//
+// LLAMA_SERVER_PREFILL_PRIORITY=0 restores the previous behavior exactly
+// (small chunks + a decode step every iteration) and is the rollback lever.
+static const bool SERVER_PREFILL_PRIORITY = server_env_flag("LLAMA_SERVER_PREFILL_PRIORITY", true);
+
+// Optional cap on the priority chunk, for sweeping the primary lever without a
+// rebuild. 0 = no extra cap (full idle_chunk_tokens).
+static const uint32_t SERVER_PREFILL_PRIORITY_CHUNK = server_env_u32("LLAMA_SERVER_PREFILL_PRIORITY_CHUNK", 0);
+
+// 1 = prefill priority applies even while a fast-lane slot generates. Default
+// 0: the fast lane is an explicit interactive-latency contract, so prefill
+// keeps yielding to it with the existing 128-token chunks.
+static const bool SERVER_PREFILL_PRIORITY_FAST = server_env_flag("LLAMA_SERVER_PREFILL_PRIORITY_FAST", false);
+
+// Generators join a decode batch once every N committed prefill chunks while a
+// prompt still needs prefill. 1 = one decode step per prefill chunk (the
+// measured operating point: 97% of solo prefill, ~one generated token per
+// chunk per slot). 0 = no decode at all until prefill finishes.
+static const uint32_t SERVER_PREFILL_DECODE_EVERY = server_env_u32("LLAMA_SERVER_PREFILL_DECODE_EVERY", 1);
+
+static server_prefill::coordinator_config server_prefill_config_from_environment() {
+    server_prefill::coordinator_config config;
+    config.prefill_priority        = SERVER_PREFILL_PRIORITY;
+    config.priority_chunk_tokens   = std::min(SERVER_PREFILL_PRIORITY_CHUNK, config.idle_chunk_tokens);
+    config.priority_yields_to_fast = !SERVER_PREFILL_PRIORITY_FAST;
+    return config;
+}
 
 struct server_kv_admission_ticket_deleter {
     void operator()(llama_kv_admission_ticket * ticket) const {
@@ -1176,10 +1253,25 @@ private:
 
     server_metrics metrics;
     server_scheduler::kv_pressure_controller kv_pressure;
-    server_prefill::coordinator prefill;
+    server_prefill::coordinator prefill{ server_prefill_config_from_environment() };
     server_trusted_scheduling::control trusted_scheduling{
         server_trusted_scheduling::config_from_environment()
     };
+
+    // [TAG_PREFILL_PRIORITY] Prefill-progress meter for the generator trickle.
+    // Counts prefill chunks committed since the last iteration that carried
+    // generator decode tokens; the gate opens at
+    // SERVER_PREFILL_DECODE_EVERY. Progress, not wall clock: the iteration
+    // period is a function of the chunk size, so a wall-clock interval short
+    // enough to matter is always due and a long enough one is unpredictable.
+    uint32_t prefill_chunks_since_decode = 0;
+    // One-shot escape so an iteration that staged literally nothing cannot
+    // spin: set when the gate was closed AND the batch came out empty.
+    bool prefill_decode_force_next = false;
+    // Did this iteration skip at least one generating slot?
+    bool prefill_decode_gate_closed = false;
+    // One log line per prefill window rather than per iteration.
+    bool prefill_priority_window_open = false;
 
     server_prefill::staged_batch_lifecycle prefill_batch;
     server_prefill::owner_selection traced_prefill_owner;
@@ -3918,15 +4010,29 @@ private:
         trusted_scheduling.record(std::move(event));
     }
 
+    // [TAG_PREFILL_PRIORITY] Real prefill progress is what meters the
+    // generator trickle, so only a committed chunk advances the counter. An
+    // aborted chunk did not happen and must not buy a decode step.
+    void note_prefill_chunk_committed() {
+        if (prefill_chunks_since_decode != std::numeric_limits<uint32_t>::max()) {
+            ++prefill_chunks_since_decode;
+        }
+    }
+
     bool commit_prefill_chunk(const server_prefill::chunk_lease & lease) {
         if (!trusted_scheduling.trace_enabled()) {
-            return prefill.commit_chunk(lease);
+            if (!prefill.commit_chunk(lease)) {
+                return false;
+            }
+            note_prefill_chunk_committed();
+            return true;
         }
         GGML_ASSERT(traced_prefill_owner && traced_prefill_owner.request_id == lease.request_id &&
                     traced_prefill_owner.cohort_id == lease.cohort_id);
         if (!prefill.commit_chunk(lease)) {
             return false;
         }
+        note_prefill_chunk_committed();
         server_trusted_scheduling::trace_event event;
         event.at_us              = ggml_time_us();
         event.kind               = server_trusted_scheduling::trace_kind::prefill_chunk_committed;
@@ -4618,9 +4724,62 @@ private:
         std::vector<server_slot *> drafting;
         server_prefill::decode_activity prefill_decode;
 
+        // [TAG_PREFILL_PRIORITY] Meter the generator trickle against prefill
+        // progress. A prefill window is open while any non-child slot still
+        // has a prompt to process; inside it a generating slot joins a decode
+        // batch only once every SERVER_PREFILL_DECODE_EVERY committed prefill
+        // chunks. Outside a prefill window nothing is gated and decode runs at
+        // full speed from the first iteration after prefill completes.
+        const bool prefill_pending = SERVER_PREFILL_PRIORITY &&
+                std::any_of(slots.begin(), slots.end(), [](const server_slot & s) {
+                    return (s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT) &&
+                           s.task && !s.task->is_child();
+                });
+
+        bool decode_due = true;
+        if (prefill_pending) {
+            decode_due = prefill_decode_force_next ||
+                         (SERVER_PREFILL_DECODE_EVERY > 0 &&
+                          prefill_chunks_since_decode >= SERVER_PREFILL_DECODE_EVERY);
+        } else {
+            // Entering the next prefill window should not open with an extra
+            // stall on top of the one the window itself imposes.
+            prefill_chunks_since_decode = SERVER_PREFILL_DECODE_EVERY;
+        }
+        prefill_decode_force_next  = false;
+        prefill_decode_gate_closed = false;
+
+        if (prefill_pending != prefill_priority_window_open) {
+            prefill_priority_window_open = prefill_pending;
+            if (prefill_pending) {
+                SRV_INF("prefill priority: window open (chunk cap under active decode = %u tokens%s, "
+                        "decode every %u prefill chunks; LLAMA_SERVER_PREFILL_PRIORITY=0 to revert)\n",
+                        prefill.config().priority_chunk_tokens != 0 ? prefill.config().priority_chunk_tokens :
+                                                                      prefill.config().idle_chunk_tokens,
+                        prefill.config().priority_yields_to_fast ? ", except under a fast-lane generator" : "",
+                        SERVER_PREFILL_DECODE_EVERY);
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
+                return;
+            }
+
+            if (!decode_due) {
+                // Skipping is pure batch construction: handle_last_sampled_token
+                // is not called, i_batch was invalidated after the previous
+                // sampling, and slot.sampled/spec_draft are inert while the
+                // slot sits out. The drafting flag is explicitly cleared so a
+                // skipped slot cannot re-enter common_speculative_draft() with
+                // stale parameters from the iteration it last participated in.
+                if (spec) {
+                    common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+                }
+                prefill_decode_gate_closed = true;
+                SLT_DBG(slot, "prefill priority: deferring decode (%u/%u prefill chunks since last decode step)\n",
+                        prefill_chunks_since_decode, SERVER_PREFILL_DECODE_EVERY);
                 return;
             }
 
@@ -4685,6 +4844,12 @@ private:
                 }
             }
         });
+
+        // [TAG_PREFILL_PRIORITY] A generator actually joined this iteration,
+        // so the meter restarts from this chunk.
+        if (prefill_pending && prefill_decode.active) {
+            prefill_chunks_since_decode = 0;
+        }
 
         // generate the actual drafts (if any)
         {
@@ -5442,6 +5607,18 @@ private:
                     slot_batched = &slot;
                 }
             });
+        }
+
+        // [TAG_PREFILL_PRIORITY] Safety net. The gate is metered against
+        // prefill progress, so an iteration that both skipped every generator
+        // and staged no prefill chunk would otherwise repeat forever (the
+        // decode path aborts after 4 consecutive empty batches). Force the
+        // generators in on the next iteration only in that exact case; unlike
+        // the wall-clock keepalive's blanket timestamp reset, this cannot fire
+        // while prefill is making progress and therefore cannot silently
+        // disable the mechanism.
+        if (prefill_decode_gate_closed && batch.size() == 0) {
+            prefill_decode_force_next = true;
         }
     }
 
