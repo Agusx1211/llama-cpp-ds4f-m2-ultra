@@ -6504,18 +6504,33 @@ void server_routes::init_routes() {
         auto * bus = &server_dashboard::instance();
 
         // hello frame first: tells the client the retained window so it can
-        // detect gaps (a cursor below first_seq means events were overwritten)
+        // detect gaps (a cursor below first_seq means events were overwritten),
+        // set its clock skew, and confirm the stream really came up.
+        //
+        // It must be delivered BY next(), not via res->data: for a streaming
+        // response the HTTP layer feeds the sink exclusively from next() and
+        // never sends res->data (server-http.cpp process_handler_response).
         const auto window = bus->snapshot_after(cursor, 0);
         const uint64_t wall_ms = (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
+        std::string hello = server_dashboard::make_hello_frame(window, (uint64_t) ggml_time_us(), wall_ms);
+
         res->status = 200;
         res->content_type = "text/event-stream; charset=utf-8";
-        res->data = server_dashboard::make_hello_frame(window, (uint64_t) ggml_time_us(), wall_ms);
 
         const auto * should_stop = &req.should_stop;
         auto last_write = std::chrono::steady_clock::now();
-        res->next = [bus, should_stop, cursor, last_write, stream_lease](std::string & output) mutable {
+        res->next = [bus, should_stop, cursor, last_write, stream_lease,
+                     hello = std::move(hello)](std::string & output) mutable {
             (void) stream_lease;
+            if (!hello.empty()) {
+                // sent before any wait, so a client learns the window (and that
+                // the stream is alive) even on a completely idle server
+                output = std::move(hello);
+                hello.clear();
+                last_write = std::chrono::steady_clock::now();
+                return true;
+            }
             while (!(*should_stop)()) {
                 const auto batch = bus->snapshot_after(cursor);
                 if (!batch.events.empty()) {
