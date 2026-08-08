@@ -88,6 +88,26 @@ struct gcp_params {
     }
 };
 
+// RFC1918 + loopback + IPv6 link-local/loopback, by address-string prefix.
+// Used only to scope the trusted-LAN dashboard static-file exemption; API
+// authentication is unaffected.
+static bool is_private_lan_address(const std::string & addr) {
+    if (addr.rfind("127.", 0) == 0 || addr == "::1" || addr.rfind("::ffff:127.", 0) == 0) {
+        return true;
+    }
+    if (addr.rfind("192.168.", 0) == 0 || addr.rfind("10.", 0) == 0 || addr.rfind("fe80:", 0) == 0) {
+        return true;
+    }
+    if (addr.rfind("172.", 0) == 0) {
+        const size_t dot = addr.find('.', 4);
+        if (dot != std::string::npos) {
+            const int octet = atoi(addr.substr(4, dot - 4).c_str());
+            return octet >= 16 && octet <= 31;
+        }
+    }
+    return false;
+}
+
 bool server_http_context::init(const common_params & params) {
     const gcp_params gcp;
 
@@ -223,7 +243,7 @@ bool server_http_context::init(const common_params & params) {
         return endpoints;
     }();
 
-    auto middleware_validate_api_key = [api_keys = params.api_keys](const httplib::Request & req, httplib::Response & res) {
+    auto middleware_validate_api_key = [api_keys = params.api_keys, trust_lan = trust_lan](const httplib::Request & req, httplib::Response & res) {
         // If API key is not set, skip validation
         if (api_keys.empty()) {
             return true;
@@ -231,6 +251,19 @@ bool server_http_context::init(const common_params & params) {
 
         // If path is public or a UI asset, skip validation
         if (get_public_endpoints.count(req.path)) {
+            return true;
+        }
+
+        // Trusted-LAN dashboard bootstrap: a browser cannot attach an
+        // Authorization header to a plain bookmark, so let private-network
+        // peers GET the static dashboard files. The files carry no secrets
+        // and every API call the page makes still requires the key (the page
+        // reads it from the #key= URL fragment, which never reaches the
+        // server). Scope: GET only, /m2-dashboard subtree only, trusted-LAN
+        // mode only, RFC1918/loopback peers only.
+        if (trust_lan && req.method == "GET" &&
+                req.path.rfind("/m2-dashboard", 0) == 0 &&
+                is_private_lan_address(req.remote_addr)) {
             return true;
         }
 
