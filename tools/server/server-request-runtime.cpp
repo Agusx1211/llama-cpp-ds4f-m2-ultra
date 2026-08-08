@@ -325,7 +325,19 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
             const bool can_refill_fast = fast_refill_enabled() && cohort.dominant == lane::fast &&
                                          scheduler.queued(lane::fast) != 0 && permit_counts.total < cohort.limit &&
                                          fast_claim_within_epoch(1, now_us);
-            if (!can_refill_fast) {
+            // Elastic same-lane refill: a normal/low cohort that closed while
+            // full reopens to its own lane as soon as a permit drains below
+            // the cohort limit. Without this, a request that arrived while
+            // all slots were busy waited for the ENTIRE cohort to drain
+            // (permit_counts.total == 0 resets the epoch) instead of joining
+            // when one slot freed - serializing turnover under sustained
+            // multi-agent load. The fast lane keeps its bounded epoch refill
+            // above, and cross-lane upgrades keep the stricter width rule in
+            // the `higher` branch.
+            const bool can_refill_elastic = cohort.dominant != lane::fast &&
+                                            scheduler.queued(cohort.dominant) != 0 &&
+                                            permit_counts.total < cohort.limit;
+            if (!can_refill_fast && !can_refill_elastic) {
                 return {};
             }
             allow_new_members = true;
