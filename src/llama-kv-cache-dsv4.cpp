@@ -3279,6 +3279,27 @@ void llama_kv_cache_dsv4::cancel_admission(uint64_t id) {
     admission_state->entries.erase(id);
 }
 
+// env: LLAMA_DSV4_ADMISSION_DEBUG=1 - one line per admission lifecycle event
+// (arm / consume / re-map). Diagnostic for [TAG_DSV4_ADMISSION_REMAP].
+static bool dsv4_admission_debug() {
+    static const bool en = []() {
+        const char * v = getenv("LLAMA_DSV4_ADMISSION_DEBUG");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return en;
+}
+
+// env: LLAMA_DSV4_ADMISSION_REMAP=0 - restore the pre-fix behaviour, i.e. trust
+// the arm-time commit and never re-map at consume. Diagnostic seam only; the
+// pre-fix behaviour loses the first batch's compressed KV (see the tag below).
+static bool dsv4_admission_remap_enabled() {
+    static const bool en = []() {
+        const char * v = getenv("LLAMA_DSV4_ADMISSION_REMAP");
+        return v == nullptr || atoi(v) != 0;
+    }();
+    return en;
+}
+
 llama_kv_cache_dsv4::admission_consume_status llama_kv_cache_dsv4::consume_admission(
         const std::vector<llama_ubatch> & ubatches,
         llama_dsv4_batch_quote & quote,
@@ -3318,11 +3339,83 @@ llama_kv_cache_dsv4::admission_consume_status llama_kv_cache_dsv4::consume_admis
             continue;
         }
 
+        const auto commit_status = entry.reservation->commit_ranges();
+        if (commit_status != GGML_METAL_SPARSE_RESERVATION_OK) {
+            quote = entry.quote;
+            limiting_family_mask = entry.limiting_family_mask;
+            admission_state->entries.erase(it);
+            return ADMISSION_ERROR;
+        }
+
+        // [TAG_DSV4_ADMISSION_REMAP]
+        //
+        // arm_admission() maps this admission's pages at task-launch time.
+        // The slot then starts its prompt and llama-server issues
+        // `slot.mem.seq_rm(slot.id, pos_next, -1)` (server-context.cpp, prompt
+        // start) with pos_next == 0 for a fresh prompt. That lands in
+        // llama_kv_cache_dsv4::seq_rm -> clear_compressed(seq, true) ->
+        // dsv4_clear_tensor_stream(), which for a page-aligned stream *unmaps*
+        // the whole per-stream range of kv_csa / kv_hca / kv_lid instead of
+        // memsetting it - i.e. it destroys exactly the mapping this admission
+        // just committed. The reservation's ticket was freed by that first
+        // commit, so commit_ranges() above is a no-op and nothing ever maps
+        // those pages again; the batch then writes its compressed K rows into
+        // unmapped sparse pages, where the writes are discarded and the reads
+        // return zero.
+        //
+        // That is the whole defect: the compressed KV rows of the FIRST batch
+        // of every request (n_batch/compress_ratio rows, i.e. 512 rows at
+        // -b 2048 with the 4:1 CSA/LID ratio) are permanently zero, in both
+        // the CSA plane and the Lightning Indexer plane. Every later batch
+        // takes the ordinary per-batch reservation path and is unaffected.
+        //
+        // Re-verify that the mapping is still there, and re-map with a FRESH
+        // transaction if it is not. A fresh transaction cannot be rejected as
+        // stale (which is why arm_admission commits early in the first place),
+        // and it costs one reservation per request. If it cannot be re-made,
+        // report NO_MATCH so the caller falls back to the ordinary per-batch
+        // reservation, which is the same path every subsequent batch uses.
+        int resident = 1;
+        std::vector<dsv4_sparse_range> ranges;
+        if (dsv4_admission_remap_enabled()) {
+            llama_dsv4_batch_quote probe_quote = {};
+            if (collect_admission_ranges(entry.spans.data(), entry.spans.size(), ranges, probe_quote)) {
+                // 1 = every page mapped and exclusively owned, 0 = not, -1 =
+                // probe unavailable. Anything other than a positive answer is
+                // treated as "must re-map": the cost is one reservation per
+                // request and the alternative is silently losing the batch.
+                resident = dsv4_sparse_ranges_resident(ranges);
+            }
+        }
+
+        if (resident != 1) {
+            dsv4_sparse_transaction remap;
+            llama_dsv4_batch_quote remap_quote = {};
+            const auto reserve_status = remap.reserve_ranges(ranges, remap_quote);
+            const bool remapped = reserve_status == dsv4_sparse_transaction::SUCCESS &&
+                    remap.commit_ranges() == GGML_METAL_SPARSE_RESERVATION_OK;
+            if (dsv4_admission_debug()) {
+                LLAMA_LOG_INFO("%s: DSV4 admission mapping was dropped after arm; re-map %s"
+                        " (ranges=%zu sparse_ranges=%zu)\n",
+                        __func__, remapped ? "ok" : "FAILED",
+                        ranges.size(), remap.sparse_range_count());
+            }
+            if (!remapped) {
+                if (reserve_status == dsv4_sparse_transaction::PRESSURE) {
+                    limiting_family_mask = remap.limiting_family_mask();
+                }
+                admission_state->entries.erase(it);
+                return ADMISSION_NO_MATCH;
+            }
+        } else if (dsv4_admission_debug()) {
+            LLAMA_LOG_INFO("%s: DSV4 admission mapping intact (resident=%d ranges=%zu)\n",
+                    __func__, resident, ranges.size());
+        }
+
         quote = entry.quote;
         limiting_family_mask = entry.limiting_family_mask;
-        const auto commit_status = entry.reservation->commit_ranges();
         admission_state->entries.erase(it);
-        return commit_status == GGML_METAL_SPARSE_RESERVATION_OK ? ADMISSION_COMMITTED : ADMISSION_ERROR;
+        return ADMISSION_COMMITTED;
     }
 
     return ADMISSION_NO_MATCH;
