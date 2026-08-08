@@ -21,6 +21,21 @@
 // max number of MTLCommandBuffer used to submit a graph for processing
 #define GGML_METAL_MAX_COMMAND_BUFFERS 8
 
+// Host-overhead profiler (LLAMA_HOST_PROFILE=1). Splits the host wall time of
+// ggml_metal_graph_compute - reported by llama_context as the "gcomp" phase -
+// into command-buffer setup, the main-thread node prefix encode, and the
+// dispatch_apply that encodes the remainder, and reports the GPU timeline of
+// each command buffer from ggml_metal_synchronize. See src/llama-context.cpp
+// for the record format.
+static bool ggml_metal_hp_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * v = getenv("LLAMA_HOST_PROFILE");
+        enabled = (v != NULL && atoi(v) != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 // Private ABI shared with ggml-metal-device.m. Keeping it out of the public
 // Metal headers avoids exposing this target-only instrumentation prototype.
 struct ggml_metal_encoder_profile_result {
@@ -720,6 +735,19 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
                 ctx->has_error = true;
                 return;
             }
+
+            // Host-overhead profiler: the GPU timeline of the graph just
+            // waited on. Command buffers are enqueued in execution order
+            // [n_cb], [0], [1], ..., so the gap between one buffer's GPU end
+            // and the next buffer's GPU start is a GPU bubble caused by the
+            // host not having committed the next buffer in time.
+            if (ggml_metal_hp_enabled()) {
+                fprintf(stderr, "HOSTPROF {\"op\":\"cbt\",\"t\":%" PRId64 ",\"cb\":%d"
+                        ",\"gs\":%.6f,\"ge\":%.6f,\"ks\":%.6f,\"ke\":%.6f}\n",
+                        ggml_time_us(), cb_idx,
+                        [cmd_buf GPUStartTime], [cmd_buf GPUEndTime],
+                        [cmd_buf kernelStartTime], [cmd_buf kernelEndTime]);
+            }
         }
     }
 
@@ -891,20 +919,6 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 
         return true;
     }
-}
-
-// Host-overhead profiler (LLAMA_HOST_PROFILE=1). Splits the host wall time of
-// ggml_metal_graph_compute - reported by llama_context as the "gcomp" phase -
-// into command-buffer setup, the main-thread node prefix encode, and the
-// dispatch_apply that encodes the remainder. See src/llama-context.cpp for the
-// record format.
-static bool ggml_metal_hp_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char * v = getenv("LLAMA_HOST_PROFILE");
-        enabled = (v != NULL && atoi(v) != 0) ? 1 : 0;
-    }
-    return enabled != 0;
 }
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
