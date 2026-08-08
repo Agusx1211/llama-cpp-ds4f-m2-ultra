@@ -185,6 +185,11 @@ target_include_directories(test-server-admin-dashboard PRIVATE
 target_link_libraries(test-server-admin-dashboard PRIVATE server-context)
 target_compile_features(test-server-admin-dashboard PRIVATE cxx_std_17)
 
+llama_build_and_test(test-server-prompt-cache.cpp)
+target_include_directories(test-server-prompt-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_link_libraries(test-server-prompt-cache PRIVATE server-context)
+target_compile_features(test-server-prompt-cache PRIVATE cxx_std_17)
+
 llama_build_and_test(test-server-queue-runtime.cpp)
 target_include_directories(test-server-queue-runtime PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_link_libraries(test-server-queue-runtime PRIVATE server-context)

@@ -48,6 +48,20 @@
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
 #define LLAMA_STATE_SEQ_VERSION 2
 
+// fork (m2-ultra): byte-layout generation of the *sequence* state produced by
+// llama_state_seq_get_data_ext() / consumed by llama_state_seq_set_data_ext().
+//
+// Upstream bumps LLAMA_STATE_SEQ_VERSION only when the container format changes;
+// this fork also changes what goes *inside* the container (KV cell packing, the
+// DSV4 sparse pool, recurrent/MTP rows, per-layer tensor types coming from the
+// gguf-m2 artifact formats) without touching upstream's version.
+//
+// Bump this whenever a fork-side change alters the serialized sequence-state
+// bytes for an otherwise identical model+config. It is mixed into the server's
+// persistent prompt-cache fingerprint, so bumping it invalidates every `.lcpc`
+// file on disk instead of restoring state that no longer parses the same way.
+#define LLAMA_STATE_SEQ_LAYOUT_M2 1
+
 #ifdef __cplusplus
 extern "C" {
 #endif
