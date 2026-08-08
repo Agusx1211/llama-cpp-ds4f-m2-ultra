@@ -47,6 +47,8 @@ DEFAULT_ERROR_PATTERNS = (
     "critical memory pressure",
     "request queue deadline expired",
     "request run deadline expired",
+    "request stalled (no progress for",
+    "request exceeded absolute run cap",
     "segmentation fault",
     "assertion failed",
 )

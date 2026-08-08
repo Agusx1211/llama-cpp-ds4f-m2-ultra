@@ -167,6 +167,13 @@ public:
     }
 
     server_queue_bind_result bind_slot(int id_task, int id_slot);
+    // Progress heartbeat for stall-based run expiry: called once per
+    // successfully decoded ubatch view with every task whose slot advanced
+    // (or is legitimately waiting behind the serialized prefill owner).
+    // Deliberately cheap - one mutex acquisition, timestamp stores only, no
+    // expiry sweep (the loop and every publication/release site already
+    // sweep).
+    void notify_progress(const std::vector<int> & id_tasks);
     bool publish_slot_result(server_response &          response,
                              int                        id_task,
                              int                        id_slot,

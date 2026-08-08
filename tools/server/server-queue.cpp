@@ -34,6 +34,13 @@ constexpr const char * fast_refill_members_environment =
     "LLAMA_SERVER_TRUSTED_FAST_REFILL_MAX_MEMBERS";
 constexpr const char * fast_refill_window_environment =
     "LLAMA_SERVER_TRUSTED_FAST_REFILL_WINDOW_MS";
+// Operational overrides for the running-state deadlines, in whole seconds.
+// The 10 -> 30 min total-runtime bump on 2026-08-08 required a rebuild;
+// stall/backstop tuning must not. Each may be set independently.
+constexpr const char *   run_stall_timeout_environment = "LLAMA_SERVER_RUN_STALL_TIMEOUT_S";
+constexpr const char *   run_cap_timeout_environment   = "LLAMA_SERVER_RUN_CAP_TIMEOUT_S";
+constexpr uint64_t       run_timeout_env_min_s         = 1;
+constexpr uint64_t       run_timeout_env_max_s         = 24ULL * 60 * 60;
 
 bool parse_bounded_decimal(const char * value, uint64_t minimum, uint64_t maximum, uint64_t & parsed) {
     if (value == nullptr) {
@@ -52,11 +59,39 @@ bool parse_bounded_decimal(const char * value, uint64_t minimum, uint64_t maximu
     return true;
 }
 
+void apply_run_deadline_environment(server_request_runtime::runtime_config & config) {
+    uint64_t seconds = 0;
+    const char * stall_value = std::getenv(run_stall_timeout_environment);
+    if (stall_value != nullptr) {
+        if (parse_bounded_decimal(stall_value, run_timeout_env_min_s, run_timeout_env_max_s, seconds)) {
+            config.default_run_stall_timeout_us = seconds * 1000 * 1000;
+            QUE_INF("run stall timeout override: %llu s\n", static_cast<unsigned long long>(seconds));
+        } else {
+            QUE_WRN("ignoring %s: must be [%llu, %llu] seconds\n", run_stall_timeout_environment,
+                    static_cast<unsigned long long>(run_timeout_env_min_s),
+                    static_cast<unsigned long long>(run_timeout_env_max_s));
+        }
+    }
+    const char * cap_value = std::getenv(run_cap_timeout_environment);
+    if (cap_value != nullptr) {
+        if (parse_bounded_decimal(cap_value, run_timeout_env_min_s, run_timeout_env_max_s, seconds)) {
+            config.default_run_timeout_us = seconds * 1000 * 1000;
+            QUE_INF("absolute run cap override: %llu s\n", static_cast<unsigned long long>(seconds));
+        } else {
+            QUE_WRN("ignoring %s: must be [%llu, %llu] seconds\n", run_cap_timeout_environment,
+                    static_cast<unsigned long long>(run_timeout_env_min_s),
+                    static_cast<unsigned long long>(run_timeout_env_max_s));
+        }
+    }
+}
+
 server_request_runtime::runtime_config live_runtime_config() {
     server_request_runtime::runtime_config config;
     // Live admission must preserve the server's existing context validation
     // until the allocator supplies a full prompt-plus-runway quote.
     config.scheduler.context_tokens = std::numeric_limits<uint64_t>::max();
+
+    apply_run_deadline_environment(config);
 
     const char * members_value = std::getenv(fast_refill_members_environment);
     const char * window_value  = std::getenv(fast_refill_window_environment);
@@ -107,9 +142,18 @@ server_task_result_ptr make_timeout_result(const server_request_runtime::expirat
     auto result      = std::make_unique<server_task_result_error>();
     result->id       = static_cast<int>(expiration.request_id - 1);
     result->err_type = ERROR_TYPE_TIMEOUT;
-    result->err_msg  = expiration.kind == server_request_runtime::deadline_kind::queue
-        ? "request queue deadline expired"
-        : "request run deadline expired";
+    switch (expiration.kind) {
+        case server_request_runtime::deadline_kind::queue:
+            result->err_msg = "request queue deadline expired";
+            break;
+        case server_request_runtime::deadline_kind::run_stall:
+            result->err_msg = "request stalled (no progress for " +
+                              std::to_string(expiration.stalled_for_us / 1000000) + "s)";
+            break;
+        case server_request_runtime::deadline_kind::run:
+            result->err_msg = "request exceeded absolute run cap";
+            break;
+    }
     return result;
 }
 
@@ -174,6 +218,7 @@ server_request_runtime::request_metadata server_queue::make_request_metadata(ser
     result.parent_id                         = task.id_parent >= 0 ? runtime_id(task.id_parent) : 0;
     result.queue_timeout_us                  = task.scheduling.queue_timeout_us;
     result.run_timeout_us                    = task.scheduling.run_timeout_us;
+    result.run_stall_timeout_us              = task.scheduling.run_stall_timeout_us;
     result.lane = to_scheduler_lane(task.scheduling.lane);
     task.scheduling.arrival_us = result.arrival_us;
     return result;
@@ -825,6 +870,19 @@ void server_queue::cleanup_pending_task(int id_target, uint64_t at_us) {
         }
         request_runtime.cancel(runtime_id(id_target), at_us);
         erase_pending_payload(id_target);
+    }
+}
+
+void server_queue::notify_progress(const std::vector<int> & id_tasks) {
+    if (id_tasks.empty()) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    const uint64_t at_us = now_us();
+    for (const int id_task : id_tasks) {
+        if (id_task >= 0) {
+            request_runtime.note_progress(runtime_id(id_task), at_us);
+        }
     }
 }
 

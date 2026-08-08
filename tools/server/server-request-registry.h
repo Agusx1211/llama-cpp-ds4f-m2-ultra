@@ -65,7 +65,10 @@ enum class reason_code : uint16_t {
     client_cancel = 500,
     server_cancel = 501,
     queue_timeout = 502,
+    // Absolute run backstop exceeded (total bound runtime).
     run_timeout   = 503,
+    // Progress-based run expiry: no slot advancement for the stall threshold.
+    run_stall     = 504,
 
     completed      = 600,
     request_failed = 601,

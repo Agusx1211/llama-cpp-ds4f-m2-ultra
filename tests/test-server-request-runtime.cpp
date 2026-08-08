@@ -665,6 +665,10 @@ void test_queue_deadlines_and_exact_capacity_reuse() {
 void test_run_deadline_and_first_terminal_wins() {
     runtime_config config;
     config.default_queue_timeout_us = 100;
+    // The run timeout is now the absolute backstop cap. The stall threshold
+    // keeps its bounded default (minutes), so on this microsecond test clock
+    // the cap at bind+20 always governs - the pre-stall expiry behavior of
+    // this test is intentionally unchanged.
     config.default_run_timeout_us   = 20;
     request_runtime runtime(config);
 
@@ -672,12 +676,12 @@ void test_run_deadline_and_first_terminal_wins() {
     require(running.run_timeout_us == 0 && runtime.admit(running),
             "zero request timeout selects bounded server run default");
     require(runtime.take_next(201).request_id == 51, "dispatch run deadline request");
-    require(runtime.bind_slot(51, 0, 205), "bind starts run deadline");
-    require(runtime.expire_due(224).empty(), "bound request lives before run deadline");
+    require(runtime.bind_slot(51, 0, 205), "bind starts absolute run cap");
+    require(runtime.expire_due(224).empty(), "bound request lives before absolute run cap");
     const auto expired = runtime.expire_due(225);
     require(expired.size() == 1 && expired[0].request_id == 51 && expired[0].kind == deadline_kind::run &&
                 expired[0].was_running,
-            "bound request expires at exact run deadline");
+            "bound request expires at exact absolute run cap");
     const request_snapshot timed_out = find_request(runtime, 51);
     require(timed_out.state == lifecycle::executing && timed_out.timeout_expired &&
                 timed_out.last_reason == server_request_registry::reason_code::run_timeout,
@@ -703,6 +707,72 @@ void test_run_deadline_and_first_terminal_wins() {
             "completed request cannot be cancelled or expired after retirement");
 }
 
+// Running requests expire on lack of PROGRESS, not on total runtime: a
+// request that keeps advancing outlives any number of stall windows, a
+// request that stops advancing expires one stall threshold after its last
+// recorded progress, and the absolute cap still bounds an endlessly
+// progressing request. (Measured 2026-08-08: total-runtime deadlines killed
+// healthy ~280K-context agent turns that decoded continuously past 30 min.)
+void test_stall_expiry_progress_and_backstop() {
+    runtime_config config;
+    config.default_queue_timeout_us     = 1000000;
+    config.default_run_timeout_us       = 1000; // absolute backstop cap
+    config.default_run_stall_timeout_us = 50;   // stall threshold
+    request_runtime runtime(config);
+
+    // Progress only exists for the run phase: queued and selected-unbound
+    // requests stay governed by the queue deadline alone.
+    require(runtime.admit(make_request(91, lane::normal, 100)), "admit progressing request");
+    require(!runtime.note_progress(91, 101), "queued request has no progress clock");
+    require(runtime.take_next(101).request_id == 91, "dispatch progressing request");
+    require(!runtime.note_progress(91, 102), "selected-unbound request has no progress clock");
+    require(runtime.bind_slot(91, 0, 105), "bind starts the stall clock");
+
+    // A steadily progressing request survives 16 consecutive windows - 850us
+    // of total runtime against a 50us stall threshold. The old total-runtime
+    // semantic would have expired it at bind+50.
+    uint64_t at_us = 105;
+    while (at_us + 40 <= 905) {
+        at_us += 40;
+        require(runtime.expire_due(at_us).empty(), "progressing request survives between touches");
+        require(runtime.note_progress(91, at_us), "running request records progress");
+    }
+    require(at_us == 905 && runtime.expire_due(945).empty(),
+            "progress-touched request outlives many stall windows");
+
+    // Then it stalls: expiry lands exactly one stall threshold after the last
+    // recorded progress and reports the observed gap.
+    require(runtime.expire_due(954).empty(), "stalled request lives before the exact stall deadline");
+    const auto stalled = runtime.expire_due(955);
+    require(stalled.size() == 1 && stalled[0].request_id == 91 &&
+                stalled[0].kind == deadline_kind::run_stall && stalled[0].was_running &&
+                stalled[0].stalled_for_us == 50,
+            "stalled request expires at the exact stall threshold with the measured gap");
+    require(!runtime.note_progress(91, 956), "expired request cannot record progress");
+    require(runtime.release_slot(91, 0, 957), "release stalled lease");
+    require(!runtime.contains(91) && has_terminal_event(runtime, 91, lifecycle::timed_out,
+                                                        server_request_registry::reason_code::run_stall),
+            "stall expiry retires with its own durable run_stall reason");
+
+    // Backstop: an endlessly progressing request is still bounded by the
+    // absolute cap, and the cap keeps the run_timeout reason.
+    require(runtime.admit(make_request(92, lane::normal, 2000)), "admit endless request");
+    require(runtime.take_next(2001).request_id == 92 && runtime.bind_slot(92, 0, 2005),
+            "bind endless request");
+    for (uint64_t tick = 2010; tick < 3005; tick += 10) {
+        require(runtime.note_progress(92, tick), "endless request keeps producing");
+    }
+    require(runtime.expire_due(3004).empty(), "cap not due before bind + cap timeout");
+    const auto capped = runtime.expire_due(3005);
+    require(capped.size() == 1 && capped[0].request_id == 92 && capped[0].kind == deadline_kind::run &&
+                capped[0].was_running && capped[0].stalled_for_us == 0,
+            "absolute run cap fires despite continuous progress");
+    require(runtime.release_slot(92, 0, 3006) &&
+                has_terminal_event(runtime, 92, lifecycle::timed_out,
+                                   server_request_registry::reason_code::run_timeout),
+            "cap expiry keeps the run_timeout reason");
+}
+
 void test_zero_configuration_keeps_bounded_defaults() {
     runtime_config config;
     config.default_queue_timeout_us = 0;
@@ -716,14 +786,30 @@ void test_zero_configuration_keeps_bounded_defaults() {
     require(runtime.expire_due(100 + runtime_config::queue_timeout_default_us).size() == 1,
             "zero configuration cannot disable bounded queue default");
 
+    // With no recorded progress, the bounded stall default governs a running
+    // request first (5 min), long before the absolute cap (2 h).
     request_metadata running = make_request(62, lane::normal, 1000);
     require(runtime.admit(running) && runtime.take_next(1001).request_id == 62 && runtime.bind_slot(62, 0, 1002),
             "bind zero-config run default request");
-    require(runtime.expire_due(1002 + runtime_config::run_timeout_default_us - 1).empty(),
-            "zero configuration keeps request before bounded run default");
-    require(runtime.expire_due(1002 + runtime_config::run_timeout_default_us).size() == 1 &&
-                runtime.release_slot(62, 0, 1002 + runtime_config::run_timeout_default_us),
-            "zero configuration cannot disable bounded run default");
+    require(runtime.expire_due(1002 + runtime_config::run_stall_timeout_default_us - 1).empty(),
+            "zero configuration keeps request before bounded stall default");
+    const auto stalled = runtime.expire_due(1002 + runtime_config::run_stall_timeout_default_us);
+    require(stalled.size() == 1 && stalled[0].kind == deadline_kind::run_stall &&
+                runtime.release_slot(62, 0, 1002 + runtime_config::run_stall_timeout_default_us),
+            "zero configuration cannot disable bounded stall default");
+
+    // A per-request stall opt-out (saturated threshold) still cannot escape
+    // the bounded absolute cap default.
+    request_metadata capped = make_request(63, lane::normal, 2000);
+    capped.run_stall_timeout_us = std::numeric_limits<uint64_t>::max();
+    require(runtime.admit(capped) && runtime.take_next(2001).request_id == 63 && runtime.bind_slot(63, 0, 2002),
+            "bind zero-config cap default request");
+    require(runtime.expire_due(2002 + runtime_config::run_timeout_default_us - 1).empty(),
+            "zero configuration keeps stall-exempt request before bounded cap default");
+    const auto cap_expired = runtime.expire_due(2002 + runtime_config::run_timeout_default_us);
+    require(cap_expired.size() == 1 && cap_expired[0].kind == deadline_kind::run &&
+                runtime.release_slot(63, 0, 2002 + runtime_config::run_timeout_default_us),
+            "zero configuration cannot disable bounded cap default");
 }
 
 void test_cache_affinity_scales_partial_hits_without_overflow() {
@@ -816,6 +902,7 @@ int main() {
         { "profiled low widths",        test_profiled_exclusive_low_widths                   },
         { "queue deadlines",            test_queue_deadlines_and_exact_capacity_reuse  },
         { "run deadline races",         test_run_deadline_and_first_terminal_wins      },
+        { "stall expiry and backstop",  test_stall_expiry_progress_and_backstop        },
         { "zero timeout defaults",      test_zero_configuration_keeps_bounded_defaults },
         { "proportional cache affinity", test_cache_affinity_scales_partial_hits_without_overflow },
         { "deterministic replay",       test_deterministic_replay              },

@@ -25,13 +25,20 @@ enum class result_code : uint8_t {
 
 enum class deadline_kind : uint8_t {
     queue = 0,
+    // Absolute run backstop: total time bound to a slot exceeded the run cap.
     run,
+    // Progress-based run expiry: the bound request stopped advancing (no
+    // decoded/prefilled tokens) for longer than its stall threshold.
+    run_stall,
 };
 
 struct expiration {
     uint64_t      request_id  = 0;
     deadline_kind kind        = deadline_kind::queue;
     bool          was_running = false;
+    // Only meaningful for deadline_kind::run_stall: the observed gap between
+    // the request's last recorded progress and the expiry decision.
+    uint64_t      stalled_for_us = 0;
 };
 
 struct publication_result {
@@ -69,7 +76,11 @@ struct request_metadata {
     server_request_registry::request_estimates estimates;
     uint64_t                                   parent_id        = 0;
     uint64_t                                   queue_timeout_us = 0;
+    // Absolute run backstop (zero selects the bounded server default).
     uint64_t                                   run_timeout_us   = 0;
+    // Stall threshold for progress-based run expiry (zero selects the bounded
+    // server default).
+    uint64_t                                   run_stall_timeout_us = 0;
 };
 
 struct dispatch_permit_snapshot {
@@ -119,17 +130,31 @@ struct runtime_config {
     // Queue waits scale with the number of elastic lanes: admissions are
     // serialized behind the prefill owner, so a cold burst on -np 4 can
     // legitimately hold a request for several prefills (30 s expired queued
-    // requests with 408 during 4-lane validation). Match the run timeout;
-    // stuck clients are still bounded by the run deadline and by
-    // disconnect-driven task cancellation.
+    // requests with 408 during 4-lane validation). Stuck clients are still
+    // bounded by the running-state deadlines below and by disconnect-driven
+    // task cancellation.
     static constexpr uint64_t queue_timeout_default_us  = 10ULL * 60 * 1000 * 1000;
-    // 30 min: a single agent turn on a hard task can think for >12k tokens,
-    // which at 4-lane-contended decode (~15-25 t/s, spec disabled at >1
-    // active) legitimately exceeds 10 minutes. Measured 2026-08-08: the
-    // 10-min default killed long turns mid-decode ("request run deadline
-    // expired"), and the kill is silent for clients that don't retry
-    // error-stops. The deadline still bounds genuinely hung requests.
-    static constexpr uint64_t run_timeout_default_us    = 30ULL * 60 * 1000 * 1000;
+    // Running requests expire on STALL, not on total runtime. Measured
+    // 2026-08-08 (four independent kills): hard-task agent turns at ~280K
+    // context legitimately decode continuously for >30 min (thinking-heavy
+    // model, context-degraded tg ~12-18 t/s solo); the previous total-runtime
+    // deadline killed such turns at 10:00 (three times) and, after being
+    // raised, at exactly 30:00 while the request was actively decoding under
+    // light load. A total-runtime bound of ANY value either kills healthy
+    // long turns or stops protecting against hangs, so the run deadline is
+    // now (a) a stall threshold on the gap since the request's slot last
+    // advanced (decoded token, accepted draft tokens, or a processed prefill
+    // ubatch) plus (b) a high absolute backstop.
+    //
+    // 5 min without any progress = hung: a genuinely alive request produces
+    // a token every few hundred ms (worst measured decode gap is one 2048-tok
+    // prefill chunk of another slot, ~10 s), so 5 min is ~30x slack while
+    // still releasing wedged slots long before the old 10-min budget.
+    static constexpr uint64_t run_stall_timeout_default_us = 5ULL * 60 * 1000 * 1000;
+    // Absolute backstop for runaway-but-progressing requests. This is NOT a
+    // typical-turn budget any more (that role failed, see above): it exists
+    // only so an endlessly progressing request cannot hold a slot forever.
+    static constexpr uint64_t run_timeout_default_us    = 2ULL * 60 * 60 * 1000 * 1000;
     static constexpr size_t   fast_refill_min_members   = 3;
     static constexpr size_t   fast_refill_max_members   = 16;
     static constexpr uint64_t fast_refill_min_window_us = 1000;
@@ -139,6 +164,7 @@ struct runtime_config {
     server_request_registry::registry_config registry;
     uint64_t                                 default_queue_timeout_us     = queue_timeout_default_us;
     uint64_t                                 default_run_timeout_us       = run_timeout_default_us;
+    uint64_t                                 default_run_stall_timeout_us = run_stall_timeout_default_us;
     uint32_t                                 overload_retry_after_seconds = 1;
     // Both fields must be in range to opt into bounded same-fast-lane refill.
     // The member limit counts every fast permit first claimed in one cohort,
@@ -174,6 +200,14 @@ class request_runtime {
     std::vector<expiration> expire_due(uint64_t now_us);
 
     bool bind_slot(uint64_t request_id, server_request_registry::slot_id slot, uint64_t at_us);
+    // Progress heartbeat for stall-based run expiry. Records that the
+    // request's slot advanced (decoded token, accepted draft tokens, or a
+    // processed prefill ubatch) and pushes its stall deadline forward. A
+    // deliberately cheap timestamp store: no registry event, no state
+    // transition. Returns false for unknown, terminal, or not-yet-running
+    // requests (queued/deferred requests stay governed by the queue
+    // deadline alone).
+    bool note_progress(uint64_t request_id, uint64_t at_us);
     publication_result gate_result_publication(uint64_t request_id,
                                                server_request_registry::slot_id slot,
                                                bool                             final,
@@ -216,7 +250,19 @@ class request_runtime {
                 server_request_registry::reason_code::none;
         uint64_t                                            queue_deadline_us = 0;
         uint64_t                                            run_timeout_us    = 0;
+        // Absolute backstop deadline; non-zero also marks the run phase as
+        // started (first slot bind).
         uint64_t                                            run_deadline_us   = 0;
+        uint64_t                                            run_stall_timeout_us = 0;
+        // Last observed forward progress of the bound slot; initialized at
+        // first bind, advanced by note_progress(). The stall deadline is
+        // last_progress_us + run_stall_timeout_us.
+        uint64_t                                            last_progress_us  = 0;
+        // Exact timeout reason (run_timeout vs run_stall) captured at expiry
+        // so the durable terminal event preserves the cause after the lease
+        // is released.
+        server_request_registry::reason_code                timeout_reason =
+                server_request_registry::reason_code::none;
         permit_state                                        permit            = permit_state::none;
     };
 
@@ -235,6 +281,7 @@ class request_runtime {
     };
 
     admission_result enqueue(record & request, uint64_t at_us);
+    expiration       planned_expiration_of(const record & request, uint64_t at_us) const;
     expiration       expire(std::map<uint64_t, record>::iterator it, deadline_kind kind, uint64_t at_us);
     expiration       expire_if_due(std::map<uint64_t, record>::iterator it, uint64_t at_us);
     bool             release_bound_slot(std::map<uint64_t, record>::iterator it,
@@ -258,6 +305,7 @@ class request_runtime {
     std::map<uint64_t, record>                records;
     uint64_t                                  default_queue_timeout_us;
     uint64_t                                  default_run_timeout_us;
+    uint64_t                                  default_run_stall_timeout_us;
     uint32_t                                  overload_retry_after_seconds;
     size_t                                    fast_refill_max_members_per_epoch = 0;
     uint64_t                                  fast_refill_window_us              = 0;

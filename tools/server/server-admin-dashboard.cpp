@@ -154,6 +154,7 @@ const char * reason_name(reason_code value) {
         case reason_code::server_cancel:     return "server_cancel";
         case reason_code::queue_timeout:     return "queue_timeout";
         case reason_code::run_timeout:       return "run_timeout";
+        case reason_code::run_stall:         return "run_stall";
         case reason_code::completed:         return "completed";
         case reason_code::request_failed:    return "request_failed";
     }
