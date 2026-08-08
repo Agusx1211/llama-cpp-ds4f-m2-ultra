@@ -1645,13 +1645,266 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 //
 // If tie_slots is ~0 the policy cannot matter; if it is a large fraction of
 // 512 the policy is a real modelling decision.
+//
+// Census v2 (lane indexer-zero-rows) additionally answers *what the zero rows
+// are*. The v1 census found the exact-zero group is exactly 512 rows wide at
+// two different pool sizes, which is structural rather than data-dependent.
+// v2 therefore also reports, per selection:
+//
+//   n_vis      index of the first -inf entry, i.e. the causal frontier the mask
+//              exposes (rows >= n_vis are padding and cannot be selected)
+//   zmin/zmax  first and last exact-zero index
+//   zruns      number of maximal contiguous runs of exact-zero indices
+//   zrun<i>    the first few runs, as first-last
+//   zseg       the logical->physical segment mapping of the zero runs, read
+//              straight out of the fused indexer node's segment_ids input;
+//              physical segment 0 is the pool's permanent all-zero segment
+//              (ZERO_SEGMENT in src/llama-dsv4-comp-pool.cpp)
+//   zk         how many sampled zero rows have an all-zero compressed K row
+//   zsel       how many of the 512 selected indices land in the zero group
 // ---------------------------------------------------------------------------
 
 static int  common_dsv4_topk_census_budget = 0;
 static long common_dsv4_topk_census_seen   = 0;
 
+// Scan the leading rows of a compressed K plane and report every maximal run of
+// identically-zero rows. Used to establish whether a zero block seen in the
+// indexer score row is an indexer-only artifact or genuine missing data in the
+// compressed KV itself: the LID and CSA planes are written by the same plan
+// (plans_csa / plans_lid in llama-kv-cache-dsv4.cpp share state_write_idxs), so
+// they must either both carry the rows or both miss them.
+// LLAMA_DSV4_ZERO_ROW_SCAN_MIN_ROWS: raise the >=1024-row gate below. At deep
+// context most prefill ubatches already expose a >=1024-row plane, so the scan
+// budget is consumed long before decode; setting this to roughly the prompt's
+// compressed-row count keeps the budget for the planes that answer the question.
+static int64_t common_dsv4_zero_scan_min_rows = 1024;
+
+static void common_dsv4_zero_row_scan(const struct ggml_tensor * k, const char * tag,
+        int64_t n_rows, int64_t row_stride_nb, int64_t n_elem) {
+    if (k == nullptr || k->type != GGML_TYPE_F16 || n_rows <= 0 || n_elem <= 0) {
+        return;
+    }
+    // Skip the narrow views the early prefill ubatches expose. The compressed
+    // plane a prefill ubatch reads is only GGML_PAD(n_visible, 256) rows wide,
+    // and the FIRST ubatch's rows are still being produced by the very graph
+    // being scanned - reading them as zero there says nothing about whether
+    // they are ever written. Only a plane wide enough to be the accumulated
+    // cache (>= 1024 rows, i.e. past the top-k radix routing threshold too) can
+    // answer that, because by then the first ubatch is long committed.
+    if (n_rows < common_dsv4_zero_scan_min_rows) {
+        return;
+    }
+    // hard cap the readback: this is a diagnostic, not a hot path
+    const int64_t max_bytes = 4*1024*1024;
+    if (n_rows*n_elem*(int64_t) sizeof(ggml_fp16_t) > max_bytes) {
+        n_rows = max_bytes/(n_elem*(int64_t) sizeof(ggml_fp16_t));
+    }
+
+    std::vector<ggml_fp16_t> row((size_t) n_elem);
+    std::string runs;
+    int64_t n_zero = 0, first_nz = -1, run_start = -1, n_runs = 0;
+    char buf[64];
+    for (int64_t i = 0; i < n_rows; ++i) {
+        ggml_backend_tensor_get(k, row.data(), (size_t) i*row_stride_nb, row.size()*sizeof(ggml_fp16_t));
+        bool z = true;
+        for (int64_t j = 0; j < n_elem; ++j) {
+            if (ggml_fp16_to_fp32(row[(size_t) j]) != 0.0f) { z = false; break; }
+        }
+        if (z) {
+            ++n_zero;
+            if (run_start < 0) { run_start = i; ++n_runs; }
+        } else {
+            if (first_nz < 0) first_nz = i;
+            if (run_start >= 0) {
+                if (n_runs <= 8) {
+                    snprintf(buf, sizeof(buf), "%s%lld-%lld", runs.empty() ? "" : ",",
+                            (long long) run_start, (long long) (i - 1));
+                    runs += buf;
+                }
+                run_start = -1;
+            }
+        }
+    }
+    if (run_start >= 0 && n_runs <= 8) {
+        snprintf(buf, sizeof(buf), "%s%lld-%lld", runs.empty() ? "" : ",",
+                (long long) run_start, (long long) (n_rows - 1));
+        runs += buf;
+    }
+    fprintf(stderr, "ZEROROWSCAN tag=%s name=%s scanned=%lld n_elem=%lld n_zero=%lld "
+            "n_runs=%lld first_nonzero=%lld runs=[%s]\n",
+            tag, k->name, (long long) n_rows, (long long) n_elem, (long long) n_zero,
+            (long long) n_runs, (long long) first_nz, runs.c_str());
+}
+
+static int  common_dsv4_zero_scan_budget = 0;
+static long common_dsv4_zero_scan_seen   = 0;
+
+// ---------------------------------------------------------------------------
+// LLAMA_DSV4_COMP_WRITE_AUDIT=<n>: audit the compressed-KV write itself.
+//
+// csa_k_write-<il> / lid_k_write-<il> are the GGML_OP_SET_ROWS nodes that store
+// the compressor output into the compressed K cache (llama_kv_cache::cpy_k via
+// llama_kv_cache_dsv4_comp_context::cpy_k). Observing the node AFTER it has run
+// answers three separate questions in one place, per prefill ubatch:
+//
+//   src_zero  how many of the rows being written are identically zero, i.e.
+//             whether the compressor produced anything at all for this ubatch
+//   dst_zero  how many of the destination rows are identically zero right after
+//             the store, i.e. whether the store landed
+//   head_zero how many of the first `head` rows of the whole cache plane are
+//             identically zero right after the store, i.e. whether rows written
+//             by an EARLIER ubatch are still there
+//
+// The defect under investigation is that compressed rows [0, n_ubatch/ratio)
+// read back as zero at decode. head_zero across consecutive prefill ubatches
+// localises that to "never written" vs "written and later lost".
+//
+// Diagnostic only: forces a scheduler split and several host readbacks per
+// audited node.
+// ---------------------------------------------------------------------------
+
+static int  common_dsv4_write_audit_budget = 0;
+static long common_dsv4_write_audit_seen   = 0;
+static int  common_dsv4_write_audit_layer  = 2;   // first CSA layer of DSV4 Flash
+
+static bool common_dsv4_write_audit_name(const char * name) {
+    char want[64];
+    snprintf(want, sizeof(want), "csa_k_write-%d", common_dsv4_write_audit_layer);
+    if (strcmp(name, want) == 0) {
+        return true;
+    }
+    snprintf(want, sizeof(want), "lid_k_write-%d", common_dsv4_write_audit_layer);
+    return strcmp(name, want) == 0;
+}
+
+static int64_t common_dsv4_count_zero_rows(
+        const struct ggml_tensor * t, int64_t n_rows, int64_t row_stride_nb, int64_t n_elem,
+        const std::vector<int64_t> * idxs, int64_t * first_nonzero) {
+    // byte-wise test so the same helper serves the F32 compressor output and
+    // the F16 cache plane; a row of -0.0 counts as written, which is what the
+    // question ("did the store land") actually asks
+    const size_t row_bytes = (size_t) n_elem*ggml_type_size(t->type);
+    std::vector<uint8_t> row(row_bytes);
+    int64_t n_zero = 0;
+    if (first_nonzero) {
+        *first_nonzero = -1;
+    }
+    for (int64_t i = 0; i < n_rows; ++i) {
+        const int64_t r = idxs ? (*idxs)[(size_t) i] : i;
+        if (r < 0) {
+            continue;
+        }
+        ggml_backend_tensor_get(t, row.data(), (size_t) r*row_stride_nb, row_bytes);
+        bool z = true;
+        for (size_t j = 0; j < row_bytes; ++j) {
+            if (row[j] != 0) { z = false; break; }
+        }
+        if (z) {
+            ++n_zero;
+        } else if (first_nonzero && *first_nonzero < 0) {
+            *first_nonzero = i;
+        }
+    }
+    return n_zero;
+}
+
+static void common_dsv4_comp_write_audit(struct ggml_tensor * t) {
+    // GGML_OP_SET_ROWS src order is (data, idxs, destination) - see the note in
+    // ggml_set_rows(); the node itself is a view of the destination.
+    const struct ggml_tensor * src  = t->src[0];
+    const struct ggml_tensor * idxt = t->src[1];
+    const struct ggml_tensor * dst  = t->src[2];
+
+    // The compressor output is F32 in the compute graph and the compressed K
+    // cache is F16, so the two sides of the store have different types.
+    if (dst == nullptr || src == nullptr || idxt == nullptr ||
+            dst->type != GGML_TYPE_F16 || idxt->type != GGML_TYPE_I64 ||
+            (src->type != GGML_TYPE_F16 && src->type != GGML_TYPE_F32)) {
+        return;
+    }
+
+    const int64_t n_write = idxt->ne[0];
+    const int64_t n_elem  = src->ne[0];
+    if (n_write <= 0 || n_elem <= 0 || n_elem != dst->ne[0]) {
+        return;
+    }
+
+    std::vector<int64_t> idxs((size_t) n_write);
+    ggml_backend_tensor_get(idxt, idxs.data(), 0, idxs.size()*sizeof(int64_t));
+
+    int64_t idx_min = idxs[0], idx_max = idxs[0];
+    for (int64_t i = 1; i < n_write; ++i) {
+        idx_min = std::min(idx_min, idxs[(size_t) i]);
+        idx_max = std::max(idx_max, idxs[(size_t) i]);
+    }
+
+    int64_t src_first_nz = -1;
+    const int64_t src_zero = common_dsv4_count_zero_rows(
+            src, n_write, (int64_t) src->nb[1], n_elem, nullptr, &src_first_nz);
+
+    int64_t dst_first_nz = -1;
+    const int64_t dst_zero = common_dsv4_count_zero_rows(
+            dst, n_write, (int64_t) dst->nb[1], n_elem, &idxs, &dst_first_nz);
+
+    // leading rows of the whole plane, capped so the readback stays bounded
+    const int64_t head = std::min<int64_t>(dst->ne[1], 4096);
+    int64_t head_first_nz = -1;
+    const int64_t head_zero = common_dsv4_count_zero_rows(
+            dst, head, (int64_t) dst->nb[1], n_elem, nullptr, &head_first_nz);
+
+    fprintf(stderr, "COMPWRITE name=%s n_write=%lld n_elem=%lld idx=[%lld,%lld] "
+            "src_zero=%lld src_first_nz=%lld dst_zero=%lld dst_first_nz=%lld "
+            "head=%lld head_zero=%lld head_first_nz=%lld plane_rows=%lld\n",
+            t->name, (long long) n_write, (long long) n_elem,
+            (long long) idx_min, (long long) idx_max,
+            (long long) src_zero, (long long) src_first_nz,
+            (long long) dst_zero, (long long) dst_first_nz,
+            (long long) head, (long long) head_zero, (long long) head_first_nz,
+            (long long) dst->ne[1]);
+}
+
 static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     GGML_UNUSED(user_data);
+
+    const bool want_write_audit =
+        common_dsv4_write_audit_seen < common_dsv4_write_audit_budget &&
+        t->op == GGML_OP_SET_ROWS && common_dsv4_write_audit_name(t->name);
+    if (want_write_audit) {
+        if (ask) {
+            return true;
+        }
+        common_dsv4_comp_write_audit(t);
+        ++common_dsv4_write_audit_seen;
+        return true;
+    }
+
+    // LLAMA_DSV4_ZERO_ROW_SCAN=<n>: scan the compressed CSA K plane directly.
+    // csa_comp_k-<il> is named by llama_model_deepseek4::graph and is the same
+    // compressed rows the Lightning Indexer selects over, so a zero block that
+    // appears in BOTH planes is missing compressed KV, while a zero block that
+    // appears only in the indexer plane is an indexer-write defect.
+    const bool want_csa =
+        common_dsv4_zero_scan_seen < common_dsv4_zero_scan_budget &&
+        t->type == GGML_TYPE_F16 && t->ne[0] > 0 &&
+        strncmp(t->name, "csa_comp_k", 10) == 0;
+    if (want_csa) {
+        if (ask) {
+            return true;
+        }
+        const bool csa_pooled = t->ne[1] > 1;
+        if ((csa_pooled ? t->ne[1] : t->ne[2]) < common_dsv4_zero_scan_min_rows) {
+            return true;   // too narrow to be informative; do not spend budget
+        }
+        // csa_comp_k is [n_embd, 1, n_csa, n_stream] (non-indexed) or
+        // [n_embd, pool_rows] (indexed); rows are nb[2] apart in the former and
+        // nb[1] apart in the latter.
+        common_dsv4_zero_row_scan(t, "csa",
+                csa_pooled ? t->ne[1] : t->ne[2],
+                (int64_t) (csa_pooled ? t->nb[1] : t->nb[2]),
+                t->ne[0]);
+        ++common_dsv4_zero_scan_seen;
+        return true;
+    }
 
     const struct ggml_tensor * s = t->src[0];
 
@@ -1662,7 +1915,8 @@ static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * 
     const bool want =
         t->op == GGML_OP_TOP_K && t->ne[0] == 512 &&
         s != nullptr && s->type == GGML_TYPE_F32 && s->ne[0] > 1024 && s->ne[1] <= 8 &&
-        common_dsv4_topk_census_seen < common_dsv4_topk_census_budget;
+        (common_dsv4_topk_census_seen < common_dsv4_topk_census_budget ||
+         common_dsv4_zero_scan_seen   < common_dsv4_zero_scan_budget);
 
     if (ask) {
         return want;
@@ -1674,7 +1928,91 @@ static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * 
     const int64_t ne00 = s->ne[0];
     const int64_t ne01 = s->ne[1];
 
-    std::vector<float> row((size_t) ne00);
+    // The fused indexed path (ggml_dsv4_indexed_lightning_indexer) keeps the
+    // whole compressed pool and its logical->physical segment directory as
+    // inputs of the score node, so the census can resolve a logical row to the
+    // physical pool row the kernel actually read, without touching the KV cache
+    // implementation. src order is (q, k_pool, weights, mask, segment_ids).
+    const struct ggml_tensor * k_pool = nullptr;
+    const struct ggml_tensor * seg    = nullptr;
+    if (s->op == GGML_OP_LIGHTNING_INDEXER) {
+        k_pool = s->src[1];
+        seg    = s->src[4];
+    }
+
+    // one direct scan of the indexer K plane per budgeted node, with the right
+    // row stride for whichever layout is live: [n_embd, pool_rows] when indexed,
+    // [n_embd, 1, n_kv, n_stream] otherwise
+    if (k_pool != nullptr && common_dsv4_zero_scan_seen < common_dsv4_zero_scan_budget) {
+        const bool pooled = seg != nullptr;
+        const int64_t k_rows = pooled ? k_pool->ne[1] : k_pool->ne[2];
+        if (k_rows >= common_dsv4_zero_scan_min_rows) {
+            common_dsv4_zero_row_scan(k_pool, "lid", k_rows,
+                    (int64_t) (pooled ? k_pool->nb[1] : k_pool->nb[2]),
+                    k_pool->ne[0]);
+            ++common_dsv4_zero_scan_seen;
+        }
+    }
+
+    std::vector<int32_t> seg_ids;
+    if (seg != nullptr && seg->type == GGML_TYPE_I32) {
+        seg_ids.resize((size_t) ggml_nelements(seg));
+        ggml_backend_tensor_get(seg, seg_ids.data(), 0, seg_ids.size()*sizeof(int32_t));
+    }
+
+    // physical pool row of a logical row, mirroring
+    // lightning_indexer_physical_row() in ggml-metal.metal
+    const int64_t n_seg_per_stream = seg != nullptr ? seg->ne[0] : 0;
+    const auto physical_row = [&](int64_t logical, int64_t stream) -> int64_t {
+        if (seg_ids.empty()) {
+            return logical;
+        }
+        const int64_t l = logical/64;
+        if (l >= n_seg_per_stream) {
+            return -1;
+        }
+        const int32_t sid = seg_ids[(size_t) (stream*n_seg_per_stream + l)];
+        return sid >= 0 ? (int64_t) sid*64 + logical%64 : -1;
+    };
+    const auto segment_of = [&](int64_t logical, int64_t stream) -> int64_t {
+        if (seg_ids.empty()) {
+            return -2;
+        }
+        const int64_t l = logical/64;
+        if (l >= n_seg_per_stream) {
+            return -1;
+        }
+        return seg_ids[(size_t) (stream*n_seg_per_stream + l)];
+    };
+
+    // is the compressed K row for this logical row identically zero?
+    const int64_t k_ne0 = k_pool != nullptr ? k_pool->ne[0] : 0;
+    std::vector<uint8_t> krow;
+    const auto k_row_is_zero = [&](int64_t logical, int64_t stream) -> int {
+        if (k_pool == nullptr || k_pool->type != GGML_TYPE_F16 || k_ne0 <= 0) {
+            return -1;
+        }
+        const int64_t phys = physical_row(logical, stream);
+        if (phys < 0 || phys >= k_pool->ne[1]) {
+            return -1;
+        }
+        krow.resize((size_t) k_ne0*sizeof(ggml_fp16_t));
+        ggml_backend_tensor_get(k_pool, krow.data(), (size_t) phys*k_pool->nb[1], krow.size());
+        const ggml_fp16_t * h = (const ggml_fp16_t *) krow.data();
+        for (int64_t i = 0; i < k_ne0; ++i) {
+            if (ggml_fp16_to_fp32(h[i]) != 0.0f) {
+                return 0;
+            }
+        }
+        return 1;
+    };
+
+    // the census only fires on decode/verify shapes, where the graph carries a
+    // single stream per selection; ne[3] of the score tensor is that stream
+    const int64_t stream = 0;
+
+    std::vector<float>   row((size_t) ne00);
+    std::vector<int32_t> sel((size_t) t->ne[0]);
     for (int64_t r = 0; r < ne01; ++r) {
         ggml_backend_tensor_get(s, row.data(), (size_t) r*s->nb[1], (size_t) ne00*sizeof(float));
 
@@ -1683,24 +2021,87 @@ static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * 
         const float pivot = tmp[511];
 
         int64_t n_gt = 0, n_eq = 0, n_pos = 0, n_neg = 0, n_inf = 0;
+        int64_t n_vis = ne00;
+        int64_t zmin = -1, zmax = -1, zruns = 0;
+        std::vector<std::pair<int64_t, int64_t>> runs;   // exact-zero runs, [first,last]
+        bool in_run = false;
         for (int64_t i = 0; i < ne00; ++i) {
             const float v = row[(size_t) i];
             if      (v >  pivot) ++n_gt;
             else if (v == pivot) ++n_eq;
             if      (v >  0.0f)  ++n_pos;
             else if (v <  0.0f)  { ++n_neg; if (std::isinf(v)) ++n_inf; }
+            if (std::isinf(v) && v < 0.0f && n_vis == ne00) {
+                n_vis = i;
+            }
+            const bool z = (v == 0.0f);
+            if (z) {
+                if (zmin < 0) zmin = i;
+                zmax = i;
+                if (!in_run) { ++zruns; runs.emplace_back(i, i); in_run = true; }
+                else         { runs.back().second = i; }
+            } else {
+                in_run = false;
+            }
+        }
+
+        // how much of the 512-wide selection lands on exact-zero rows
+        int64_t zsel = -1;
+        if (t->type == GGML_TYPE_I32 && r < t->ne[1]) {
+            ggml_backend_tensor_get(t, sel.data(), (size_t) r*t->nb[1], (size_t) t->ne[0]*sizeof(int32_t));
+            zsel = 0;
+            for (int64_t i = 0; i < t->ne[0]; ++i) {
+                const int32_t idx = sel[(size_t) i];
+                if (idx >= 0 && idx < ne00 && row[(size_t) idx] == 0.0f) {
+                    ++zsel;
+                }
+            }
+        }
+
+        // sample the zero group: segment mapping and whether K is really zero
+        std::string zseg;
+        int64_t zk_zero = 0, zk_seen = 0;
+        {
+            char buf[64];
+            int64_t emitted = 0;
+            for (const auto & rn : runs) {
+                if (emitted >= 8) { zseg += ",..."; break; }
+                const int64_t s0 = segment_of(rn.first,  stream);
+                const int64_t s1 = segment_of(rn.second, stream);
+                snprintf(buf, sizeof(buf), "%s%lld-%lld:seg%lld-%lld",
+                        emitted ? "," : "",
+                        (long long) rn.first, (long long) rn.second,
+                        (long long) s0, (long long) s1);
+                zseg += buf;
+                ++emitted;
+            }
+            const int64_t probes[3] = { zmin, zmin >= 0 ? (zmin + zmax)/2 : -1, zmax };
+            for (int64_t p : probes) {
+                if (p < 0) continue;
+                const int z = k_row_is_zero(p, stream);
+                if (z >= 0) { ++zk_seen; zk_zero += z; }
+            }
         }
 
         // src is named lid_score_masked-<il> by llama_model_deepseek4::graph,
         // so the layer is recoverable; only the target has a Lightning Indexer
         // (src/models/dflash.cpp, the DSpark drafter, has no top-k at all), so
         // every census line below is the target's.
+        if (common_dsv4_topk_census_seen >= common_dsv4_topk_census_budget) {
+            continue;   // zero-row-scan-only mode
+        }
         fprintf(stderr,
                 "TOPKCENSUS src=%s ne00=%lld ne01=%lld row=%lld pivot=%.9g "
-                "n_gt=%lld n_eq=%lld tie_slots=%lld n_pos=%lld n_neg=%lld n_inf=%lld\n",
+                "n_gt=%lld n_eq=%lld tie_slots=%lld n_pos=%lld n_neg=%lld n_inf=%lld "
+                "n_vis=%lld zmin=%lld zmax=%lld zruns=%lld zsel=%lld zk=%lld/%lld "
+                "npool=%lld nseg=%lld zseg=[%s]\n",
                 s->name, (long long) ne00, (long long) ne01, (long long) r, (double) pivot,
                 (long long) n_gt, (long long) n_eq, (long long) (512 - n_gt),
-                (long long) n_pos, (long long) n_neg, (long long) n_inf);
+                (long long) n_pos, (long long) n_neg, (long long) n_inf,
+                (long long) n_vis, (long long) zmin, (long long) zmax, (long long) zruns,
+                (long long) zsel, (long long) zk_zero, (long long) zk_seen,
+                (long long) (k_pool != nullptr ? k_pool->ne[1] : -1),
+                (long long) n_seg_per_stream, zseg.c_str());
     }
 
     ++common_dsv4_topk_census_seen;
@@ -1742,8 +2143,25 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // one host readback per indexer selection, so it is very slow.
     if (cparams.cb_eval == nullptr) {
         const char * census = std::getenv("LLAMA_DSV4_TOPK_CENSUS");
-        if (census != nullptr && std::atoi(census) > 0) {
-            common_dsv4_topk_census_budget = std::atoi(census);
+        const char * zscan  = std::getenv("LLAMA_DSV4_ZERO_ROW_SCAN");
+        const char * waudit = std::getenv("LLAMA_DSV4_COMP_WRITE_AUDIT");
+        if (zscan != nullptr && std::atoi(zscan) > 0) {
+            common_dsv4_zero_scan_budget = std::atoi(zscan);
+            const char * zmin = std::getenv("LLAMA_DSV4_ZERO_ROW_SCAN_MIN_ROWS");
+            if (zmin != nullptr && std::atoll(zmin) > 0) {
+                common_dsv4_zero_scan_min_rows = std::atoll(zmin);
+            }
+        }
+        if (waudit != nullptr && std::atoi(waudit) > 0) {
+            common_dsv4_write_audit_budget = std::atoi(waudit);
+            const char * wlayer = std::getenv("LLAMA_DSV4_COMP_WRITE_AUDIT_LAYER");
+            if (wlayer != nullptr) {
+                common_dsv4_write_audit_layer = std::atoi(wlayer);
+            }
+        }
+        if ((census != nullptr && std::atoi(census) > 0) || common_dsv4_zero_scan_budget > 0 ||
+                common_dsv4_write_audit_budget > 0) {
+            common_dsv4_topk_census_budget = census != nullptr ? std::atoi(census) : 0;
             cparams.cb_eval               = common_dsv4_topk_census_cb;
             cparams.cb_eval_user_data     = nullptr;
         }
