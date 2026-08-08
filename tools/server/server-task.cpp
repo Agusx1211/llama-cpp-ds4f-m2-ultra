@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
+#include "server-dashboard-bus.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -1816,6 +1817,18 @@ bool server_prompt_cache::spill_to_disk(server_prompt_cache_state & state) {
             state.prompt.n_tokens(), size_ram / (1024.0*1024.0), path.c_str(), dt_ms,
             dt_ms > 0.0 ? (size_ram / (1024.0*1024.0)) / (dt_ms / 1000.0) : 0.0);
 
+    ++dash_spills;
+    dash_bytes_spilled += size_ram;
+    {
+        server_dashboard::event ev;
+        ev.kind = server_dashboard::event_kind::cache_op;
+        ev.code = (uint16_t) server_dashboard::cache_op_code::spill;
+        ev.a    = state.prompt.n_tokens();
+        ev.b    = (int64_t) size_ram;
+        ev.f    = dt_ms;
+        server_dashboard::instance().emit(ev);
+    }
+
     return true;
 }
 
@@ -1890,6 +1903,18 @@ bool server_prompt_cache::load_from_disk(server_prompt_cache_state & state) {
             state.prompt.n_tokens(), mib, state.file.c_str(), dt_ms,
             dt_ms > 0.0 ? mib / (dt_ms / 1000.0) : 0.0);
 
+    ++dash_disk_loads;
+    dash_bytes_disk_load += hdr.size_main + hdr.size_drft;
+    {
+        server_dashboard::event ev;
+        ev.kind = server_dashboard::event_kind::cache_op;
+        ev.code = (uint16_t) server_dashboard::cache_op_code::disk_load;
+        ev.a    = state.prompt.n_tokens();
+        ev.b    = (int64_t) (hdr.size_main + hdr.size_drft);
+        ev.f    = dt_ms;
+        server_dashboard::instance().emit(ev);
+    }
+
     return true;
 }
 
@@ -1951,12 +1976,17 @@ void server_prompt_cache::rescan_disk() {
         state.file          = f.path;
         state.size_disk     = f.size;
 
+        state.dash_id         = dash_id_next++;
+        state.dash_created_us = ggml_time_us();
+
         states.push_back(std::move(state));
         ++n_restored;
     }
 
     SRV_INF("prompt cache SSD tier: restored %zu entries (%.3f GiB) from '%s'\n",
             n_restored, size_disk_total() / (1024.0*1024.0*1024.0), disk_dir.c_str());
+
+    publish_dashboard_state();
 }
 
 std::list<server_prompt_cache_state>::iterator server_prompt_cache::drop_entry(std::list<server_prompt_cache_state>::iterator it) {
@@ -1966,6 +1996,16 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::drop_entry(s
         if (ec) {
             SRV_WRN("failed to remove prompt cache file '%s': %s\n", it->file.c_str(), ec.message().c_str());
         }
+    }
+
+    ++dash_drops;
+    {
+        server_dashboard::event ev;
+        ev.kind = server_dashboard::event_kind::cache_op;
+        ev.code = (uint16_t) server_dashboard::cache_op_code::drop;
+        ev.a    = it->prompt.n_tokens();
+        ev.b    = (int64_t) (it->on_disk() ? it->size_disk : it->size());
+        server_dashboard::instance().emit(ev);
     }
 
     return states.erase(it);
@@ -1982,6 +2022,16 @@ bool server_prompt_cache::evict_oldest_ram() {
         }
 
         SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", it->size() / (1024.0 * 1024.0));
+
+        ++dash_drops;
+        {
+            server_dashboard::event ev;
+            ev.kind = server_dashboard::event_kind::cache_op;
+            ev.code = (uint16_t) server_dashboard::cache_op_code::drop;
+            ev.a    = it->prompt.n_tokens();
+            ev.b    = (int64_t) it->size();
+            server_dashboard::instance().emit(ev);
+        }
 
         states.erase(it);
 
@@ -2064,13 +2114,29 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     state_new.prompt.checkpoints = prompt.checkpoints;
     state_new.data.main          = std::move(state_data_tgt);
     state_new.data.drft          = std::move(state_data_dft);
+    state_new.dash_id            = dash_id_next++;
+    state_new.dash_created_us    = ggml_time_us();
 
     states.push_back(std::move(state_new));
+
+    ++dash_saves;
+    dash_bytes_saved += state_size_new;
+    {
+        server_dashboard::event ev;
+        ev.kind = server_dashboard::event_kind::cache_op;
+        ev.code = (uint16_t) server_dashboard::cache_op_code::save;
+        ev.a    = prompt.n_tokens();
+        ev.b    = (int64_t) state_size_new;
+        server_dashboard::instance().emit(ev);
+    }
 
     return &states.back();
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    ++dash_lookups;
+    dash_last_load = {};
+
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -2102,15 +2168,28 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    if (it_best == states.end()) {
+        // no cache entry beats the resident state
+        if (lcp_best > 0) {
+            ++dash_hits_resident;
+            dash_last_load.source   = 0; // resident
+            dash_last_load.n_tokens = (uint64_t) lcp_best;
+        } else {
+            ++dash_misses;
+        }
+    }
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
         const bool from_disk = it_best->on_disk();
+        const int  lcp_restored = it_best->prompt.tokens.get_common_prefix(tokens_new);
 
         if (from_disk && !load_from_disk(*it_best)) {
             // unreadable or stale file - drop the entry so it is not retried
             drop_entry(it_best);
 
+            ++dash_misses;
             return false;
         }
 
@@ -2124,6 +2203,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
         }
 
+        const size_t bytes_restored = it_best->data.size();
+
         {
             auto & data = it_best->data.main;
 
@@ -2136,6 +2217,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 // drop it (and its file) instead of retrying it forever
                 drop_entry(it_best);
 
+                ++dash_misses;
                 return false;
             }
 
@@ -2156,6 +2238,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                     drop_entry(it_best);
 
+                    ++dash_misses;
                     return false;
                 }
 
@@ -2168,6 +2251,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             // stale rows.
         }
 
+        ++dash_hits_entry;
+        dash_last_load.source   = from_disk ? 2 : 1; // disk : ram
+        dash_last_load.n_tokens = (uint64_t) std::max(0, lcp_restored);
+        dash_last_load.n_bytes  = bytes_restored;
+
         if (from_disk) {
             // keep the file and a slim index entry: the same prefix can be
             // reloaded again later (other slots, branched conversations, or
@@ -2176,6 +2264,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             slim.prompt.tokens = it_best->prompt.tokens.clone();
             slim.file          = std::move(it_best->file);
             slim.size_disk     = it_best->size_disk;
+
+            slim.dash_id          = it_best->dash_id;
+            slim.dash_created_us  = it_best->dash_created_us;
+            slim.dash_last_hit_us = ggml_time_us();
+            slim.dash_hits        = it_best->dash_hits + 1;
 
             prompt = std::move(it_best->prompt);
 
@@ -2240,4 +2333,49 @@ void server_prompt_cache::update() {
                 (state.on_disk() ? state.size_disk : state.size()) / (1024.0 * 1024.0),
                 state.on_disk() ? "(disk)" : "(ram)");
     }
+
+    publish_dashboard_state();
+}
+
+void server_prompt_cache::publish_dashboard_state() {
+    server_dashboard::cache_state out;
+    out.enabled          = true;
+    out.at_us            = (uint64_t) ggml_time_us();
+    out.limit_ram_bytes  = limit_size;
+    out.limit_disk_bytes = limit_disk;
+    out.limit_tokens     = limit_tokens;
+    out.used_ram_bytes   = size();
+    out.used_disk_bytes  = size_disk_total();
+    out.tokens_total     = n_tokens();
+
+    out.entries.reserve(states.size());
+    for (const auto & state : states) {
+        server_dashboard::cache_entry_state entry;
+        entry.id          = state.dash_id;
+        entry.tokens      = (uint64_t) state.prompt.n_tokens();
+        entry.bytes_ram   = state.size();
+        entry.bytes_disk  = state.size_disk;
+        entry.on_disk     = state.on_disk();
+        entry.created_us  = (uint64_t) std::max<int64_t>(0, state.dash_created_us);
+        entry.last_hit_us = (uint64_t) std::max<int64_t>(0, state.dash_last_hit_us);
+        entry.hits        = state.dash_hits;
+        if (state.on_disk()) {
+            entry.file = std::filesystem::path(state.file).filename().string();
+        }
+        out.entries.push_back(std::move(entry));
+    }
+
+    out.counters.lookups         = dash_lookups;
+    out.counters.hits_entry      = dash_hits_entry;
+    out.counters.hits_resident   = dash_hits_resident;
+    out.counters.misses          = dash_misses;
+    out.counters.saves           = dash_saves;
+    out.counters.spills          = dash_spills;
+    out.counters.disk_loads      = dash_disk_loads;
+    out.counters.drops           = dash_drops;
+    out.counters.bytes_saved     = dash_bytes_saved;
+    out.counters.bytes_spilled   = dash_bytes_spilled;
+    out.counters.bytes_disk_load = dash_bytes_disk_load;
+
+    server_dashboard::instance().publish_cache_state(std::move(out));
 }

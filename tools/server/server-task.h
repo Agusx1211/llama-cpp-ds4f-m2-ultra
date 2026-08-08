@@ -679,6 +679,15 @@ struct server_prompt_cache_state {
     std::string file;
     size_t size_disk = 0;
 
+    // m2-dashboard bookkeeping (introspection only, never drives eviction).
+    // A RAM hit consumes the entry (load() moves it into the slot), so hit
+    // counts accumulate mostly on SSD-tier entries, which keep a slim index
+    // entry across hits.
+    uint64_t dash_id          = 0; // stable id from the allocation counter
+    int64_t  dash_created_us  = 0;
+    int64_t  dash_last_hit_us = 0; // 0 = never hit
+    uint32_t dash_hits        = 0;
+
     bool on_disk() const { return !file.empty(); }
 
     // RAM footprint of the entry (disk entries hold no blobs in RAM)
@@ -745,6 +754,34 @@ struct server_prompt_cache {
 
     // erase an entry and unlink its backing file (if any)
     std::list<server_prompt_cache_state>::iterator drop_entry(std::list<server_prompt_cache_state>::iterator it);
+
+    // m2-dashboard introspection (main thread only; see server-dashboard-bus.h).
+    // What the most recent load() consult did, read by get_available_slot to
+    // emit one cache_restore event with an unambiguous source.
+    struct dash_load_report {
+        int      source   = 4; // server_dashboard::restore_code numeric value (4 = miss)
+        uint64_t n_tokens = 0; // prefix tokens restored (entry hit) or kept (resident)
+        uint64_t n_bytes  = 0; // state bytes restored into the slot (entry hits only)
+    };
+    dash_load_report dash_last_load;
+
+    // monotone counters for hit-rate/traffic reporting
+    uint64_t dash_id_next         = 1;
+    uint64_t dash_lookups         = 0;
+    uint64_t dash_hits_entry      = 0;
+    uint64_t dash_hits_resident   = 0;
+    uint64_t dash_misses          = 0;
+    uint64_t dash_saves           = 0;
+    uint64_t dash_spills          = 0;
+    uint64_t dash_disk_loads      = 0;
+    uint64_t dash_drops           = 0;
+    uint64_t dash_bytes_saved     = 0;
+    uint64_t dash_bytes_spilled   = 0;
+    uint64_t dash_bytes_disk_load = 0;
+
+    // rebuild and publish the occupancy snapshot served by
+    // GET /m2-dashboard/cache-state (called from update() and rescan_disk())
+    void publish_dashboard_state();
 };
 
 // used exclusively by router mode

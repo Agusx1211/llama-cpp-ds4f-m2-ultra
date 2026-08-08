@@ -1,6 +1,8 @@
 #include "server-task.h"
 #include "server-queue.h"
 
+#include "server-dashboard-bus.h"
+
 #include "log.h"
 
 #include <algorithm>
@@ -243,13 +245,30 @@ server_request_runtime::admission_result server_queue::validate_user_family(cons
     return request_runtime.validate_dispatch_family(priority, demand, physical_slot_capacity);
 }
 
+// m2-dashboard: mirror the durable queue transitions onto the dashboard event
+// bus. The bus append is a leaf (one mutex + struct copy) and is safe under
+// the queue mutex; see server-dashboard-bus.h.
+static void dash_emit_queued(const server_request_runtime::request_metadata & metadata, uint64_t at_us) {
+    server_dashboard::event ev;
+    ev.kind       = server_dashboard::event_kind::queued;
+    ev.at_us      = at_us;
+    ev.request_id = metadata.id;
+    ev.lane       = static_cast<uint8_t>(metadata.lane);
+    ev.a          = (int64_t) metadata.counts.prompt_tokens;
+    ev.b          = (int64_t) metadata.counts.requested_output_tokens;
+    ev.c          = (int64_t) metadata.parent_id;
+    server_dashboard::instance().emit(ev);
+}
+
 server_request_runtime::admission_result server_queue::enqueue_user_task(server_task && task, uint64_t at_us) {
     const int task_id = task.id;
-    const auto admitted = request_runtime.admit(make_request_metadata(task, at_us));
+    const auto metadata = make_request_metadata(task, at_us);
+    const auto admitted = request_runtime.admit(metadata);
     if (!admitted) {
         QUE_WRN("reject task, id = %d, reason = %s\n", task_id, server_scheduler::to_string(admitted.reason));
         return admitted;
     }
+    dash_emit_queued(metadata, at_us);
     queue_user_tasks.emplace(task_id, std::move(task));
     return admitted;
 }
@@ -370,7 +389,8 @@ server_queue_post_result server_queue::post(std::vector<server_task> && tasks, b
                 if (child.scheduling.arrival_us == 0) {
                     child.scheduling.arrival_us = parent.scheduling.arrival_us;
                 }
-                const auto admitted = request_runtime.admit(make_request_metadata(child, at_us), false);
+                const auto child_metadata = make_request_metadata(child, at_us);
+                const auto admitted = request_runtime.admit(child_metadata, false);
                 if (!admitted) {
                     QUE_WRN("reject child task, id = %d, reason = %s\n", child.id,
                             server_scheduler::to_string(admitted.reason));
@@ -382,6 +402,7 @@ server_queue_post_result server_queue::post(std::vector<server_task> && tasks, b
                     notify_expired(expired);
                     return rejected_post(admitted, child.id);
                 }
+                dash_emit_queued(child_metadata, at_us);
                 admitted_ids.push_back(runtime_id(child.id));
             }
         } else if (front) {
@@ -583,6 +604,16 @@ void server_queue::defer(server_task && task, server_queue_defer_reason reason) 
         notify_expired(expired);
         return;
     }
+    if (is_user_task(task)) {
+        server_dashboard::event ev;
+        ev.kind       = server_dashboard::event_kind::deferred;
+        ev.at_us      = at_us;
+        ev.request_id = runtime_id(task.id);
+        ev.code       = (uint16_t) (reason == server_queue_defer_reason::physical_admission ?
+                server_dashboard::defer_code::physical_admission :
+                server_dashboard::defer_code::capacity);
+        server_dashboard::instance().emit(ev);
+    }
     queue_tasks_deferred.push_back(std::move(task));
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
@@ -753,6 +784,17 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 GGML_ASSERT(task_it != queue_user_tasks.end());
                 task = std::move(task_it->second);
                 queue_user_tasks.erase(task_it);
+                {
+                    const uint64_t dispatch_us = now_us();
+                    server_dashboard::event ev;
+                    ev.kind       = server_dashboard::event_kind::dispatched;
+                    ev.at_us      = dispatch_us;
+                    ev.request_id = decision.request_id;
+                    ev.lane       = static_cast<uint8_t>(decision.lane);
+                    ev.a          = dispatch_us > task.scheduling.arrival_us ?
+                            (int64_t) (dispatch_us - task.scheduling.arrival_us) : 0;
+                    server_dashboard::instance().emit(ev);
+                }
             }
             lock.unlock();
 
