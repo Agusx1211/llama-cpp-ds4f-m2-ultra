@@ -4489,6 +4489,16 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
                 auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg, blocked, red_assoc);
 
+                // GGML_METAL_KPROF attributes one counter-sampled pass per graph
+                // *node*, so the vec kernel and its reducer land in the same
+                // segment and the census cannot say which of the two carries the
+                // op's cost. Open a fresh segment here when kprof is active so
+                // the split-K reduction is measured on its own. Measurement
+                // only: with kprof off this is a no-op.
+                if (ggml_metal_kprof_stride() > 0) {
+                    ggml_metal_encoder_kprof_split(enc, ctx->raw_idx(idx));
+                }
+
                 ggml_metal_encoder_set_pipeline(enc, pipeline0);
                 ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
                 ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
