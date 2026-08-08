@@ -4219,7 +4219,6 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // half4x4 kernel
         const int nqptg = OP_FLASH_ATTN_EXT_VEC_NQPSG; // queries per threadgroup
         const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache values per simdgroup !! sync with kernel template arguments !!
-        const int nhptg = 1;                           // heads per threadgroup
 
         GGML_ASSERT(nqptg <= 32);
         GGML_ASSERT(nqptg  % 1  == 0);
@@ -4369,6 +4368,55 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             }
         }
 
+        // MQA head batching ("heads per threadgroup").
+        //
+        // DSV4 decode attention is multi-query: one 512-wide KV head serves all
+        // 64 query heads. At nhptg = 1 the kernel launches one threadgroup per
+        // query head and every one of them streams the same selected K/V rows
+        // across the memory fabric, so a layer performs ne02 = 64 reads of a
+        // working set that exists once.
+        //
+        // nhptg > 1 puts nhptg query heads that share a KV head into one
+        // threadgroup, as nsg*nhptg SIMDgroups laid out head-major. Each head
+        // keeps its own key-stream split, accumulator and reduction and runs the
+        // unmodified single-head code on the unmodified chunk list, so the
+        // arithmetic and its order do not change - the result is bit-identical -
+        // but the heads now execute on one GPU core and their identical K/V
+        // loads collapse in that core's L1 instead of crossing the fabric nhptg
+        // times.
+        //
+        // Threads and threadgroup memory both scale with nhptg, so threadgroup
+        // memory per thread (the quantity that caps occupancy) is unchanged.
+        // This is what separates it from GGML_FA_SPLIT_NSG, which raised
+        // threadgroup memory per *thread* by the same factor and lost.
+        int32_t nhptg = 1;
+        {
+            static const int32_t nh_env = []() {
+                const char * s = std::getenv("GGML_FA_NHPTG");
+                return s ? atoi(s) : GGML_METAL_FA_NHPTG_DEFAULT;
+            }();
+
+            // ne12 == 1: every query head maps to KV head 0, so a threadgroup's
+            //            heads provably share their K/V rows
+            // ne32 == 1: the mask does not depend on the head, so the batched
+            //            heads take identical skip decisions (they would still
+            //            be correct otherwise, just not aligned)
+            // !has_bias: the ALiBi slope is per head and is hoisted out of the
+            //            chunk loop; excluded rather than plumbed through
+            const bool nh_ok = nh_env > 1 && has_mask && ne12 == 1 && ne32 == 1 && !has_bias &&
+                    ne02 > 1 && ne13 == ne03;
+
+            if (nh_ok) {
+                int32_t nh = std::min<int32_t>(nh_env, 8);
+
+                while (nh > 1 && (ne02 % nh != 0 || FATTN_SMEM(nsg*nh) > props_dev->max_theadgroup_memory_size)) {
+                    nh /= 2;
+                }
+
+                nhptg = nh;
+            }
+        }
+
         // [NWG][DV4] partial layout: coalesced stores, at the price of a
         // reducer that needs threadgroup memory and three extra barriers.
         // Measured slower or neutral at every geometry the DSV4 decode graph
@@ -4383,18 +4431,20 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         static const bool geom_log = std::getenv("GGML_FA_GEOM_LOG") != nullptr;
         if (geom_log) {
             static std::vector<uint64_t> seen;
-            const uint64_t key = ((uint64_t) ne11 << 24) | ((uint64_t) nwg << 16) |
-                                 ((uint64_t) nsg << 8)   | ((uint64_t) dsv4_sparse_mask << 1) | (uint64_t) blocked;
+            const uint64_t key = ((uint64_t) ne11 << 32) | ((uint64_t) ne01 << 24) | ((uint64_t) nwg << 16) |
+                                 ((uint64_t) nsg << 8)   | ((uint64_t) nhptg << 2) |
+                                 ((uint64_t) dsv4_sparse_mask << 1) | (uint64_t) blocked;
             if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
                 seen.push_back(key);
                 // stderr rather than GGML_LOG_INFO: llama-server installs its
                 // own ggml log callback and ggml's INFO level does not reach
                 // the server log
-                fprintf(stderr, "FAGEOM ne11=%d ne01=%d ne02=%d dk=%d dv=%d nchunks=%d nwg=%d nsg=%d mskip=%d blk=%d tmp_bytes=%d\n",
-                        (int) ne11, (int) ne01, (int) ne02, (int) ne00, (int) ne20,
-                        (int) ((ne11 + ncpsg - 1)/ncpsg), (int) nwg, (int) nsg,
+                fprintf(stderr, "FAGEOM ne11=%d ne01=%d ne02=%d ne03=%d ne12=%d ne32=%d dk=%d dv=%d nchunks=%d nwg=%d nsg=%d nh=%d mskip=%d blk=%d tmp_bytes=%d kv_bytes=%d\n",
+                        (int) ne11, (int) ne01, (int) ne02, (int) ne03, (int) ne12, (int) ne32, (int) ne00, (int) ne20,
+                        (int) ((ne11 + ncpsg - 1)/ncpsg), (int) nwg, (int) nsg, (int) nhptg,
                         (int) dsv4_sparse_mask, (int) blocked,
-                        (int) (4*(ne01*ne02*ne03*nwg*(ne20 + 2))));
+                        (int) (4*(ne01*ne02*ne03*nwg*(ne20 + 2))),
+                        (int) (ne11*ne12*ne13*(nb11 + nb21)));
             }
         }
 
@@ -4434,9 +4484,17 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg, blocked);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg, blocked, nhptg);
 
-        GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+        // the vector kernel keeps a full DV accumulator per lane, so its
+        // maxTotalThreadsPerThreadgroup can be well below 1024; back the head
+        // batching off until the threadgroup fits.
+        while (nhptg > 1 && nsg*nhptg*32 > (int64_t) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+            nhptg /= 2;
+            pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg, blocked, nhptg);
+        }
+
+        GGML_ASSERT(nsg*nhptg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -4446,7 +4504,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
 
-        const size_t smem = FATTN_SMEM(nsg);
+        const size_t smem = FATTN_SMEM(nsg*nhptg);
 
         //printf("smem: %zu, max: %zu, nsg = %d, nsgmax = %d\n", smem, props_dev->max_theadgroup_memory_size, (int) nsg, (int) nsgmax);
         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
@@ -4460,7 +4518,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg*nhptg, 1);
         } else {
             // sanity checks
             assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
@@ -4473,7 +4531,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer(enc, bid_tmp, 7);
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg*nhptg, 1);
 
             // sync the 2 kernels
             ggml_metal_op_concurrency_reset(ctx);
