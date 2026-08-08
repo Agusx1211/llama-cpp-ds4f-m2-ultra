@@ -1100,6 +1100,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 // in threadgroup memory after the reduction area.
                 GGML_ASSERT(ne00 % 4 == 0); // ne00 % QK_E4M3_M2 == 0 by block invariant
                 nsg = ggml_metal_mv_nsg(ne00, 512, 4); // NF = 16 -> 512 elems/simdgroup
+                // fork: A/B knob for the NR0 sweep (bit-identical in every
+                // value - per-row accumulation order is NR0-independent).
+                // Default stays 4; see the note below.
                 nr0 = 4; // 2 in the BF16 original; 4 halves the per-threadgroup
                          // fixed costs (LUT staging, reduce) and shares each
                          // activation load across 4 rows. Per-row accumulation
@@ -1112,6 +1115,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 // 1.31x: the longer 8-row serial loop per thread loses more
                 // than the halved fixed costs buy. The kernel keeps its
                 // case-8 dispatch for future experiments; the host stays at 4.
+                {
+                    const char * v = getenv("GGML_MV_NR0_E4M3");
+                    if (v) {
+                        const int r = atoi(v);
+                        if (r == 2 || r == 4 || r == 8) {
+                            nr0 = r;
+                        }
+                    }
+                }
                 nr1 = 1;
                 smem = 32*sizeof(float)*nr0 + 256*sizeof(float);
                 suffix = "_4";
