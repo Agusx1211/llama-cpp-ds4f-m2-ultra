@@ -12,10 +12,17 @@
 #include "server-dashboard-bus.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <vector>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 using json = nlohmann::ordered_json;
 
@@ -1650,58 +1657,436 @@ json server_task_result_apply_lora::to_json() {
 // server_prompt_cache
 //
 
-// SSD tier file format: a single file per cached prompt state, holding the
-// tokens (so the index can be rebuilt at startup), the serialized target and
-// draft sequence states, and the context checkpoints. Byte order is the host
-// order of the target machine (M2 Ultra); the fingerprint guards against
-// restoring states from a different model/config/build.
-static constexpr uint32_t PCACHE_DISK_MAGIC   = 0x4350434Cu; // "LCPC"
-static constexpr uint32_t PCACHE_DISK_VERSION = 1u;
+// SSD tier file format: see the pcache_disk_header block in server-task.h for
+// the layout, the two guards (schema version + fingerprint) and the integrity
+// model. Everything below treats the file as untrusted input: no length read
+// from a file may size an allocation before it has been proven to fit inside
+// the bytes the file actually has.
 
-struct pcache_disk_header {
-    uint32_t magic;
-    uint32_t version;
-    uint64_t fingerprint;
-    uint64_t size_main;
-    uint64_t size_drft;
-    uint32_t n_tokens;
-    uint32_t n_checkpoints;
+static constexpr uint64_t PCACHE_HASH_SEED_HDR = 0x9E3779B97F4A7C15ull;
+
+// hash primes (xxh64)
+static constexpr uint64_t PCACHE_HP1 = 0x9E3779B185EBCA87ull;
+static constexpr uint64_t PCACHE_HP2 = 0xC2B2AE3D27D4EB4Full;
+static constexpr uint64_t PCACHE_HP3 = 0x165667B19E3779F9ull;
+static constexpr uint64_t PCACHE_HP4 = 0x85EBCA77C2B2AE63ull;
+static constexpr uint64_t PCACHE_HP5 = 0x27D4EB2F165667C5ull;
+
+static inline uint64_t pcache_rotl(uint64_t x, int r) {
+    return (x << r) | (x >> (64 - r));
+}
+
+static inline uint64_t pcache_load_u64(const uint8_t * p) {
+    uint64_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+static inline uint64_t pcache_round(uint64_t acc, uint64_t v) {
+    return pcache_rotl(acc + v*PCACHE_HP2, 31)*PCACHE_HP1;
+}
+
+static inline uint64_t pcache_merge(uint64_t acc, uint64_t v) {
+    return (acc ^ (pcache_rotl(v*PCACHE_HP2, 31)*PCACHE_HP1))*PCACHE_HP1 + PCACHE_HP4;
+}
+
+uint64_t server_pcache_hash(const void * data, size_t size, uint64_t seed) {
+    const uint8_t *       p   = static_cast<const uint8_t *>(data);
+    const uint8_t * const end = p + size;
+
+    uint64_t h;
+
+    if (size >= 32) {
+        uint64_t v1 = seed + PCACHE_HP1 + PCACHE_HP2;
+        uint64_t v2 = seed + PCACHE_HP2;
+        uint64_t v3 = seed;
+        uint64_t v4 = seed - PCACHE_HP1;
+
+        const uint8_t * const limit = end - 32;
+        do {
+            v1 = pcache_round(v1, pcache_load_u64(p +  0));
+            v2 = pcache_round(v2, pcache_load_u64(p +  8));
+            v3 = pcache_round(v3, pcache_load_u64(p + 16));
+            v4 = pcache_round(v4, pcache_load_u64(p + 24));
+            p += 32;
+        } while (p <= limit);
+
+        h = pcache_rotl(v1, 1) + pcache_rotl(v2, 7) + pcache_rotl(v3, 12) + pcache_rotl(v4, 18);
+        h = pcache_merge(h, v1);
+        h = pcache_merge(h, v2);
+        h = pcache_merge(h, v3);
+        h = pcache_merge(h, v4);
+    } else {
+        h = seed + PCACHE_HP5;
+    }
+
+    h += (uint64_t) size;
+
+    while (p + 8 <= end) {
+        h  = pcache_rotl(h ^ (pcache_rotl(pcache_load_u64(p)*PCACHE_HP2, 31)*PCACHE_HP1), 27)*PCACHE_HP1 + PCACHE_HP4;
+        p += 8;
+    }
+
+    while (p < end) {
+        h  = pcache_rotl(h ^ (*p * PCACHE_HP5), 11)*PCACHE_HP1;
+        p += 1;
+    }
+
+    h ^= h >> 33;
+    h *= PCACHE_HP2;
+    h ^= h >> 29;
+    h *= PCACHE_HP3;
+    h ^= h >> 32;
+
+    return h;
+}
+
+uint64_t server_pcache_header_hash(const pcache_disk_header & hdr) {
+    return server_pcache_hash(&hdr, offsetof(pcache_disk_header, hash_header), PCACHE_HASH_SEED_HDR);
+}
+
+// a + b with overflow detection
+static inline bool pcache_add_checked(uint64_t & a, uint64_t b) {
+    if (a > UINT64_MAX - b) {
+        return false;
+    }
+    a += b;
+    return true;
+}
+
+#ifndef _WIN32
+static void pcache_fsync(const std::string & path, bool is_dir) {
+    const int fd = ::open(path.c_str(), is_dir ? (O_RDONLY | O_DIRECTORY) : O_RDONLY);
+    if (fd < 0) {
+        return;
+    }
+    // note: on macOS this does not force the drive's own write cache (that needs
+    // F_FULLFSYNC, which is far too slow for the spill path). It is enough to
+    // order the data before the rename against a process crash; a power cut can
+    // still leave a truncated tail, which the payload hash rejects on load.
+    (void) ::fsync(fd);
+    (void) ::close(fd);
+}
+#else
+static void pcache_fsync(const std::string &, bool) {}
+#endif
+
+// Sequential writer: streams the payload while chaining a hash over exactly the
+// chunks the reader will read back, in the same order and with the same sizes.
+struct pcache_writer {
+    std::ofstream out;
+
+    uint64_t payload_size = 0;
+    uint64_t payload_hash = 0;
+
+    bool ok = true;
+
+    bool write_raw(const void * data, size_t size) {
+        if (!ok) {
+            return false;
+        }
+        if (size > 0) {
+            if (!out.write(static_cast<const char *>(data), (std::streamsize) size)) {
+                ok = false;
+                return false;
+            }
+            payload_hash = server_pcache_hash(data, size, payload_hash);
+        }
+        payload_size += size;
+        return true;
+    }
+
+    template <typename T>
+    bool write_pod(const T & v) {
+        return write_raw(&v, sizeof(v));
+    }
+
+    bool write_blob(const std::vector<uint8_t> & v) {
+        const uint64_t n = v.size();
+        return write_pod(n) && write_raw(v.data(), (size_t) n);
+    }
 };
 
-static bool pcache_write(std::ofstream & out, const void * data, size_t size) {
-    return bool(out.write(reinterpret_cast<const char *>(data), size));
-}
+// Sequential reader bounded by the payload length declared in a header that has
+// already been validated against the real file size. `left` is the ground truth:
+// nothing is allocated or read past it.
+struct pcache_reader {
+    std::ifstream in;
 
-static bool pcache_read(std::ifstream & in, void * data, size_t size) {
-    return bool(in.read(reinterpret_cast<char *>(data), size));
-}
+    uint64_t left = 0;
+    uint64_t hash = 0;
 
-template <typename T>
-static bool pcache_write_pod(std::ofstream & out, const T & v) {
-    return pcache_write(out, &v, sizeof(v));
-}
+    bool ok = true;
 
-template <typename T>
-static bool pcache_read_pod(std::ifstream & in, T & v) {
-    return pcache_read(in, &v, sizeof(v));
-}
+    bool read_raw(void * data, uint64_t size) {
+        if (!ok) {
+            return false;
+        }
+        if (size > left) {
+            ok = false;
+            return false;
+        }
+        if (size > 0) {
+            if (!in.read(static_cast<char *>(data), (std::streamsize) size)) {
+                ok = false;
+                return false;
+            }
+            hash = server_pcache_hash(data, (size_t) size, hash);
+        }
+        left -= size;
+        return true;
+    }
 
-static bool pcache_write_blob(std::ofstream & out, const std::vector<uint8_t> & v) {
-    const uint64_t n = v.size();
-    return pcache_write_pod(out, n) && (n == 0 || pcache_write(out, v.data(), n));
-}
+    template <typename T>
+    bool read_pod(T & v) {
+        return read_raw(&v, sizeof(v));
+    }
 
-static bool pcache_read_blob(std::ifstream & in, std::vector<uint8_t> & v) {
-    uint64_t n = 0;
-    if (!pcache_read_pod(in, n)) {
+    // resize-from-file, but only after the declared length is proven to fit in
+    // both the configured maximum and the bytes that remain in this file
+    bool read_sized(std::vector<uint8_t> & v, uint64_t n, uint64_t max_bytes) {
+        if (!ok) {
+            return false;
+        }
+        if (n > max_bytes || n > left) {
+            ok = false;
+            return false;
+        }
+        try {
+            v.resize((size_t) n);
+        } catch (const std::bad_alloc &) {
+            ok = false;
+            return false;
+        }
+        return read_raw(v.data(), n);
+    }
+
+    bool read_blob(std::vector<uint8_t> & v, uint64_t max_bytes) {
+        uint64_t n = 0;
+        if (!read_pod(n)) {
+            return false;
+        }
+        return read_sized(v, n, max_bytes);
+    }
+};
+
+// Read and fully validate a header. On failure `reason` explains why, and the
+// caller must treat the file as unusable - never fatal, never trusted.
+static bool pcache_read_header(std::ifstream & in,
+                               uint64_t        file_size,
+                               uint64_t        fingerprint,
+                               uint64_t        max_tokens,
+                               pcache_disk_header & hdr,
+                               const char *  & reason) {
+    reason = "";
+
+    if (file_size < sizeof(pcache_disk_header)) {
+        reason = "smaller than the header";
         return false;
+    }
+
+    if (file_size > PCACHE_MAX_FILE_BYTES) {
+        reason = "larger than the maximum entry size";
+        return false;
+    }
+
+    if (!in.read(reinterpret_cast<char *>(&hdr), sizeof(hdr))) {
+        reason = "truncated header";
+        return false;
+    }
+
+    if (hdr.magic != PCACHE_DISK_MAGIC) {
+        reason = "bad magic";
+        return false;
+    }
+
+    if (hdr.version != PCACHE_DISK_VERSION) {
+        reason = "unsupported schema version";
+        return false;
+    }
+
+    if (hdr.hash_header != server_pcache_header_hash(hdr)) {
+        reason = "header checksum mismatch";
+        return false;
+    }
+
+    if (hdr.fingerprint != fingerprint) {
+        reason = "stale fingerprint (different model, ABI, KV layout or geometry)";
+        return false;
+    }
+
+    const uint64_t payload_avail = file_size - sizeof(pcache_disk_header);
+    if (hdr.size_payload != payload_avail) {
+        reason = "declared payload size does not match the file";
+        return false;
+    }
+
+    if (hdr.n_tokens > max_tokens) {
+        reason = "token count above the configured maximum";
+        return false;
+    }
+
+    if (hdr.n_checkpoints > PCACHE_MAX_CHECKPOINTS) {
+        reason = "checkpoint count above the maximum";
+        return false;
+    }
+
+    if (hdr.size_main > PCACHE_MAX_BLOB_BYTES || hdr.size_drft > PCACHE_MAX_BLOB_BYTES) {
+        reason = "state blob above the maximum";
+        return false;
+    }
+
+    // minimum bytes the declared contents need; n_tokens and n_checkpoints are
+    // already capped, so these products cannot overflow
+    const uint64_t ckpt_fixed_bytes = sizeof(int64_t) + sizeof(int) + 2*sizeof(llama_pos) + 3*sizeof(uint64_t);
+
+    uint64_t need = hdr.n_tokens*(uint64_t) sizeof(llama_token);
+    if (!pcache_add_checked(need, hdr.size_main) ||
+        !pcache_add_checked(need, hdr.size_drft) ||
+        !pcache_add_checked(need, hdr.n_checkpoints*ckpt_fixed_bytes)) {
+        reason = "declared lengths overflow";
+        return false;
+    }
+
+    if (need > payload_avail) {
+        reason = "declared lengths exceed the file";
+        return false;
+    }
+
+    return true;
+}
+
+//
+// persistent cache identity
+//
+
+namespace {
+
+struct pcache_fnv1a {
+    uint64_t h = 0xcbf29ce484222325ull;
+
+    void mix(const void * data, size_t size) {
+        const uint8_t * b = static_cast<const uint8_t *>(data);
+        for (size_t i = 0; i < size; ++i) {
+            h = (h ^ b[i])*0x100000001b3ull;
+        }
+    }
+
+    template <typename T>
+    void mix_pod(const T & v) {
+        mix(&v, sizeof(v));
+    }
+
+    // length-prefixed, so no pair of adjacent fields can be confused for another
+    void mix_str(const std::string & s) {
+        const uint64_t n = s.size();
+        mix_pod(n);
+        mix(s.data(), s.size());
+    }
+
+    void mix_artifact(const server_prompt_cache_fingerprint_inputs::artifact & a) {
+        mix_pod(a.present);
+        mix_str(a.path);
+        mix_pod(a.size);
+        mix_pod(a.mtime);
+        mix_pod(a.probe);
+    }
+};
+
+} // namespace
+
+uint64_t server_pcache_file_probe_impl(const std::string & path) {
+    std::error_code ec;
+    const uint64_t size = (uint64_t) std::filesystem::file_size(path, ec);
+    if (ec) {
+        return 0;
+    }
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        return 0;
+    }
+
+    constexpr size_t n_probe = 64*1024;
+
+    std::vector<uint8_t> buf(std::min<uint64_t>(size, n_probe));
+
+    uint64_t h = server_pcache_hash(&size, sizeof(size), PCACHE_HASH_SEED_HDR);
+
+    if (!buf.empty()) {
+        if (!in.read(reinterpret_cast<char *>(buf.data()), (std::streamsize) buf.size())) {
+            return 0;
+        }
+        h = server_pcache_hash(buf.data(), buf.size(), h);
+    }
+
+    if (size > n_probe) {
+        const uint64_t tail = std::min<uint64_t>(size - n_probe, n_probe);
+        buf.resize((size_t) tail);
+        in.seekg((std::streamoff) (size - tail), std::ios::beg);
+        if (!in.read(reinterpret_cast<char *>(buf.data()), (std::streamsize) buf.size())) {
+            return 0;
+        }
+        h = server_pcache_hash(buf.data(), buf.size(), h);
+    }
+
+    // never return 0 for a readable file: 0 is the "unreadable" sentinel
+    return h == 0 ? 1 : h;
+}
+
+uint64_t server_prompt_cache_file_probe(const std::string & path) {
+    if (path.empty()) {
+        return 0;
     }
     try {
-        v.resize(n);
-    } catch (const std::bad_alloc &) {
-        return false;
+        return server_pcache_file_probe_impl(path);
+    } catch (...) {
+        return 0;
     }
-    return n == 0 || pcache_read(in, v.data(), n);
+}
+
+uint64_t server_prompt_cache_fingerprint(const server_prompt_cache_fingerprint_inputs & in) {
+    pcache_fnv1a fp;
+
+    // schema/ABI generation first: bumping any of these invalidates every file
+    fp.mix_pod(in.schema_version);
+    fp.mix_pod(in.state_seq_version);
+    fp.mix_pod(in.state_seq_layout);
+    fp.mix_pod(in.session_version);
+
+    // model artifacts - the draft identity matters as much as the target one:
+    // a `.lcpc` file carries both sequence states
+    fp.mix_artifact(in.model_tgt);
+    fp.mix_artifact(in.model_dft);
+
+    // KV representation
+    fp.mix_pod(in.kv_type_k_tgt);
+    fp.mix_pod(in.kv_type_v_tgt);
+    fp.mix_pod(in.kv_type_k_dft);
+    fp.mix_pod(in.kv_type_v_dft);
+    fp.mix_pod(in.flash_attn_type);
+    fp.mix_pod(in.kv_unified);
+    fp.mix_pod(in.swa_full);
+
+    // layout-sensitive geometry
+    fp.mix_pod(in.n_ctx_tgt);
+    fp.mix_pod(in.n_seq_max_tgt);
+    fp.mix_pod(in.n_ctx_dft);
+    fp.mix_pod(in.n_seq_max_dft);
+    fp.mix_pod(in.n_parallel);
+
+    // speculative configuration (sizes the draft recurrent state, decides what
+    // each checkpoint's data_spec contains)
+    {
+        const uint64_t n = in.spec_types.size();
+        fp.mix_pod(n);
+        for (const int32_t t : in.spec_types) {
+            fp.mix_pod(t);
+        }
+    }
+    fp.mix_pod(in.spec_n_max);
+
+    return fp.h;
 }
 
 size_t server_prompt_cache::size() const {
@@ -1748,53 +2133,102 @@ bool server_prompt_cache::spill_to_disk(server_prompt_cache_state & state) {
 
     const int64_t t_start = ggml_time_us();
 
+    const llama_tokens & tokens = state.prompt.tokens.get_tokens();
+
+    // refuse to write anything the reader would have to refuse
+    if ((uint64_t) tokens.size() > disk_max_tokens ||
+        (uint64_t) state.prompt.checkpoints.size() > PCACHE_MAX_CHECKPOINTS ||
+        (uint64_t) state.data.main.size() > PCACHE_MAX_BLOB_BYTES ||
+        (uint64_t) state.data.drft.size() > PCACHE_MAX_BLOB_BYTES) {
+        SRV_WRN(" - prompt cache entry (%zu tokens, %zu checkpoints, %zu B) exceeds the SSD tier limits, not spilling\n",
+                tokens.size(), state.prompt.checkpoints.size(), state.data.size());
+        return false;
+    }
+
     std::string path;
     do {
         path = disk_dir + "/pc-" + std::to_string(disk_fingerprint % 0xffffffull) + "-" + std::to_string(disk_seq++) + ".lcpc";
     } while (std::filesystem::exists(path));
 
-    const llama_tokens & tokens = state.prompt.tokens.get_tokens();
+    // write to a temporary name and publish with an atomic rename: a crash or a
+    // full disk must never leave a partial file in the discoverable namespace
+    const std::string path_tmp = path + ".tmp";
 
-    pcache_disk_header hdr = {
-        /*.magic         =*/ PCACHE_DISK_MAGIC,
-        /*.version       =*/ PCACHE_DISK_VERSION,
-        /*.fingerprint   =*/ disk_fingerprint,
-        /*.size_main     =*/ state.data.main.size(),
-        /*.size_drft     =*/ state.data.drft.size(),
-        /*.n_tokens      =*/ (uint32_t) tokens.size(),
-        /*.n_checkpoints =*/ (uint32_t) state.prompt.checkpoints.size(),
-    };
+    pcache_disk_header hdr = {};
 
     bool ok = false;
     {
-        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        pcache_writer w;
+        w.out.open(path_tmp, std::ios::binary | std::ios::trunc);
 
-        ok = out.is_open() &&
-             pcache_write_pod(out, hdr) &&
-             pcache_write(out, tokens.data(), tokens.size()*sizeof(llama_token)) &&
-             pcache_write(out, state.data.main.data(), state.data.main.size()) &&
-             pcache_write(out, state.data.drft.data(), state.data.drft.size());
+        ok = w.out.is_open();
+
+        if (ok) {
+            // reserve the header; it is rewritten below once the payload hash
+            // is known (not part of the payload, so written outside the writer)
+            ok = bool(w.out.write(reinterpret_cast<const char *>(&hdr), sizeof(hdr)));
+        }
+
+        ok = ok &&
+             w.write_raw(tokens.data(), tokens.size()*sizeof(llama_token)) &&
+             w.write_raw(state.data.main.data(), state.data.main.size()) &&
+             w.write_raw(state.data.drft.data(), state.data.drft.size());
 
         for (const auto & ckpt : state.prompt.checkpoints) {
             ok = ok &&
-                 pcache_write_pod(out, ckpt.n_tokens) &&
-                 pcache_write_pod(out, ckpt.id_task)  &&
-                 pcache_write_pod(out, ckpt.pos_min)  &&
-                 pcache_write_pod(out, ckpt.pos_max)  &&
-                 pcache_write_blob(out, ckpt.data_tgt) &&
-                 pcache_write_blob(out, ckpt.data_dft) &&
-                 pcache_write_blob(out, ckpt.data_spec);
+                 w.write_pod(ckpt.n_tokens) &&
+                 w.write_pod(ckpt.id_task)  &&
+                 w.write_pod(ckpt.pos_min)  &&
+                 w.write_pod(ckpt.pos_max)  &&
+                 w.write_blob(ckpt.data_tgt) &&
+                 w.write_blob(ckpt.data_dft) &&
+                 w.write_blob(ckpt.data_spec);
         }
 
         if (ok) {
-            out.flush();
-            ok = bool(out);
+            hdr.magic         = PCACHE_DISK_MAGIC;
+            hdr.version       = PCACHE_DISK_VERSION;
+            hdr.fingerprint   = disk_fingerprint;
+            hdr.size_main     = state.data.main.size();
+            hdr.size_drft     = state.data.drft.size();
+            hdr.n_tokens      = tokens.size();
+            hdr.n_checkpoints = state.prompt.checkpoints.size();
+            hdr.size_payload  = w.payload_size;
+            hdr.hash_payload  = w.payload_hash;
+            hdr.hash_header   = server_pcache_header_hash(hdr);
+
+            w.out.seekp(0, std::ios::beg);
+
+            ok = bool(w.out.write(reinterpret_cast<const char *>(&hdr), sizeof(hdr)));
+        }
+
+        if (ok) {
+            w.out.flush();
+            ok = bool(w.out);
+        }
+
+        w.out.close();
+        ok = ok && !w.out.fail();
+    }
+
+    if (ok) {
+        // order the data before the rename, then make the rename itself durable
+        pcache_fsync(path_tmp, false);
+
+        std::error_code ec;
+        std::filesystem::rename(path_tmp, path, ec);
+        if (ec) {
+            SRV_WRN(" - failed to publish prompt cache file '%s': %s\n", path.c_str(), ec.message().c_str());
+            ok = false;
+        } else {
+            pcache_fsync(disk_dir, true);
         }
     }
 
     if (!ok) {
         SRV_WRN(" - failed to spill prompt cache entry to '%s', dropping the file\n", path.c_str());
         std::error_code ec;
+        std::filesystem::remove(path_tmp, ec);
         std::filesystem::remove(path, ec);
         return false;
     }
@@ -1837,64 +2271,80 @@ bool server_prompt_cache::load_from_disk(server_prompt_cache_state & state) {
 
     const int64_t t_start = ggml_time_us();
 
-    std::ifstream in(state.file, std::ios::binary);
-    if (!in.is_open()) {
-        SRV_WRN(" - failed to open prompt cache file '%s'\n", state.file.c_str());
-        return false;
-    }
-
-    pcache_disk_header hdr = {};
-    if (!pcache_read_pod(in, hdr) ||
-            hdr.magic != PCACHE_DISK_MAGIC ||
-            hdr.version != PCACHE_DISK_VERSION ||
-            hdr.fingerprint != disk_fingerprint ||
-            hdr.n_tokens != state.prompt.tokens.size()) {
-        SRV_WRN(" - prompt cache file '%s' has a stale or corrupt header\n", state.file.c_str());
-        return false;
-    }
-
-    llama_tokens tokens(hdr.n_tokens);
-    if (!pcache_read(in, tokens.data(), tokens.size()*sizeof(llama_token)) ||
-            tokens != state.prompt.tokens.get_tokens()) {
-        SRV_WRN(" - prompt cache file '%s' does not match its index entry\n", state.file.c_str());
-        return false;
-    }
-
-    try {
-        state.data.main.resize(hdr.size_main);
-        state.data.drft.resize(hdr.size_drft);
-    } catch (const std::bad_alloc &) {
-        SRV_WRN(" - failed to allocate %zu bytes to reload prompt cache file '%s'\n",
-                (size_t) (hdr.size_main + hdr.size_drft), state.file.c_str());
-        return false;
-    }
-
-    bool ok = pcache_read(in, state.data.main.data(), state.data.main.size()) &&
-              pcache_read(in, state.data.drft.data(), state.data.drft.size());
-
-    state.prompt.checkpoints.clear();
-    for (uint32_t i = 0; ok && i < hdr.n_checkpoints; ++i) {
-        common_prompt_checkpoint ckpt = {};
-        ok = pcache_read_pod(in, ckpt.n_tokens) &&
-             pcache_read_pod(in, ckpt.id_task)  &&
-             pcache_read_pod(in, ckpt.pos_min)  &&
-             pcache_read_pod(in, ckpt.pos_max)  &&
-             pcache_read_blob(in, ckpt.data_tgt) &&
-             pcache_read_blob(in, ckpt.data_dft) &&
-             pcache_read_blob(in, ckpt.data_spec);
-        if (ok) {
-            state.prompt.checkpoints.push_back(std::move(ckpt));
-        }
-    }
-
-    if (!ok) {
-        SRV_WRN(" - failed to read prompt cache file '%s'\n", state.file.c_str());
+    const auto reject = [&](const char * why) {
+        SRV_WRN(" - prompt cache file '%s' rejected: %s\n", state.file.c_str(), why);
         state.data.main.clear();
         state.data.main.shrink_to_fit();
         state.data.drft.clear();
         state.data.drft.shrink_to_fit();
         state.prompt.checkpoints.clear();
         return false;
+    };
+
+    std::error_code ec;
+    const uint64_t file_size = (uint64_t) std::filesystem::file_size(state.file, ec);
+    if (ec) {
+        return reject("cannot stat the file");
+    }
+
+    pcache_reader r;
+    r.in.open(state.file, std::ios::binary);
+    if (!r.in.is_open()) {
+        return reject("cannot open the file");
+    }
+
+    pcache_disk_header hdr    = {};
+    const char *       reason = "";
+    if (!pcache_read_header(r.in, file_size, disk_fingerprint, disk_max_tokens, hdr, reason)) {
+        return reject(reason);
+    }
+
+    if (hdr.n_tokens != (uint64_t) state.prompt.tokens.size()) {
+        return reject("token count does not match the index entry");
+    }
+
+    r.left = hdr.size_payload;
+
+    // tokens: bounded by the header check above, so this resize is safe
+    llama_tokens tokens((size_t) hdr.n_tokens);
+    if (!r.read_raw(tokens.data(), hdr.n_tokens*(uint64_t) sizeof(llama_token))) {
+        return reject("truncated token array");
+    }
+
+    if (tokens != state.prompt.tokens.get_tokens()) {
+        return reject("tokens do not match the index entry");
+    }
+
+    bool ok = r.read_sized(state.data.main, hdr.size_main, PCACHE_MAX_BLOB_BYTES) &&
+              r.read_sized(state.data.drft, hdr.size_drft, PCACHE_MAX_BLOB_BYTES);
+
+    state.prompt.checkpoints.clear();
+    for (uint64_t i = 0; ok && i < hdr.n_checkpoints; ++i) {
+        common_prompt_checkpoint ckpt = {};
+        ok = r.read_pod(ckpt.n_tokens) &&
+             r.read_pod(ckpt.id_task)  &&
+             r.read_pod(ckpt.pos_min)  &&
+             r.read_pod(ckpt.pos_max)  &&
+             r.read_blob(ckpt.data_tgt,  PCACHE_MAX_BLOB_BYTES) &&
+             r.read_blob(ckpt.data_dft,  PCACHE_MAX_BLOB_BYTES) &&
+             r.read_blob(ckpt.data_spec, PCACHE_MAX_BLOB_BYTES);
+        if (ok) {
+            state.prompt.checkpoints.push_back(std::move(ckpt));
+        }
+    }
+
+    if (!ok) {
+        return reject("truncated or inconsistent payload");
+    }
+
+    if (r.left != 0) {
+        return reject("trailing bytes after the payload");
+    }
+
+    // every byte of the payload has now been hashed exactly once, in the same
+    // chunking the writer used
+    if (r.hash != hdr.hash_payload) {
+        return reject("payload checksum mismatch");
     }
 
     const double dt_ms = (ggml_time_us() - t_start) / 1000.0;
@@ -1930,15 +2380,51 @@ void server_prompt_cache::rescan_disk() {
     };
 
     std::vector<found_file> files;
-    for (const auto & entry : std::filesystem::directory_iterator(disk_dir, ec)) {
-        if (!entry.is_regular_file(ec) || entry.path().extension() != ".lcpc") {
-            continue;
+    std::vector<std::string> orphan_tmp;
+    {
+        std::error_code it_ec;
+        auto it = std::filesystem::directory_iterator(disk_dir, it_ec);
+        if (it_ec) {
+            SRV_WRN("failed to scan prompt cache directory '%s': %s\n", disk_dir.c_str(), it_ec.message().c_str());
+            return;
         }
-        files.push_back({ entry.path().string(), entry.last_write_time(ec), (size_t) entry.file_size(ec) });
+
+        for (const auto & entry : it) {
+            std::error_code e_ec;
+            if (!entry.is_regular_file(e_ec) || e_ec) {
+                continue;
+            }
+
+            const auto ext = entry.path().extension();
+
+            // leftovers from a spill that was interrupted before its rename;
+            // they were never discoverable, so they are simply garbage now
+            if (ext == ".tmp") {
+                orphan_tmp.push_back(entry.path().string());
+                continue;
+            }
+
+            if (ext != ".lcpc") {
+                continue;
+            }
+
+            std::error_code m_ec;
+            std::error_code s_ec;
+            const auto mtime = entry.last_write_time(m_ec);
+            const auto size  = entry.file_size(s_ec);
+            if (m_ec || s_ec) {
+                SRV_WRN("skipping unreadable prompt cache file '%s'\n", entry.path().string().c_str());
+                continue;
+            }
+
+            files.push_back({ entry.path().string(), mtime, (size_t) size });
+        }
     }
-    if (ec) {
-        SRV_WRN("failed to scan prompt cache directory '%s': %s\n", disk_dir.c_str(), ec.message().c_str());
-        return;
+
+    for (const auto & path : orphan_tmp) {
+        SRV_WRN("removing incomplete prompt cache file '%s'\n", path.c_str());
+        std::error_code rmec;
+        std::filesystem::remove(path, rmec);
     }
 
     // oldest first, so the eviction order survives the restart
@@ -1947,27 +2433,55 @@ void server_prompt_cache::rescan_disk() {
     });
 
     size_t n_restored = 0;
-    for (const auto & f : files) {
-        std::ifstream in(f.path, std::ios::binary);
+    size_t n_dropped  = 0;
 
-        pcache_disk_header hdr = {};
+    for (const auto & f : files) {
+        // one unusable file must never take the server down: everything below
+        // is bounded by the header validation, and any surprise from the
+        // filesystem or the allocator is contained here
+        bool ok = false;
+
+        pcache_disk_header hdr    = {};
+        const char *       reason = "unknown";
+
         llama_tokens tokens;
 
-        bool ok = in.is_open() &&
-                  pcache_read_pod(in, hdr) &&
-                  hdr.magic == PCACHE_DISK_MAGIC &&
-                  hdr.version == PCACHE_DISK_VERSION &&
-                  hdr.fingerprint == disk_fingerprint;
+        try {
+            pcache_reader r;
+            r.in.open(f.path, std::ios::binary);
 
-        if (ok) {
-            tokens.resize(hdr.n_tokens);
-            ok = pcache_read(in, tokens.data(), tokens.size()*sizeof(llama_token));
+            if (!r.in.is_open()) {
+                reason = "cannot open the file";
+            } else if (pcache_read_header(r.in, (uint64_t) f.size, disk_fingerprint, disk_max_tokens, hdr, reason)) {
+                r.left = hdr.size_payload;
+
+                // n_tokens is bounded by disk_max_tokens (<= the context size)
+                // and by the payload the file really has, so this is the only
+                // allocation the rescan performs
+                tokens.resize((size_t) hdr.n_tokens);
+
+                ok = r.read_raw(tokens.data(), hdr.n_tokens*(uint64_t) sizeof(llama_token));
+                if (!ok) {
+                    reason = "truncated token array";
+                }
+
+                // note: the payload hash is deliberately *not* verified here -
+                // that would read every spilled byte at startup. load_from_disk()
+                // verifies it before the state is ever handed to llama.
+            }
+        } catch (const std::exception & e) {
+            reason = e.what();
+            ok     = false;
+        } catch (...) {
+            reason = "unhandled error";
+            ok     = false;
         }
 
         if (!ok) {
-            SRV_WRN("removing stale prompt cache file '%s'\n", f.path.c_str());
+            SRV_WRN("dropping unusable prompt cache file '%s': %s\n", f.path.c_str(), reason);
             std::error_code rmec;
             std::filesystem::remove(f.path, rmec);
+            ++n_dropped;
             continue;
         }
 
@@ -1983,8 +2497,8 @@ void server_prompt_cache::rescan_disk() {
         ++n_restored;
     }
 
-    SRV_INF("prompt cache SSD tier: restored %zu entries (%.3f GiB) from '%s'\n",
-            n_restored, size_disk_total() / (1024.0*1024.0*1024.0), disk_dir.c_str());
+    SRV_INF("prompt cache SSD tier: restored %zu entries (%.3f GiB), dropped %zu unusable, from '%s'\n",
+            n_restored, size_disk_total() / (1024.0*1024.0*1024.0), n_dropped, disk_dir.c_str());
 
     publish_dashboard_state();
 }
