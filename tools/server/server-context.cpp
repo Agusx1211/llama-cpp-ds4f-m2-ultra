@@ -2101,34 +2101,44 @@ private:
             return result;
         }
 
-        // Widen the idle-only prototype by exactly one vertical slice: a fresh
-        // singleton may share the next target batch with one independent,
-        // finite generator. Its next logical position joins the same atomic
-        // reservation, so consume_admission() still requires full batch
-        // coverage and never falls back after launch.
+        // Concurrent admission: a new singleton or family joins the running
+        // cohort whenever the total slot count fits n_parallel. Every busy
+        // slot that is actively generating contributes exactly its next
+        // decode position to the same atomic reservation - the one row the
+        // immediately following batch can consume - so consume_admission()
+        // still sees full batch coverage when the new prompt enters the very
+        // next target batch. Generators with an unlimited budget (n_predict
+        // -1, the production agent shape) participate identically: the
+        // reservation needs only their NEXT position, which exists regardless
+        // of the remaining budget, and their decode beyond the admission
+        // runway already runs on the ordinary per-batch reservation path.
+        // Busy slots that are not generating right now (a prefill in flight,
+        // a parent/child family member, or a stopping slot) contribute no
+        // span: their resident rows were committed by their own armed
+        // admission (arm_admission commits the sparse reservation
+        // immediately), and any batch this ticket does not fully cover falls
+        // back to the per-batch reservation path (consume_admission
+        // NO_MATCH), where already-committed rows cost zero new pages. The
+        // new slot then waits in SLOT_STATE_STARTED for the prefill owner
+        // like any other queued prefill candidate - admission gating widens,
+        // prefill compute stays serialized.
         std::vector<server_slot *> active_continuations;
+        size_t n_busy_independent = 0;
         for (server_slot & slot : slots) {
             if (!slot.is_processing() ||
                     std::find(family_slots.begin(), family_slots.end(), &slot) != family_slots.end()) {
                 continue;
             }
 
-            const int32_t effective_n_predict = slot.task->params.n_predict != -1 ?
-                    slot.task->params.n_predict : params_base.n_predict;
-            const bool finite_independent_generator =
-                    family_slots.size() == 1 &&
-                    slot.state == SLOT_STATE_GENERATING &&
-                    !slot.task->is_parent() && !slot.task->is_child() &&
-                    slot.has_next_token &&
-                    effective_n_predict >= 0 && slot.n_decoded < effective_n_predict;
-            if (!finite_independent_generator) {
-                result.status = admission_gate_status::deferred;
-                return result;
+            ++n_busy_independent;
+            if (slot.state == SLOT_STATE_GENERATING && slot.has_next_token) {
+                const llama_pos pos_begin = slot.prompt.tokens.pos_next();
+                if (pos_begin >= 0 && pos_begin < slot.n_ctx) {
+                    active_continuations.push_back(&slot);
+                }
             }
-
-            active_continuations.push_back(&slot);
         }
-        if (family_slots.size() + active_continuations.size() > (size_t) params_base.n_parallel) {
+        if (family_slots.size() + n_busy_independent > (size_t) params_base.n_parallel) {
             result.status = admission_gate_status::deferred;
             return result;
         }
@@ -2255,11 +2265,9 @@ private:
         }
 
         for (server_slot * active : active_continuations) {
+            // position bounds were validated when the continuation was
+            // collected above; nothing mutates slot state in between
             const llama_pos pos_begin = active->prompt.tokens.pos_next();
-            if (pos_begin < 0 || pos_begin >= active->n_ctx) {
-                result.status = admission_gate_status::deferred;
-                return result;
-            }
             spans.push_back({ active->id, pos_begin, pos_begin + 1 });
         }
 
@@ -2271,10 +2279,13 @@ private:
 
         llama_kv_admission_quote quote = {};
         auto quote_status = llama_kv_admission_quote_ranges(ctx_tgt, spans.data(), spans.size(), &quote);
-        if (quote_status == LLAMA_KV_ADMISSION_PRESSURE && active_continuations.empty()) {
+        if (quote_status == LLAMA_KV_ADMISSION_PRESSURE) {
             // Idle residency (kept for prompt reuse) may be occupying the
             // pages this admission needs. Snapshot and purge idle slots other
             // than the admitted family, then re-quote once before failing.
+            // Busy slots are never touched, so this is safe alongside active
+            // continuations too - without it, a concurrent admission under
+            // idle-residency pressure would defer until a slot releases.
             if (try_clear_idle_slots(&family_slots)) {
                 quote_status = llama_kv_admission_quote_ranges(ctx_tgt, spans.data(), spans.size(), &quote);
             }
@@ -3842,6 +3853,30 @@ private:
 #endif
 
         retry_pending_prefill_failures();
+
+        // Deferred admissions must not wait for a slot release. Admission
+        // feasibility changes on every iteration - a prefill completes, a
+        // generator stops, transient page pressure clears - so requeue one
+        // deferred task whenever a free slot could accept it. Without this,
+        // a task deferred during another request's prefill window was
+        // retried only when that whole request finished (pop_deferred_task
+        // runs from callback_on_release alone), which serialized the entire
+        // multi-slot server under agent traffic. The requeued task flows
+        // through the ordinary scheduler path and simply re-defers if the
+        // gate still refuses it; with no free slot an admission retry cannot
+        // succeed, so we skip the requeue to avoid pointless churn.
+        if (queue_tasks.queue_tasks_deferred_size() > 0) {
+            bool has_free_slot = false;
+            for (const auto & slot : slots) {
+                if (!slot.is_processing()) {
+                    has_free_slot = true;
+                    break;
+                }
+            }
+            if (has_free_slot) {
+                queue_tasks.pop_deferred_task(-1);
+            }
+        }
 
         // check if all slots are idle
         {
