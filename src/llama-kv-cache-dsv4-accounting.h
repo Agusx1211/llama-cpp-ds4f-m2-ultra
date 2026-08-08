@@ -16,12 +16,14 @@
 // it avoids the placement-sparse mapping/submission cost. The declared bytes
 // are virtual on the placement-sparse pool (physical pages materialize per
 // used row), so the bound guards address-space/bookkeeping growth rather than
-// resident memory. 20 GiB covers the validated elastic-vertical envelope -
-// up to 4 unified lanes at 512k (~9.4 GiB declared) and up to 4 lanes at 1M
-// (~18.8 GiB declared); the exact admission vertical requires the affine
-// layout, so configurations beyond this bound fall back to the aggregate
-// pool and the vertical refuses to start (loudly) instead of degrading.
-static constexpr uint64_t LLAMA_DSV4_MAX_AFFINE_COMPRESSED_BYTES = UINT64_C(20)*1024*1024*1024;
+// resident memory. Measured 2026-08-08: a 4-lane unified 1M-context config
+// declares slightly over 20 GiB (the earlier ~18.8 GiB estimate missed
+// per-layer/per-seq padding), so the previous 20 GiB bound made the exact
+// admission vertical refuse 1M configs. 28 GiB covers 4 unified lanes at 1M
+// with margin; configurations beyond this bound still fall back to the
+// aggregate pool and the vertical refuses to start (loudly) instead of
+// degrading.
+static constexpr uint64_t LLAMA_DSV4_MAX_AFFINE_COMPRESSED_BYTES = UINT64_C(28)*1024*1024*1024;
 
 struct llama_dsv4_aggregate_selector {
     bool     unified                   = false;
