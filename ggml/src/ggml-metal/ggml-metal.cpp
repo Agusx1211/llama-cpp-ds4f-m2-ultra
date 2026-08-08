@@ -658,6 +658,47 @@ static ggml_metal_sparse_reservation_result ggml_backend_metal_dsv4_sparse_prepa
             n_pools, limiting_pool);
 }
 
+// Returns 1 when the ranges need no sparse reservation at all, 0 when they do,
+// and -1 on invalid input. Tensor ranges that touch no placement-sparse buffer
+// need no reservation and report 1.
+static int ggml_backend_metal_dsv4_sparse_ranges_resident(
+        ggml_tensor * const * tensors,
+        const size_t * offsets,
+        const size_t * sizes,
+        size_t n_ranges) {
+    if (tensors == nullptr || offsets == nullptr || sizes == nullptr || n_ranges == 0) {
+        return -1;
+    }
+
+    std::vector<ggml_metal_sparse_buffer_range> absolute;
+    absolute.reserve(n_ranges);
+    for (size_t i = 0; i < n_ranges; ++i) {
+        ggml_tensor * tensor = tensors[i];
+        if (tensor == nullptr || tensor->buffer == nullptr ||
+                offsets[i] > ggml_nbytes(tensor) ||
+                sizes[i] > ggml_nbytes(tensor) - offsets[i]) {
+            return -1;
+        }
+        if (!ggml_backend_buffer_is_metal(tensor->buffer)) {
+            continue;
+        }
+        ggml_metal_buffer_t buffer = (ggml_metal_buffer_t) tensor->buffer->context;
+        if (!ggml_metal_buffer_is_sparse(buffer)) {
+            continue;
+        }
+        const ggml_metal_buffer_id bid = ggml_metal_buffer_get_id(buffer, tensor);
+        if (bid.metal == nullptr) {
+            return -1;
+        }
+        absolute.push_back({ buffer, bid.offs + offsets[i], sizes[i] });
+    }
+    if (absolute.empty()) {
+        return 1;
+    }
+
+    return ggml_metal_buffers_sparse_ranges_resident(absolute.data(), absolute.size());
+}
+
 static ggml_metal_sparse_reservation_result ggml_backend_metal_dsv4_sparse_quote_tensor_ranges(
         ggml_tensor * const * tensors,
         const size_t * offsets,
@@ -1382,6 +1423,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_dsv4_sparse_tensor_usage") == 0) {
         return (void *)ggml_backend_metal_dsv4_sparse_tensor_usage;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_ranges_resident") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_ranges_resident;
     }
     if (strcmp(name, "ggml_backend_metal_dsv4_sparse_quote_tensor_ranges") == 0) {
         return (void *)ggml_backend_metal_dsv4_sparse_quote_tensor_ranges;

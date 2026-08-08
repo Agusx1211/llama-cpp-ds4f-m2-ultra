@@ -368,6 +368,50 @@ static bool dsv4_sparse_append_slot(
     return dsv4_sparse_append_k_rows(kv, std::move(rows), family, ranges);
 }
 
+// Steady-state decode writes into pages that are already mapped and privately
+// owned, so the sparse reservation it performs is a no-op that still costs
+// O(virtual pages in the pool) to plan. This probe answers "no reservation
+// needed" in O(pages in the ranges); see
+// ggml_metal_buffers_sparse_ranges_resident for why skipping is exact.
+// Returns 1 (skip), 0 (reserve) or -1 (probe unavailable / invalid).
+static int dsv4_sparse_ranges_resident(const std::vector<dsv4_sparse_range> & ranges) {
+    static const bool disabled = []() {
+        const char * v = getenv("LLAMA_DSV4_SPARSE_RESIDENT_DISABLE");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    if (disabled || ranges.empty()) {
+        return -1;
+    }
+
+    using resident_fn = int (*)(ggml_tensor * const *, const size_t *, const size_t *, size_t);
+
+    resident_fn resident = nullptr;
+    for (const auto & range : ranges) {
+        resident = (resident_fn) dsv4_backend_proc(
+                range.tensor, "ggml_backend_metal_dsv4_sparse_ranges_resident");
+        if (resident != nullptr) {
+            break;
+        }
+    }
+    if (resident == nullptr) {
+        return -1;
+    }
+
+    std::vector<ggml_tensor *> tensors;
+    std::vector<size_t>        offsets;
+    std::vector<size_t>        sizes;
+    tensors.reserve(ranges.size());
+    offsets.reserve(ranges.size());
+    sizes.reserve(ranges.size());
+    for (const auto & range : ranges) {
+        tensors.push_back(range.tensor);
+        offsets.push_back(range.offset);
+        sizes.push_back(range.size);
+    }
+
+    return resident(tensors.data(), offsets.data(), sizes.data(), tensors.size());
+}
+
 using dsv4_sparse_quote_fn   = ggml_metal_sparse_reservation_result (*)(ggml_tensor * const *,
                                                                       const size_t *,
                                                                       const size_t *,
@@ -4726,6 +4770,35 @@ bool llama_kv_cache_dsv4_context::reserve_batch_ranges() {
     }
 
     hp_mark(hp_coll);
+
+    // Fast path. With no COW allocation pending and every target page already
+    // mapped and exclusively owned, the reservation below would quote
+    // required_pages = 0 and its commit would perform no mapping operation, no
+    // generation bump and no net accounting change - while still paying the
+    // planner's full scan of the pool's virtual and physical page tables,
+    // twice (quote and commit re-quote), on every decode step. Skipping it is
+    // observationally identical.
+    //
+    // The test seams are excluded: the page-delta audit expects a transaction
+    // to observe, and an injected physical-pressure fault is consumed inside
+    // the reservation.
+    if (cow_allocations.empty() &&
+            !dsv4_test_page_delta_audit_enabled.load(std::memory_order_relaxed) &&
+            dsv4_test_pressure_count.load(std::memory_order_relaxed) == 0 &&
+            dsv4_sparse_ranges_resident(ranges) > 0) {
+        batch_ranges_reserved = true;
+        if (hp) {
+            hp_mark(hp_resv);
+            const int64_t t1 = ggml_time_us();
+            fprintf(stderr, "HOSTPROF {\"op\":\"pref\",\"t\":%" PRId64 ",\"tot\":%" PRId64
+                    ",\"path\":\"resident\",\"nub\":%zu,\"nr\":%zu"
+                    ",\"adm\":%" PRId64 ",\"aggr\":%" PRId64 ",\"cow\":%" PRId64
+                    ",\"coll\":%" PRId64 ",\"resv\":%" PRId64 "}\n",
+                    t1, t1 - hp_t0, ubatches.size(), ranges.size(),
+                    hp_adm, hp_aggr, hp_cow, hp_coll, hp_resv);
+        }
+        return true;
+    }
 
     dsv4_sparse_transaction reservation;
     const auto reserve_status = reservation.reserve_ranges(ranges, last_batch_quote);
