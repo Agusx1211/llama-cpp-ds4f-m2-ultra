@@ -360,6 +360,25 @@ static const arm g_arms[] = {
     { "blocked/assoc=xor",  { "GGML_FA_TMP_BLOCKED=1", "GGML_FA_RED_ASSOC=xor", nullptr, nullptr },        false },
     { "split-nsg=2",        { "GGML_FA_SPLIT_NSG=2", nullptr, nullptr, nullptr },                          false },
     { "split-nsg=4",        { "GGML_FA_SPLIT_NSG=4", nullptr, nullptr, nullptr },                          false },
+    // MQA head batching: nhptg query heads share one threadgroup so their
+    // identical K/V loads collapse in one core's L1. Every head still runs the
+    // nhptg = 1 code on the same chunk list, so this must be bit-identical.
+    { "nh=2",               { "GGML_FA_NHPTG=2", nullptr, nullptr, nullptr },                              true  },
+    { "nh=4",               { "GGML_FA_NHPTG=4", nullptr, nullptr, nullptr },                              true  },
+    { "nh=8",               { "GGML_FA_NHPTG=8", nullptr, nullptr, nullptr },                              true  },
+    { "nh=4+fitoff",        { "GGML_FA_NHPTG=4", "GGML_FA_NWG_FIT_DISABLE=1", nullptr, nullptr },          true  },
+    // The DSV4 mask-skip specialization and its two implementations.
+    //
+    // mskip=off is NOT bit-identical, and the reason is instructive: skipping a
+    // group whose NE softmax weights are all exactly zero adds exactly 0*V, so
+    // the *semantics* are the same - but removing the `continue` lets the
+    // fast-math front end reassociate and vectorize the unrolled cc loop, which
+    // changes the accumulation order. It is kept as a measurement arm.
+    //
+    // mskip/scan (the pre-ballot per-group rescan) must match: it takes exactly
+    // the same skip decisions, so the emitted arithmetic is the same.
+    { "mskip=off",          { "GGML_METAL_DSV4_FA_MASK_SKIP_DISABLE=1", nullptr, nullptr, nullptr },       false },
+    { "mskip/scan",         { "GGML_FA_MSKIP_BALLOT=0", nullptr, nullptr, nullptr },                       true  },
 };
 
 static const int g_n_arms = (int) (sizeof(g_arms)/sizeof(g_arms[0]));

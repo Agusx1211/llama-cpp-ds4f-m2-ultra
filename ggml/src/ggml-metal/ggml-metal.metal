@@ -8551,6 +8551,42 @@ constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EX
 //          coalesced; the reducer is restructured to keep its loads coalesced too.
 constant bool FC_flash_attn_ext_vec_blocked [[function_constant(FC_FLASH_ATTN_EXT_VEC + 24)]];
 
+// MQA head batching: how many *query heads* one threadgroup covers.
+//
+// DeepSeek V4 decode is multi-query attention - one 512-wide KV head serves all
+// 64 query heads - so at nh = 1 the same K/V rows are pulled across the memory
+// fabric once per query head: 64 independent threadgroups, one per head, each
+// streaming the whole selected KV working set.
+//
+// nh > 1 grows the threadgroup to nsg*nh SIMDgroups laid out head-major
+// (sgitg = hsg*nsg + ksg), so query head `tgpig[1]*nh + hsg` keeps its own full
+// set of nsg key streams, its own query, softmax scratch and DV accumulator,
+// and its own cross-SIMDgroup reduction. Every head therefore runs *exactly*
+// the nh = 1 code on exactly the same chunk list: the arithmetic and its order
+// are unchanged and the result is bit-identical. The only difference is that
+// the nh heads sharing a K/V row now sit in one threadgroup, i.e. on one GPU
+// core, and their loads collapse in that core's L1 instead of crossing the
+// fabric nh times.
+//
+// Threads per threadgroup and threadgroup memory both scale with nh, so bytes
+// of threadgroup memory per *thread* - the quantity that bounds occupancy - is
+// unchanged. Requires ne12 == 1 (one KV head), ne32 == 1 (a head-independent
+// mask) and no ALiBi.
+constant int32_t FC_flash_attn_ext_vec_nh [[function_constant(FC_FLASH_ATTN_EXT_VEC + 25)]];
+
+// How the mask-skip specialization above decides whether a group of NE cache
+// items is live.
+//   false: rescan the NE threadgroup-memory slots per group, in both the Q*K^T
+//          and the P*V loop - 2*C threadgroup loads per lane per KV chunk on
+//          top of the 2*(DK4+DV4)/NL device loads that do the actual work.
+//   true:  one simd_ballot per predicate per chunk. Lane i already holds the
+//          mask (and later the softmax weight) of cache item i, so the whole
+//          C-wide liveness bitmap is one instruction and each group test is a
+//          shift and a mask. The skip decisions are identical, so this is
+//          bit-identical; it is a function constant only so the two can be
+//          A/B'd on one binary (GGML_FA_MSKIP_BALLOT=0).
+constant bool FC_flash_attn_ext_vec_mskip_ballot [[function_constant(FC_FLASH_ATTN_EXT_VEC + 26)]];
+
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -8588,14 +8624,27 @@ kernel void kernel_flash_attn_ext_vec(
 
 #define NWG  (FC_flash_attn_ext_vec_nwg)
 #define NSG  (FC_flash_attn_ext_vec_nsg)
+#define NH   (FC_flash_attn_ext_vec_nh)
 
 #define NS10 (FC_flash_attn_ext_vec_ns10)
 #define NS20 (FC_flash_attn_ext_vec_ns20)
 
+    // total SIMDgroups in the threadgroup: NSG key streams x NH query heads
+    const short NTG = NSG*NH;
+
+    // The threadgroup's NTG SIMDgroups are laid out head-major:
+    //   sgitg = hsg*NSG + ksg
+    // so the NSG key streams of one query head are contiguous and every
+    // relative offset the cross-SIMDgroup reduction uses (r*(SH/2), r*PV4) is
+    // unchanged. At NH == 1 this is ksg = sgitg, hsg = 0, i.e. the historical
+    // layout exactly.
+    const short ksg = sgitg%NSG; // which key stream this SIMDgroup owns
+    const short hsg = sgitg/NSG; // which of the NH batched query heads
+
     const short iwg = tgpig[2]%NWG;
 
     const ushort iq3 = tgpig[2]/NWG;
-    const ushort iq2 = tgpig[1];
+    const ushort iq2 = tgpig[1]*NH + hsg;
     const ushort iq1 = tgpig[0];
 
     constexpr short DK4 = DK/4;
@@ -8616,12 +8665,15 @@ kernel void kernel_flash_attn_ext_vec(
 
   //const short T = PK + NSG*SH; // shared memory size per query in (half)
 
-  //threadgroup q_t   * sq  = (threadgroup q_t   *) (shmem_f16 +                      0*PK); // holds the query data
-    threadgroup q4_t  * sq4 = (threadgroup q4_t  *) (shmem_f16 +                      0*PK); // same as above but in q4_t
-    threadgroup s_t   * ss  = (threadgroup s_t   *) (shmem_f16 +   sgitg*SH       + NSG*PK); // scratch buffer for attention
-    threadgroup s4_t  * ss4 = (threadgroup s4_t  *) (shmem_f16 +   sgitg*SH       + NSG*PK); // same as above but in s4_t
-    threadgroup half  * sm  = (threadgroup half  *) (shmem_f16 +   sgitg*SH + 2*C + NSG*PK); // scratch buffer for mask
-    threadgroup o4_t  * so4 = (threadgroup o4_t  *) (shmem_f16 + 2*sgitg*PV       + NSG*PK + NSG*SH); // scratch buffer for the results
+    // note: the region sizes use NTG = NSG*NH so the nh = 1 layout is bit-for-bit
+    //       the historical one; at nh > 1 every SIMDgroup owns its own query,
+    //       softmax scratch and accumulator, i.e. one full single-head state
+  //threadgroup q_t   * sq  = (threadgroup q_t   *) (shmem_f16 +   hsg*PK             ); // holds the query data
+    threadgroup q4_t  * sq4 = (threadgroup q4_t  *) (shmem_f16 +   hsg*PK             ); // same as above but in q4_t
+    threadgroup s_t   * ss  = (threadgroup s_t   *) (shmem_f16 +   sgitg*SH       + NTG*PK); // scratch buffer for attention
+    threadgroup s4_t  * ss4 = (threadgroup s4_t  *) (shmem_f16 +   sgitg*SH       + NTG*PK); // same as above but in s4_t
+    threadgroup half  * sm  = (threadgroup half  *) (shmem_f16 +   sgitg*SH + 2*C + NTG*PK); // scratch buffer for mask
+    threadgroup o4_t  * so4 = (threadgroup o4_t  *) (shmem_f16 + 2*sgitg*PV       + NTG*PK + NTG*SH); // scratch buffer for the results
 
     // store the result for all queries in shared memory (the O matrix from the paper)
     so4 += tiisg;
@@ -8650,8 +8702,16 @@ kernel void kernel_flash_attn_ext_vec(
     }
 
     // zero out so
+    // note: so4 has already been advanced by tiisg, so lanes with tiisg >= NL
+    //       run past this SIMDgroup's DV4 accumulator slots. Only lanes 0..NL-1
+    //       ever accumulate into so4 (see the `ty == 0` guards below), so the
+    //       surplus stores were always dead - but at nh > 1 they would land in
+    //       the *next* head's accumulator, and for the last SIMDgroup they run
+    //       past the threadgroup allocation entirely. Bound them.
     for (short i = 0; i < DV4/NL; ++i) {
-        so4[i*NL] = (o4_t) 0.0f;
+        if (tiisg + i*NL < DV4) {
+            so4[i*NL] = (o4_t) 0.0f;
+        }
     }
 
     // zero out shared memory SH
@@ -8686,7 +8746,7 @@ kernel void kernel_flash_attn_ext_vec(
 
         // loop over the KV cache
         // each simdgroup handles blocks of Q rows and C columns
-        for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG) {
+        for (int ic0 = iwg*NSG + ksg; ; ic0 += NWG*NSG) {
             int ic = ic0*C;
             if (ic >= args.ne11) {
                 break;
@@ -8727,6 +8787,15 @@ kernel void kernel_flash_attn_ext_vec(
                 continue;
             }
 
+            // liveness bitmap of the C cache items of this chunk: bit i is set
+            // when item i is not masked. Lane i holds sm[i], so this is one
+            // instruction for the whole chunk (see FC_..._mskip_ballot).
+            uint amk = ~0u;
+            uint avk = ~0u;
+            if (FC_flash_attn_ext_vec_sparse_mask && FC_flash_attn_ext_vec_mskip_ballot) {
+                amk = (uint) ((simd_vote::vote_t) simd_ballot(sm[tiisg] > -MAXHALF));
+            }
+
             // Q*K^T
             {
                 device      const k4_t * pk4 = (device const k4_t *) (k + ic*args.nb11);
@@ -8741,9 +8810,13 @@ kernel void kernel_flash_attn_ext_vec(
                 FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                     bool active = true;
                     if (FC_flash_attn_ext_vec_sparse_mask) {
-                        active = false;
-                        FOR_UNROLL (short ii = 0; ii < NE; ++ii) {
-                            active |= sm[cc*NE + ii] > -MAXHALF;
+                        if (FC_flash_attn_ext_vec_mskip_ballot) {
+                            active = ((amk >> (cc*NE)) & ((1u << NE) - 1)) != 0;
+                        } else {
+                            active = false;
+                            FOR_UNROLL (short ii = 0; ii < NE; ++ii) {
+                                active |= sm[cc*NE + ii] > -MAXHALF;
+                            }
                         }
                     }
 
@@ -8839,6 +8912,13 @@ kernel void kernel_flash_attn_ext_vec(
                 // the P matrix from the paper (Q rows, C columns)
                 ss[tiisg] = vs;
 
+                // liveness bitmap for the P*V loop: strictly stronger than the
+                // mask bitmap, because a visible key whose logit is far below
+                // the running max underflows to exactly zero
+                if (FC_flash_attn_ext_vec_sparse_mask && FC_flash_attn_ext_vec_mskip_ballot) {
+                    avk = (uint) ((simd_vote::vote_t) simd_ballot(vs != 0.0f));
+                }
+
                 // O = diag(ms)*O
                 if ((DV4/NL % NW == 0) || ty == 0) {
                     FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
@@ -8866,9 +8946,13 @@ kernel void kernel_flash_attn_ext_vec(
                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                         bool active = true;
                         if (FC_flash_attn_ext_vec_sparse_mask) {
-                            active = false;
-                            FOR_UNROLL (short jj = 0; jj < NE; ++jj) {
-                                active |= ss[cc*NE + jj] != 0.0f;
+                            if (FC_flash_attn_ext_vec_mskip_ballot) {
+                                active = ((avk >> (cc*NE)) & ((1u << NE) - 1)) != 0;
+                            } else {
+                                active = false;
+                                FOR_UNROLL (short jj = 0; jj < NE; ++jj) {
+                                    active |= ss[cc*NE + jj] != 0.0f;
+                                }
                             }
                         }
                         if (!active) {
@@ -8883,9 +8967,13 @@ kernel void kernel_flash_attn_ext_vec(
                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                         bool active = true;
                         if (FC_flash_attn_ext_vec_sparse_mask) {
-                            active = false;
-                            FOR_UNROLL (short jj = 0; jj < NE; ++jj) {
-                                active |= ss[cc*NE + jj] != 0.0f;
+                            if (FC_flash_attn_ext_vec_mskip_ballot) {
+                                active = ((avk >> (cc*NE)) & ((1u << NE) - 1)) != 0;
+                            } else {
+                                active = false;
+                                FOR_UNROLL (short jj = 0; jj < NE; ++jj) {
+                                    active |= ss[cc*NE + jj] != 0.0f;
+                                }
                             }
                         }
                         if (!active) {
@@ -8950,7 +9038,7 @@ kernel void kernel_flash_attn_ext_vec(
             }
         }
 
-        if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
+        if (FC_flash_attn_ext_vec_has_sinks && ksg == 0 && iwg == 0) {
             const float m = M;
             const int sink_idx = args.sinks_rows ? iq1 : iq2;
             const float s = tiisg == 0 ? ((device const float *) sinks)[sink_idx] : -FLT_MAX/2;
@@ -8981,8 +9069,11 @@ kernel void kernel_flash_attn_ext_vec(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // parallel reduce
+    // note: `ksg < r` rather than `sgitg < r` - at nh > 1 every query head has
+    //       its own contiguous block of NSG key-stream SIMDgroups and reduces
+    //       inside it. At nh == 1, ksg == sgitg.
     for (short r = NSG/2; r > 0; r >>= 1) {
-        if (sgitg < r) {
+        if (ksg < r) {
             const float S0 = ss[           0];
             const float S1 = ss[r*(SH/2) + 0];
 
@@ -9011,7 +9102,10 @@ kernel void kernel_flash_attn_ext_vec(
     }
 
     // final rescale with 1/S and store to global memory
-    if (sgitg == 0) {
+    // note: at nh > 1 every SIMDgroup owns a different query head and stores its
+    //       own row (ksg == 0 for all of them); at nh == 1 this is `sgitg == 0`,
+    //       the SIMDgroup that holds the cross-SIMDgroup reduction result
+    if (ksg == 0) {
         const int64_t nrows = args.ne3*args.ne2*args.ne1;
         const int64_t rid   = iq3*args.ne2*args.ne1 + iq2 + iq1*args.ne1;
 
@@ -9047,6 +9141,7 @@ kernel void kernel_flash_attn_ext_vec(
 
 #undef NWG
 #undef NSG
+#undef NH
 #undef NS10
 #undef NS20
 }
