@@ -320,12 +320,41 @@ def cache_add_entry(tokens, tier, created_ago_s=0.0, hits=0, last_hit_ago_s=None
     }
     with STATE_LOCK:
         CACHE["entries"][eid] = entry
+    if tier == "ram":
+        cache_enforce_ram_budget(protect_id=eid)
     return eid
 
 
 def cache_remove_entry(eid):
     with STATE_LOCK:
         CACHE["entries"].pop(eid, None)
+
+
+def cache_enforce_ram_budget(protect_id=None, target_fraction=0.93):
+    """Every finished request re-caches its own KV state (post_save), so
+    without eviction the RAM tier grows without bound. Spill the oldest
+    entries to disk once usage crosses the limit — the same pressure
+    response the real server's prompt cache applies."""
+    evicted = []
+    with STATE_LOCK:
+        limit = CACHE["limit_ram_bytes"]
+        ram = [e for e in CACHE["entries"].values() if e["tier"] == "ram"]
+        used = sum(e["bytes"] for e in ram)
+        if used <= limit:
+            return
+        ram.sort(key=lambda e: e["created_at"])  # oldest first
+        for e in ram:
+            if used <= limit * target_fraction:
+                break
+            if e["id"] == protect_id:
+                continue
+            e["tier"] = "disk"
+            e["file"] = f"pc-mockA1-{e['id']}.lcpc"
+            used -= e["bytes"]
+            evicted.append((e["tokens"], e["bytes"]))
+    for tokens, b in evicted:
+        cache_record_op("spill", tokens, b)
+        BUS.emit("cache_op", {"op": "spill", "tokens": tokens, "bytes": b, "ms": round(random.uniform(400, 3500), 1)})
 
 
 def cache_record_lookup(kind):
@@ -490,7 +519,10 @@ def run_request(slot_id, **cfg):
         psf["gap_why"] = gap_why
     BUS.emit("prompt_start", psf, t_ms=int(t), req=req_id, slot=slot_id)
     t_prompt = t
-    slot_set_active(slot_id, task_id, n_prompt, n_past, n_past, 0, max_out)
+    # processed = NEW tokens processed so far (excludes the cached/restored
+    # prefix) so cached+processed sums to n_prompt, matching the real
+    # n_prompt_tokens_processed convention (core.mjs slotContextTokens()).
+    slot_set_active(slot_id, task_id, n_prompt, 0, n_past, 0, max_out)
 
     remaining = n_prompt - n_past
     rate = cfg.get("prefill_rate", 800.0)
@@ -510,7 +542,7 @@ def run_request(slot_id, **cfg):
         yield real_step
         BUS.emit("prefill_progress", {"n_done": done, "n_prompt": n_prompt, "n_batch": batch, "ms": round(t - t_prompt, 1)},
                  t_ms=int(t), req=req_id, slot=slot_id)
-        slot_set_active(slot_id, task_id, n_prompt, done, n_past, 0, max_out)
+        slot_set_active(slot_id, task_id, n_prompt, done - n_past, n_past, 0, max_out)
     reg_state(req_id, "decode")
     t_decode0 = t
 
@@ -550,7 +582,7 @@ def run_request(slot_id, **cfg):
         BUS.emit("decode_progress", {"n_dec": n, "draft_n": draft_n, "draft_a": draft_a,
                                       "ms": round(t - t_decode0, 1), "tps": round(tps, 2)},
                  t_ms=int(t), req=req_id, slot=slot_id)
-        slot_set_active(slot_id, task_id, n_prompt + n, n_prompt, n_past, n, max_out,
+        slot_set_active(slot_id, task_id, n_prompt + n, n_prompt - n_past, n_past, n, max_out,
                          remain=(max_out - n if max_out > 0 else -1))
 
     pp_ms = t_decode0 - t_prompt
@@ -570,7 +602,7 @@ def run_request(slot_id, **cfg):
         BUS.emit("cache_op", {"op": "save", "tokens": tot, "bytes": b, "ms": 0.0}, t_ms=int(t) + 2)
         cache_add_entry(tot, "ram")
 
-    slot_set_resident_idle(slot_id, task_id, n_prompt + n, n_prompt, n_past, n, max_out)
+    slot_set_resident_idle(slot_id, task_id, n_prompt + n, n_prompt - n_past, n_past, n, max_out)
     lo, hi = cfg.get("idle_after", (0.6, 2.5))
     yield random.uniform(lo, hi)
     slot_set_idle(slot_id)
@@ -636,7 +668,7 @@ def tpl_short_chat(slot_id, **extra):
 
 def tpl_deep_context(slot_id, **extra):
     """100k+ token prompt, RAM-tier partial reuse, long-ish decode."""
-    n_prompt = random.randint(105_000, 280_000)
+    n_prompt = random.randint(60_000, 150_000)
     cached = int(n_prompt * random.uniform(0.55, 0.85))
     b = int(cached * BYTES_PER_TOKEN)
     cfg = dict(
@@ -682,7 +714,7 @@ def tpl_ssd_restore(slot_id, **extra):
 
 def tpl_donor_share(slot_id, donor_slot=0, **extra):
     """Zero-copy seq_cp share from a live donor slot (near-instant, huge)."""
-    n_prompt = random.randint(60_000, 130_000)
+    n_prompt = random.randint(30_000, 80_000)
     tokens = int(n_prompt * random.uniform(0.9, 0.99))
     cfg = dict(
         lane=random.choice(LANES), n_prompt=n_prompt, max_out=0,
@@ -749,7 +781,7 @@ def tpl_full_recompute(slot_id, **extra):
 def tpl_wasted_restore(slot_id, **extra):
     """THE key case: a slow multi-GiB restore succeeds, then admission
     clears the slot anyway, discarding every restored token."""
-    n_prompt = random.randint(60_000, 150_000)
+    n_prompt = random.randint(40_000, 100_000)
     tokens = int(n_prompt * random.uniform(0.85, 0.99))
     b = int(tokens * BYTES_PER_TOKEN)
     ms = random.uniform(900, 4300)
@@ -836,15 +868,46 @@ TEMPLATES = [
     (8, tpl_wasted_restore), (5, tpl_stall), (5, tpl_cancelled),
 ]
 
+# rough worst-case n_prompt per template, used only to keep the *sum* of
+# concurrently-resident tokens across slots plausible against the shared
+# n_ctx budget (real llama-server enforces this; the dashboard's KV-context
+# tile assumes it — see core.mjs renderTiles()). Not exact, just a guard
+# against three big templates landing on slots 1-3 at once.
+_TEMPLATE_MAX_PROMPT = {
+    tpl_trivial: 60, tpl_short_chat: 16_000, tpl_cancelled: 20_000, tpl_stall: 60_000,
+    tpl_full_recompute: 40_000, tpl_partial_recompute: 55_000, tpl_ssd_restore: 60_000,
+    tpl_donor_share: 80_000, tpl_wasted_restore: 100_000, tpl_deep_context: 150_000,
+}
 
-def pick_template():
-    total = sum(w for w, _ in TEMPLATES)
+
+def pick_template(max_prompt=None):
+    candidates = TEMPLATES
+    if max_prompt is not None:
+        filtered = [(w, fn) for w, fn in TEMPLATES if _TEMPLATE_MAX_PROMPT.get(fn, 0) <= max_prompt]
+        candidates = filtered or [(w, fn) for w, fn in TEMPLATES if fn is tpl_trivial]
+    total = sum(w for w, _ in candidates)
     r = random.uniform(0, total)
     upto = 0.0
-    for w, fn in TEMPLATES:
+    for w, fn in candidates:
         upto += w
         if r <= upto:
             return fn
+    return candidates[-1][1]
+
+
+def other_slots_context(exclude_slot):
+    """Sum of resident context tokens on slots other than `exclude_slot`,
+    the same accounting core.mjs's slotContextTokens() uses."""
+    with STATE_LOCK:
+        total = 0
+        for s in SLOTS:
+            if s["id"] == exclude_slot or s.get("id_task") is None:
+                continue
+            nt = s.get("next_token", [{}])
+            decoded = nt[0].get("n_decoded", 0) if nt else 0
+            total += max(s.get("n_prompt_tokens", 0),
+                          s.get("n_prompt_tokens_cache", 0) + s.get("n_prompt_tokens_processed", 0) + decoded)
+        return total
     return TEMPLATES[-1][1]
 
 
@@ -949,7 +1012,7 @@ def seed_persistent_giant_turn():
         "req_id": req_id, "task_id": task_id, "n_prompt": n_prompt, "n_past": n_past,
         "n_dec": n_dec, "draft_n": draft_n, "draft_a": draft_a, "decode_start_ms": t_after_prefill,
     })
-    slot_set_active(0, task_id, n_prompt + n_dec, n_prompt, n_past, n_dec, 0, remain=-1)
+    slot_set_active(0, task_id, n_prompt + n_dec, n_prompt - n_past, n_past, n_dec, 0, remain=-1)
 
 
 def seed_history():
@@ -1014,8 +1077,8 @@ def persistent_giant_turn_ticker():
             "n_dec": st["n_dec"], "draft_n": st["draft_n"], "draft_a": st["draft_a"],
             "ms": round(now_ms() - st["decode_start_ms"], 1), "tps": round(tps, 2),
         }, req=st["req_id"], slot=0)
-        slot_set_active(0, st["task_id"], st["n_prompt"] + st["n_dec"], st["n_prompt"], st["n_past"],
-                         st["n_dec"], 0, remain=-1)
+        slot_set_active(0, st["task_id"], st["n_prompt"] + st["n_dec"], st["n_prompt"] - st["n_past"],
+                         st["n_past"], st["n_dec"], 0, remain=-1)
 
 
 def cache_publish_ticker():
@@ -1068,9 +1131,11 @@ def cache_jitter_loop():
 
 
 def slot_cycle(slot_id):
-    """Runs one template, then a short idle pause, forever."""
+    """Runs one template, then a short idle pause, forever. Leaves headroom
+    against N_CTX so the KV-context tile never has to show over 100%."""
     while True:
-        fn = pick_template()
+        headroom = max(0, N_CTX - other_slots_context(slot_id) - 20_000)
+        fn = pick_template(max_prompt=headroom)
         yield from fn(slot_id)
         yield random.uniform(0.4, 2.2)
 
