@@ -134,6 +134,9 @@ struct server_routes {
     server_http_context::handler_t get_admin_dashboard_events;
     server_http_context::handler_t post_admin_dashboard_detail;
     server_http_context::handler_t post_admin_dashboard_control;
+    // m2-dashboard v2: key-authenticated realtime feed + cache introspection
+    server_http_context::handler_t get_dashboard_events;
+    server_http_context::handler_t get_dashboard_cache_state;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
     server_http_context::handler_t get_props;

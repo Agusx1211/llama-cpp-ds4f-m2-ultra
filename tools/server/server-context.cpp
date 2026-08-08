@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-admin-dashboard.h"
 #include "server-admission.h"
+#include "server-dashboard-bus.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -25,6 +26,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cinttypes>
@@ -413,6 +415,12 @@ struct server_slot {
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // m2-dashboard decode-progress aggregation state (see maybe_emit_decode_progress):
+    // last emitted n_decoded and its timestamp, so decode advances become one
+    // bus event per >=32 tokens or >=1 s instead of per token
+    int32_t dash_n_decoded_last = 0;
+    int64_t dash_t_last_us      = 0;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -444,6 +452,9 @@ struct server_slot {
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
+
+        dash_n_decoded_last = 0;
+        dash_t_last_us      = 0;
 
         prefill_disposition = {};
 
@@ -731,6 +742,34 @@ struct server_slot {
         n_decoded_last = n_decoded;
 
         SLT_INF(*this, "n_decoded = %6d, tg = %6.2f t/s, tg_3s = %6.2f t/s\n", n_decoded, n_gen_second, n_gen_second_win);
+    }
+
+    // m2-dashboard: aggregate decode advances into one bus event per >=32
+    // decoded tokens or >=1 s, whichever comes first (never per token). The
+    // guard is two integer compares; the emit itself is a leaf ring append.
+    void dash_note_decode() {
+        if (!task || n_decoded <= 0) {
+            return;
+        }
+        const int64_t now = ggml_time_us();
+        const int64_t t_base = dash_t_last_us != 0 ? dash_t_last_us : t_start_generation;
+        if (n_decoded - dash_n_decoded_last < 32 && now - t_base < 1000000) {
+            return;
+        }
+        server_dashboard::event ev;
+        ev.kind       = server_dashboard::event_kind::decode_progress;
+        ev.request_id = static_cast<uint64_t>(task->id) + 1;
+        ev.slot       = id;
+        ev.a          = n_decoded;
+        ev.b          = n_draft_total;
+        ev.c          = n_draft_accepted;
+        ev.d          = std::max<int64_t>(0, now - t_start_generation);
+        const int64_t dt = now - t_base;
+        ev.f          = dt > 0 ? (n_decoded - dash_n_decoded_last) * 1e6 / dt : 0.0;
+        server_dashboard::instance().emit(ev);
+
+        dash_n_decoded_last = n_decoded;
+        dash_t_last_us      = now;
     }
 
     void print_timings_pp() const {
@@ -1839,11 +1878,18 @@ private:
 
         bool update_cache = false;
 
+        // m2-dashboard: record how the slot was chosen and how much prefix it
+        // holds; one slot_selected event is emitted once the choice is final
+        auto dash_select      = server_dashboard::select_code::lru;
+        size_t dash_lcp       = 0;
+        double dash_sim       = 0.0;
+
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+                dash_select = server_dashboard::select_code::by_id;
             }
         }
 
@@ -1881,6 +1927,9 @@ private:
                     f_sim_best = f_sim_cur;
 
                     ret = &slot;
+
+                    dash_lcp = lcp_len;
+                    dash_sim = f_sim_cur;
                 }
             }
 
@@ -1890,6 +1939,7 @@ private:
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                             f_sim_best, slot_prompt_similarity, f_keep);
+                    dash_select = server_dashboard::select_code::lcp_affinity;
                 }
 
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
@@ -1924,6 +1974,18 @@ private:
         }
 
         if (ret) {
+            {
+                server_dashboard::event ev;
+                ev.kind       = server_dashboard::event_kind::slot_selected;
+                ev.request_id = static_cast<uint64_t>(task.id) + 1;
+                ev.slot       = ret->id;
+                ev.code       = (uint16_t) dash_select;
+                ev.a          = (int64_t) dash_lcp;
+                ev.b          = (int64_t) task.tokens.size();
+                ev.f          = dash_sim;
+                server_dashboard::instance().emit(ev);
+            }
+
             const bool consult_cache = prompt_cache != nullptr && task.type == SERVER_TASK_TYPE_COMPLETION;
             update_cache = update_cache && consult_cache;
 
@@ -1974,6 +2036,19 @@ private:
                     SLT_INF(*ret, "shared %zu-token prefix from slot %d via zero-copy seq_cp (%.2f ms, task has %d)\n",
                             lcp_donor, donor->id, (ggml_time_us() - t_share) / 1000.0, (int) task.tokens.size());
 
+                    {
+                        server_dashboard::event ev;
+                        ev.kind       = server_dashboard::event_kind::cache_restore;
+                        ev.request_id = static_cast<uint64_t>(task.id) + 1;
+                        ev.slot       = ret->id;
+                        ev.code       = (uint16_t) server_dashboard::restore_code::donor;
+                        ev.a          = (int64_t) lcp_donor;
+                        ev.c          = (int64_t) task.tokens.size();
+                        ev.d          = donor->id;
+                        ev.f          = (ggml_time_us() - t_share) / 1000.0;
+                        server_dashboard::instance().emit(ev);
+                    }
+
                     if (prompt_cache) {
                         prompt_cache->update();
                     }
@@ -2011,6 +2086,21 @@ private:
                 const size_t n_reusable = ret->prompt.tokens.get_common_prefix(task.tokens);
                 SLT_INF(*ret, "prompt cache: %zu/%d prefix tokens available after save/load (%.2f ms)\n",
                         n_reusable, (int) task.tokens.size(), (ggml_time_us() - t_start) / 1000.0);
+
+                {
+                    const auto & report = prompt_cache->dash_last_load;
+                    server_dashboard::event ev;
+                    ev.kind       = server_dashboard::event_kind::cache_restore;
+                    ev.request_id = static_cast<uint64_t>(task.id) + 1;
+                    ev.slot       = ret->id;
+                    ev.code       = (uint16_t) report.source; // restore_code numeric values
+                    ev.a          = (int64_t) n_reusable;
+                    ev.b          = (int64_t) report.n_bytes;
+                    ev.c          = (int64_t) task.tokens.size();
+                    ev.d          = -1;
+                    ev.f          = (ggml_time_us() - t_start) / 1000.0;
+                    server_dashboard::instance().emit(ev);
+                }
             }
         }
 
@@ -2145,6 +2235,14 @@ private:
 
         std::vector<llama_kv_admission_span> spans;
         spans.reserve(family_slots.size());
+
+        // m2-dashboard: per-slot admission outcomes, emitted only when the
+        // admission actually succeeds (deferred families retry and would spam
+        // duplicate ready events otherwise; the queue's deferred event already
+        // records the wait and its reason)
+        std::vector<server_dashboard::event> dash_pending;
+        dash_pending.reserve(family_slots.size());
+
         for (size_t i = 0; i < family_slots.size(); ++i) {
             server_slot & slot = *family_slots[i];
             server_task & task = *family_tasks[i];
@@ -2243,6 +2341,20 @@ private:
                 SLT_INF(slot, "elastic admission reuses resident prefix: lcp=%zu resident=%zu frontier=%d task=%d span_end=%zu%s\n",
                         n_lcp, n_prompt_res, (int) pos_frontier, (int) task.n_tokens(), (size_t) plan.span_tokens,
                         (llama_pos) plan.span_tokens <= pos_frontier ? " (below frontier, spanless)" : "");
+                {
+                    server_dashboard::event ev;
+                    ev.kind       = server_dashboard::event_kind::admission;
+                    ev.request_id = static_cast<uint64_t>(task.id) + 1;
+                    ev.slot       = slot.id;
+                    ev.code       = (uint16_t) ((llama_pos) plan.span_tokens <= pos_frontier ?
+                            server_dashboard::admission_code::ready_spanless :
+                            server_dashboard::admission_code::ready_reuse);
+                    ev.a          = (int64_t) n_lcp;
+                    ev.b          = (int64_t) n_prompt_res;
+                    ev.c          = (int64_t) pos_frontier;
+                    ev.d          = (int64_t) plan.span_tokens;
+                    dash_pending.push_back(ev);
+                }
                 if ((llama_pos) plan.span_tokens > pos_frontier) {
                     spans.push_back({ slot.id, pos_frontier, (llama_pos) plan.span_tokens });
                 }
@@ -2261,6 +2373,54 @@ private:
                 }
                 slot.prompt_clear();
                 spans.push_back({ slot.id, 0, (llama_pos) plan.span_tokens });
+                {
+                    // m2-dashboard: attribute the clear. Re-tests the
+                    // reuse_resident predicate above in priority order (a
+                    // handful of integer compares on a path that has already
+                    // done far more work) so the reason travels as a
+                    // structured field instead of only appearing in the log.
+                    auto why = server_dashboard::clear_code::empty_slot;
+                    if (n_prompt_res == 0) {
+                        why = server_dashboard::clear_code::empty_slot;
+                    } else if (family_slots.size() != 1) {
+                        why = server_dashboard::clear_code::family;
+                    } else if (n_lcp == 0) {
+                        why = server_dashboard::clear_code::no_lcp;
+                    } else if (n_lcp >= (size_t) task.n_tokens()) {
+                        why = server_dashboard::clear_code::lcp_covers_task;
+                    } else if (slot.prompt.tokens.has_mtmd) {
+                        why = server_dashboard::clear_code::mtmd;
+                    } else if (task.params.n_cache_reuse != 0) {
+                        why = server_dashboard::clear_code::cache_reuse_opt;
+                    } else if (!task.params.cache_prompt) {
+                        why = server_dashboard::clear_code::no_cache_prompt;
+                    } else {
+                        // the predicate survived the cheap gates, so it failed
+                        // inside the checkpoint/rollback block
+                        const llama_pos pos_next_r  = slot.prompt.tokens.pos_next(n_lcp);
+                        const llama_pos pos_thold_r = std::max(0, pos_next_r - n_swa);
+                        const llama_pos pos_min_r   =
+                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                        if (pos_min_r < 0) {
+                            why = server_dashboard::clear_code::no_pos_min;
+                        } else if (pos_min_r >= pos_thold_r) {
+                            why = server_dashboard::clear_code::no_covering_checkpoint;
+                        } else {
+                            why = server_dashboard::clear_code::rs_window;
+                        }
+                    }
+
+                    server_dashboard::event ev;
+                    ev.kind       = server_dashboard::event_kind::admission;
+                    ev.request_id = static_cast<uint64_t>(task.id) + 1;
+                    ev.slot       = slot.id;
+                    ev.code       = (uint16_t) server_dashboard::admission_code::ready_full_clear;
+                    ev.a          = (int64_t) why;
+                    ev.b          = (int64_t) n_prompt_res;
+                    ev.c          = (int64_t) n_lcp;
+                    ev.d          = (int64_t) plan.span_tokens;
+                    dash_pending.push_back(ev);
+                }
             }
         }
 
@@ -2274,6 +2434,9 @@ private:
         if (spans.empty()) {
             // spanless reuse only: nothing new to reserve, the prefill works
             // entirely below the resident frontier
+            for (const auto & ev : dash_pending) {
+                server_dashboard::instance().emit(ev);
+            }
             return result;
         }
 
@@ -2322,6 +2485,10 @@ private:
             send_error(result_task, "DSV4 physical admission reservation failed", ERROR_TYPE_UNAVAILABLE);
             result.status = admission_gate_status::rejected;
             return result;
+        }
+
+        for (const auto & ev : dash_pending) {
+            server_dashboard::instance().emit(ev);
         }
 
         return result;
@@ -2827,6 +2994,29 @@ private:
         }
 
         res->generation_params = slot.task->params; // copy the parameters
+
+        // m2-dashboard: terminal timings for the request's timeline (the
+        // registry terminal event follows separately with the durable reason)
+        {
+            server_dashboard::event ev;
+            ev.kind       = server_dashboard::event_kind::finished;
+            ev.request_id = static_cast<uint64_t>(slot.task->id) + 1;
+            ev.slot       = slot.id;
+            switch (slot.stop) {
+                case STOP_TYPE_EOS:   ev.code = (uint16_t) server_dashboard::stop_code::eos;     break;
+                case STOP_TYPE_LIMIT: ev.code = (uint16_t) server_dashboard::stop_code::limit;   break;
+                case STOP_TYPE_WORD:  ev.code = (uint16_t) server_dashboard::stop_code::word;    break;
+                default:              ev.code = (uint16_t) server_dashboard::stop_code::aborted; break;
+            }
+            ev.a = slot.task->n_tokens();
+            ev.b = slot.n_prompt_tokens_cache;
+            ev.c = slot.n_decoded;
+            ev.d = slot.n_draft_total;
+            ev.e = slot.n_draft_accepted;
+            ev.f = slot.t_prompt_processing;
+            ev.g = slot.t_token_generation;
+            server_dashboard::instance().emit(ev);
+        }
 
         return publish_or_stage_prefill_result(
             slot, server_queue_result_kind::final, std::move(res), true);
@@ -4488,6 +4678,14 @@ private:
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
 
+                        // m2-dashboard: how the prefill landing was decided
+                        // (reusable prefix vs where n_past actually lands, and
+                        // why the difference exists); one prompt_start event
+                        int  dash_n_past_lcp  = 0;     // n_past before checkpoint landing
+                        bool dash_ckpt_landed = false; // landed on a restored checkpoint
+                        bool dash_reset       = false; // no usable checkpoint: full re-process
+                        bool dash_last_token  = false; // [TAG_PROMPT_LOGITS] single-token trim
+
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
@@ -4615,6 +4813,8 @@ private:
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
+                            dash_n_past_lcp = n_past;
+
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
 
@@ -4699,6 +4899,8 @@ private:
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+
+                                        dash_ckpt_landed = true;
                                     }
 
                                     if (do_reset) {
@@ -4706,6 +4908,8 @@ private:
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
+
+                                        dash_reset = true;
                                     }
                                 }
                             }
@@ -4729,12 +4933,30 @@ private:
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
+
+                            dash_last_token = true;
                         }
 
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        {
+                            server_dashboard::event ev;
+                            ev.kind       = server_dashboard::event_kind::prompt_start;
+                            ev.request_id = static_cast<uint64_t>(slot.task->id) + 1;
+                            ev.slot       = slot.id;
+                            ev.a          = slot.task->n_tokens();
+                            ev.b          = n_past;
+                            ev.c          = dash_n_past_lcp;
+                            ev.code       = (uint16_t) (
+                                    dash_reset       ? server_dashboard::span_code::recompute_reset :
+                                    dash_ckpt_landed ? server_dashboard::span_code::recompute_checkpoint_gap :
+                                    dash_last_token  ? server_dashboard::span_code::recompute_last_token :
+                                                       server_dashboard::span_code::recompute_no_cache);
+                            server_dashboard::instance().emit(ev);
+                        }
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -4989,6 +5211,21 @@ private:
                             static_cast<uint64_t>(slot.task->n_tokens()),
                             prefill_decode);
                         GGML_ASSERT(prefill_batch.begin(lease, n_tokens_prev, n_tokens_cur));
+
+                        // m2-dashboard: one prefill_progress event per staged
+                        // ubatch (decode of this chunk follows in the same
+                        // scheduler iteration)
+                        {
+                            server_dashboard::event ev;
+                            ev.kind       = server_dashboard::event_kind::prefill_progress;
+                            ev.request_id = request_id;
+                            ev.slot       = slot.id;
+                            ev.a          = slot.prompt.n_tokens();
+                            ev.b          = slot.task->n_tokens();
+                            ev.c          = n_tokens_cur;
+                            ev.d          = std::max<int64_t>(0, ggml_time_us() - slot.t_start_process_prompt);
+                            server_dashboard::instance().emit(ev);
+                        }
                     }
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
@@ -5450,6 +5687,7 @@ private:
             }
 
             slot.print_timings_tg();
+            slot.dash_note_decode();
         });
 
         // speculative decoding - main model sample and accept
@@ -5587,6 +5825,7 @@ private:
             }
 
             slot.print_timings_tg();
+            slot.dash_note_decode();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
@@ -6207,6 +6446,96 @@ void server_routes::init_routes() {
                 }
                 std::this_thread::sleep_for(
                         std::chrono::milliseconds(server_admin_dashboard::poll_interval_milliseconds));
+            }
+            output.clear();
+            return false;
+        };
+        return res;
+    };
+
+    // m2-dashboard v2 (tools/m2-dashboard): realtime SSE feed + prompt-cache
+    // introspection. Unlike the loopback admin routes above, these are
+    // ordinary key-authenticated endpoints (the global API-key middleware
+    // covers every non-public path), so the LAN dashboard page can consume
+    // them with its #key= credential.
+    this->get_dashboard_cache_state = [this](const server_http_req &) {
+        auto res = create_response(true);
+        res->headers["Cache-Control"] = "no-store";
+        const auto state = server_dashboard::instance().cache();
+        res->ok(server_dashboard::cache_state_to_json(state, (uint64_t) ggml_time_us()));
+        return res;
+    };
+
+    this->get_dashboard_events = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        res->headers["Cache-Control"] = "no-store";
+
+        // resume cursor: Last-Event-ID header (EventSource convention) or the
+        // ?after= query parameter (fetch-based clients); header wins
+        uint64_t cursor = 0;
+        if (req.ambiguous_last_event_id_header ||
+            !server_admin_dashboard::parse_last_event_id(req.headers, cursor)) {
+            res->error(format_error_response("invalid Last-Event-ID header", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (cursor == 0) {
+            const std::string after = req.get_param("after");
+            if (!after.empty()) {
+                const char * begin = after.data();
+                const char * end   = begin + after.size();
+                const auto parsed  = std::from_chars(begin, end, cursor, 10);
+                if (parsed.ec != std::errc() || parsed.ptr != end) {
+                    res->error(format_error_response("invalid after parameter", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+            }
+        }
+
+        auto stream_lease = server_dashboard::try_acquire_stream_lease();
+        if (!stream_lease) {
+            res->error(format_error_response(
+                    "too many live dashboard event streams", ERROR_TYPE_OVERLOADED));
+            return res;
+        }
+
+        // captured by pointer, not by reference: res->next outlives this
+        // handler frame (same convention as the admin dashboard stream above).
+        // The bus is a function-local static, so it outlives every request.
+        auto * bus = &server_dashboard::instance();
+
+        // hello frame first: tells the client the retained window so it can
+        // detect gaps (a cursor below first_seq means events were overwritten)
+        const auto window = bus->snapshot_after(cursor, 0);
+        const uint64_t wall_ms = (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        res->status = 200;
+        res->content_type = "text/event-stream; charset=utf-8";
+        res->data = server_dashboard::make_hello_frame(window, (uint64_t) ggml_time_us(), wall_ms);
+
+        const auto * should_stop = &req.should_stop;
+        auto last_write = std::chrono::steady_clock::now();
+        res->next = [bus, should_stop, cursor, last_write, stream_lease](std::string & output) mutable {
+            (void) stream_lease;
+            while (!(*should_stop)()) {
+                const auto batch = bus->snapshot_after(cursor);
+                if (!batch.events.empty()) {
+                    output.clear();
+                    const uint64_t offset = server_dashboard::wall_offset_ms();
+                    for (const auto & ev : batch.events) {
+                        output += server_dashboard::make_sse_frame(ev, offset);
+                        cursor = ev.seq;
+                    }
+                    last_write = std::chrono::steady_clock::now();
+                    return true;
+                }
+                if (std::chrono::steady_clock::now() - last_write >=
+                    std::chrono::milliseconds(server_dashboard::heartbeat_ms)) {
+                    output = ": keepalive\n\n";
+                    last_write = std::chrono::steady_clock::now();
+                    return true;
+                }
+                std::this_thread::sleep_for(
+                        std::chrono::milliseconds(server_dashboard::poll_interval_ms));
             }
             output.clear();
             return false;
