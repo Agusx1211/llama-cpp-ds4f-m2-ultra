@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <vector>
 #include <cmath>
 
 static_assert(sizeof(ggml_metal_kargs_mul_mv) == 112, "ggml_metal_kargs_mul_mv ABI size changed");
@@ -4307,6 +4308,96 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             }
         }
 
+        // Split-K regrouping: nwg*nsg is the number of independent key streams,
+        // i.e. the primary parallelism of the kernel. Moving streams from
+        // workgroups into SIMDgroups of the same threadgroup keeps that product
+        // constant while cutting the split-K partial state that has to travel
+        // through device memory by the same factor, because the intra-threadgroup
+        // tree reduce combines the SIMDgroups in threadgroup memory.
+        //
+        // This is explicitly NOT the rejected nwg sweep of
+        // notes/2026-08-02-dsv4-sparse-fa-workgroup-rejection.md, which lowered
+        // nwg with nsg pinned at 1 and therefore divided the primary grid.
+        //
+        // Not bit-identical: the reduction association changes.
+        {
+            static const int32_t split_nsg = []() {
+                const char * s = std::getenv("GGML_FA_SPLIT_NSG");
+                return s ? atoi(s) : 0;
+            }();
+
+            if (split_nsg > 1 && dsv4_sparse_mask && nsg == 1 && nwg % split_nsg == 0) {
+                const int32_t nsg_new = std::min(split_nsg, 8);
+
+                const size_t smem_new = FATTN_SMEM(nsg_new);
+
+                if (smem_new <= props_dev->max_theadgroup_memory_size) {
+                    nsg  = nsg_new;
+                    nwg /= nsg_new;
+                }
+            }
+        }
+
+        // Fit the workgroup fan-out to the number of KV chunks that exist.
+        // A workgroup with iwg*nsg >= nchunks exits its cache loop immediately
+        // and contributes an all-zero partial (S = 0, M = -FLT_MAX/2, O = 0)
+        // that the reducer then has to read back: at ne11 = 256 with ncpsg = 32
+        // that is 24 of 32 workgroups, i.e. three quarters of the 4 MiB/layer
+        // temp round-trip moving nothing.
+        //
+        // Bit-identical: the fan-out is only lowered when nchunks <= nwg*nsg, in
+        // which case every stream still owns exactly the same single chunk (the
+        // ic0 += NWG*NSG stride is never applied), and the reducer contributes
+        // exactly the zero partial the dropped workgroups used to write.
+        // nwg is kept a power of two so the reducer's balanced-tree association
+        // is unchanged.
+        {
+            static const bool nwg_fit = std::getenv("GGML_FA_NWG_FIT_DISABLE") == nullptr;
+
+            if (nwg_fit && nwg > 1) {
+                const int64_t nchunks = (ne11 + ncpsg - 1)/ncpsg;
+                const int64_t nstream = (nchunks + nsg - 1)/nsg;
+
+                int32_t nwg_new = 1;
+                while (nwg_new < nstream && nwg_new < nwg) {
+                    nwg_new *= 2;
+                }
+
+                // keep the split-K path: nwg == 1 selects a different, disabled
+                // code path in this kernel family
+                nwg = std::max(2, nwg_new);
+            }
+        }
+
+        // [NWG][DV4] partial layout: coalesced stores, at the price of a
+        // reducer that needs threadgroup memory and three extra barriers.
+        // Measured slower or neutral at every geometry the DSV4 decode graph
+        // uses and not bit-identical, so it is opt-in - see the lane note.
+        static const bool fa_blocked = std::getenv("GGML_FA_TMP_BLOCKED") != nullptr;
+
+        const bool blocked = fa_blocked && nwg > 1;
+
+        // GGML_FA_GEOM_LOG=1: one line per distinct vec-kernel geometry. Used to
+        // capture what the DSV4 decode graph actually asks for at depth, where
+        // the gather path fixes ne11 at n_raw + indexer_top_k.
+        static const bool geom_log = std::getenv("GGML_FA_GEOM_LOG") != nullptr;
+        if (geom_log) {
+            static std::vector<uint64_t> seen;
+            const uint64_t key = ((uint64_t) ne11 << 24) | ((uint64_t) nwg << 16) |
+                                 ((uint64_t) nsg << 8)   | ((uint64_t) dsv4_sparse_mask << 1) | (uint64_t) blocked;
+            if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
+                seen.push_back(key);
+                // stderr rather than GGML_LOG_INFO: llama-server installs its
+                // own ggml log callback and ggml's INFO level does not reach
+                // the server log
+                fprintf(stderr, "FAGEOM ne11=%d ne01=%d ne02=%d dk=%d dv=%d nchunks=%d nwg=%d nsg=%d mskip=%d blk=%d tmp_bytes=%d\n",
+                        (int) ne11, (int) ne01, (int) ne02, (int) ne00, (int) ne20,
+                        (int) ((ne11 + ncpsg - 1)/ncpsg), (int) nwg, (int) nsg,
+                        (int) dsv4_sparse_mask, (int) blocked,
+                        (int) (4*(ne01*ne02*ne03*nwg*(ne20 + 2))));
+            }
+        }
+
         ggml_metal_kargs_flash_attn_ext_vec args = {
             /*.ne01          =*/ ne01,
             /*.ne02          =*/ ne02,
@@ -4343,7 +4434,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg, blocked);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -4395,14 +4486,39 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                     nrows,
                 };
 
-                auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg);
+                // the reduction association the blocked reducer must reproduce
+                // to stay bitwise equal to simd_sum(); see the kernel comment
+                static const int32_t red_assoc = []() {
+                    const char * s = std::getenv("GGML_FA_RED_ASSOC");
+                    return s && std::strcmp(s, "xor") == 0 ? 0 : 1;
+                }();
+
+                auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg, blocked, red_assoc);
+
+                // GGML_METAL_KPROF attributes one counter-sampled pass per graph
+                // *node*, so the vec kernel and its reducer land in the same
+                // segment and the census cannot say which of the two carries the
+                // op's cost. Open a fresh segment here when kprof is active so
+                // the split-K reduction is measured on its own. Measurement
+                // only: with kprof off this is a no-op.
+                if (ggml_metal_kprof_stride() > 0) {
+                    ggml_metal_encoder_kprof_split(enc, ctx->raw_idx(idx));
+                }
 
                 ggml_metal_encoder_set_pipeline(enc, pipeline0);
                 ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
                 ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
                 ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
 
-                ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
+                // interleaved: one SIMDgroup per workgroup slot, each lane owns a
+                // workgroup, so the threadgroup must hold nwg SIMDgroups and one
+                // threadgroup covers a whole row.
+                // blocked: a threadgroup covers 32 output float4 of one row with
+                // nwg/4 SIMDgroups; the total thread count is the same.
+                const int32_t nblk    = blocked ? ((ne20/4) + 31)/32 : 1;
+                const int32_t nth_red = blocked ? 32*(nwg > 4 ? nwg/4 : 1) : 32*nwg;
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, nrows*nblk, 1, 1, nth_red, 1, 1);
             }
         }
 #undef FATTN_SMEM

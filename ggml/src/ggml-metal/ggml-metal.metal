@@ -8542,6 +8542,15 @@ constant int32_t FC_flash_attn_ext_vec_ns20 [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 22)]];
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
 
+// split-K partial layout in the temp buffer (see kernel_flash_attn_ext_vec_reduce):
+//   false: [DV4][NWG] - the historical interleaved layout. The reducer reads it
+//          coalesced, but every simdgroup lane of the producing workgroup stores
+//          into a *different* 128 B cache line (stride NWG*sizeof(float4) = 512 B
+//          at NWG=32), so the write side is a 16-of-128 byte scatter.
+//   true:  [NWG][DV4] - one contiguous block per workgroup. Stores are fully
+//          coalesced; the reducer is restructured to keep its loads coalesced too.
+constant bool FC_flash_attn_ext_vec_blocked [[function_constant(FC_FLASH_ATTN_EXT_VEC + 24)]];
+
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -9011,9 +9020,20 @@ kernel void kernel_flash_attn_ext_vec(
 
         const float S = NWG == 1 ? (ss[0] == 0.0f ? 0.0f : 1.0f/ss[0]) : 1.0f;
 
-        // interleave the workgroup data
-        for (short i = tiisg; i < DV4; i += NW) {
-            dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[i]*S;
+        if (FC_flash_attn_ext_vec_blocked) {
+            // one contiguous DV4 block per workgroup -> the 32 lanes of this
+            // simdgroup store 32 consecutive float4 (512 B), i.e. 4 full cache
+            // lines instead of 32 partially-written ones
+            device float4 * dst4w = dst4 + rid*DV4*NWG + iwg*DV4;
+
+            for (short i = tiisg; i < DV4; i += NW) {
+                dst4w[i] = (float4) so4[i]*S;
+            }
+        } else {
+            // interleave the workgroup data
+            for (short i = tiisg; i < DV4; i += NW) {
+                dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[i]*S;
+            }
         }
 
         // store S and M
@@ -9165,27 +9185,57 @@ template [[host_name("kernel_flash_attn_ext_vec_q8_0_dk576_dv512")]] kernel flas
 #undef FA_TYPES
 #undef FA_TYPES_F32
 
-constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
-constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
+constant int32_t FC_flash_attn_ext_vec_reduce_DV      [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
+constant int32_t FC_flash_attn_ext_vec_reduce_NWG     [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
+constant bool    FC_flash_attn_ext_vec_reduce_blocked [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 2)]];
+
+// Association of the partial sum, selected at pipeline build time. The
+// interleaved layout reduces over the 32 SIMD lanes with simd_sum(), whose
+// association is an implementation detail of the Metal runtime; the blocked
+// layout has to reproduce it exactly or the two layouts stop being bitwise
+// equal. Measured on M2 Ultra by tests/test-metal-fa-splitk:
+//   RED_ASSOC_XOR  - balanced tree in index order, i.e. an xor butterfly
+//                    (v += simd_shuffle_xor(v, 1, 2, 4, 8, 16)): does NOT match
+//   RED_ASSOC_DOWN - v += simd_shuffle_down(v, 16, 8, 4, 2, 1), i.e. a balanced
+//                    tree over the bit-reversed index order
+#define RED_ASSOC_XOR  0
+#define RED_ASSOC_DOWN 1
+
+constant int32_t FC_flash_attn_ext_vec_reduce_assoc [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 3)]];
+
+// one rescaled partial of workgroup w for output element i
+#define FA_RED_LD(w) (htmp4[(w)*DV4 + i]*sms[w])
 
 kernel void kernel_flash_attn_ext_vec_reduce(
         constant ggml_metal_kargs_flash_attn_ext_vec_reduce & args,
         device  const char * htmp,
         device        char * dst,
-        uint   tgpig[[threadgroup_position_in_grid]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+        uint    tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort  ntg  [[threads_per_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
 #define NWG (FC_flash_attn_ext_vec_reduce_NWG)
 #define DV  (FC_flash_attn_ext_vec_reduce_DV)
 
-    const uint64_t rid = tgpig;
+    // output float4 blocks per row; the blocked reducer uses one threadgroup per
+    // (row, block) so that the thread count matches the interleaved reducer
+    const short NBLK = (DV/4 + 31)/32;
+
+    const uint64_t rid = FC_flash_attn_ext_vec_reduce_blocked ? tgpig/NBLK : tgpig;
 
     const short iwg = tiisg;
 
+    // workgroups beyond NWG never wrote a partial. The producer leaves the
+    // corresponding slots at (S = 0, M = -FLT_MAX/2, O = 0), so contributing
+    // exactly that from the surplus lanes keeps the arithmetic identical to a
+    // full 32-workgroup launch while allowing NWG < 32.
+    const bool act = iwg < NWG;
+
     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV*NWG;
 
-    float S = ss[rid*(2*NWG) + 2*iwg + 0];
-    float M = ss[rid*(2*NWG) + 2*iwg + 1];
+    float S = act ? ss[rid*(2*NWG) + 2*iwg + 0] :  0.0f;
+    float M = act ? ss[rid*(2*NWG) + 2*iwg + 1] : -FLT_MAX/2;
 
     const float m  = simd_max(M);
     const float ms = exp(M - m);
@@ -9198,17 +9248,83 @@ kernel void kernel_flash_attn_ext_vec_reduce(
     device const float4 * htmp4 = (device const float4 *) htmp + rid*DV4*NWG;
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
-    for (short i = sgitg; i < DV4; i += NWG) {
-        const float4 v = simd_sum(htmp4[i*NWG + iwg]*ms);
+    if (FC_flash_attn_ext_vec_reduce_blocked) {
+        // [NWG][DV4] layout.
+        //
+        // The interleaved reducer gives every workgroup slot its own SIMD lane,
+        // which is why it reaches 32*NWG threads per row; naively giving every
+        // *output element* its own thread instead costs 8x the parallelism and
+        // is much slower despite the better access pattern. So keep the thread
+        // count and split both dimensions: a threadgroup owns EPT = 32 output
+        // elements of one row, SIMDgroup s owns WPT of the NWG workgroups, and
+        // lane l owns one element. A SIMDgroup then loads 32 consecutive float4
+        // (512 B) per step - coalesced on both sides of the round trip.
+        const short NSGR = NWG > 4 ? NWG/4 : 1;   // SIMDgroups per threadgroup
+        const short WPT  = NWG/NSGR;              // workgroup slots per thread
 
-        if (iwg == 0) {
-            dst4[i] = v*S;
+        threadgroup float  sms [32];
+        threadgroup float4 sacc[8][32];
+
+        const short l = tiisg;
+        const short i = (short) (tgpig % NBLK)*32 + l;
+
+        if (sgitg == 0 && act) {
+            sms[iwg] = ms;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (i < DV4) {
+            float4 v;
+
+            if (WPT == 4) {
+                const float4 v0 = FA_RED_LD(sgitg           );
+                const float4 v1 = FA_RED_LD(sgitg +   NSGR  );
+                const float4 v2 = FA_RED_LD(sgitg + 2*NSGR  );
+                const float4 v3 = FA_RED_LD(sgitg + 3*NSGR  );
+
+                // shuffle_down pairs (w, w + NWG/2) before (w, w + NWG/4)
+                v = FC_flash_attn_ext_vec_reduce_assoc == RED_ASSOC_DOWN ?
+                    (v0 + v2) + (v1 + v3) :
+                    (v0 + v1) + (v2 + v3);
+            } else if (WPT == 2) {
+                v = FA_RED_LD(sgitg) + FA_RED_LD(sgitg + NSGR);
+            } else {
+                v = FA_RED_LD(sgitg);
+            }
+
+            sacc[sgitg][l] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // cross-SIMDgroup tree. RED_ASSOC_DOWN continues the shuffle_down
+        // deltas (NSGR/2, NSGR/4, ... 1); RED_ASSOC_XOR walks index order.
+        for (short d = NSGR/2; d > 0; d >>= 1) {
+            if (sgitg < d && i < DV4) {
+                sacc[sgitg][l] = sacc[sgitg][l] + sacc[sgitg + d][l];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (sgitg == 0 && i < DV4) {
+            dst4[i] = sacc[0][l]*S;
+        }
+    } else {
+        for (short i = sgitg; i < DV4; i += NWG) {
+            const float4 v = simd_sum(act ? htmp4[i*NWG + iwg]*ms : (float4) 0.0f);
+
+            if (iwg == 0) {
+                dst4[i] = v*S;
+            }
         }
     }
 
 #undef NWG
 #undef DV
 }
+
+#undef FA_RED_LD
 
 template<typename T0, typename T1>
 kernel void kernel_cpy_t_t(
