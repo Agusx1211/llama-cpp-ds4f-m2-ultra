@@ -18,6 +18,15 @@
   --gen:         #3987e5;   /* series 1: generation */
   --pp:          #d95926;   /* series 2: prompt processing */
   --gen-track:   #10315c;
+  /* cache-reuse family: ONE aqua hue, ordinal lightness steps by restore
+   * cost (zero-copy < RAM < SSD). Ramp validated (ordinal + each step vs
+   * orange on the dark page): see notes/2026-08-08-dashboard-v2.md */
+  --cache-0:     #45c48f;   /* zero-copy reuse: resident / donor seq_cp */
+  --cache-1:     #1da87a;   /* RAM-tier restore */
+  --cache-2:     #0c8a5e;   /* SSD-tier restore */
+  /* queue-wait bars are DATA, not grid: they need >=3:1 on the page, which
+   * --baseline (a recessive rule colour, 1.65:1) does not provide */
+  --queued:      #6a6961;
   --good:        #0ca30c;
   --warning:     #fab219;
   --serious:     #ec835a;
@@ -25,8 +34,12 @@
   --ring:        rgba(255, 255, 255, 0.10);
 }
 
+/* Light mode is a selected set of steps from the same ramps, re-validated
+ * against the light surface (#f9f9f7) — not an automatic inversion.
+ * ?theme=dark|light pins a mode via [data-theme]; both selectors are kept in
+ * sync deliberately (see notes/2026-08-08-dashboard-v2.md). */
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme="dark"]) {
     color-scheme: light;
     --page:      #f9f9f7;
     --surface:   #fcfcfb;
@@ -35,11 +48,34 @@
     --muted:     #898781;
     --grid:      #e1e0d9;
     --baseline:  #c3c2b7;
+    --queued:    #8c8b82;
     --gen:       #2a78d6;
     --pp:        #eb6834;
     --gen-track: #cde2fb;
+    --cache-0:   #4fc794;
+    --cache-1:   #159a6b;
+    --cache-2:   #0d7c53;
     --ring:      rgba(11, 11, 11, 0.10);
   }
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --page:      #f9f9f7;
+  --surface:   #fcfcfb;
+  --ink:       #0b0b0b;
+  --ink-2:     #52514e;
+  --muted:     #898781;
+  --grid:      #e1e0d9;
+  --baseline:  #c3c2b7;
+  --queued:    #8c8b82;
+  --gen:       #2a78d6;
+  --pp:        #eb6834;
+  --gen-track: #cde2fb;
+  --cache-0:   #4fc794;
+  --cache-1:   #159a6b;
+  --cache-2:   #0d7c53;
+  --ring:      rgba(11, 11, 11, 0.10);
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -246,9 +282,248 @@ main.stale { opacity: 0.55; transition: opacity 0.3s; }
 }
 .tooltip b { color: var(--ink); font-weight: 600; }
 
+/* ---- view tabs ---- */
+
+.tabs { display: inline-flex; gap: 2px; }
+.tabs button, .seg-buttons button {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--muted);
+  padding: 3px 10px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.tabs button:hover, .seg-buttons button:hover { color: var(--ink); }
+.tabs button.active, .seg-buttons button.active {
+  color: var(--ink);
+  background: var(--surface);
+  border-color: var(--ring);
+}
+.view[hidden] { display: none; }
+
+/* ---- timeline view ---- */
+
+.controls { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.controls-group { display: inline-flex; align-items: center; gap: 10px; }
+.controls-group[hidden] { display: none; }
+.seg-buttons { display: inline-flex; gap: 2px; }
+.seg-buttons button { font-size: 12px; padding: 2px 8px; }
+
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.legend .key { display: inline-flex; align-items: center; gap: 5px; }
+.legend .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+.tl-axis {
+  position: relative;
+  height: 18px;
+  margin-left: var(--tl-label-w, 230px);
+  margin-right: var(--tl-meta-w, 120px);
+  border-bottom: 1px solid var(--grid);
+  font-size: 11px;
+  color: var(--muted);
+}
+.tl-axis .tick { position: absolute; top: 1px; transform: translateX(-50%); font-variant-numeric: tabular-nums; }
+.tl-axis .tick.now { color: var(--ink-2); transform: translateX(-100%); }
+.tl-axis .tick.fit-note { transform: none; }
+
+.timeline { display: flex; flex-direction: column; }
+
+.tl-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  border-bottom: 1px solid var(--grid);
+  padding: 5px 0;
+  cursor: pointer;
+}
+.tl-row:hover { background: color-mix(in srgb, var(--surface) 60%, transparent); }
+.tl-row:focus-visible { outline: 2px solid var(--gen); outline-offset: -2px; background: color-mix(in srgb, var(--surface) 60%, transparent); }
+/* two lines so a long terminal label ("stalled -> killed") never clips the
+ * id/lane, which a single nowrap row did */
+.tl-row .who {
+  width: var(--tl-label-w, 230px);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 12px;
+  overflow: hidden;
+  padding-right: 10px;
+}
+.tl-row .who .l1 { display: flex; align-items: baseline; gap: 8px; white-space: nowrap; }
+.tl-row .who .l2 { font-size: 11px; }
+.tl-row .who b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.tl-row .who .lane { color: var(--muted); }
+.tl-row .who .st { margin-left: auto; }
+.tl-row .who .st.err { color: var(--critical); }
+.tl-row .who .st.warn { color: var(--warning); }
+.tl-row .who .st.ok { color: var(--muted); }
+
+.tl-track { position: relative; flex: 1; height: 16px; min-width: 60px; }
+.tl-track .lane-line { position: absolute; left: 0; right: 0; top: 50%; border-top: 1px solid var(--grid); }
+.tl-seg {
+  position: absolute;
+  top: 2px;
+  height: 12px;
+  border-radius: 2px;
+  min-width: 2px;
+}
+/* "per request" scale: segments flow instead of being absolutely positioned,
+ * so each request's own duration always fills the track */
+.tl-track.fit { display: flex; align-items: center; height: 18px; }
+.tl-track.fit .tl-seg {
+  position: static;
+  top: auto;
+  height: 16px;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+}
+.tl-track.fit.live-edge { border-right: 2px solid var(--ink); }
+/* in-bar direct labels: only on segments wide enough to hold them.
+ * Ink is fixed black/white per fill (not a theme token) because the label sits
+ * ON the mark: black clears 4.5:1 on every categorical fill, but the queued
+ * neutral is dark enough that only white does (3.52 vs 5.52). */
+.tl-track.fit .tl-seg em {
+  font-style: normal;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  padding: 0 5px;
+  color: #000;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.tl-track.fit .tl-seg.q em { color: #fff; }
+/* 2px surface gap between touching segments (mark spec) */
+.tl-seg + .tl-seg { border-left: 2px solid var(--page); }
+.tl-seg.q   { background: var(--queued); }
+.tl-seg.pp  { background: var(--pp); }
+.tl-seg.gen { background: var(--gen); }
+.tl-seg.c0  { background: var(--cache-0); }
+.tl-seg.c1  { background: var(--cache-1); }
+.tl-seg.c2  { background: var(--cache-2); }
+.tl-seg.live-edge { border-right: 2px solid var(--ink); }
+
+.tl-row .meta {
+  width: var(--tl-meta-w, 120px);
+  flex: none;
+  text-align: right;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.tl-row .meta b { color: var(--ink-2); font-weight: 500; }
+
+/* expanded request detail */
+.tl-detail {
+  border-bottom: 1px solid var(--grid);
+  background: var(--surface);
+  border: 1px solid var(--ring);
+  border-radius: 6px;
+  margin: 4px 0 10px;
+  padding: 10px 12px;
+  font-size: 12px;
+}
+.tl-detail h3 { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 8px 0 4px; }
+.tl-detail h3:first-child { margin-top: 0; }
+.tl-detail .facts { display: flex; gap: 18px; flex-wrap: wrap; color: var(--ink-2); }
+.tl-detail .facts b { color: var(--ink); font-weight: 600; }
+.tl-detail .facts .u { color: var(--muted); }
+
+/* prompt composition bar: token spans on [0, n_prompt) */
+.tl-detail .warn-line {
+  margin: 8px 0 2px;
+  padding: 6px 8px;
+  border-left: 3px solid var(--warning);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.tl-detail .warn-line b { color: var(--warning); font-weight: 600; }
+
+/* per-request time composition (same marks as the token span bar below) */
+.phase-bar { display: flex; height: 14px; border-radius: 3px; overflow: hidden; margin: 4px 0 2px; background: var(--grid); }
+.phase-bar i { display: block; height: 100%; }
+.phase-bar i + i { border-left: 2px solid var(--surface); }
+.phase-bar .q { background: var(--queued); }
+.phase-bar .pp { background: var(--pp); }
+.phase-bar .gen { background: var(--gen); }
+.phase-bar .c0 { background: var(--cache-0); }
+.phase-bar .c1 { background: var(--cache-1); }
+.phase-bar .c2 { background: var(--cache-2); }
+.phase-list { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+.phase-list b { color: var(--ink-2); font-weight: 600; }
+.phase-list .swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+.phase-list .swatch.q { background: var(--queued); }
+.phase-list .swatch.pp { background: var(--pp); }
+.phase-list .swatch.gen { background: var(--gen); }
+.phase-list .swatch.c0 { background: var(--cache-0); }
+.phase-list .swatch.c1 { background: var(--cache-1); }
+.phase-list .swatch.c2 { background: var(--cache-2); }
+
+.span-bar { display: flex; height: 14px; border-radius: 3px; overflow: hidden; margin: 4px 0 2px; background: var(--baseline); }
+.span-bar i { display: block; height: 100%; }
+.span-bar i + i { border-left: 2px solid var(--surface); }
+.span-bar .c0 { background: var(--cache-0); }
+.span-bar .c1 { background: var(--cache-1); }
+.span-bar .c2 { background: var(--cache-2); }
+.span-bar .rc { background: var(--pp); }
+.span-list { color: var(--muted); line-height: 1.6; }
+.span-list .swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 5px; }
+.span-list b { color: var(--ink-2); font-weight: 500; }
+
+svg.mini { display: block; width: 100%; height: 40px; margin-top: 2px; }
+svg.mini .spark-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+svg.mini .spark-area { opacity: 0.10; }
+/* Ratio series: the LINE'S HEIGHT in a fixed 0–100 % box is the signal, so no
+ * area fill (a filled 86 % reads as a solid block rather than a level). The
+ * dashed rule marks 100 %. */
+svg.mini.cache-rate .spark-line { stroke: var(--cache-1); }
+svg.mini.cache-rate .spark-area { display: none; }
+.tiles .rate-frame {
+  position: relative;
+  margin-top: 4px;
+  border-top: 1px dashed var(--grid);
+}
+.tiles .rate-frame .cap {
+  position: absolute;
+  right: 0;
+  top: -1px;
+  font-size: 10px;
+  color: var(--muted);
+  background: var(--surface);
+  padding-left: 4px;
+}
+.tl-detail svg.mini { display: block; width: 100%; height: 40px; margin-top: 2px; }
+.tl-detail .spark-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.tl-detail .spark-area { opacity: 0.10; }
+.tl-detail .mini.pp .spark-line { stroke: var(--pp); }
+.tl-detail .mini.pp .spark-area { fill: var(--pp); }
+.tl-detail .mini.gen .spark-line { stroke: var(--gen); }
+.tl-detail .mini.gen .spark-area { fill: var(--gen); }
+
+/* ---- cache view ---- */
+
+.tier-bar { height: 8px; border-radius: 4px; background: var(--baseline); margin-top: auto; overflow: hidden; }
+.tier-bar i { display: block; height: 100%; border-radius: 4px; }
+.tier-bar.ram i  { background: var(--cache-1); }
+.tier-bar.disk i { background: var(--cache-2); }
+.tile.cache-rate .spark-line { stroke: var(--cache-1); fill: none; }
+.tile.cache-rate .spark-area { fill: var(--cache-1); opacity: 0.10; }
+.tile.cache-rate .spark-dot  { fill: var(--cache-1); stroke: var(--surface); }
+td .tier-tag { font-size: 11px; padding: 1px 6px; border-radius: 3px; color: var(--page); font-weight: 600; }
+td .tier-tag.ram  { background: var(--cache-1); }
+td .tier-tag.disk { background: var(--cache-2); }
+
 @media (max-width: 720px) {
   body { padding: 12px; }
   .model { max-width: 100%; }
   .bar { width: 60px; }
   #work th:nth-child(2), #work td:nth-child(2) { display: none; } /* lane column */
+  .tl-row .who { width: 130px; }
+  .tl-axis { margin-left: 130px; margin-right: 70px; }
+  .tl-row .meta { width: 70px; }
 }

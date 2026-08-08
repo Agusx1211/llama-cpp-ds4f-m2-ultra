@@ -421,6 +421,26 @@ bool ggml_metal_buffer_sparse_get_usage(
         ggml_metal_buffer_t buf,
         struct ggml_metal_sparse_usage * usage);
 
+// Largest number of distinct sparse pools a residency probe can span. The DSV4
+// decode batch touches one pool per memory family; the bound exists only so the
+// probe can order its locks on the stack without allocating.
+#define GGML_METAL_SPARSE_RESIDENT_MAX_POOLS 64
+
+// Cheap predicate for "this write needs no reservation at all". Returns 1 when
+// every page covered by the ranges is already mapped to a physical page that
+// this virtual mapping owns exclusively (v2p != UINT32_MAX and p_ref == 1), 0
+// when a reservation is required, and -1 on invalid input.
+//
+// A quote over such a range set yields new_pages = cow_pages = required_pages =
+// 0, and committing that reservation performs no mapping operation, no
+// generation bump, no COW copy and no net change to the pool's reserved-page
+// accounting. The probe is therefore an exact substitute for the full
+// quote/reserve/commit cycle in that case, and costs O(pages in ranges)
+// instead of O(virtual pages in the pool).
+int ggml_metal_buffers_sparse_ranges_resident(
+        const struct ggml_metal_sparse_buffer_range * ranges,
+        size_t n_ranges);
+
 enum ggml_metal_sparse_reservation_result ggml_metal_buffers_sparse_quote(
         const struct ggml_metal_sparse_buffer_range * ranges,
         size_t n_ranges,

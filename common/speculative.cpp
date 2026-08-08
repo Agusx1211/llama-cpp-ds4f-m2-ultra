@@ -37,6 +37,17 @@ static const bool SPEC_MTP_DIRECT_VERIFY_H_DISABLED = []() {
     return value != nullptr && value[0] == '1' && value[1] == '\0';
 }();
 
+// env: LLAMA_HOST_PROFILE=1 - per-step host-overhead attribution (see
+// src/llama-context.cpp). Emits spec-orchestration wall times as JSONL on
+// stderr with the same HOSTPROF prefix so one trace covers decode + spec.
+static bool spec_host_prof_enabled() {
+    static const bool en = []() {
+        const char * v = std::getenv("LLAMA_HOST_PROFILE");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return en;
+}
+
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
@@ -2870,8 +2881,16 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
         return result;
     }
 
+    const int64_t hp_t0 = spec_host_prof_enabled() ? ggml_time_us() : 0;
+
     for (auto & impl : spec->impls) {
         result = result && impl->process(batch);
+    }
+
+    if (spec_host_prof_enabled()) {
+        const int64_t t1 = ggml_time_us();
+        fprintf(stderr, "HOSTPROF {\"op\":\"spproc\",\"t\":%" PRId64 ",\"tot\":%" PRId64 ",\"n\":%d}\n",
+                t1, t1 - hp_t0, batch.n_tokens);
     }
 
     return result;
@@ -2912,6 +2931,8 @@ void common_speculative_draft(common_speculative * spec) {
 
     auto & dparams = spec->dparams;
 
+    int hp_n_drafting = 0;
+
     {
         int n_drafting = 0;
 
@@ -2926,7 +2947,11 @@ void common_speculative_draft(common_speculative * spec) {
         if (n_drafting == 0) {
             return;
         }
+
+        hp_n_drafting = n_drafting;
     }
+
+    const int64_t hp_t0 = spec_host_prof_enabled() ? ggml_time_us() : 0;
 
     for (auto & impl : spec->impls) {
         {
@@ -2984,12 +3009,20 @@ void common_speculative_draft(common_speculative * spec) {
             dp.drafting = false;
         }
     }
+
+    if (spec_host_prof_enabled()) {
+        const int64_t t1 = ggml_time_us();
+        fprintf(stderr, "HOSTPROF {\"op\":\"spdraft\",\"t\":%" PRId64 ",\"tot\":%" PRId64 ",\"nseq\":%d}\n",
+                t1, t1 - hp_t0, hp_n_drafting);
+    }
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     GGML_ASSERT(impl);
+
+    const int64_t hp_t0 = spec_host_prof_enabled() ? ggml_time_us() : 0;
 
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
@@ -3016,6 +3049,12 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         if (impl_other.get() != impl) {
             impl_other->accept(seq_id, n_accepted, true);
         }
+    }
+
+    if (spec_host_prof_enabled()) {
+        const int64_t t1 = ggml_time_us();
+        fprintf(stderr, "HOSTPROF {\"op\":\"spacc\",\"t\":%" PRId64 ",\"tot\":%" PRId64 ",\"nacc\":%d}\n",
+                t1, t1 - hp_t0, (int) n_accepted);
     }
 }
 

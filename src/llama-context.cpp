@@ -334,6 +334,15 @@ llama_context::llama_context(
         }
     }
 
+    {
+        const char * LLAMA_HOST_PROFILE = getenv("LLAMA_HOST_PROFILE");
+        hp_enabled = LLAMA_HOST_PROFILE && atoi(LLAMA_HOST_PROFILE) != 0;
+
+        if (hp_enabled) {
+            LLAMA_LOG_WARN("%s: host-overhead profiler enabled (LLAMA_HOST_PROFILE) - JSONL on stderr, prefix HOSTPROF\n", __func__);
+        }
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -811,7 +820,18 @@ void llama_context::synchronize() {
         return;
     }
 
-    ggml_backend_sched_synchronize(sched.get());
+    if (hp_enabled) {
+        const int64_t t0 = ggml_time_us();
+        ggml_backend_sched_synchronize(sched.get());
+        const int64_t t1 = ggml_time_us();
+        // only emit real waits; back-to-back synchronize calls return in ~1 us
+        if (t1 - t0 > 20) {
+            fprintf(stderr, "HOSTPROF {\"op\":\"sync\",\"c\":\"%p\",\"t\":%" PRId64 ",\"wait\":%" PRId64 "}\n",
+                    (void *) this, t1, t1 - t0);
+        }
+    } else {
+        ggml_backend_sched_synchronize(sched.get());
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1446,6 +1466,17 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    int64_t hp_t = hp_enabled ? ggml_time_us() : 0;
+    const auto hp_mark = [this, &hp_t](int64_t & acc) {
+        if (hp_enabled) {
+            const int64_t t = ggml_time_us();
+            acc += t - hp_t;
+            hp_t = t;
+        }
+    };
+
+    hp.n_ubatch++;
+
     if (mctx && !mctx->apply()) {
         mctx->finish(false);
         if (mctx->get_status() == LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE) {
@@ -1457,6 +1488,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    hp_mark(hp.apply);
+
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
@@ -1464,7 +1497,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    const bool hp_reused = !graph_reuse_disable && res->can_reuse(gparams);
+    hp_mark(hp.reuse_chk);
+
+    if (hp_reused) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1475,6 +1511,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        hp.n_reuse++;
     } else {
         res->reset();
 
@@ -1500,6 +1537,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             dsv4_amx->prepare_graph(gf, gparams.dsv4_amx_mode, true);
         }
 
+        hp_mark(hp.build);
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1508,6 +1547,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
             return nullptr;
         }
+
+        hp_mark(hp.alloc);
+    }
+
+    if (hp_enabled) {
+        hp_t = ggml_time_us(); // exclude the reuse-path synchronize above from set_inp
     }
 
     // set the input data for the input tensors
@@ -1520,7 +1565,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    hp_mark(hp.set_inp);
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    hp_mark(hp.gcomp);
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1559,6 +1609,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
     if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
+    }
+
+    const int64_t hp_t0 = hp_enabled ? ggml_time_us() : 0;
+    if (hp_enabled) {
+        hp.reset();
     }
 
     const uint32_t n_tokens = balloc->get_n_tokens();
@@ -1719,6 +1774,19 @@ int llama_context::encode(const llama_batch & batch_inp) {
                 cross.seq_ids_enc[i].insert(seq_id);
             }
         }
+    }
+
+    if (hp_enabled) {
+        const int64_t t1 = ggml_time_us();
+        fprintf(stderr,
+                "HOSTPROF {\"op\":\"enc\",\"c\":\"%p\",\"m\":\"%s\",\"t\":%" PRId64 ",\"tot\":%" PRId64
+                ",\"n\":%u,\"nub\":%d,\"reuse\":%d"
+                ",\"apply\":%" PRId64 ",\"chk\":%" PRId64 ",\"build\":%" PRId64
+                ",\"alloc\":%" PRId64 ",\"setinp\":%" PRId64 ",\"gcomp\":%" PRId64 "}\n",
+                (void *) this, llm_arch_name(model.arch), t1, t1 - hp_t0,
+                n_tokens, hp.n_ubatch, hp.n_reuse,
+                hp.apply, hp.reuse_chk, hp.build,
+                hp.alloc, hp.set_inp, hp.gcomp);
     }
 
     return 0;
@@ -1902,10 +1970,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    const int64_t hp_t0 = hp_enabled ? ggml_time_us() : 0;
+    int64_t hp_t = hp_t0;
+    const auto hp_mark = [this, &hp_t](int64_t & acc) {
+        if (hp_enabled) {
+            const int64_t t = ggml_time_us();
+            acc += t - hp_t;
+            hp_t = t;
+        }
+    };
+    if (hp_enabled) {
+        hp.reset();
+    }
+
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
+
+    hp_mark(hp.balloc);
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
@@ -1938,8 +2021,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     bool did_optimize = false;
 
+    if (hp_enabled) {
+        hp_t = ggml_time_us(); // exclude embd_seq sync + sched_reserve
+    }
+
     // handle any pending shifts/copies
     memory_update(false);
+
+    hp_mark(hp.mupd);
 
     llama_memory_context_ptr mctx;
 
@@ -1992,6 +2081,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
+    hp_mark(hp.mctx_init);
+
     // DSV4 reserves the physical pages for every logical ubatch here, before
     // output_reserve() invalidates the previous decode's observable outputs.
     // A pressure result therefore leaves outputs and logical sequence state
@@ -2007,11 +2098,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -2;
     }
 
+    hp_mark(hp.preflight);
+
     // reserve output buffer
     if (output_reserve(n_outputs_all, n_tokens_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+
+    hp_mark(hp.outres);
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
@@ -2039,6 +2134,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        if (hp_enabled) {
+            hp_t = ggml_time_us(); // extraction phase starts here
+        }
 
         if (!res) {
             if (mctx->get_status() == LLAMA_MEMORY_STATUS_KV_PHYSICAL_PRESSURE) {
@@ -2210,6 +2309,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+
+        hp_mark(hp.extract);
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -2264,6 +2365,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (hp_enabled) {
+        const int64_t t1 = ggml_time_us();
+        fprintf(stderr,
+                "HOSTPROF {\"op\":\"dec\",\"c\":\"%p\",\"m\":\"%s\",\"t\":%" PRId64 ",\"tot\":%" PRId64
+                ",\"n\":%u,\"no\":%u,\"nub\":%d,\"reuse\":%d"
+                ",\"balloc\":%" PRId64 ",\"mupd\":%" PRId64 ",\"mctx\":%" PRId64 ",\"pre\":%" PRId64
+                ",\"outres\":%" PRId64 ",\"apply\":%" PRId64 ",\"chk\":%" PRId64 ",\"build\":%" PRId64
+                ",\"alloc\":%" PRId64 ",\"setinp\":%" PRId64 ",\"gcomp\":%" PRId64 ",\"extr\":%" PRId64 "}\n",
+                (void *) this, llm_arch_name(model.arch), t1, t1 - hp_t0,
+                n_tokens_all, n_outputs_all, hp.n_ubatch, hp.n_reuse,
+                hp.balloc, hp.mupd, hp.mctx_init, hp.preflight,
+                hp.outres, hp.apply, hp.reuse_chk, hp.build,
+                hp.alloc, hp.set_inp, hp.gcomp, hp.extract);
+    }
 
     return 0;
 }
@@ -3299,6 +3415,8 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    const int64_t hp_ts = hp_enabled ? ggml_time_us() : 0;
+
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -3310,7 +3428,15 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         io->write(&io_magic, sizeof(io_magic));
         io->write(&seq_id, sizeof(seq_id));
 
-        return state_seq_write_data(*io, seq_id, flags);
+        const size_t ret = state_seq_write_data(*io, seq_id, flags);
+
+        if (hp_enabled) {
+            const int64_t t1 = ggml_time_us();
+            fprintf(stderr, "HOSTPROF {\"op\":\"ssg\",\"c\":\"%p\",\"t\":%" PRId64 ",\"tot\":%" PRId64 ",\"bytes\":%zu,\"flags\":%d}\n",
+                    (void *) this, t1, t1 - hp_ts, ret, (int) flags);
+        }
+
+        return ret;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
@@ -3318,6 +3444,8 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    const int64_t hp_ts = hp_enabled ? ggml_time_us() : 0;
+
     std::unique_ptr<llama_io_read_i> io;
     auto * dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
     llama_seq_id candidate_seq_id = seq_id;
@@ -3442,6 +3570,12 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
             }
         } else {
             published = true;
+        }
+
+        if (hp_enabled) {
+            const int64_t t1 = ggml_time_us();
+            fprintf(stderr, "HOSTPROF {\"op\":\"sss\",\"c\":\"%p\",\"t\":%" PRId64 ",\"tot\":%" PRId64 ",\"bytes\":%zu,\"flags\":%d}\n",
+                    (void *) this, t1, t1 - hp_ts, nread, (int) flags);
         }
 
         return nread;

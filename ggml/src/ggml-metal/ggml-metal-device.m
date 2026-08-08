@@ -3063,6 +3063,91 @@ bool ggml_metal_buffer_sparse_get_usage(
     return true;
 }
 
+int ggml_metal_buffers_sparse_ranges_resident(
+        const struct ggml_metal_sparse_buffer_range * ranges,
+        size_t n_ranges) {
+#if TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
+    if (@available(macOS 26.4, *)) {
+        if (ranges == NULL || n_ranges == 0) {
+            return -1;
+        }
+
+        // Collect the distinct pools in address order. ggml_metal_sparse_prepare
+        // sorts its entries the same way, so taking the locks in this order
+        // cannot deadlock against a concurrent reservation or move.
+        ggml_metal_buffer_t bufs[GGML_METAL_SPARSE_RESIDENT_MAX_POOLS];
+        size_t n_bufs = 0;
+        for (size_t i = 0; i < n_ranges; ++i) {
+            ggml_metal_buffer_t buf = ranges[i].buffer;
+            if (buf == NULL || !buf->is_sparse) {
+                return -1;
+            }
+            size_t j = 0;
+            while (j < n_bufs && (uintptr_t) bufs[j] < (uintptr_t) buf) {
+                ++j;
+            }
+            if (j < n_bufs && bufs[j] == buf) {
+                continue;
+            }
+            if (n_bufs == GGML_METAL_SPARSE_RESIDENT_MAX_POOLS) {
+                // Out of lock slots: report "needs a reservation" and let the
+                // caller take the general path.
+                return 0;
+            }
+            for (size_t k = n_bufs; k > j; --k) {
+                bufs[k] = bufs[k - 1];
+            }
+            bufs[j] = buf;
+            ++n_bufs;
+        }
+
+        for (size_t i = 0; i < n_bufs; ++i) {
+            [bufs[i]->sparse_lock lock];
+        }
+
+        int resident = 1;
+        for (size_t i = 0; i < n_ranges; ++i) {
+            ggml_metal_buffer_t buf = ranges[i].buffer;
+            const size_t size = ranges[i].size;
+            if (size == 0) {
+                continue;
+            }
+            const size_t offset = ranges[i].offset;
+            const size_t virtual_size = buf->sparse_n_virtual*buf->sparse_page_size;
+            if (offset > virtual_size || size > virtual_size - offset) {
+                resident = -1;
+                break;
+            }
+            const size_t v0 = offset/buf->sparse_page_size;
+            const size_t v1 = (offset + size - 1)/buf->sparse_page_size;
+            for (size_t v = v0; v <= v1; ++v) {
+                const uint32_t p = buf->sparse_v2p[v];
+                // p_ref != 1 covers both a page shared with another virtual
+                // mapping (COW required) and two pages of this same range set
+                // aliasing one physical page (also COW).
+                if (p == UINT32_MAX || p >= buf->sparse_n_physical ||
+                        buf->sparse_p_ref[p] != 1) {
+                    resident = 0;
+                    break;
+                }
+            }
+            if (resident != 1) {
+                break;
+            }
+        }
+
+        for (size_t i = 0; i < n_bufs; ++i) {
+            [bufs[i]->sparse_lock unlock];
+        }
+
+        return resident;
+    }
+#endif
+    GGML_UNUSED(ranges);
+    GGML_UNUSED(n_ranges);
+    return 0;
+}
+
 enum ggml_metal_sparse_reservation_result ggml_metal_buffers_sparse_quote(
         const struct ggml_metal_sparse_buffer_range * ranges,
         size_t n_ranges,
