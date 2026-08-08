@@ -210,12 +210,24 @@ void test_dispatch_permits_cover_selection_defer_and_caps() {
         require(permits.claimed[static_cast<size_t>(priority)] == cap && permits.total == cap,
                 "live lane ceiling is exact");
         require(capped.release_slot(bound[0].first, bound[0].second, 1001), "release first lane-cap request");
-        require(!capped.take_next(1002, 64).selected, "closed cohort rejects staggered same-lane refill");
+        // Elastic same-lane refill: a normal/low cohort that closed while at
+        // its ceiling reopens to its own lane as soon as one permit drains.
+        // (Previously the excess request waited for the WHOLE cohort to
+        // drain, which serialized turnover under sustained multi-agent load;
+        // the fast lane keeps its bounded epoch refill semantics.)
+        const dispatch_result refilled = capped.take_next(1002, 64);
+        require(refilled.selected, "elastic same-lane refill joins after one staggered release");
+        require(capped.bind_slot(refilled.request_id, bound[0].second, 1003), "bind refilled lane-cap request");
+        permits = capped.permits();
+        require(permits.claimed[static_cast<size_t>(priority)] == cap && permits.total == cap,
+                "elastic refill restores the exact lane ceiling");
+        require(!capped.take_next(1004, 64).selected, "refilled cohort still enforces the lane ceiling");
+        require(capped.release_slot(refilled.request_id, bound[0].second, 1005), "release refilled request");
         for (size_t i = 1; i < bound.size(); ++i) {
-            require(capped.release_slot(bound[i].first, bound[i].second, 1002 + i),
+            require(capped.release_slot(bound[i].first, bound[i].second, 1006 + i),
                     "drain remaining lane-cap request");
         }
-        require(capped.take_next(2000, 64).selected, "same-lane refill resumes after complete cohort drain");
+        require(capped.permits().total == 0, "lane-cap cohort drains without permit leaks");
     }
 
     request_runtime physical;
@@ -262,11 +274,16 @@ void test_bounded_same_fast_cohort_refill() {
     }
     require(ordinary.take_next(110, 2).request_id == 11 && ordinary.bind_slot(11, 0, 111) &&
                 ordinary.take_next(112, 2).request_id == 12 && ordinary.bind_slot(12, 1, 113) &&
-                ordinary.release_slot(11, 0, 114) && !ordinary.take_next(115, 2).selected,
-            "fast refill opt-in does not reopen an ordinary closed cohort");
-    require(ordinary.release_slot(12, 1, 116) && ordinary.cancel(13, 117) &&
+                ordinary.release_slot(11, 0, 114),
+            "stage ordinary cohort with one staggered release");
+    // The normal lane refills elastically on its own merit (not through the
+    // fast opt-in): the queued third request joins as soon as a permit
+    // drains below the cohort limit, instead of waiting for full drain.
+    require(ordinary.take_next(115, 2).request_id == 13 && ordinary.bind_slot(13, 0, 116),
+            "ordinary lane refills elastically after one staggered release");
+    require(ordinary.release_slot(12, 1, 117) && ordinary.release_slot(13, 0, 118) &&
                 ordinary.permits().total == 0 && ordinary.summary().active_requests == 0,
-            "ordinary closed cohort drains without leaks");
+            "ordinary refilled cohort drains without leaks");
 }
 
 void test_fast_refill_window_and_terminal_boundaries() {
