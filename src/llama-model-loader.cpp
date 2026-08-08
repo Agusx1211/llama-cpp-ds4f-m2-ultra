@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
+#include "llama-m2-layout.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -697,15 +698,14 @@ llama_model_loader::llama_model_loader(
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
-    // fork gate: gguf-m2 artifact layout version (see
+    // fork gate: gguf-m2 artifact layout (see src/llama-m2-layout.h and
     // notes/2026-08-07-gguf-m2-artifact-format-design.md). Fork-owned tensor
     // encodings may only be interpreted when the artifact declares the exact
-    // layout version this build implements. Silent reinterpretation of packed
-    // code bytes would produce plausible garbage, so both directions fail
-    // loudly. Stock GGUFs (no m2 types, no m2 key) are unaffected.
+    // layout version this build implements AND a layout description equal to
+    // the one this build's decode constants generate. Silent reinterpretation
+    // of packed code bytes would produce plausible garbage, so every direction
+    // fails loudly. Stock GGUFs (no m2 types, no m2 key) are unaffected.
     {
-        const uint32_t M2_LAYOUT_VERSION_SUPPORTED = 1;
-
         bool has_m2_types = false;
         for (const auto & it : weights_map) {
             const enum ggml_type t = it.second.tensor->type;
@@ -730,13 +730,35 @@ llama_model_loader::llama_model_loader(
                     gguf_type_name(gguf_get_kv_type(metadata, kid))));
             }
             const uint32_t ver = gguf_get_val_u32(metadata, kid);
-            if (ver != M2_LAYOUT_VERSION_SUPPORTED) {
+
+            // The version alone is a number somebody has to remember to bump.
+            // Validate the layout description as well — it is built out of the
+            // same constants the kernels decode with, so it cannot drift from
+            // the build silently — and the hash the converter derived from it.
+            // See src/llama-m2-layout.h.
+            auto get_str = [&](const char * key) -> const char * {
+                const int k = gguf_find_key(metadata, key);
+                if (k < 0) {
+                    return nullptr;
+                }
+                if (gguf_get_kv_type(metadata, k) != GGUF_TYPE_STRING) {
+                    throw std::runtime_error(format(
+                        "%s: '%s' has type %s, expected string", __func__, key,
+                        gguf_type_name(gguf_get_kv_type(metadata, k))));
+                }
+                return gguf_get_val_str(metadata, k);
+            };
+
+            const std::string err = llama_m2_layout::check(
+                    ver, get_str("m2.layout.description"), get_str("m2.layout.hash"));
+            if (!err.empty()) {
                 throw std::runtime_error(format(
-                    "%s: gguf-m2 artifact has m2.layout.version = %u but this build implements version %u exactly "
-                    "— rebuild or reconvert; refusing to load", __func__, ver, M2_LAYOUT_VERSION_SUPPORTED));
+                    "%s: gguf-m2 artifact layout gate: %s; refusing to load", __func__, err.c_str()));
             }
+
             LLAMA_LOG_INFO("%s: gguf-m2 artifact detected (m2.layout.version = %u, m2 tensor types %s)\n",
                     __func__, ver, has_m2_types ? "present" : "absent");
+            LLAMA_LOG_INFO("%s: gguf-m2 layout: %s\n", __func__, get_str("m2.layout.description"));
         }
 
         // MXFP4_M2 scale nibbles decode as E8M0 byte = MXFP4_M2_SCALE_BIAS +

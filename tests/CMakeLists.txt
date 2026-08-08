@@ -495,6 +495,8 @@ llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-m2-e4m3.cpp) # fork: gguf-m2 E4M3_M2 bit-exactness vs BF16 kernels
 llama_build_and_test(test-m2-mxfp4.cpp) # fork: gguf-m2 MXFP4_M2 bit-exactness vs MXFP4 kernels
 llama_build_and_test(test-m2-nf8.cpp) # fork: gguf-m2 NF8_M2 bit-exactness vs BF16 kernels (incl. escape blocks)
+llama_build_and_test(test-m2-layout-gate.cpp) # fork: gguf-m2 artifact layout gate (src/llama-m2-layout.h)
+target_include_directories(test-m2-layout-gate PRIVATE ${PROJECT_SOURCE_DIR}/src)
 if (UNIX)
     llama_build_and_test(test-dsv4-indexed-concat-contract.cpp)
 endif()
