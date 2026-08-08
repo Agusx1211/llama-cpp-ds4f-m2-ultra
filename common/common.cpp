@@ -1645,6 +1645,23 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 //
 // If tie_slots is ~0 the policy cannot matter; if it is a large fraction of
 // 512 the policy is a real modelling decision.
+//
+// Census v2 (lane indexer-zero-rows) additionally answers *what the zero rows
+// are*. The v1 census found the exact-zero group is exactly 512 rows wide at
+// two different pool sizes, which is structural rather than data-dependent.
+// v2 therefore also reports, per selection:
+//
+//   n_vis      index of the first -inf entry, i.e. the causal frontier the mask
+//              exposes (rows >= n_vis are padding and cannot be selected)
+//   zmin/zmax  first and last exact-zero index
+//   zruns      number of maximal contiguous runs of exact-zero indices
+//   zrun<i>    the first few runs, as first-last
+//   zseg       the logical->physical segment mapping of the zero runs, read
+//              straight out of the fused indexer node's segment_ids input;
+//              physical segment 0 is the pool's permanent all-zero segment
+//              (ZERO_SEGMENT in src/llama-dsv4-comp-pool.cpp)
+//   zk         how many sampled zero rows have an all-zero compressed K row
+//   zsel       how many of the 512 selected indices land in the zero group
 // ---------------------------------------------------------------------------
 
 static int  common_dsv4_topk_census_budget = 0;
@@ -1674,7 +1691,77 @@ static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * 
     const int64_t ne00 = s->ne[0];
     const int64_t ne01 = s->ne[1];
 
-    std::vector<float> row((size_t) ne00);
+    // The fused indexed path (ggml_dsv4_indexed_lightning_indexer) keeps the
+    // whole compressed pool and its logical->physical segment directory as
+    // inputs of the score node, so the census can resolve a logical row to the
+    // physical pool row the kernel actually read, without touching the KV cache
+    // implementation. src order is (q, k_pool, weights, mask, segment_ids).
+    const struct ggml_tensor * k_pool = nullptr;
+    const struct ggml_tensor * seg    = nullptr;
+    if (s->op == GGML_OP_LIGHTNING_INDEXER) {
+        k_pool = s->src[1];
+        seg    = s->src[4];
+    }
+
+    std::vector<int32_t> seg_ids;
+    if (seg != nullptr && seg->type == GGML_TYPE_I32) {
+        seg_ids.resize((size_t) ggml_nelements(seg));
+        ggml_backend_tensor_get(seg, seg_ids.data(), 0, seg_ids.size()*sizeof(int32_t));
+    }
+
+    // physical pool row of a logical row, mirroring
+    // lightning_indexer_physical_row() in ggml-metal.metal
+    const int64_t n_seg_per_stream = seg != nullptr ? seg->ne[0] : 0;
+    const auto physical_row = [&](int64_t logical, int64_t stream) -> int64_t {
+        if (seg_ids.empty()) {
+            return logical;
+        }
+        const int64_t l = logical/64;
+        if (l >= n_seg_per_stream) {
+            return -1;
+        }
+        const int32_t sid = seg_ids[(size_t) (stream*n_seg_per_stream + l)];
+        return sid >= 0 ? (int64_t) sid*64 + logical%64 : -1;
+    };
+    const auto segment_of = [&](int64_t logical, int64_t stream) -> int64_t {
+        if (seg_ids.empty()) {
+            return -2;
+        }
+        const int64_t l = logical/64;
+        if (l >= n_seg_per_stream) {
+            return -1;
+        }
+        return seg_ids[(size_t) (stream*n_seg_per_stream + l)];
+    };
+
+    // is the compressed K row for this logical row identically zero?
+    const int64_t k_ne0 = k_pool != nullptr ? k_pool->ne[0] : 0;
+    std::vector<uint8_t> krow;
+    const auto k_row_is_zero = [&](int64_t logical, int64_t stream) -> int {
+        if (k_pool == nullptr || k_pool->type != GGML_TYPE_F16 || k_ne0 <= 0) {
+            return -1;
+        }
+        const int64_t phys = physical_row(logical, stream);
+        if (phys < 0 || phys >= k_pool->ne[1]) {
+            return -1;
+        }
+        krow.resize((size_t) k_ne0*sizeof(ggml_fp16_t));
+        ggml_backend_tensor_get(k_pool, krow.data(), (size_t) phys*k_pool->nb[1], krow.size());
+        const ggml_fp16_t * h = (const ggml_fp16_t *) krow.data();
+        for (int64_t i = 0; i < k_ne0; ++i) {
+            if (ggml_fp16_to_fp32(h[i]) != 0.0f) {
+                return 0;
+            }
+        }
+        return 1;
+    };
+
+    // the census only fires on decode/verify shapes, where the graph carries a
+    // single stream per selection; ne[3] of the score tensor is that stream
+    const int64_t stream = 0;
+
+    std::vector<float>   row((size_t) ne00);
+    std::vector<int32_t> sel((size_t) t->ne[0]);
     for (int64_t r = 0; r < ne01; ++r) {
         ggml_backend_tensor_get(s, row.data(), (size_t) r*s->nb[1], (size_t) ne00*sizeof(float));
 
@@ -1683,12 +1770,66 @@ static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * 
         const float pivot = tmp[511];
 
         int64_t n_gt = 0, n_eq = 0, n_pos = 0, n_neg = 0, n_inf = 0;
+        int64_t n_vis = ne00;
+        int64_t zmin = -1, zmax = -1, zruns = 0;
+        std::vector<std::pair<int64_t, int64_t>> runs;   // exact-zero runs, [first,last]
+        bool in_run = false;
         for (int64_t i = 0; i < ne00; ++i) {
             const float v = row[(size_t) i];
             if      (v >  pivot) ++n_gt;
             else if (v == pivot) ++n_eq;
             if      (v >  0.0f)  ++n_pos;
             else if (v <  0.0f)  { ++n_neg; if (std::isinf(v)) ++n_inf; }
+            if (std::isinf(v) && v < 0.0f && n_vis == ne00) {
+                n_vis = i;
+            }
+            const bool z = (v == 0.0f);
+            if (z) {
+                if (zmin < 0) zmin = i;
+                zmax = i;
+                if (!in_run) { ++zruns; runs.emplace_back(i, i); in_run = true; }
+                else         { runs.back().second = i; }
+            } else {
+                in_run = false;
+            }
+        }
+
+        // how much of the 512-wide selection lands on exact-zero rows
+        int64_t zsel = -1;
+        if (t->type == GGML_TYPE_I32 && r < t->ne[1]) {
+            ggml_backend_tensor_get(t, sel.data(), (size_t) r*t->nb[1], (size_t) t->ne[0]*sizeof(int32_t));
+            zsel = 0;
+            for (int64_t i = 0; i < t->ne[0]; ++i) {
+                const int32_t idx = sel[(size_t) i];
+                if (idx >= 0 && idx < ne00 && row[(size_t) idx] == 0.0f) {
+                    ++zsel;
+                }
+            }
+        }
+
+        // sample the zero group: segment mapping and whether K is really zero
+        std::string zseg;
+        int64_t zk_zero = 0, zk_seen = 0;
+        {
+            char buf[64];
+            int64_t emitted = 0;
+            for (const auto & rn : runs) {
+                if (emitted >= 8) { zseg += ",..."; break; }
+                const int64_t s0 = segment_of(rn.first,  stream);
+                const int64_t s1 = segment_of(rn.second, stream);
+                snprintf(buf, sizeof(buf), "%s%lld-%lld:seg%lld-%lld",
+                        emitted ? "," : "",
+                        (long long) rn.first, (long long) rn.second,
+                        (long long) s0, (long long) s1);
+                zseg += buf;
+                ++emitted;
+            }
+            const int64_t probes[3] = { zmin, zmin >= 0 ? (zmin + zmax)/2 : -1, zmax };
+            for (int64_t p : probes) {
+                if (p < 0) continue;
+                const int z = k_row_is_zero(p, stream);
+                if (z >= 0) { ++zk_seen; zk_zero += z; }
+            }
         }
 
         // src is named lid_score_masked-<il> by llama_model_deepseek4::graph,
@@ -1697,10 +1838,16 @@ static bool common_dsv4_topk_census_cb(struct ggml_tensor * t, bool ask, void * 
         // every census line below is the target's.
         fprintf(stderr,
                 "TOPKCENSUS src=%s ne00=%lld ne01=%lld row=%lld pivot=%.9g "
-                "n_gt=%lld n_eq=%lld tie_slots=%lld n_pos=%lld n_neg=%lld n_inf=%lld\n",
+                "n_gt=%lld n_eq=%lld tie_slots=%lld n_pos=%lld n_neg=%lld n_inf=%lld "
+                "n_vis=%lld zmin=%lld zmax=%lld zruns=%lld zsel=%lld zk=%lld/%lld "
+                "npool=%lld nseg=%lld zseg=[%s]\n",
                 s->name, (long long) ne00, (long long) ne01, (long long) r, (double) pivot,
                 (long long) n_gt, (long long) n_eq, (long long) (512 - n_gt),
-                (long long) n_pos, (long long) n_neg, (long long) n_inf);
+                (long long) n_pos, (long long) n_neg, (long long) n_inf,
+                (long long) n_vis, (long long) zmin, (long long) zmax, (long long) zruns,
+                (long long) zsel, (long long) zk_zero, (long long) zk_seen,
+                (long long) (k_pool != nullptr ? k_pool->ne[1] : -1),
+                (long long) n_seg_per_stream, zseg.c_str());
     }
 
     ++common_dsv4_topk_census_seen;
