@@ -2593,6 +2593,53 @@ static void ggml_metal_sparse_submit(
     id<MTLHeap> heap = (id<MTLHeap>) buf->sparse_heap;
     id<MTLBuffer> metal = buf->buffers[0].metal;
 
+    // [TAG_SPARSE_WATCHDOG]
+    // Wait for the legacy queue to be idle before committing the bridge.
+    //
+    // The bridge below is a three-hop round trip: `before` signals the shared
+    // event on the legacy queue, the MTL4 queue waits for it, remaps tiles and
+    // signals back, and `after` waits for that second signal before running its
+    // zero-fill/COW blits. Every hop is a GPU-side wait, so the two legacy
+    // command buffers are alive from the moment they are committed until the
+    // whole round trip finishes.
+    //
+    // The host does not run in lockstep with the GPU: llama_decode() updates
+    // the KV memory - which is what calls this function - for chunk N+1 while
+    // chunk N's graph is still executing. A 2048-token DeepSeek V4 Flash
+    // prefill ubatch is *one* command buffer holding 5.5-6.2 s of GPU work
+    // (measured; that is simply what ~350 t/s prefill means at ub 2048), and
+    // this queue is serial. The bridge therefore could not start for ~6 s,
+    // which is past Metal's GPU watchdog: the driver killed it with
+    // kIOGPUCommandBufferCallbackErrorTimeout at exactly 5002.9 ms, and every
+    // later submission on the queue then reported
+    // kIOGPUCommandBufferCallbackErrorSubmissionsIgnored - the "command buffer
+    // failed with status 5" fault that killed target-only long prefills at a
+    // fixed 6144 tokens and the 2048-chunk-with-live-generators shape.
+    //
+    // Draining first costs the host the overlap between mapping/encoding chunk
+    // N+1 and executing chunk N (tens of ms against seconds of GPU work), and
+    // in exchange the bridge is always committed to an empty queue and runs in
+    // microseconds. It is a no-op during decode, where the caller has already
+    // synchronized to sample. Note that the bridge already forces this
+    // serialization on the GPU - the mapping must follow all earlier graph work
+    // - so nothing that used to overlap still does; the wait only moves to the
+    // host, where the watchdog does not apply.
+    // GGML_METAL_SPARSE_BRIDGE_DRAIN_DISABLE=1 restores the pre-fix behaviour.
+    // It exists to re-demonstrate the fault (and as a rollback lever), not as a
+    // supported configuration: without the drain, long prefills fault the GPU.
+    static int drain_disabled = -1;
+    if (drain_disabled < 0) {
+        const char * v = getenv("GGML_METAL_SPARSE_BRIDGE_DRAIN_DISABLE");
+        drain_disabled = (v != NULL && atoi(v) != 0) ? 1 : 0;
+        if (drain_disabled) {
+            GGML_LOG_WARN("%s: GGML_METAL_SPARSE_BRIDGE_DRAIN_DISABLE=1: the sparse mapping bridge will be committed behind in-flight graph work; long prefills are expected to fault the GPU watchdog\n", __func__);
+        }
+    }
+
+    if (!drain_disabled) {
+        ggml_metal_device_queue_drain(buf->dev);
+    }
+
     // Mapping changes must follow all earlier graph work and precede all later
     // graph work on the backend's legacy queue. Shared events bridge that queue
     // with the MTL4 queue that owns placement-sparse mapping operations.
