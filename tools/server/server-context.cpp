@@ -51,6 +51,36 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// env: LLAMA_SPEC_TRACE=1 - per-decode-step determinism trace (see the twin
+// seam in common/speculative.cpp). Hashes the *target* logits row that each
+// sampling decision reads, so two runs of the same request against the same
+// server state can be diffed down to the first step whose target output
+// differs. FNV-1a over the raw float bits: any bit change in the row changes
+// the hash. The hash costs one full read of a ~129k-float row (~0.5 MB) per
+// sampled token and is therefore strictly opt-in.
+static bool server_spec_trace_enabled() {
+    static const bool en = []() {
+        const char * v = std::getenv("LLAMA_SPEC_TRACE");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return en;
+}
+
+static uint64_t server_logits_row_hash(llama_context * ctx, int32_t idx, int32_t n_vocab) {
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    if (logits == nullptr) {
+        return 0;
+    }
+    uint64_t h = 1469598103934665603ull;
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &logits[i], sizeof(bits));
+        h ^= bits;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 // Exact-value benchmark control, captured once at process startup.
 static const bool SERVER_SPEC_SAMPLER_CLONE_OPT_DISABLED = []() {
     const char * env = std::getenv("LLAMA_SERVER_SPEC_SAMPLER_CLONE_OPT_DISABLE");
@@ -5770,6 +5800,13 @@ private:
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
 
+            if (server_spec_trace_enabled()) {
+                fprintf(stderr, "SPECTRACE tgt slot=%d n_dec=%d n_past=%d idx=%d id=%d h=%016" PRIx64 "\n",
+                        slot.id, slot.n_decoded, slot.prompt.n_tokens(), tok_idx, (int) id,
+                        server_logits_row_hash(slot.ctx_tgt, tok_idx,
+                                llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(slot.ctx_tgt)))));
+            }
+
             slot.i_batch = -1;
 
             common_sampler_accept(slot.smpl.get(), id, true);
@@ -5847,8 +5884,31 @@ private:
                         may_use_ckpt_tgt ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+
+                std::string trace_pre;
+                if (server_spec_trace_enabled()) {
+                    const int32_t n_vocab =
+                            llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(slot.ctx_tgt)));
+                    trace_pre = string_format("SPECTRACE ver slot=%d n_dec=%d n_past=%d n_draft=%zu h=[",
+                            slot.id, slot.n_decoded, slot.prompt.n_tokens(), n_draft);
+                    for (size_t i = 0; i < slot.spec_i_batch.size(); ++i) {
+                        trace_pre += string_format(i ? ",%016" PRIx64 : "%016" PRIx64,
+                                server_logits_row_hash(slot.ctx_tgt, slot.spec_i_batch[i], n_vocab));
+                    }
+                    trace_pre += "]";
+                }
+
                 auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
+
+                if (server_spec_trace_enabled()) {
+                    trace_pre += string_format(" acc=%zu ids=[", accepted.size());
+                    for (size_t i = 0; i < accepted.size(); ++i) {
+                        trace_pre += string_format(i ? ",%d" : "%d", (int) accepted[i]);
+                    }
+                    trace_pre += "]";
+                    fprintf(stderr, "%s\n", trace_pre.c_str());
+                }
 
                 GGML_ASSERT(accepted.size() >= 1);
 
