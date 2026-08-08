@@ -292,6 +292,70 @@ ggml_metal_device_t ggml_metal_device_get(int device);
 void * ggml_metal_device_get_obj  (ggml_metal_device_t dev); // id<MTLDevice>
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQueue>
 
+// [TAG_QUEUE_DRAIN]
+// Block until every command buffer previously submitted to the device's single
+// shared command queue has finished executing.
+//
+// ggml_metal_synchronize() is a *context*-level operation: it waits on the last
+// command buffer that one ggml_metal_t enqueued and status-checks the buffers
+// that context owns. Several producers submit to the same dev->mtl_queue
+// without ever passing through a context - the placement-sparse mapping
+// before/after pair with its zero-fill/COW blit, the residency-set dummy work,
+// the buffer set/get/clear blits, and any other ggml_metal_t that shares the
+// device. A context-level synchronize therefore cannot prove that the GPU is
+// idle, which matters whenever host memory backing a Metal buffer is about to
+// be released: graph command buffers are created with
+// commandBufferWithUnretainedReferences, so the driver holds no reference that
+// would keep a freed allocation alive.
+//
+// Command buffers on one MTLCommandQueue execute in enqueue/commit order, so
+// committing an empty command buffer and waiting for it drains everything that
+// was already submitted, whoever submitted it. This needs no enumeration of the
+// producers and stays correct when a new one is added.
+void ggml_metal_device_queue_drain(ggml_metal_device_t dev);
+
+// [TAG_CB_ERROR_SCAN]
+// GGML_METAL_CB_ERROR_INFO=1: create graph command buffers with
+// MTLCommandBufferErrorOptionEncoderExecutionStatus and push a debug group per
+// encoded node, so that a failed command buffer's NSError carries per-encoder
+// execution state and signposts naming the op that faulted. Opt-in: it adds
+// driver bookkeeping to every command buffer and a debug-group push/pop per
+// node.
+bool ggml_metal_cb_error_info_enabled(void);
+
+// [TAG_CB_ERROR_SCAN]
+// Inspect a command buffer that the GPU has finished with and, if it did not
+// complete, log a detailed report: origin, sequence number, status, NSError
+// domain/code/description, underlying error and (under
+// GGML_METAL_CB_ERROR_INFO=1) per-encoder execution state and signposts.
+// Returns true when the buffer completed successfully.
+//
+// `origin` must outlive the call (use a string literal). `seq` is the sequence
+// number returned by ggml_metal_cmd_buf_watch, or -1 when unknown.
+bool ggml_metal_cmd_buf_check(const char * origin, int idx, int64_t seq, ggml_metal_cmd_buf_t cmd_buf);
+
+// [TAG_CB_ERROR_SCAN]
+// Attach a completion handler that runs ggml_metal_cmd_buf_check as soon as the
+// GPU finishes with this buffer, and return the global submission sequence
+// number assigned to it.
+//
+// This is what makes a fault attributable. A single MTLCommandQueue is shared
+// by every ggml_metal_t on the device *and* by producers that belong to no
+// context at all - the placement-sparse mapping before/after pair, the
+// residency-set dummy work, the queue-drain barrier. Only some of those are
+// ever status-checked, and ggml_metal_graph_compute() replaces the previous
+// graph's command buffers without inspecting them when nothing synchronized in
+// between. When the GPU faults, every command buffer behind the culprit reports
+// kIOGPUCommandBufferCallbackErrorSubmissionsIgnored, so a fault whose culprit
+// is never inspected is indistinguishable from one with no culprit at all - the
+// state two investigations of the target-only prefill fault got stuck in.
+// Checking at completion time makes the first failure in *time* order visible
+// no matter who submitted it or whether anyone waits for it.
+int64_t ggml_metal_cmd_buf_watch(const char * origin, int idx, ggml_metal_cmd_buf_t cmd_buf);
+
+// Number of command buffer failures observed so far by ggml_metal_cmd_buf_check.
+int64_t ggml_metal_cmd_buf_n_failures(void);
+
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev);
 
 void ggml_metal_device_rsets_add(ggml_metal_device_t dev, ggml_metal_rset_t rset);

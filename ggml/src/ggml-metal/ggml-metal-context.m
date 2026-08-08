@@ -130,6 +130,9 @@ struct ggml_metal_encode_profile_segment {
 
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
+
+    // [TAG_CB_ERROR_SCAN] global submission sequence number of obj
+    int64_t seq;
 };
 
 struct ggml_metal {
@@ -709,6 +712,35 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
+// [TAG_CB_ERROR_SCAN]
+// Graph command buffers are normally created with unretained references (the
+// driver must not keep ggml's compute buffers alive behind ggml's back, and the
+// retain traffic is measurable). GGML_METAL_CB_ERROR_INFO=1 keeps that but adds
+// MTLCommandBufferErrorOptionEncoderExecutionStatus, which makes the driver
+// attach per-encoder execution status to the NSError of a failed command
+// buffer. That is the only way to learn *which* encoder faulted; it is opt-in
+// because it costs driver bookkeeping on every command buffer. The same flag
+// turns on the per-node debug groups in ggml_metal_op_encode(), so the reported
+// signposts name the op that was executing.
+static id<MTLCommandBuffer> ggml_metal_graph_cmd_buf_new(id<MTLCommandQueue> queue) {
+    if (ggml_metal_cb_error_info_enabled()) {
+        if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, visionOS 1.0, *)) {
+            MTLCommandBufferDescriptor * desc = [MTLCommandBufferDescriptor new];
+
+            desc.retainedReferences = NO;
+            desc.errorOptions       = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+
+            id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithDescriptor:desc];
+
+            [desc release];
+
+            return cmd_buf;
+        }
+    }
+
+    return [queue commandBufferWithUnretainedReferences];
+}
+
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
@@ -717,23 +749,31 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
     }
 
     // check status of all command buffers
+    // [TAG_CB_ERROR_SCAN] scan in *execution* order ([n_cb], [0], [1], ...) and
+    // never stop at the first failure, so the log names the culprit and not the
+    // buffers that merely inherited its error
     {
         const int n_cb = ctx->n_cb;
 
-        for (int cb_idx = 0; cb_idx <= n_cb; ++cb_idx) {
+        int n_failed = 0;
+
+        for (int exec_pos = 0; exec_pos <= n_cb; ++exec_pos) {
+            const int cb_idx = (exec_pos == 0) ? n_cb : (exec_pos - 1);
+
             id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
             if (!cmd_buf) {
                 continue;
             }
 
-            MTLCommandBufferStatus status = [cmd_buf status];
-            if (status != MTLCommandBufferStatusCompleted) {
-                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, cb_idx, (int) status);
-                if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
-                }
+            // the detailed report was already emitted by the completion
+            // handler installed in ggml_metal_graph_compute [TAG_CB_ERROR_SCAN]
+            if ([cmd_buf status] != MTLCommandBufferStatusCompleted) {
+                GGML_LOG_ERROR("%s: error: graph command buffer %d (execution position %d of %d, submission #%lld) did not complete%s\n",
+                        __func__, cb_idx, exec_pos, n_cb + 1, (long long) ctx->cmd_bufs[cb_idx].seq,
+                        n_failed == 0 ? " - first in execution order" : "");
+                n_failed++;
                 ctx->has_error = true;
-                return;
+                continue;
             }
 
             // Host-overhead profiler: the GPU timeline of the graph just
@@ -749,6 +789,10 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
                         [cmd_buf kernelStartTime], [cmd_buf kernelEndTime]);
             }
         }
+
+        if (n_failed > 0) {
+            GGML_LOG_ERROR("%s: error: %d of %d graph command buffers failed\n", __func__, n_failed, n_cb + 1);
+        }
     }
 
     // release any completed extra command buffers
@@ -756,21 +800,17 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
         for (size_t i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
             id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
 
-            MTLCommandBufferStatus status = [cmd_buf status];
-            if (status != MTLCommandBufferStatusCompleted) {
-                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
-                if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
-                }
+            // These are async set/get/cpy tensor blits and event signal/wait
+            // buffers. Each of them updates cmd_buf_last when it is submitted,
+            // so the wait above normally covers them - but a context that was
+            // synchronized once already has cmd_buf_last == nil, and a
+            // status-only check would then report a still-running buffer as a
+            // failure. Wait explicitly; it is free when they are done.
+            [cmd_buf waitUntilCompleted];
 
-                // release this and all remaining command buffers before returning
-                for (size_t j = i; j < ctx->cmd_bufs_ext.count; ++j) {
-                    [ctx->cmd_bufs_ext[j] release];
-                }
-                [ctx->cmd_bufs_ext removeAllObjects];
-
+            if ([cmd_buf status] != MTLCommandBufferStatusCompleted) {
+                GGML_LOG_ERROR("%s: error: extra command buffer %d did not complete\n", __func__, (int) i);
                 ctx->has_error = true;
-                return;
             }
 
             [cmd_buf release];
@@ -820,6 +860,9 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
                            size:size];
 
         [encoder endEncoding];
+
+        ggml_metal_cmd_buf_watch("set-tensor-async", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
+
         [cmd_buf commit];
         [buf_src release];
 
@@ -864,6 +907,9 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
                            size:size];
 
         [encoder endEncoding];
+
+        ggml_metal_cmd_buf_watch("get-tensor-async", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
+
         [cmd_buf commit];
         [buf_dst release];
 
@@ -903,6 +949,8 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 
         ggml_metal_event_t ev_cpy = ggml_metal_get_ev_cpy(ctx_src);
         ggml_metal_event_encode_signal(ev_cpy, cmd_buf);
+
+        ggml_metal_cmd_buf_watch("cpy-tensor-async", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
 
         [cmd_buf commit];
 
@@ -1031,13 +1079,17 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
         {
-            id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+            id<MTLCommandBuffer> cmd_buf = ggml_metal_graph_cmd_buf_new(queue);
             [cmd_buf retain];
 
             if (ctx->cmd_bufs[n_cb].obj) {
                 [ctx->cmd_bufs[n_cb].obj release];
             }
             ctx->cmd_bufs[n_cb].obj = cmd_buf;
+
+            // [TAG_CB_ERROR_SCAN] report a failure the moment the GPU reports
+            // it, even if nothing ever synchronizes on this buffer
+            ctx->cmd_bufs[n_cb].seq = ggml_metal_cmd_buf_watch("graph", n_cb, cmd_buf);
 
             [cmd_buf enqueue];
 
@@ -1054,13 +1106,16 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // prepare the rest of the command buffers asynchronously (optional)
         // cmd_buf[0.. n_cb)
         for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
-            id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+            id<MTLCommandBuffer> cmd_buf = ggml_metal_graph_cmd_buf_new(queue);
             [cmd_buf retain];
 
             if (ctx->cmd_bufs[cb_idx].obj) {
                 [ctx->cmd_bufs[cb_idx].obj release];
             }
             ctx->cmd_bufs[cb_idx].obj = cmd_buf;
+
+            // [TAG_CB_ERROR_SCAN]
+            ctx->cmd_bufs[cb_idx].seq = ggml_metal_cmd_buf_watch("graph", cb_idx, cmd_buf);
 
             // always enqueue the first two command buffers
             // enqueue all of the command buffers if we don't need to abort
@@ -1186,6 +1241,8 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
 
         ggml_metal_event_encode_signal(ev, cmd_buf);
 
+        ggml_metal_cmd_buf_watch("event-signal", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
+
         [cmd_buf commit];
 
         [ctx->cmd_bufs_ext addObject:cmd_buf];
@@ -1201,6 +1258,8 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
 
         ggml_metal_event_encode_wait(ev, cmd_buf);
+
+        ggml_metal_cmd_buf_watch("event-wait", 0, cmd_buf); // [TAG_CB_ERROR_SCAN]
 
         [cmd_buf commit];
 
