@@ -1383,16 +1383,42 @@ bool ggml_metal_cmd_buf_check(const char * origin, int idx, int64_t seq, ggml_me
 }
 
 // [TAG_CB_ERROR_SCAN] see ggml-metal-device.h
+// GGML_METAL_CB_TRACE=1: log every command buffer's origin, submission number,
+// host latency from watch to completion, and GPU start/end. This is how queue
+// depth becomes visible: a command buffer that waits seconds behind a
+// multi-second graph command buffer on the shared serial queue is killed by the
+// GPU watchdog (kIOGPUCommandBufferCallbackErrorTimeout).
+static bool ggml_metal_cb_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * v = getenv("GGML_METAL_CB_TRACE");
+        enabled = (v != NULL && atoi(v) != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 int64_t ggml_metal_cmd_buf_watch(const char * origin, int idx, ggml_metal_cmd_buf_t cmd_buf_raw) {
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
     if (cmd_buf == nil) {
         return -1;
     }
 
-    const int64_t seq = atomic_fetch_add_explicit(&g_cmd_buf_seq, 1, memory_order_relaxed);
+    const int64_t seq   = atomic_fetch_add_explicit(&g_cmd_buf_seq, 1, memory_order_relaxed);
+    const int64_t t_sub = ggml_time_us();
+    const bool    trace = ggml_metal_cb_trace_enabled();
 
     [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-        ggml_metal_cmd_buf_check(origin, idx, seq, cb);
+        const bool ok = ggml_metal_cmd_buf_check(origin, idx, seq, cb);
+
+        if (!ok || trace) {
+            const double gpu_start = [cb GPUStartTime];
+            const double gpu_end   = [cb GPUEndTime];
+
+            GGML_LOG_ERROR("ggml_metal_cmd_buf: %s %-16s #%-6lld idx %4d: host %8.1f ms from submit to completion, GPU %8.3f ms (start %.6f end %.6f)\n",
+                    ok ? "trace:" : "error:", origin, (long long) seq, idx,
+                    (ggml_time_us() - t_sub)/1000.0,
+                    (gpu_end - gpu_start)*1000.0, gpu_start, gpu_end);
+        }
     }];
 
     return seq;
