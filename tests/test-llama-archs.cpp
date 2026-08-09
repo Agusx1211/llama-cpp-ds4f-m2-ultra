@@ -2920,9 +2920,10 @@ static bool test_dsv4_aggregate_logical_rollback(size_t seed, ggml_backend_dev_t
             char pattern[] = "/tmp/llama-dsv4-segment-restore-XXXXXX";
             const char * root = ::mkdtemp(pattern);
             GGML_ASSERT(root != nullptr);
+            const std::filesystem::path canonical_root = std::filesystem::canonical(root);
             {
                 llama_dsv4_segment_store_config config;
-                config.root_path = root;
+                config.root_path = canonical_root.string();
                 llama_dsv4_segment_store store(config);
                 llama_dsv4_segment_identity identity;
                 identity.geometry_identity = state.identity;
@@ -2943,8 +2944,8 @@ static bool test_dsv4_aggregate_logical_rollback(size_t seed, ggml_backend_dev_t
                 const auto usage_before = memory->memory_usage_snapshot();
                 const auto missing_digest = published.manifest.segments.front().content_digest;
                 const std::filesystem::path missing_path =
-                        std::filesystem::path(root)/"chunks"/(llama_snapshot_digest_hex(missing_digest) + ".chunk");
-                const std::filesystem::path held_path = std::filesystem::path(root)/"held.chunk";
+                        canonical_root/"chunks"/(llama_snapshot_digest_hex(missing_digest) + ".chunk");
+                const std::filesystem::path held_path = canonical_root/"held.chunk";
                 std::filesystem::rename(missing_path, held_path);
                 const auto rejected = store.restore(published.manifest, identity, *memory, 1);
                 GGML_ASSERT(rejected.status == llama_dsv4_segment_status::missing_chunk);
@@ -2959,7 +2960,7 @@ static bool test_dsv4_aggregate_logical_rollback(size_t seed, ggml_backend_dev_t
                         restored.segments_read == published.manifest.segments.size());
             }
             std::error_code remove_error;
-            std::filesystem::remove_all(root, remove_error);
+            std::filesystem::remove_all(canonical_root, remove_error);
             GGML_ASSERT(!remove_error);
         } else {
             auto quote = memory->quote_logical_import(1, state);

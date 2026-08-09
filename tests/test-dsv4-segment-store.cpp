@@ -43,7 +43,11 @@ class temporary_directory {
         if (created == nullptr) {
             fail("mkdtemp failed: " + std::string(std::strerror(errno)));
         }
-        value = created;
+        // Darwin exposes /tmp as a symlink to /private/tmp. The store
+        // deliberately rejects symlinked path components, so hand it the
+        // canonical directory created by mkdtemp rather than the alias used
+        // to create it.
+        value = fs::canonical(created);
     }
 
     ~temporary_directory() {
