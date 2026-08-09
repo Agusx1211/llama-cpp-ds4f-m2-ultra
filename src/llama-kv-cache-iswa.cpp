@@ -731,8 +731,33 @@ void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
 
 llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
     [[maybe_unused]] auto resident_scope = lock_resident();
-    // the base cache is a superset of the SWA cache, so we can just check the SWA cache
-    return kv_swa->seq_pos_min(seq_id);
+
+    // The SWA ring can retain cells that are already masked at the current
+    // frontier. The sequence state codec omits those cells, so exposing their
+    // physical minimum would make pre-save coverage disagree with the restored
+    // state. Report the first visible position instead.
+    const llama_pos pos_min = kv_swa->seq_pos_min(seq_id);
+    const llama_pos pos_max = kv_swa->seq_pos_max(seq_id);
+    if (pos_min < 0 || pos_max < 0 || kv_swa->swa_type == LLAMA_SWA_TYPE_NONE) {
+        return pos_min;
+    }
+
+    GGML_ASSERT(kv_swa->n_swa > 0);
+    llama_pos visible_min = pos_min;
+    switch (kv_swa->swa_type) {
+        case LLAMA_SWA_TYPE_NONE:
+            break;
+        case LLAMA_SWA_TYPE_STANDARD:
+            visible_min = std::max(visible_min, pos_max - (llama_pos) kv_swa->n_swa + 1);
+            break;
+        case LLAMA_SWA_TYPE_CHUNKED:
+            visible_min = std::max(visible_min, (pos_max / (llama_pos) kv_swa->n_swa) * (llama_pos) kv_swa->n_swa);
+            break;
+        case LLAMA_SWA_TYPE_SYMMETRIC:
+            visible_min = std::max(visible_min, pos_max - (llama_pos) kv_swa->n_swa / 2);
+            break;
+    }
+    return visible_min;
 }
 
 llama_pos llama_kv_cache_iswa::seq_pos_max(llama_seq_id seq_id) const {

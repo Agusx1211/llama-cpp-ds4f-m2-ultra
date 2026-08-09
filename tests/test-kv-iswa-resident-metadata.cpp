@@ -1186,6 +1186,31 @@ void test_logical_sequence_staleness_and_empty_replacement() {
     assert(logical_state_equal(f.cache.export_logical_sequence(1), empty));
 }
 
+void test_state_round_trip_preserves_visible_swa_bounds() {
+    backend_scope backend;
+    cache_fixture source;
+    cache_fixture restored;
+
+    for (llama_pos pos = 0; pos < 8; ++pos) {
+        source.put_metadata(0, (uint32_t) pos, (uint32_t) pos, pos);
+    }
+
+    // n_swa is four, so positions [0, 3] are resident but masked at frontier
+    // seven. Sequence coverage must describe the same visible suffix that the
+    // state codec serializes, not those stale ring rows.
+    assert(source.cache.seq_pos_min(0) == 4);
+    assert(source.cache.seq_pos_max(0) == 7);
+
+    vector_writer writer;
+    source.cache.state_write(writer, 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+    vector_reader reader(writer.data);
+    restored.cache.state_read(reader, 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+
+    assert(reader.n_bytes() == writer.n_bytes());
+    assert(restored.cache.seq_pos_min(0) == source.cache.seq_pos_min(0));
+    assert(restored.cache.seq_pos_max(0) == source.cache.seq_pos_max(0));
+}
+
 void test_cross_thread_transaction_release_and_destruction() {
     backend_scope backend;
     cache_fixture f;
@@ -1254,6 +1279,7 @@ int main() {
     test_disabled_path_does_not_offer_residency();
     test_logical_sequence_prepared_replacement();
     test_logical_sequence_staleness_and_empty_replacement();
+    test_state_round_trip_preserves_visible_swa_bounds();
     test_cross_thread_transaction_release_and_destruction();
     assert(std::strcmp(llama_kv_iswa_resident_status_name(
             llama_kv_iswa_resident_status::resource_exhausted), "resource_exhausted") == 0);
