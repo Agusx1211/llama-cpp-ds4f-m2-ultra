@@ -159,7 +159,9 @@ static bool test_dsv4_multi_seq_rollback(const common_params & params, llama_mod
         cparams.n_ctx      = 512;
         cparams.n_batch    = 256;
         cparams.n_ubatch   = n_ubatch;
-        cparams.kv_unified = params.kv_unified;
+        // Always request the production four-lane layout. llama_context falls
+        // back to fixed split storage when elastic Metal pages are unavailable.
+        cparams.kv_unified = true;
         return llama_context_ptr(llama_init_from_model(model, cparams));
     };
 
@@ -197,7 +199,7 @@ static bool test_dsv4_multi_seq_rollback(const common_params & params, llama_mod
     }
     if (!dsv4_compare_replay_logits(
                 ctx_roll.get(), ctx_ref.get(), n_vocab, n_seqs*n_replay,
-                params.kv_unified ? "four-sequence requested-unified replay" : "four-sequence split replay")) {
+                "four-sequence requested-unified replay")) {
         return false;
     }
 
