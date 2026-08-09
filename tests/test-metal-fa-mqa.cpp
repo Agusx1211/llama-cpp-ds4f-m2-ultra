@@ -12,7 +12,7 @@
 //   csa2816   21 layers   2304 raw + 512 gathered, all of the gathered live
 //   hca2560   20 layers   2304 raw + a compressed tail (18k context)
 //   hca10496  20 layers   the same family at 1M context
-//   ver2816    verify     csa2816 with ne01 = 4 (speculative verification)
+//   ver{2..16} verify     csa2816 with fixed speculative-verification widths
 //
 // and reports, per arm:
 //
@@ -113,7 +113,13 @@ static const fa_geom g_geoms[] = {
     { "csa2816",  2816,  1, 1024, 128, 2304,  512, false },
     { "hca2560",  2560,  1, 1024, 128, 2304,  160, false },
     { "hca10496", 10496, 1, 1024, 128, 2304, 8192, true  },
+    { "ver2",     2816,  2, 1024, 128, 2304,  512, false },
+    { "ver3",     2816,  3, 1024, 128, 2304,  512, false },
     { "ver2816",  2816,  4, 1024, 128, 2304,  512, false },
+    { "ver6",     2816,  6, 1024, 128, 2304,  512, false },
+    { "ver8",     2816,  8, 1024, 128, 2304,  512, false },
+    { "ver12",    2816, 12, 1024, 128, 2304,  512, false },
+    { "ver16",    2816, 16, 1024, 128, 2304,  512, false },
 };
 
 static const int g_n_geoms = (int) (sizeof(g_geoms)/sizeof(g_geoms[0]));
