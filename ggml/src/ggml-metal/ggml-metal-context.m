@@ -25,8 +25,8 @@
 // ggml_metal_graph_compute - reported by llama_context as the "gcomp" phase -
 // into command-buffer setup, the main-thread node prefix encode, and the
 // dispatch_apply that encodes the remainder, and reports the GPU timeline of
-// each command buffer from ggml_metal_synchronize. See src/llama-context.cpp
-// for the record format.
+// each command buffer plus the last-buffer GPU-end -> host-return wake latency
+// from ggml_metal_synchronize. See src/llama-context.cpp for the record format.
 static bool ggml_metal_hp_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -744,7 +744,27 @@ static id<MTLCommandBuffer> ggml_metal_graph_cmd_buf_new(id<MTLCommandQueue> que
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
+        const bool hp = ggml_metal_hp_enabled();
+        const int64_t wait_start_us = hp ? ggml_time_us() : 0;
+
         [ctx->cmd_buf_last waitUntilCompleted];
+
+        // GPUEndTime is expressed in host-time seconds. Capture the host clock
+        // immediately after waitUntilCompleted returns, before status scans or
+        // profiler I/O, so `wake` isolates the GPU-complete -> host-return tail.
+        if (hp) {
+            const int64_t wait_return_us = ggml_time_us();
+            const double gpu_end_s = [ctx->cmd_buf_last GPUEndTime];
+            const int64_t gpu_end_us = gpu_end_s > 0.0 ? (int64_t) (gpu_end_s*1e6) : -1;
+
+            fprintf(stderr, "HOSTPROF {\"op\":\"cbw\",\"t\":%" PRId64
+                    ",\"wait\":%" PRId64 ",\"ge\":%.6f,\"wake\":%" PRId64
+                    ",\"status\":%lu}\n",
+                    wait_return_us, wait_return_us - wait_start_us, gpu_end_s,
+                    gpu_end_us >= 0 ? wait_return_us - gpu_end_us : -1,
+                    (unsigned long) [ctx->cmd_buf_last status]);
+        }
+
         ctx->cmd_buf_last = nil;
     }
 
