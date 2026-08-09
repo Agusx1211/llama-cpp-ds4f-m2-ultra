@@ -137,6 +137,10 @@ struct server_routes {
     // m2-dashboard v2: key-authenticated realtime feed + cache introspection
     server_http_context::handler_t get_dashboard_events;
     server_http_context::handler_t get_dashboard_cache_state;
+    // m2-dashboard v3: bounded request content, live token mirror, cache preview
+    server_http_context::handler_t get_dashboard_content;
+    server_http_context::handler_t get_dashboard_watch;
+    server_http_context::handler_t get_dashboard_cache_preview;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
     server_http_context::handler_t get_props;

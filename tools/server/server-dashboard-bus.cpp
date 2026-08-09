@@ -408,6 +408,13 @@ json cache_state_to_json(const cache_state & state, uint64_t now_us) {
         if (!entry.file.empty()) {
             row["file"] = entry.file;
         }
+        // v3, additive: does a text preview exist for this entry, and which
+        // request's save created it. The preview TEXT is never in this payload
+        // — it is fetched one entry at a time from /m2-dashboard/cache-preview.
+        row["preview"] = !entry.head_ids.empty();
+        if (entry.request_id != 0) {
+            row["req"] = entry.request_id;
+        }
         entries.push_back(std::move(row));
     }
 
@@ -465,6 +472,491 @@ std::shared_ptr<void> try_acquire_stream_lease() {
 
 size_t active_streams() {
     return g_active_streams.load();
+}
+
+// UTF-8 safe truncation -----------------------------------------------------
+
+// Longest prefix of `s` that is at most `max_bytes` long and does not end in
+// the middle of a multi-byte sequence.
+size_t utf8_prefix_len(const std::string & s, size_t max_bytes) {
+    if (s.size() <= max_bytes) {
+        return s.size();
+    }
+    size_t n = max_bytes;
+    // back off while the next byte is a continuation byte (10xxxxxx)
+    while (n > 0 && ((unsigned char) s[n] & 0xC0) == 0x80) {
+        --n;
+    }
+    return n;
+}
+
+// Start offset of the longest suffix of `s` that is at most `max_bytes` long
+// and begins on a code-point boundary.
+size_t utf8_suffix_start(const std::string & s, size_t max_bytes) {
+    if (s.size() <= max_bytes) {
+        return 0;
+    }
+    size_t start = s.size() - max_bytes;
+    while (start < s.size() && ((unsigned char) s[start] & 0xC0) == 0x80) {
+        ++start;
+    }
+    return start;
+}
+
+// content store -------------------------------------------------------------
+
+void content_store::set_enabled(bool enable) {
+    std::lock_guard<std::mutex> lock(mtx);
+    on = enable;
+    if (!enable) {
+        entries.clear();
+        order.clear();
+        tombstones.clear();
+        bytes_used = 0;
+    }
+}
+
+bool content_store::enabled() const {
+    std::lock_guard<std::mutex> lock(mtx);
+    return on;
+}
+
+void content_store::evict_locked() {
+    // A running request is the one thing that must survive FIFO pressure: a
+    // 45-minute agent turn is the OLDEST record on the box, so plain FIFO
+    // would evict the prompt of the request you are currently watching. The
+    // exemption is itself bounded — a hard ceiling at twice the nominal cap
+    // catches records that never reach a terminal state.
+    const bool hard = entries.size() > content_max_requests * 2;
+    size_t     skipped = 0;
+    while (order.size() > skipped &&
+           (entries.size() > content_max_requests || bytes_used > content_max_bytes)) {
+        const uint64_t oldest = order.front();
+        order.pop_front();
+        const auto it = entries.find(oldest);
+        if (it == entries.end()) {
+            continue;
+        }
+        if (!hard && !it->second.complete) {
+            order.push_back(oldest); // still generating: keep it, try the next
+            ++skipped;
+            continue;
+        }
+        bytes_used -= std::min(bytes_used, it->second.bytes());
+        entries.erase(it);
+        ++evicted;
+        // a small tombstone list lets the UI say "no longer retained" instead
+        // of "never seen" for a request the store actually held
+        tombstones.push_back(oldest);
+        if (tombstones.size() > content_max_requests * 4) {
+            tombstones.pop_front();
+        }
+    }
+}
+
+void content_store::capture_input(uint64_t req, int32_t slot, uint64_t n_tokens,
+                                  std::vector<int32_t> && head, std::vector<int32_t> && tail) {
+    if (req == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!on) {
+        return;
+    }
+    auto it = entries.find(req);
+    if (it == entries.end()) {
+        it = entries.emplace(req, request_content{}).first;
+        it->second.request_id = req;
+        order.push_back(req);
+    } else {
+        bytes_used -= std::min(bytes_used, it->second.bytes());
+    }
+    request_content & c = it->second;
+    c.slot      = slot;
+    c.at_us     = (uint64_t) ggml_time_us();
+    c.has_input = true;
+    c.in_tokens = n_tokens;
+    c.in_head   = std::move(head);
+    c.in_tail   = std::move(tail);
+    bytes_used += c.bytes();
+    evict_locked();
+}
+
+void content_store::capture_output(uint64_t req, int32_t slot, const std::string & text,
+                                   uint64_t n_tokens) {
+    if (req == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!on) {
+        return;
+    }
+    auto it = entries.find(req);
+    if (it == entries.end()) {
+        it = entries.emplace(req, request_content{}).first;
+        it->second.request_id = req;
+        order.push_back(req);
+    } else {
+        bytes_used -= std::min(bytes_used, it->second.bytes());
+    }
+    request_content & c = it->second;
+    c.slot       = slot;
+    c.at_us      = (uint64_t) ggml_time_us();
+    c.complete   = true;
+    c.has_output = true;
+    c.out_tokens = n_tokens;
+    c.out_bytes  = text.size();
+    c.out_head.assign(text, 0, utf8_prefix_len(text, content_out_head_bytes));
+    if (text.size() > c.out_head.size()) {
+        const size_t remaining = text.size() - c.out_head.size();
+        const size_t want      = std::min(remaining, content_out_tail_bytes);
+        size_t       start     = text.size() - want;
+        while (start < text.size() && ((unsigned char) text[start] & 0xC0) == 0x80) {
+            ++start;
+        }
+        if (start < c.out_head.size()) {
+            start = c.out_head.size();
+        }
+        c.out_tail.assign(text, start, text.size() - start);
+    } else {
+        c.out_tail.clear();
+    }
+    bytes_used += c.bytes();
+    evict_locked();
+}
+
+void content_store::mark_final(uint64_t req) {
+    std::lock_guard<std::mutex> lock(mtx);
+    const auto it = entries.find(req);
+    if (it == entries.end()) {
+        return;
+    }
+    // the request reached a terminal state (including cancel/stall, which never
+    // reach send_final_response): it stops being eviction-exempt
+    it->second.complete = true;
+    evict_locked();
+}
+
+bool content_store::lookup(uint64_t req, request_content & out) const {
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!on) {
+        return false;
+    }
+    const auto it = entries.find(req);
+    if (it == entries.end()) {
+        return false;
+    }
+    out = it->second;
+    return true;
+}
+
+content_stats content_store::usage() const {
+    std::lock_guard<std::mutex> lock(mtx);
+    content_stats st;
+    st.requests = entries.size();
+    st.bytes    = bytes_used;
+    st.evicted  = evicted;
+    return st;
+}
+
+bool content_store::was_evicted(uint64_t req) const {
+    std::lock_guard<std::mutex> lock(mtx);
+    return std::find(tombstones.begin(), tombstones.end(), req) != tombstones.end();
+}
+
+void content_store::clear() {
+    std::lock_guard<std::mutex> lock(mtx);
+    entries.clear();
+    order.clear();
+    tombstones.clear();
+    bytes_used = 0;
+    evicted    = 0;
+}
+
+content_store & content() {
+    static content_store store;
+    return store;
+}
+
+// live token mirror ---------------------------------------------------------
+
+namespace detail {
+std::atomic<uint32_t> watch_active{0};
+}
+
+int watch_registry::attach(uint64_t req) {
+    if (req == 0) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    for (size_t i = 0; i < maximum_watch_streams; ++i) {
+        if (slots[i].in_use) {
+            continue;
+        }
+        slots[i]          = slot_state{};
+        slots[i].in_use   = true;
+        slots[i].req      = req;
+        slots[i].replace  = true; // the first drain is authoritative, not a delta
+        detail::watch_active.fetch_add(1, std::memory_order_relaxed);
+        return (int) i;
+    }
+    return -1;
+}
+
+void watch_registry::detach(int lease) {
+    if (lease < 0 || (size_t) lease >= maximum_watch_streams) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!slots[lease].in_use) {
+        return;
+    }
+    slots[lease] = slot_state{};
+    detail::watch_active.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void watch_registry::sync(uint64_t req, int32_t slot_id, const std::string & generated,
+                          int32_t n_dec) {
+    std::lock_guard<std::mutex> lock(mtx);
+    for (auto & s : slots) {
+        if (!s.in_use || s.req != req) {
+            continue;
+        }
+        s.slot  = slot_id;
+        s.n_dec = n_dec;
+        if (generated.size() < s.mirrored) {
+            // the slot trimmed a stop word off its own tail: everything the
+            // reader has is now wrong, so hand it the whole current text
+            s.replace  = true;
+            s.pending  = generated;
+            s.mirrored = generated.size();
+            s.produced = generated.size();
+            s.start    = 0;
+        } else if (generated.size() > s.mirrored) {
+            if (s.pending.empty()) {
+                s.start = s.produced;
+            }
+            s.pending.append(generated, s.mirrored, generated.size() - s.mirrored);
+            s.produced += generated.size() - s.mirrored;
+            s.mirrored  = generated.size();
+        }
+        if (s.pending.size() > watch_mirror_bytes) {
+            // the reader is not keeping up. Keep the newest bytes and account
+            // for what was dropped rather than growing without bound. After a
+            // trim the reader cannot splice, so it is resynced with a replace.
+            const size_t start = utf8_suffix_start(s.pending, watch_mirror_bytes);
+            s.pending.erase(0, start);
+            s.dropped += start;
+            s.start   += start;
+            s.replace  = true;
+        }
+    }
+}
+
+void watch_registry::finish(uint64_t req, int32_t n_dec) {
+    std::lock_guard<std::mutex> lock(mtx);
+    for (auto & s : slots) {
+        if (s.in_use && s.req == req) {
+            s.ended = true;
+            if (n_dec > 0) {
+                s.n_dec = n_dec;
+            }
+        }
+    }
+}
+
+bool watch_registry::drain(int lease, watch_view & out) {
+    if (lease < 0 || (size_t) lease >= maximum_watch_streams) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    slot_state & s = slots[lease];
+    if (!s.in_use) {
+        return false;
+    }
+    out.req     = s.req;
+    out.slot    = s.slot;
+    out.n_dec   = s.n_dec;
+    out.cursor  = s.produced;
+    out.offset  = s.start;
+    out.dropped = s.dropped;
+    out.replace = s.replace;
+    out.ended   = s.ended;
+    out.text    = std::move(s.pending);
+    s.pending.clear();
+    s.start   = s.produced;
+    s.replace = false;
+    return true;
+}
+
+size_t watch_registry::active() const {
+    return detail::watch_active.load(std::memory_order_relaxed);
+}
+
+void watch_registry::reset() {
+    std::lock_guard<std::mutex> lock(mtx);
+    for (auto & s : slots) {
+        s = slot_state{};
+    }
+    detail::watch_active.store(0, std::memory_order_relaxed);
+}
+
+watch_registry & watches() {
+    static watch_registry registry;
+    return registry;
+}
+
+// content serialization -----------------------------------------------------
+
+static json content_caps_json() {
+    return {
+        { "in_head_tokens", content_in_head_tokens },
+        { "in_tail_tokens", content_in_tail_tokens },
+        { "out_head_bytes", content_out_head_bytes },
+        { "out_tail_bytes", content_out_tail_bytes },
+        { "max_requests", content_max_requests },
+        { "max_bytes", content_max_bytes },
+    };
+}
+
+static json content_stats_json(const content_stats & stats) {
+    return {
+        { "requests", stats.requests },
+        { "bytes", stats.bytes },
+        { "evicted", stats.evicted },
+    };
+}
+
+static json input_json(const request_content & c, const detokenizer & detok) {
+    const uint64_t shown = (uint64_t) (c.in_head.size() + c.in_tail.size());
+    return {
+        { "n_tokens", c.in_tokens },
+        { "head", detok(c.in_head) },
+        { "tail", detok(c.in_tail) },
+        { "head_tokens", c.in_head.size() },
+        { "tail_tokens", c.in_tail.size() },
+        { "elided_tokens", c.in_tokens > shown ? c.in_tokens - shown : 0 },
+        { "truncated", c.in_tokens > shown },
+    };
+}
+
+json content_to_json(uint64_t req, const request_content * found, const char * reason,
+                     const content_stats & stats, const detokenizer & detok) {
+    if (found == nullptr) {
+        return {
+            { "v", schema_version },
+            { "req", req },
+            { "found", false },
+            { "reason", reason ? reason : "absent" },
+            { "caps", content_caps_json() },
+            { "store", content_stats_json(stats) },
+        };
+    }
+
+    const request_content & c = *found;
+    json out = {
+        { "v", schema_version },
+        { "req", req },
+        { "found", true },
+        { "state", c.complete ? "final" : "live" },
+        { "slot", c.slot },
+        { "t_ms", c.at_us / 1000 + wall_offset_ms() },
+        { "caps", content_caps_json() },
+        { "store", content_stats_json(stats) },
+    };
+    out["input"] = c.has_input ? input_json(c, detok) : json(nullptr);
+    if (c.has_output) {
+        const uint64_t shown = (uint64_t) (c.out_head.size() + c.out_tail.size());
+        out["output"] = {
+            { "n_tokens", c.out_tokens },
+            { "n_bytes", c.out_bytes },
+            { "head", c.out_head },
+            { "tail", c.out_tail },
+            { "elided_bytes", c.out_bytes > shown ? c.out_bytes - shown : 0 },
+            { "truncated", c.out_bytes > shown },
+        };
+    } else {
+        out["output"] = nullptr;
+    }
+    return out;
+}
+
+json cache_preview_to_json(uint64_t id, const cache_entry_state * entry, uint64_t now_us,
+                           uint64_t snapshot_at_us, const detokenizer & detok) {
+    // "found" means "there is text to show": an entry with no retained tokens
+    // (the same thing cache-state reports as preview:false) is not previewable
+    if (entry == nullptr || entry->head_ids.empty()) {
+        return {
+            { "v", schema_version },
+            { "id", id },
+            { "found", false },
+        };
+    }
+    const uint64_t shown = (uint64_t) (entry->head_ids.size() + entry->tail_ids.size());
+    json out = {
+        { "v", schema_version },
+        { "id", id },
+        { "found", true },
+        { "tier", entry->on_disk ? "disk" : "ram" },
+        { "tokens", entry->tokens },
+        { "head", detok(entry->head_ids) },
+        { "tail", detok(entry->tail_ids) },
+        { "head_tokens", entry->head_ids.size() },
+        { "tail_tokens", entry->tail_ids.size() },
+        { "elided_tokens", entry->tokens > shown ? entry->tokens - shown : 0 },
+        { "truncated", entry->tokens > shown },
+        { "age_ms", now_us > snapshot_at_us ? (now_us - snapshot_at_us) / 1000 : 0 },
+    };
+    if (entry->request_id != 0) {
+        out["req"] = entry->request_id;
+    }
+    return out;
+}
+
+std::string make_watch_hello_frame(uint64_t req, const watch_view & view, const char * state,
+                                   const json & input) {
+    const json hello = {
+        { "v", schema_version },
+        { "k", "watch-hello" },
+        { "req", req },
+        { "slot", view.slot },
+        { "state", state },
+        { "n_dec", view.n_dec },
+        { "cursor", view.cursor },
+        { "text", view.text },
+        { "dropped", view.dropped },
+        { "input", input },
+        { "caps", { { "mirror_bytes", watch_mirror_bytes }, { "max_streams", maximum_watch_streams } } },
+    };
+    return "event: watch-hello\ndata: " + hello.dump() + "\n\n";
+}
+
+std::string make_watch_frame(const watch_view & view) {
+    // cursor: END offset for a delta, START offset for a rewind (see
+    // watch_view). `offset` carries the start offset unconditionally so a
+    // client never has to branch on the kind to know where `text` sits.
+    const json frame = {
+        { "v", schema_version },
+        { "k", view.replace ? "rewind" : "delta" },
+        { "req", view.req },
+        { "cursor", view.replace ? view.offset : view.cursor },
+        { "offset", view.offset },
+        { "text", view.text },
+        { "n_dec", view.n_dec },
+        { "dropped", view.dropped },
+    };
+    return "data: " + frame.dump() + "\n\n";
+}
+
+std::string make_watch_end_frame(uint64_t req, const char * reason, int32_t n_dec) {
+    const json frame = {
+        { "v", schema_version },
+        { "k", "end" },
+        { "req", req },
+        { "reason", reason },
+        { "n_dec", n_dec },
+    };
+    return "event: watch-end\ndata: " + frame.dump() + "\n\n";
 }
 
 }  // namespace server_dashboard

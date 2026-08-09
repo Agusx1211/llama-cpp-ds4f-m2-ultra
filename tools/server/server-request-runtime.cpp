@@ -886,6 +886,16 @@ bool request_runtime::finish(std::map<uint64_t, record>::iterator it,
         ev.a          = static_cast<int64_t>(terminal);
         server_dashboard::instance().emit(ev);
     }
+    // v3: close out any live /m2-dashboard/watch stream on this request, and
+    // let its retained content become evictable. A cancelled or stalled request
+    // never reaches send_final_response, so this is the only place that does
+    // either for those paths.
+    if (server_dashboard::watching()) {
+        server_dashboard::watches().finish(it->second.metadata.id, 0);
+    }
+    if (server_dashboard::content().enabled()) {
+        server_dashboard::content().mark_final(it->second.metadata.id);
+    }
     release_permit(it->second);
     records.erase(it);
     return true;

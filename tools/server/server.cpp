@@ -164,6 +164,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
         params.model_alias.insert(model_name);
     }
 
+    // m2-dashboard v3: arm (or disarm) the bounded content store before any
+    // request can reach a capture site. Router mode never captures — it holds
+    // no slots and forbids the dashboard routes outright.
+    server_dashboard::content().set_enabled(params.dashboard_content && !is_router_server);
+
     // note: this is guaranteed to out-live ctx_http and tools
     server_mcp mcp_mgr;
 
@@ -248,6 +253,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_admin_dashboard_control = router_admin_forbidden;
         routes.get_dashboard_events         = router_admin_forbidden;
         routes.get_dashboard_cache_state    = router_admin_forbidden;
+        routes.get_dashboard_content        = router_admin_forbidden;
+        routes.get_dashboard_watch          = router_admin_forbidden;
+        routes.get_dashboard_cache_preview  = router_admin_forbidden;
 
         ctx_http.post("/models",               ex_wrapper(models_routes->post_router_models));
         ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
@@ -266,6 +274,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post(server_admin_dashboard::control_path,  ex_wrapper(routes.post_admin_dashboard_control));
     ctx_http.get (server_dashboard::events_path,         ex_wrapper(routes.get_dashboard_events));
     ctx_http.get (server_dashboard::cache_state_path,    ex_wrapper(routes.get_dashboard_cache_state));
+    ctx_http.get (server_dashboard::content_path,        ex_wrapper(routes.get_dashboard_content));
+    ctx_http.get (server_dashboard::watch_path,          ex_wrapper(routes.get_dashboard_watch));
+    ctx_http.get (server_dashboard::cache_preview_path,  ex_wrapper(routes.get_dashboard_cache_preview));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models)); // public endpoint (no API key check)

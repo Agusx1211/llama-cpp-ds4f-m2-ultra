@@ -629,6 +629,13 @@ struct common_params {
     std::string cache_disk           = "";  // SSD tier directory for the prompt cache ("" = disabled)
     int32_t     cache_disk_limit_gib = 256; // -1 = no limit
 
+    // m2-dashboard v3: bounded retention of request content (prompt head/tail
+    // token ids + capped generated text) behind /m2-dashboard/content,
+    // /m2-dashboard/watch and /m2-dashboard/cache-preview. Caps live in
+    // tools/server/server-dashboard-bus.h. --no-dashboard-content turns the
+    // capture off entirely: the store stays empty and all three routes 501.
+    bool dashboard_content = true;
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
