@@ -20,6 +20,8 @@
 #endif
 
 #include "server-task.h"
+#include "speculative.h"
+#include "mtmd.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -119,6 +121,15 @@ struct entry_spec {
     int    seed     = 1;
 };
 
+server_prompt_restore_domain restore_domain(
+        llama_pos pos_min,
+        llama_pos pos_max,
+        uint32_t rollback_tokens,
+        uint32_t swa_tokens = 0,
+        bool rollback_bounded = true) {
+    return { pos_min, pos_max, rollback_tokens, swa_tokens, rollback_bounded };
+}
+
 server_prompt_cache_state make_state(const entry_spec & spec) {
     server_prompt_cache_state state;
 
@@ -137,6 +148,16 @@ server_prompt_cache_state make_state(const entry_spec & spec) {
         ckpt.data_spec = i == 0 ? std::vector<uint8_t>() : make_blob(32, (uint8_t) (0x50 + i));
         state.prompt.checkpoints.push_back(std::move(ckpt));
     }
+
+    const llama_pos frontier = (llama_pos) spec.n_tokens - 2;
+    const auto target = restore_domain(frontier, frontier, 5, 7);
+    const auto draft  = restore_domain(frontier, frontier, 5, 11);
+    state.coverage = server_prompt_build_restore_coverage(
+            state.prompt,
+            spec.n_drft > 0 ? server_prompt_restore_scope::target_and_draft
+                            : server_prompt_restore_scope::target_only,
+            target,
+            spec.n_drft > 0 ? draft : server_prompt_restore_domain {});
 
     return state;
 }
@@ -173,6 +194,23 @@ void reseal(std::vector<uint8_t> & file, pcache_disk_header hdr) {
     memcpy(file.data(), &hdr, sizeof(hdr));
 }
 
+uint64_t coverage_hash_of(const std::vector<uint8_t> & file, const pcache_disk_header & hdr) {
+    require(hdr.size_coverage == sizeof(pcache_disk_coverage) +
+            hdr.n_checkpoints*sizeof(pcache_disk_checkpoint_coverage),
+            "fixture has an invalid coverage size");
+    require(sizeof(pcache_disk_header) + hdr.size_coverage <= file.size(),
+            "fixture coverage is truncated");
+
+    const uint8_t * data = file.data() + sizeof(pcache_disk_header);
+    uint64_t hash = server_pcache_hash(data, sizeof(pcache_disk_coverage), 0);
+    data += sizeof(pcache_disk_coverage);
+    for (uint64_t i = 0; i < hdr.n_checkpoints; ++i) {
+        hash = server_pcache_hash(data, sizeof(pcache_disk_checkpoint_coverage), hash);
+        data += sizeof(pcache_disk_checkpoint_coverage);
+    }
+    return hash;
+}
+
 //
 // tests
 //
@@ -190,6 +228,10 @@ void test_round_trip() {
     spec.n_ckpt   = 3;
 
     const server_prompt_cache_state expected = make_state(spec);
+    const auto expected_plan = server_prompt_make_restore_plan(
+            expected.coverage, expected.prompt.tokens, 25, 25);
+    require(expected_plan.kind == server_prompt_restore_kind::checkpoint,
+            "round-trip fixture does not exercise checkpoint coverage");
 
     const std::string file = spill_one(dir.path, spec);
     require(std::filesystem::exists(file), "spilled file does not exist");
@@ -204,12 +246,32 @@ void test_round_trip() {
     require(state.on_disk(), "restored entry is not marked on-disk");
     require(state.prompt.tokens.get_tokens() == expected.prompt.tokens.get_tokens(), "restored tokens differ");
     require(state.prompt.checkpoints.empty(), "rescan must not load checkpoints into RAM");
+    require(state.coverage.scope == expected.coverage.scope, "rescan lost the restore scope");
+    require(state.coverage.target.pos_min == expected.coverage.target.pos_min &&
+            state.coverage.target.pos_max == expected.coverage.target.pos_max,
+            "rescan changed the target frontier summary");
+    require(state.coverage.target.swa_tokens == 7 && state.coverage.draft.swa_tokens == 11,
+            "rescan changed target/draft SWA coverage");
+    require(state.coverage.checkpoints.size() == expected.coverage.checkpoints.size(),
+            "rescan did not index checkpoint coverage");
+    const auto indexed_plan = server_prompt_make_restore_plan(
+            state.coverage, state.prompt.tokens, 25, 25);
+    require(indexed_plan.kind == expected_plan.kind &&
+            indexed_plan.effective_tokens == expected_plan.effective_tokens &&
+            indexed_plan.checkpoint_index == expected_plan.checkpoint_index,
+            "startup coverage screening changed the restore/admission plan");
 
     require(cache.load_from_disk(state), "load_from_disk rejected a healthy file");
 
     require(state.data.main == expected.data.main, "target state blob differs after reload");
     require(state.data.drft == expected.data.drft, "draft state blob differs after reload");
     require(state.prompt.checkpoints.size() == expected.prompt.checkpoints.size(), "checkpoint count differs after reload");
+    const auto loaded_plan = server_prompt_make_restore_plan(
+            state.coverage, state.prompt.tokens, 25, 25);
+    require(loaded_plan.kind == indexed_plan.kind &&
+            loaded_plan.effective_tokens == indexed_plan.effective_tokens &&
+            loaded_plan.checkpoint_index == indexed_plan.checkpoint_index,
+            "full payload load changed the screened restore plan");
 
     auto it_a = state.prompt.checkpoints.begin();
     auto it_b = expected.prompt.checkpoints.begin();
@@ -257,6 +319,348 @@ void test_tiering_preserved() {
     require(!std::filesystem::exists(file), "drop_entry left the file behind");
 
     printf("  ok: RAM->SSD spill, disk accounting and drop-unlink still behave\n");
+}
+
+server_prompt make_prompt(size_t n_tokens, int seed) {
+    server_prompt prompt;
+    prompt.tokens = server_tokens(make_tokens(n_tokens, seed), false);
+    return prompt;
+}
+
+void add_checkpoint(
+        server_prompt & prompt,
+        int64_t n_tokens,
+        llama_pos pos_min,
+        llama_pos pos_max,
+        bool paired = false,
+        bool speculative = false) {
+    common_prompt_checkpoint checkpoint = {};
+    checkpoint.n_tokens = n_tokens;
+    checkpoint.pos_min  = pos_min;
+    checkpoint.pos_max  = pos_max;
+    checkpoint.data_tgt = make_blob(64, 0x61);
+    if (paired) {
+        checkpoint.data_dft = make_blob(32, 0x71);
+    }
+    if (speculative) {
+        checkpoint.data_spec = make_blob(16, 0x81);
+    }
+    prompt.checkpoints.push_back(std::move(checkpoint));
+}
+
+server_prompt_restore_coverage coverage_for(
+        const server_prompt & prompt,
+        llama_pos pos_min,
+        llama_pos pos_max,
+        uint32_t rollback_tokens = 5,
+        server_prompt_restore_scope scope = server_prompt_restore_scope::target_only) {
+    const bool paired = scope == server_prompt_restore_scope::target_and_draft;
+    const auto target = restore_domain(pos_min, pos_max, rollback_tokens, 0, true);
+    return server_prompt_build_restore_coverage(
+            prompt,
+            scope,
+            target,
+            paired ? target : server_prompt_restore_domain {});
+}
+
+void test_restore_planner_boundaries_and_rollback() {
+    // Full-match direct reuse consumes one token for [TAG_PROMPT_LOGITS].
+    server_prompt exact = make_prompt(64, 11);
+    auto exact_coverage = coverage_for(exact, 62, 62, 5);
+    auto plan = server_prompt_make_restore_plan(exact_coverage, exact.tokens, 64, 64);
+    require(plan.kind == server_prompt_restore_kind::direct, "full match was not directly restorable");
+    require(plan.full_match && plan.effective_tokens == 63 && plan.recompute_tokens == 1,
+            "full-match last-token adjustment is wrong");
+
+    // Equality at the threshold is intentionally not enough: a checkpoint at
+    // threshold-1 is the first one that guarantees at least one token of work.
+    server_prompt boundary_bad = make_prompt(96, 12);
+    add_checkpoint(boundary_bad, 64, 63, 63);
+    auto bad_coverage = coverage_for(boundary_bad, 94, 94, 5);
+    plan = server_prompt_make_restore_plan(bad_coverage, boundary_bad.tokens, 64, 64);
+    require(plan.kind == server_prompt_restore_kind::unusable,
+            "checkpoint at the strict full-match threshold was admitted");
+
+    server_prompt boundary_good = make_prompt(96, 12);
+    add_checkpoint(boundary_good, 63, 62, 62);
+    auto good_coverage = coverage_for(boundary_good, 94, 94, 5);
+    plan = server_prompt_make_restore_plan(good_coverage, boundary_good.tokens, 64, 64);
+    require(plan.kind == server_prompt_restore_kind::checkpoint && plan.effective_tokens == 63 &&
+            plan.recompute_tokens == 1,
+            "checkpoint immediately below the threshold did not land exactly");
+
+    // Bounded recurrent rollback: the inclusive edge is valid, one token past
+    // it is unusable in the absence of a covering checkpoint.
+    server_prompt rollback = make_prompt(100, 13);
+    auto rollback_coverage = coverage_for(rollback, 90, 98, 4);
+    plan = server_prompt_make_restore_plan(rollback_coverage, rollback.tokens, 95, 97);
+    require(plan.kind == server_prompt_restore_kind::direct && plan.effective_tokens == 95,
+            "rollback depth edge was rejected");
+    plan = server_prompt_make_restore_plan(rollback_coverage, rollback.tokens, 94, 97);
+    require(plan.kind == server_prompt_restore_kind::unusable,
+            "rollback beyond the represented depth was admitted");
+
+    auto no_rollback_coverage = server_prompt_build_restore_coverage(
+            rollback,
+            server_prompt_restore_scope::target_only,
+            restore_domain(90, 98, 0));
+    plan = server_prompt_make_restore_plan(no_rollback_coverage, rollback.tokens, 99, 100);
+    require(plan.kind == server_prompt_restore_kind::direct && plan.effective_tokens == 99,
+            "zero-depth bounded state rejected an exact frontier");
+    plan = server_prompt_make_restore_plan(no_rollback_coverage, rollback.tokens, 98, 100);
+    require(plan.kind == server_prompt_restore_kind::unusable,
+            "zero-depth bounded state admitted a one-token rollback");
+
+    // A generated prompt commonly contains one sampled token beyond the state
+    // frontier. When that whole token vector is an LCP of a longer request,
+    // it is not a full request match, but the pending token still has to be
+    // evaluated. The frontier, not source_tokens.size(), caps direct reuse.
+    server_prompt pending = make_prompt(100, 14);
+    auto pending_coverage = coverage_for(pending, 98, 98, 4);
+    plan = server_prompt_make_restore_plan(pending_coverage, pending.tokens, 100, 104);
+    require(plan.kind == server_prompt_restore_kind::direct &&
+            plan.effective_tokens == 99 && plan.recompute_tokens == 1 && plan.pos_next == 99,
+            "undecoded final token was claimed as represented state");
+
+    auto complete_coverage = coverage_for(pending, 99, 99, 4);
+    plan = server_prompt_make_restore_plan(complete_coverage, pending.tokens, 100, 104);
+    require(plan.kind == server_prompt_restore_kind::direct &&
+            plan.effective_tokens == 100 && plan.recompute_tokens == 0,
+            "fully represented divergent prefix was truncated");
+
+    auto impossible_coverage = complete_coverage;
+    impossible_coverage.target.pos_min = 100;
+    impossible_coverage.target.pos_max = 100;
+    require(!server_prompt_restore_coverage_is_valid(impossible_coverage, pending.tokens),
+            "frontier beyond the source position domain was accepted");
+
+    printf("  ok: boundaries, pending-token cap, full-match adjustment and rollback edges are exact\n");
+}
+
+void test_paired_unequal_swa_thresholds() {
+    const server_prompt prompt = make_prompt(100, 15);
+
+    // Both models represent state through token 98, but their different SWA
+    // widths retain different minima. This is a valid paired frontier.
+    auto coverage = server_prompt_build_restore_coverage(
+            prompt,
+            server_prompt_restore_scope::target_and_draft,
+            restore_domain(60, 98, 32, 10),
+            restore_domain(40, 98, 32, 30));
+    require(server_prompt_restore_coverage_is_valid(coverage, prompt.tokens),
+            "paired coverage rejected unequal SWA minima at one decoded frontier");
+    auto plan = server_prompt_make_restore_plan(coverage, prompt.tokens, 80, 90);
+    require(plan.kind == server_prompt_restore_kind::direct && plan.effective_tokens == 80 &&
+            plan.target_pos_threshold == 70 && plan.draft_pos_threshold == 50,
+            "paired direct reuse did not apply independent SWA thresholds");
+
+    // Reusing the target's narrower-SWA threshold for the draft would be a
+    // false positive here: draft pos_min 60 does not cover its threshold 50.
+    coverage = server_prompt_build_restore_coverage(
+            prompt,
+            server_prompt_restore_scope::target_and_draft,
+            restore_domain(60, 98, 32, 10),
+            restore_domain(60, 98, 32, 30));
+    plan = server_prompt_make_restore_plan(coverage, prompt.tokens, 80, 90);
+    require(plan.kind == server_prompt_restore_kind::unusable,
+            "target SWA threshold falsely qualified the draft domain");
+
+    // Reusing the target's wider-SWA threshold for the draft would be a false
+    // negative here: the draft has its own narrower window and covers 70.
+    coverage = server_prompt_build_restore_coverage(
+            prompt,
+            server_prompt_restore_scope::target_and_draft,
+            restore_domain(40, 98, 32, 30),
+            restore_domain(60, 98, 32, 10));
+    plan = server_prompt_make_restore_plan(coverage, prompt.tokens, 80, 90);
+    require(plan.kind == server_prompt_restore_kind::direct && plan.effective_tokens == 80,
+            "target SWA threshold falsely rejected the draft domain");
+
+    printf("  ok: paired target/draft restores use independent SWA thresholds\n");
+}
+
+server_prompt make_mrope_prompt() {
+    mtmd::input_chunks fixtures(mtmd_test_create_input_chunks());
+    require(fixtures.size() >= 2, "mtmd test fixture has no image chunk");
+
+    const mtmd_input_chunk * image = fixtures[1];
+    size_t serialized_size = 0;
+    require(mtmd_input_chunk_save(image, nullptr, 0, &serialized_size) == 0 && serialized_size > 64,
+            "failed to size serialized image chunk");
+
+    std::vector<char> serialized(serialized_size);
+    require(mtmd_input_chunk_save(image, serialized.data(), serialized.size(), nullptr) == 0,
+            "failed to serialize image chunk");
+
+    // Serialized test fixture layout: version, chunk type, empty text-token
+    // count, has-image flag, nx, ny, then position type. Switch NORMAL (0) to
+    // MROPE (1), where this 4x4x16 image occupies 256 token cells but 4 decoder
+    // positions. mtmd_input_chunk_load validates the resulting representation.
+    constexpr size_t pos_type_offset =
+            sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint8_t) +
+            2*sizeof(uint32_t);
+    const uint32_t mrope = 1;
+    require(pos_type_offset + sizeof(mrope) <= serialized.size(), "serialized image layout is truncated");
+    memcpy(serialized.data() + pos_type_offset, &mrope, sizeof(mrope));
+
+    mtmd::input_chunk_ptr image_mrope(mtmd_input_chunk_load(serialized.data(), serialized.size()));
+    require(image_mrope != nullptr, "failed to load synthetic M-RoPE image chunk");
+    require(mtmd_input_chunk_get_n_tokens(image_mrope.get()) !=
+            (size_t) mtmd_input_chunk_get_n_pos(image_mrope.get()),
+            "synthetic media chunk does not have a nontrivial token/position mapping");
+
+    server_prompt prompt;
+    prompt.tokens.has_mtmd = true;
+    prompt.tokens.push_back(101);
+    prompt.tokens.push_back(102);
+    prompt.tokens.push_back(image_mrope.get());
+    prompt.tokens.push_back(103);
+    prompt.tokens.push_back(104);
+    return prompt;
+}
+
+void test_position_aware_frontier_mapping() {
+    server_prompt prompt = make_mrope_prompt();
+    require(prompt.tokens.size() == 260 && prompt.tokens.pos_next() == 8,
+            "unexpected M-RoPE fixture geometry");
+
+    // State through decoder position 6 contains 2 text tokens, all 256 image
+    // cells (4 positions), and one trailing token: 259 represented tokens.
+    auto coverage = coverage_for(prompt, 6, 6, 4);
+    require(server_prompt_restore_coverage_is_valid(coverage, prompt.tokens),
+            "legal non-1:1 frontier was rejected");
+    auto plan = server_prompt_make_restore_plan(coverage, prompt.tokens, 260, 264);
+    require(plan.kind == server_prompt_restore_kind::direct &&
+            plan.effective_tokens == 259 && plan.pos_next == 7,
+            "planner treated decoder positions as token indexes");
+
+    // Position 3 is inside the indivisible image chunk. size_up_to_pos() must
+    // not turn that into a plausible claim for all 256 media token cells.
+    auto inside_media = coverage_for(prompt, 3, 3, 4);
+    require(!server_prompt_restore_coverage_is_valid(inside_media, prompt.tokens),
+            "frontier inside a media chunk was accepted");
+
+    printf("  ok: restore coverage is position-aware for non-1:1 media mappings\n");
+}
+
+void test_speculative_sequence_state_clear() {
+    common_speculative_deferred_state state;
+    state.pending_pos      = 73;
+    state.pending_embd     = { 1.0f, 2.0f, 3.0f };
+    state.verify_pos_first = 70;
+    state.verify_embd      = { 4.0f, 5.0f, 6.0f };
+    state.verify_rows      = 1;
+
+    state.clear();
+    require(state.pending_pos == -1 && state.verify_pos_first == -1 && state.verify_rows == 0 &&
+            state.verify_embd.empty() &&
+            state.pending_embd == std::vector<float>({ 0.0f, 0.0f, 0.0f }),
+            "sequence clear retained an EAGLE3 deferred or verify boundary");
+
+    // Reuse the exact same absolute frontier with another conversation's
+    // embedding. The old row is gone, so numeric adjacency cannot bridge the
+    // conversations and only the new boundary can be serialized/used.
+    state.pending_pos  = 73;
+    state.pending_embd = { 9.0f, 8.0f, 7.0f };
+    require(state.pending_pos == 73 &&
+            state.pending_embd == std::vector<float>({ 9.0f, 8.0f, 7.0f }),
+            "same-position replacement resurrected the displaced boundary embedding");
+
+    // Public dispatch is intentionally null-safe for servers with no drafter.
+    common_speculative_clear_state(nullptr, 0);
+
+    printf("  ok: same-position EAGLE3 sequence reuse clears displaced boundary state\n");
+}
+
+void test_coverage_aware_supersession() {
+    constexpr size_t boundary = 64;
+
+    // A longer token superset without a covering checkpoint must retain the
+    // useful exact boundary entry.
+    {
+        server_prompt_cache cache(64, TEST_LIMIT_TOKENS, "", 0, TEST_FINGERPRINT);
+        server_prompt shorter = make_prompt(boundary, 21);
+        const auto shorter_coverage = coverage_for(shorter, 62, 62, 5);
+        require(cache.alloc(shorter, shorter_coverage, 128, 0) != nullptr,
+                "failed to allocate the shorter boundary");
+
+        server_prompt longer = make_prompt(128, 21);
+        const auto longer_coverage = coverage_for(longer, 126, 126, 5);
+        require(cache.alloc(longer, longer_coverage, 256, 0) != nullptr,
+                "failed to allocate the longer entry");
+        require(cache.states.size() == 2,
+                "longer entry without restore coverage deleted the exact boundary");
+    }
+
+    // A checkpoint at boundary-1 can reproduce the shorter entry's effective
+    // full-match landing, so supersession is safe.
+    {
+        server_prompt_cache cache(64, TEST_LIMIT_TOKENS, "", 0, TEST_FINGERPRINT);
+        server_prompt shorter = make_prompt(boundary, 22);
+        const auto shorter_coverage = coverage_for(shorter, 62, 62, 5);
+        require(cache.alloc(shorter, shorter_coverage, 128, 0) != nullptr,
+                "failed to allocate the shorter boundary");
+
+        server_prompt longer = make_prompt(128, 22);
+        add_checkpoint(longer, 63, 62, 62);
+        const auto longer_coverage = coverage_for(longer, 126, 126, 5);
+        require(cache.alloc(longer, longer_coverage, 256, 0) != nullptr,
+                "failed to allocate checkpoint-covered replacement");
+        require(cache.states.size() == 1 && cache.states.front().prompt.tokens.size() == 128,
+                "valid exact checkpoint did not supersede the shorter entry");
+    }
+
+    printf("  ok: containment preserves uncovered boundaries and prunes exactly covered ones\n");
+}
+
+void test_target_draft_checkpoint_hygiene() {
+    server_prompt source = make_prompt(80, 31);
+    add_checkpoint(source, 48, 47, 47, /*paired=*/true, /*speculative=*/true);
+
+    // Target-only capture strips both draft checkpoint bytes and speculative
+    // implementation state.
+    {
+        server_prompt_cache cache(64, TEST_LIMIT_TOKENS, "", 0, TEST_FINGERPRINT);
+        const auto coverage = coverage_for(source, 78, 78, 5, server_prompt_restore_scope::target_only);
+        auto * state = cache.alloc(source, coverage, 128, 0);
+        require(state != nullptr, "target-only allocation failed");
+        require(state->coverage.scope == server_prompt_restore_scope::target_only && state->data.drft.empty(),
+                "target-only entry retained a draft top-level state");
+        require(state->prompt.checkpoints.size() == 1 &&
+                state->prompt.checkpoints.front().data_dft.empty() &&
+                state->prompt.checkpoints.front().data_spec.empty(),
+                "target-only entry retained draft/spec checkpoint state");
+    }
+
+    // A paired entry retains the complete atomic checkpoint and advertises the
+    // stronger restore domain.
+    {
+        server_prompt_cache cache(64, TEST_LIMIT_TOKENS, "", 0, TEST_FINGERPRINT);
+        const auto coverage = coverage_for(source, 78, 78, 5,
+                server_prompt_restore_scope::target_and_draft);
+        auto * state = cache.alloc(source, coverage, 128, 64);
+        require(state != nullptr, "paired allocation failed");
+        require(state->coverage.scope == server_prompt_restore_scope::target_and_draft &&
+                !state->prompt.checkpoints.front().data_dft.empty() &&
+                !state->prompt.checkpoints.front().data_spec.empty(),
+                "paired entry did not retain draft/spec checkpoint state");
+    }
+
+    // This is the donor predicate used by server-context: raw LCP alone is not
+    // enough, while the target-only checkpoint makes the donor usable.
+    server_prompt donor_bad = make_prompt(128, 32);
+    auto donor_coverage = coverage_for(donor_bad, 126, 126, 5);
+    auto plan = server_prompt_make_restore_plan(donor_coverage, donor_bad.tokens, 64, 64);
+    require(plan.kind == server_prompt_restore_kind::unusable,
+            "uncovered live donor was qualified");
+    add_checkpoint(donor_bad, 63, 62, 62, /*paired=*/true, /*speculative=*/true);
+    donor_coverage = coverage_for(donor_bad, 126, 126, 5,
+            server_prompt_restore_scope::target_only);
+    plan = server_prompt_make_restore_plan(donor_coverage, donor_bad.tokens, 64, 64);
+    require(plan.kind == server_prompt_restore_kind::checkpoint && plan.effective_tokens == 63,
+            "coverage-qualified target-only donor was rejected");
+
+    printf("  ok: target-only capture strips draft/spec state; paired and donor coverage stay exact\n");
 }
 
 // The fingerprint must change when anything the serialized state depends on
@@ -426,6 +830,57 @@ std::vector<uint8_t> corrupt_header_checksum(std::vector<uint8_t> f) {
     return f;
 }
 
+std::vector<uint8_t> corrupt_coverage_checksum(std::vector<uint8_t> f) {
+    // The header remains valid, but startup verifies the independently sealed
+    // coverage prefix before admitting the entry.
+    f[sizeof(pcache_disk_header) + offsetof(pcache_disk_coverage, target_rollback_tokens)] ^= 0x01;
+    return f;
+}
+
+std::vector<uint8_t> corrupt_draft_swa_checksum(std::vector<uint8_t> f) {
+    // draft_swa_tokens independently affects paired restore qualification; it
+    // is part of the startup-verifiable coverage prefix, not an unsealed hint.
+    f[sizeof(pcache_disk_header) + offsetof(pcache_disk_coverage, draft_swa_tokens)] ^= 0x01;
+    return f;
+}
+
+std::vector<uint8_t> corrupt_coverage_scope(std::vector<uint8_t> f) {
+    auto hdr = header_of(f);
+    auto * coverage = reinterpret_cast<pcache_disk_coverage *>(
+            f.data() + sizeof(pcache_disk_header));
+    coverage->scope = 0xff;
+    hdr.hash_coverage = coverage_hash_of(f, hdr);
+    reseal(f, hdr);
+    return f;
+}
+
+std::vector<uint8_t> corrupt_coverage_components(std::vector<uint8_t> f) {
+    auto hdr = header_of(f);
+    require(hdr.n_checkpoints > 0, "fixture has no checkpoint coverage");
+    auto * checkpoint = reinterpret_cast<pcache_disk_checkpoint_coverage *>(
+            f.data() + sizeof(pcache_disk_header) + sizeof(pcache_disk_coverage));
+    checkpoint->components = SERVER_PROMPT_RESTORE_COMPONENT_TARGET;
+    hdr.hash_coverage = coverage_hash_of(f, hdr);
+    reseal(f, hdr);
+    return f;
+}
+
+std::vector<uint8_t> corrupt_coverage_frontier(std::vector<uint8_t> f) {
+    auto hdr = header_of(f);
+    auto * coverage = reinterpret_cast<pcache_disk_coverage *>(
+            f.data() + sizeof(pcache_disk_header));
+
+    // Text positions are one-to-one in an SSD entry. A frontier equal to the
+    // token count claims one decoded position beyond the serialized prompt.
+    coverage->target_pos_min = (int32_t) hdr.n_tokens;
+    coverage->target_pos_max = (int32_t) hdr.n_tokens;
+    coverage->draft_pos_min  = (int32_t) hdr.n_tokens;
+    coverage->draft_pos_max  = (int32_t) hdr.n_tokens;
+    hdr.hash_coverage = coverage_hash_of(f, hdr);
+    reseal(f, hdr);
+    return f;
+}
+
 std::vector<uint8_t> corrupt_absurd_n_tokens(std::vector<uint8_t> f) {
     auto hdr = header_of(f);
     hdr.n_tokens = 0x0000FFFFFFFFFFFFull; // ~281 T tokens -> 1.1 PiB of llama_token
@@ -492,6 +947,7 @@ std::vector<uint8_t> corrupt_checkpoint_blob_length(std::vector<uint8_t> f) {
 
     // first checkpoint blob length sits right after the fixed checkpoint fields
     const size_t off_ckpt = sizeof(pcache_disk_header) +
+                            (size_t) hdr.size_coverage +
                             (size_t) hdr.n_tokens*sizeof(llama_token) +
                             (size_t) hdr.size_main +
                             (size_t) hdr.size_drft;
@@ -511,6 +967,11 @@ const corruption corruptions[] = {
     { "bad magic",                     corrupt_bad_magic,                false },
     { "future schema version",         corrupt_future_version,           false },
     { "header checksum mismatch",      corrupt_header_checksum,          false },
+    { "coverage checksum mismatch",    corrupt_coverage_checksum,        false },
+    { "draft SWA checksum mismatch",   corrupt_draft_swa_checksum,       false },
+    { "invalid coverage scope",        corrupt_coverage_scope,           false },
+    { "incomplete paired checkpoint",  corrupt_coverage_components,      false },
+    { "impossible coverage frontier",  corrupt_coverage_frontier,        false },
     { "absurd n_tokens (2^48)",        corrupt_absurd_n_tokens,          false },
     { "n_tokens beyond the context",   corrupt_n_tokens_over_context,    false },
     { "n_tokens beyond the payload",   corrupt_n_tokens_over_payload,    false },
@@ -643,6 +1104,12 @@ int main() {
     const test_case tests[] = {
         { "round trip",                 test_round_trip                          },
         { "tiering preserved",          test_tiering_preserved                   },
+        { "restore plan boundaries",    test_restore_planner_boundaries_and_rollback },
+        { "paired unequal SWA",         test_paired_unequal_swa_thresholds       },
+        { "position-aware frontier",    test_position_aware_frontier_mapping     },
+        { "speculative sequence clear", test_speculative_sequence_state_clear    },
+        { "coverage supersession",      test_coverage_aware_supersession          },
+        { "target/draft hygiene",       test_target_draft_checkpoint_hygiene     },
         { "fingerprint identity",       test_fingerprint_covers_state_identity   },
         { "stale fingerprint",          test_stale_fingerprint_is_rejected       },
         { "corrupt file matrix",        test_corrupt_files_are_skipped           },

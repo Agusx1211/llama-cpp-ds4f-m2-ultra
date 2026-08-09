@@ -455,20 +455,38 @@ struct server_slot {
     // include_dft = false saves a target-only snapshot; used when the draft
     // context did not advance with the target (speculation bypassed for a
     // parallel cohort) and its state must not be resurrected on restore
+    server_prompt_restore_coverage prompt_restore_coverage(bool force_target_only = false) const {
+        return server_prompt_capture_restore_coverage(
+                prompt, ctx_tgt, ctx_dft, id, force_target_only);
+    }
+
     bool prompt_save(server_prompt_cache & prompt_cache, bool include_dft = true) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
 
+        const auto coverage = server_prompt_capture_restore_coverage(
+                prompt, ctx_tgt, ctx_dft, id, !include_dft);
+        const bool paired_frontier = coverage.scope == server_prompt_restore_scope::target_and_draft;
+        if (include_dft && ctx_dft != nullptr && !paired_frontier) {
+            const llama_pos draft_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_dft), id);
+            const llama_pos draft_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id);
+            SLT_WRN(*this,
+                    "target/draft prompt-cache frontiers differ (target=[%d,%d], draft=[%d,%d]); publishing target-only\n",
+                    (int) coverage.target.pos_min, (int) coverage.target.pos_max,
+                    (int) draft_pos_min, (int) draft_pos_max);
+        }
+
         const size_t cur_size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = (include_dft && ctx_dft) ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const size_t cur_size_dft = paired_frontier ?
+                llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, coverage, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
         }
@@ -479,7 +497,7 @@ struct server_slot {
         cur->dash_req = dash_req;
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (include_dft && ctx_dft) {
+        if (paired_frontier) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
@@ -490,6 +508,13 @@ struct server_slot {
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else if (prompt_cache.dash_last_load.restored_scope !=
+                server_prompt_restore_scope::invalid) {
+            // Top-level cache entries do not serialize implementation state.
+            // Even a paired target+draft install therefore cannot retain the
+            // displaced conversation's EAGLE3 deferred boundary. A later
+            // paired checkpoint landing restores its own serialized boundary.
+            common_speculative_clear_state(spec, id);
         }
 
         return res;
@@ -499,6 +524,7 @@ struct server_slot {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+        common_speculative_clear_state(spec, id);
 
         prompt.clear();
     }
@@ -2223,6 +2249,7 @@ private:
             if (task.type == SERVER_TASK_TYPE_COMPLETION && task.id_slot == -1) {
                 server_slot * donor = nullptr;
                 size_t lcp_donor = 0;
+                server_prompt_restore_plan donor_plan;
                 for (server_slot & other : slots) {
                     if (other.id == ret->id || other.prompt.tokens.empty() || other.prompt.tokens.has_mtmd) {
                         continue;
@@ -2232,14 +2259,24 @@ private:
                         continue; // prompt not fully in KV yet
                     }
                     const size_t lcp = other.prompt.tokens.get_common_prefix(task.tokens);
-                    if (lcp > lcp_donor) {
+                    const auto plan = server_prompt_make_restore_plan(
+                            other.prompt_restore_coverage(/*force_target_only=*/true),
+                            other.prompt.tokens,
+                            lcp,
+                            task.tokens.size());
+                    if (plan.kind != server_prompt_restore_kind::unusable &&
+                            plan.effective_tokens > donor_plan.effective_tokens) {
                         lcp_donor = lcp;
                         donor = &other;
+                        donor_plan = plan;
                     }
                 }
 
                 const size_t lcp_self = ret->prompt.tokens.get_common_prefix(task.tokens);
-                if (donor != nullptr && lcp_donor >= 1024 && lcp_donor > lcp_self) {
+                const auto self_plan = server_prompt_make_restore_plan(
+                        ret->prompt_restore_coverage(), ret->prompt.tokens, lcp_self, task.tokens.size());
+                if (donor != nullptr && donor_plan.effective_tokens >= 1024 &&
+                        donor_plan.effective_tokens > self_plan.effective_tokens) {
                     const int64_t t_share = ggml_time_us();
 
                     if (update_cache) {
@@ -2249,18 +2286,31 @@ private:
 
                     ret->prompt_clear();
                     llama_memory_seq_cp(llama_get_memory(ctx_tgt), donor->id, ret->id, -1, -1);
+                    if (ctx_dft) {
+                        llama_memory_seq_rm(llama_get_memory(ctx_dft), ret->id, -1, -1);
+                    }
 
-                    ret->prompt.tokens      = donor->prompt.tokens.clone();
-                    ret->prompt.checkpoints = donor->prompt.checkpoints;
+                    ret->prompt.tokens = donor->prompt.tokens.clone();
+                    for (const auto & checkpoint : donor->prompt.checkpoints) {
+                        if (checkpoint.data_tgt.empty()) {
+                            continue;
+                        }
+                        auto target_only = checkpoint;
+                        target_only.clear_dft();
+                        ret->prompt.checkpoints.push_back(std::move(target_only));
+                    }
 
                     const double share_ms = (ggml_time_us() - t_share) / 1000.0;
 
                     ret->residue_from   = server_slot::residue_origin::donor_share;
-                    ret->residue_tokens = lcp_donor;
+                    ret->residue_tokens = donor_plan.effective_tokens;
                     ret->residue_ms     = share_ms;
 
-                    SLT_INF(*ret, "shared %zu-token prefix from slot %d via zero-copy seq_cp (%.2f ms, task has %d)\n",
-                            lcp_donor, donor->id, share_ms, (int) task.tokens.size());
+                    SLT_INF(*ret,
+                            "shared coverage-qualified prefix from slot %d via zero-copy seq_cp "
+                            "(raw=%zu effective=%zu kind=%u, %.2f ms, task has %d)\n",
+                            donor->id, lcp_donor, donor_plan.effective_tokens,
+                            (unsigned) donor_plan.kind, share_ms, (int) task.tokens.size());
 
                     {
                         server_dashboard::event ev;
@@ -2268,7 +2318,7 @@ private:
                         ev.request_id = static_cast<uint64_t>(task.id) + 1;
                         ev.slot       = ret->id;
                         ev.code       = (uint16_t) server_dashboard::restore_code::donor;
-                        ev.a          = (int64_t) lcp_donor;
+                        ev.a          = (int64_t) donor_plan.effective_tokens;
                         ev.c          = (int64_t) task.tokens.size();
                         ev.d          = donor->id;
                         ev.f          = (ggml_time_us() - t_share) / 1000.0;
@@ -2309,7 +2359,7 @@ private:
 
                 // one INFO line per cache consultation: how much of the task's
                 // prefix is available in the selected slot after save/load
-                const size_t n_reusable = ret->prompt.tokens.get_common_prefix(task.tokens);
+                const size_t n_reusable = prompt_cache->dash_last_load.n_tokens;
                 const double consult_ms = (ggml_time_us() - t_start) / 1000.0;
 
                 if (n_reusable > 0) {
@@ -2536,6 +2586,8 @@ private:
             bool reuse_resident = false;
             llama_pos pos_min = -1;
             llama_pos pos_min_thold = -1;
+            llama_pos resident_pos_next = -1;
+            server_prompt_restore_plan restore_plan;
             if (family_slots.size() != 1) {
                 no_reuse_code   = "family_geometry";
                 no_reuse_reason = "family admission keeps the full-clear geometry";
@@ -2555,34 +2607,25 @@ private:
                 no_reuse_code   = "cache_prompt_off";
                 no_reuse_reason = "cache_prompt disabled";
             } else {
-                const llama_pos pos_next = slot.prompt.tokens.pos_next(n_lcp);
-                pos_min_thold = std::max(0, pos_next - n_swa - (full_match ? 1 : 0));
-                pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                const auto coverage = slot.prompt_restore_coverage();
+                restore_plan = server_prompt_make_restore_plan(
+                        coverage, slot.prompt.tokens, n_lcp, task.tokens.size());
+                pos_min = coverage.target.pos_min;
+                pos_min_thold = coverage.scope == server_prompt_restore_scope::target_and_draft ?
+                        std::min(restore_plan.target_pos_threshold, restore_plan.draft_pos_threshold) :
+                        restore_plan.target_pos_threshold;
+                resident_pos_next = coverage.target.pos_max < std::numeric_limits<llama_pos>::max() ?
+                        coverage.target.pos_max + 1 : -1;
 
                 if (pos_min < 0) {
                     no_reuse_code   = "no_cells";
                     no_reuse_reason = "resident sequence has no cells";
-                } else if (pos_min >= pos_min_thold) {
-                    // the prefill checkpoint block will run: it restores the
-                    // newest covering checkpoint or resets to zero. Reuse only
-                    // when a covering checkpoint exists - a reset would
-                    // re-decode the full span with resident rows freed
-                    // mid-flight, strictly worse than clearing here.
-                    reuse_resident = std::any_of(
-                            slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
-                            [&](const common_prompt_checkpoint & cur) {
-                                return cur.pos_max <= pos_next && (cur.pos_min < pos_min_thold || cur.pos_min == 0);
-                            });
-                    if (!reuse_resident) {
+                } else {
+                    reuse_resident = restore_plan.kind != server_prompt_restore_kind::unusable;
+                    if (!reuse_resident && pos_min >= pos_min_thold) {
                         no_reuse_code   = "no_checkpoint";
                         no_reuse_reason = "no checkpoint covers the landing";
-                    }
-                } else {
-                    // no checkpoint pass: the tail trim at the prefill must
-                    // fit the bounded rs rollback window (DSV4 has no general
-                    // partial seq_rm)
-                    reuse_resident = (int64_t) (n_prompt_res - n_landing) <= (int64_t) llama_n_rs_seq(ctx_tgt);
-                    if (!reuse_resident) {
+                    } else if (!reuse_resident) {
                         no_reuse_code   = "rs_window";
                         no_reuse_reason = "resident tail exceeds the rs rollback window";
                     }
@@ -2615,11 +2658,12 @@ private:
             // re-decode writes back) and the ordinary per-batch reservation
             // covers the landing, exactly like the sub-frontier backfill of
             // a spanned reuse.
-            const llama_pos pos_frontier = reuse_resident ? slot.prompt.tokens.pos_next() : 0;
+            const llama_pos pos_frontier = reuse_resident ? resident_pos_next : 0;
 
             if (reuse_resident) {
-                SLT_INF(slot, "elastic admission reuses resident prefix: lcp=%zu resident=%zu frontier=%d task=%d span_end=%zu%s\n",
-                        n_lcp, n_prompt_res, (int) pos_frontier, (int) task.n_tokens(), (size_t) plan.span_tokens,
+                SLT_INF(slot, "elastic admission reuses resident prefix: lcp=%zu effective=%zu restore=%u resident=%zu frontier=%d task=%d span_end=%zu%s\n",
+                        n_lcp, restore_plan.effective_tokens, (unsigned) restore_plan.kind,
+                        n_prompt_res, (int) pos_frontier, (int) task.n_tokens(), (size_t) plan.span_tokens,
                         (llama_pos) plan.span_tokens <= pos_frontier ? " (below frontier, spanless)" : "");
                 {
                     server_dashboard::event ev;
@@ -2629,7 +2673,7 @@ private:
                     ev.code       = (uint16_t) ((llama_pos) plan.span_tokens <= pos_frontier ?
                             server_dashboard::admission_code::ready_spanless :
                             server_dashboard::admission_code::ready_reuse);
-                    ev.a          = (int64_t) n_lcp;
+                    ev.a          = (int64_t) restore_plan.effective_tokens;
                     ev.b          = (int64_t) n_prompt_res;
                     ev.c          = (int64_t) pos_frontier;
                     ev.d          = (int64_t) plan.span_tokens;
@@ -5256,7 +5300,92 @@ private:
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
 
-                            if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
+                            bool restore_plan_applied = false;
+                            if (SERVER_DSV4_ADMISSION_VERTICAL && n_past > 0 &&
+                                    n_past <= slot.prompt.n_tokens()) {
+                                restore_plan_applied = true;
+
+                                const auto coverage = slot.prompt_restore_coverage();
+                                const auto restore_plan = server_prompt_make_restore_plan(
+                                        coverage, slot.prompt.tokens, (size_t) n_past,
+                                        (size_t) slot.task->n_tokens());
+
+                                if (restore_plan.kind == server_prompt_restore_kind::direct) {
+                                    n_past = (int) restore_plan.effective_tokens;
+                                    pos_next = restore_plan.pos_next;
+                                    dash_last_token = restore_plan.full_match &&
+                                            restore_plan.recompute_tokens == 1;
+                                    if (coverage.scope == server_prompt_restore_scope::target_only) {
+                                        if (ctx_dft) {
+                                            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+                                        }
+                                        common_speculative_clear_state(spec.get(), slot.id);
+                                    }
+                                } else if (restore_plan.kind == server_prompt_restore_kind::checkpoint) {
+                                    const auto checkpoint = std::find_if(
+                                            slot.prompt.checkpoints.rbegin(),
+                                            slot.prompt.checkpoints.rend(),
+                                            [&](const common_prompt_checkpoint & cur) {
+                                                return cur.n_tokens == restore_plan.checkpoint_n_tokens &&
+                                                       cur.pos_min == coverage.checkpoints[restore_plan.checkpoint_index].pos_min &&
+                                                       cur.pos_max == coverage.checkpoints[restore_plan.checkpoint_index].pos_max &&
+                                                       !cur.data_tgt.empty() &&
+                                                       (coverage.scope != server_prompt_restore_scope::target_and_draft ||
+                                                        !cur.data_dft.empty());
+                                            });
+
+                                    if (checkpoint != slot.prompt.checkpoints.rend()) {
+                                        bool checkpoint_state_ok = true;
+                                        checkpoint->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        if (coverage.scope == server_prompt_restore_scope::target_and_draft) {
+                                            checkpoint->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            if (checkpoint->data_spec.empty()) {
+                                                common_speculative_clear_state(spec.get(), slot.id);
+                                            } else {
+                                                checkpoint_state_ok = common_speculative_set_state(
+                                                        spec.get(), slot.id, checkpoint->data_spec);
+                                            }
+                                        } else {
+                                            // Target-only cache/donor entries
+                                            // must not leave an older draft
+                                            // frontier or checkpoint alive.
+                                            if (ctx_dft) {
+                                                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+                                            }
+                                            common_speculative_clear_state(spec.get(), slot.id);
+                                        }
+
+                                        if (checkpoint_state_ok) {
+                                            pos_next = restore_plan.landing_pos;
+                                            n_past   = (int) restore_plan.effective_tokens;
+                                            dash_ckpt_landed = true;
+
+                                            SLT_TRC(slot,
+                                                    "restored coverage-planned checkpoint "
+                                                    "(pos_min=%d pos_max=%d n_tokens=%" PRId64 " n_past=%d scope=%u)\n",
+                                                    checkpoint->pos_min, checkpoint->pos_max,
+                                                    checkpoint->n_tokens, n_past, (unsigned) coverage.scope);
+                                        } else {
+                                            SLT_WRN(slot, "%s", "checkpoint speculative state is incompatible; resetting\n");
+                                            common_speculative_clear_state(spec.get(), slot.id);
+                                            pos_next   = 0;
+                                            n_past     = 0;
+                                            dash_reset = true;
+                                        }
+                                    } else {
+                                        pos_next  = 0;
+                                        n_past    = 0;
+                                        dash_reset = true;
+                                    }
+                                } else {
+                                    SLT_TRC(slot, "%s", "forcing full prompt re-processing: restore coverage is unusable\n");
+                                    pos_next  = 0;
+                                    n_past    = 0;
+                                    dash_reset = true;
+                                }
+                            }
+
+                            if (!restore_plan_applied && n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
@@ -5327,15 +5456,31 @@ private:
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        if (!it->data_dft.empty()) {
+                                            it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            // restore the draft's speculative state
+                                            if (it->data_spec.empty()) {
+                                                common_speculative_clear_state(spec.get(), slot.id);
+                                            } else {
+                                                do_reset = !common_speculative_set_state(
+                                                        spec.get(), slot.id, it->data_spec);
+                                            }
+                                        } else {
+                                            if (ctx_dft) {
+                                                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+                                            }
+                                            common_speculative_clear_state(spec.get(), slot.id);
+                                        }
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        if (!do_reset) {
+                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
 
-                                        dash_ckpt_landed = true;
+                                            dash_ckpt_landed = true;
+                                        } else {
+                                            common_speculative_clear_state(spec.get(), slot.id);
+                                        }
                                     }
 
                                     if (do_reset) {

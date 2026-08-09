@@ -206,7 +206,8 @@ struct common_speculative_impl {
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
-    virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+    virtual bool set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) { return false; }
+    virtual void clear_state(llama_seq_id /*seq_id*/) {}
 
     // true if this implementation requires the target context to extract post-norm embeddings
     virtual bool need_embd() const = 0;
@@ -225,6 +226,15 @@ struct common_speculative_impl {
     // Optional implementation-specific counters appended to the shared stats.
     virtual std::string extra_stats() const { return {}; }
 };
+
+void common_speculative_deferred_state::clear() {
+    pending_pos = -1;
+    std::fill(pending_embd.begin(), pending_embd.end(), 0.0f);
+
+    verify_pos_first = -1;
+    verify_rows      = 0;
+    verify_embd.clear();
+}
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -490,14 +500,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
-    // [per-seq] deferred boundary state
-    std::vector<std::vector<float>> pending_g_last;
-    std::vector<llama_pos>          pending_pos_last;
-
-    // [per-seq] snapshot of the most recent process()'s encoder output
-    std::vector<std::vector<float>> verify_g;         // [n_seq][n_rows * n_embd_dec]
-    std::vector<llama_pos>          verify_pos_first; // [n_seq] — pos of verify_g[seq][0]
-    std::vector<int32_t>            verify_g_rows;    // [n_seq] — number of rows
+    // [per-seq] deferred boundary and latest verify encoder rows
+    std::vector<common_speculative_deferred_state> seq_state;
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
@@ -575,12 +579,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         // (used both for the encoder output g_embd and the decoder pre-norm output).
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        pending_g_last.assign(n_seq, std::vector<float>(n_embd_dec, 0.0f));
-        pending_pos_last.assign(n_seq, -1);
-
-        verify_g.assign(n_seq, std::vector<float>());
-        verify_pos_first.assign(n_seq, -1);
-        verify_g_rows.assign(n_seq, 0);
+        seq_state.resize(n_seq);
+        for (auto & state : seq_state) {
+            state.pending_embd.resize(n_embd_dec, 0.0f);
+        }
     }
 
     ~common_speculative_impl_draft_eagle3() override {
@@ -730,13 +732,14 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             //   1) pending_pos_last >= 0
             //   2) pending_pos_last + 1 == pos[beg]
             //   3) pending_pos_last > dft_pos_max // TODO: is this check needed?
-            const llama_pos pending_pos = pending_pos_last[seq_id];
+            auto & state = seq_state[seq_id];
+            const llama_pos pending_pos = state.pending_pos;
             if (pending_pos >= 0 && pending_pos + 1 == batch_in.pos[beg]) {
                 const llama_pos dft_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
                 if (pending_pos > dft_pos_max) {
                     common_batch_add(batch, batch_in.token[beg], pending_pos, { seq_id }, /*logits=*/ false);
                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec,
-                                pending_g_last[seq_id].data(), row_bytes);
+                                state.pending_embd.data(), row_bytes);
                 }
             }
 
@@ -748,12 +751,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
             // refresh deferred state
             const int32_t n_rows = end - beg + 1;
-            verify_pos_first[seq_id] = batch_in.pos[beg];
-            pending_pos_last[seq_id] = batch_in.pos[end];
-            verify_g_rows[seq_id]    = n_rows;
-            verify_g[seq_id].resize((size_t) n_rows * n_embd_dec, 0.0f);
-            std::memcpy(verify_g[seq_id].data(),       g_embd + (size_t) beg * n_embd_dec, row_bytes * n_rows);
-            std::memcpy(pending_g_last[seq_id].data(), g_embd + (size_t) end * n_embd_dec, row_bytes);
+            state.verify_pos_first = batch_in.pos[beg];
+            state.pending_pos      = batch_in.pos[end];
+            state.verify_rows      = n_rows;
+            state.verify_embd.resize((size_t) n_rows * n_embd_dec, 0.0f);
+            std::memcpy(state.verify_embd.data(),  g_embd + (size_t) beg * n_embd_dec, row_bytes * n_rows);
+            std::memcpy(state.pending_embd.data(), g_embd + (size_t) end * n_embd_dec, row_bytes);
         }
 
         if (batch.n_tokens > 0) {
@@ -789,7 +792,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             if (!dp.drafting) {
                 continue;
             }
-            if (pending_pos_last[seq_id] < 0) {
+            const auto & state = seq_state[seq_id];
+            if (state.pending_pos < 0) {
                 continue;
             }
 
@@ -797,11 +801,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pending_pos_last[seq_id], -1);
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, state.pending_pos, -1);
 
-            common_batch_add(batch, dp.id_last, pending_pos_last[seq_id], { seq_id }, true);
+            common_batch_add(batch, dp.id_last, state.pending_pos, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec,
-                        pending_g_last[seq_id].data(),
+                        state.pending_embd.data(),
                         row_bytes);
         }
 
@@ -866,7 +870,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                     continue;
                 }
 
-                common_batch_add(batch, id, pending_pos_last[seq_id] + (i + 1), { seq_id }, true);
+                common_batch_add(batch, id, seq_state[seq_id].pending_pos + (i + 1), { seq_id }, true);
                 std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec, prenorm, row_bytes);
             }
 
@@ -900,15 +904,16 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             return;
         }
 
-        const int32_t n_rows = verify_g_rows[seq_id];
+        auto & state = seq_state[seq_id];
+        const int32_t n_rows = state.verify_rows;
         if (n_rows <= 0) {
             return;
         }
 
         const int32_t i_g = std::min<int32_t>(n_accepted, n_rows - 1);
-        pending_pos_last[seq_id] = verify_pos_first[seq_id] + i_g;
-        std::memcpy(pending_g_last[seq_id].data(),
-                    verify_g[seq_id].data() + (size_t) i_g * n_embd_dec,
+        state.pending_pos = state.verify_pos_first + i_g;
+        std::memcpy(state.pending_embd.data(),
+                    state.verify_embd.data() + (size_t) i_g * n_embd_dec,
                     (size_t) n_embd_dec * sizeof(float));
     }
 
@@ -923,12 +928,13 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         if (!need_boundary_stash()) {
             return false;
         }
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos_last[seq_id] < 0) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || seq_state[seq_id].pending_pos < 0) {
             return false;
         }
 
-        const llama_pos          pos = pending_pos_last[seq_id];
-        const std::vector<float> & g = pending_g_last[seq_id];
+        const auto & state = seq_state[seq_id];
+        const llama_pos pos = state.pending_pos;
+        const std::vector<float> & g = state.pending_embd;
 
         data.resize(sizeof(llama_pos) + g.size() * sizeof(float));
         std::memcpy(data.data(),                     &pos,     sizeof(llama_pos));
@@ -936,23 +942,38 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         return true;
     }
 
-    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
         if (!need_boundary_stash()) {
-            return;
+            return false;
         }
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-            return;
+            return false;
         }
         if (data.size() != sizeof(llama_pos) + (size_t) n_embd_dec * sizeof(float)) {
-            return;
+            return false;
         }
 
         llama_pos pos = -1;
         std::memcpy(&pos, data.data(), sizeof(llama_pos));
 
-        pending_pos_last[seq_id] = pos;
-        pending_g_last[seq_id].resize(n_embd_dec);
-        std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
+        auto & state = seq_state[seq_id];
+        state.clear();
+        state.pending_pos = pos;
+        state.pending_embd.resize(n_embd_dec);
+        std::memcpy(state.pending_embd.data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
+        return true;
+    }
+
+    void clear_state(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        // A restored conversation can land at the same absolute position as
+        // the displaced one. Keeping either deferred row would satisfy the
+        // numeric adjacency test in process()/accept() and pair the new token
+        // with the old conversation's boundary embedding.
+        seq_state[seq_id].clear();
     }
 
     bool need_embd() const override {
@@ -3079,13 +3100,27 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
     return false;
 }
 
-void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    bool restored = false;
+    for (auto & impl : spec->impls) {
+        if (impl->set_state(seq_id, data)) {
+            restored = true;
+        }
+    }
+    return restored;
+}
+
+void common_speculative_clear_state(common_speculative * spec, llama_seq_id seq_id) {
     if (spec == nullptr) {
         return;
     }
 
     for (auto & impl : spec->impls) {
-        impl->set_state(seq_id, data);
+        impl->clear_state(seq_id);
     }
 }
 
