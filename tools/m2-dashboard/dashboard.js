@@ -42,6 +42,7 @@ import {
     extentLabel,
     parseCachePreview,
     parseContent,
+    watchRenderView,
 } from "./lib/content.mjs";
 
 const POLL_MS = 2000;
@@ -1298,7 +1299,7 @@ function repaintContent(req) {
 
 function startWatch(req) {
     stopWatch();
-    const entry = { req: req.id, stream: null, state: null, pinned: true };
+    const entry = { req: req.id, stream: null, state: null, pinned: true, showAll: false };
     entry.stream = new WatchStream({
         req: req.id,
         apiKey: currentApiKey(),
@@ -1460,19 +1461,22 @@ function renderContentBlock(req, node) {
     if (watching) updateWatchPane(watching); // now that the pane is in the document
 }
 
-// How much of a live generation is laid out at once. The accumulated text is
-// already capped in content.mjs; this is a second, tighter bound so a 45-minute
-// turn does not re-layout 256 KiB of <pre> on every frame.
-const WATCH_RENDER_BYTES = 24 * 1024;
-
 // Built once per watch, then mutated in place as tokens arrive.
 function watchPane(watching) {
     const box = el("div", "content-side out watching");
     const head = el("div", "cs-head");
     head.append(el("b", "", "OUTPUT · live"));
     const extent = el("span", "cs-extent");
+    const toggle = el("button", "", "show full so far");
+    toggle.type = "button";
+    toggle.hidden = true;
+    toggle.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        watching.showAll = !watching.showAll;
+        updateWatchPane(watching);
+    });
     const tag = el("span", "live-tag on", "connecting");
-    head.append(extent, tag);
+    head.append(extent, toggle, tag);
     box.append(head);
 
     const body = el("div", "cs-body scroll");
@@ -1484,7 +1488,7 @@ function watchPane(watching) {
         watching.pinned = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
     });
 
-    watching.pane = { box, extent, tag, body, pre, caret };
+    watching.pane = { box, extent, toggle, tag, body, pre, caret };
     updateWatchPane(watching);
     return box;
 }
@@ -1493,22 +1497,31 @@ function updateWatchPane(watching) {
     const pane = watching?.pane;
     if (!pane) return;
     const s = watching.state;
-    const full = s?.text ?? "";
-    const shown = full.length > WATCH_RENDER_BYTES ? full.slice(-WATCH_RENDER_BYTES) : full;
+    const view = watchRenderView(s, watching.showAll);
 
     // A live pane must never claim to be complete: it says what it has and,
     // when the stream outran the mirror, that earlier output is simply gone.
-    const trimmed = (s?.dropped ?? 0) + (s?.clientDropped ?? 0) + (full.length - shown.length);
-    pane.extent.textContent = (s?.nDec ?? 0).toLocaleString("en-US") + " tokens · " +
-        formatBytes(s?.cursor ?? 0) + " generated" +
-        (trimmed > 0 ? " · newest " + formatBytes(shown.length) + " shown, " +
-            formatBytes(trimmed) + " earlier output dropped" : "");
+    let extent = (s?.nDec ?? 0).toLocaleString("en-US") + " tokens · " +
+        formatBytes(s?.cursor ?? 0) + " generated";
+    if (view.hidden > 0) {
+        extent += " · newest " + formatBytes(view.text.length) + " shown, " +
+            formatBytes(view.hidden) + " earlier output hidden";
+        if (view.dropped > 0) extent += ", " + formatBytes(view.dropped) + " unavailable";
+    } else if (view.dropped > 0) {
+        extent += " · all retained text shown, " + formatBytes(view.dropped) +
+            " earlier output unavailable";
+    } else {
+        extent += " · all output so far shown";
+    }
+    pane.extent.textContent = extent;
+    pane.toggle.hidden = !view.clipped;
+    pane.toggle.textContent = watching.showAll ? "show newest only" : "show full so far";
     pane.tag.className = "live-tag " + (s?.ended ? "done" : "on");
     pane.tag.textContent = s?.ended
         ? (WATCH_REASON_LABEL[s.reason] ?? s.reason ?? "closed")
         : (s?.frames ?? 0) > 0 ? "streaming" : "connecting";
 
-    pane.pre.textContent = shown;
+    pane.pre.textContent = view.text;
     if (!s?.ended) pane.pre.append(pane.caret);
 
     // stay on the newest token unless the operator scrolled away from it

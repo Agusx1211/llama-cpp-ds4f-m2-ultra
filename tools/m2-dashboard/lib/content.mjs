@@ -11,9 +11,9 @@
 // Design rules this module encodes (see notes/2026-08-09-dashboard-v3.md):
 //   - content is NEVER on the event stream and never in the replay ring, so
 //     nothing here reads from EventStore;
-//   - every server payload is bounded (head + tail with an explicit elision
-//     count) and this module keeps its own client-side bound on top, so a page
-//     left open on a 45-minute agent turn cannot grow without limit;
+//   - target-sized request payloads are complete; truly oversized payloads
+//     retain an explicit elision count, and this module keeps its own bound on
+//     a live stream so a page left open indefinitely cannot grow without limit;
 //   - reveal is per request / per entry and lives only in memory: nothing is
 //     written to localStorage, the URL, or any log.
 
@@ -24,11 +24,25 @@ export const CONTENT_PATH = "/m2-dashboard/content";
 export const WATCH_PATH = "/m2-dashboard/watch";
 export const CACHE_PREVIEW_PATH = "/m2-dashboard/cache-preview";
 
-// Client-side ceiling on a watched generation. The server mirror is bounded
-// per-poll, not per-request: a 45-minute turn emits megabytes over its life, so
-// the page keeps only the newest slice and says how much it dropped.
-export const WATCH_TEXT_MAX = 256 * 1024;
-export const WATCH_TEXT_TRIM_TO = 192 * 1024;
+// Keep a complete target-sized generation (production requests at most 32K
+// output tokens) while retaining a hard browser bound for pathological or
+// future-unbounded streams. Rendering still defaults to a small tail; a human
+// can explicitly reveal everything accumulated with the live-pane control.
+export const WATCH_TEXT_MAX = 8 * 1024 * 1024;
+export const WATCH_TEXT_TRIM_TO = 6 * 1024 * 1024;
+export const WATCH_RENDER_CHARS = 24 * 1024;
+
+export function watchRenderView(state, showAll = false) {
+    const full = typeof state?.text === "string" ? state.text : "";
+    const clipped = full.length > WATCH_RENDER_CHARS;
+    const hidden = showAll ? 0 : Math.max(0, full.length - WATCH_RENDER_CHARS);
+    return {
+        text: hidden > 0 ? full.slice(hidden) : full,
+        clipped,
+        hidden,
+        dropped: (state?.dropped ?? 0) + (state?.clientDropped ?? 0),
+    };
+}
 
 // ---------------------------------------------------------------------------
 // GET /m2-dashboard/content
