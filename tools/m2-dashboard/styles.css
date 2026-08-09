@@ -55,6 +55,9 @@
     --cache-0:   #4fc794;
     --cache-1:   #159a6b;
     --cache-2:   #0d7c53;
+    /* the dark-mode amber is 1.74:1 on the light page - unreadable as status
+     * text and below the 3:1 a data mark needs. Same hue, darker step. */
+    --warning:   #9a6100;
     --ring:      rgba(11, 11, 11, 0.10);
   }
 }
@@ -75,6 +78,7 @@
   --cache-0:   #4fc794;
   --cache-1:   #159a6b;
   --cache-2:   #0d7c53;
+  --warning:   #9a6100;
   --ring:      rgba(11, 11, 11, 0.10);
 }
 
