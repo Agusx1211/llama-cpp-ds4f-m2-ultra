@@ -3548,6 +3548,17 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::drop_entry(
     return erase_entry(it, true);
 }
 
+bool server_prompt_cache::discard(server_prompt_cache_state * state) {
+    const auto it = std::find_if(states.begin(), states.end(),
+            [&](const server_prompt_cache_state & candidate) { return &candidate == state; });
+    if (it == states.end()) {
+        return false;
+    }
+
+    drop_entry(it);
+    return true;
+}
+
 bool server_prompt_cache::evict_oldest_ram() {
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (it->on_disk() || !it->has_ram_fallback() || it->io_in_flight() ||
@@ -3751,154 +3762,207 @@ server_prompt_cache_state * server_prompt_cache::alloc(
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(
+        server_prompt & prompt,
+        const server_tokens & tokens_new,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        int32_t id_slot) {
     poll_io_completions();
 
     ++dash_lookups;
     dash_last_load = {};
 
+    const auto capture_coverage = [&](const server_prompt & source) {
+        if (restore_hooks_for_test.capture_coverage) {
+            return restore_hooks_for_test.capture_coverage(source, ctx_tgt, ctx_dft, id_slot);
+        }
+        return server_prompt_capture_restore_coverage(source, ctx_tgt, ctx_dft, id_slot);
+    };
+    const auto seq_size = [&](llama_context * ctx) {
+        if (restore_hooks_for_test.get_size) {
+            return restore_hooks_for_test.get_size(ctx, id_slot);
+        }
+        return llama_state_seq_get_size_ext(ctx, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    };
+    const auto seq_get = [&](llama_context * ctx, uint8_t * data, size_t size) {
+        if (restore_hooks_for_test.get_data) {
+            return restore_hooks_for_test.get_data(ctx, data, size, id_slot);
+        }
+        return llama_state_seq_get_data_ext(ctx, data, size, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    };
+    const auto seq_set = [&](llama_context * ctx, const std::vector<uint8_t> & data) {
+        if (restore_hooks_for_test.set_data) {
+            return restore_hooks_for_test.set_data(ctx, data.data(), data.size(), id_slot);
+        }
+        return llama_state_seq_set_data_ext(ctx, data.data(), data.size(), id_slot, 0);
+    };
+    const auto seq_clear = [&](llama_context * ctx) {
+        if (restore_hooks_for_test.clear) {
+            restore_hooks_for_test.clear(ctx, id_slot);
+        } else {
+            llama_memory_seq_rm(llama_get_memory(ctx), id_slot, -1, -1);
+        }
+    };
+    const auto clear_destination = [&]() {
+        seq_clear(ctx_tgt);
+        if (ctx_dft) {
+            seq_clear(ctx_dft);
+        }
+    };
+
     const size_t lcp_resident = prompt.tokens.get_common_prefix(tokens_new);
-    const auto coverage_resident = server_prompt_capture_restore_coverage(
-            prompt, ctx_tgt, ctx_dft, id_slot);
+    const auto coverage_resident = capture_coverage(prompt);
     const auto plan_resident = server_prompt_make_restore_plan(
             coverage_resident, prompt.tokens, lcp_resident, tokens_new.size());
 
-    size_t reusable_best = plan_resident.effective_tokens;
     SRV_TRC(" - looking for better prompt, resident raw lcp = %zu, effective = %zu, kind = %u\n",
-            lcp_resident, reusable_best, (unsigned) plan_resident.kind);
+            lcp_resident, plan_resident.effective_tokens, (unsigned) plan_resident.kind);
 
-    auto it_best = states.end();
+    const auto find_best_candidate = [&](server_prompt_restore_plan & plan_best) {
+        size_t reusable_best = plan_resident.effective_tokens;
+        auto it_best = states.end();
+
+        // Rank only coverage-qualified effective tokens. A long state with an
+        // exact system/tool/user checkpoint is valuable even when that boundary
+        // is less than 25% of the serialized prompt. Ties stay resident.
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it->coverage.scope == server_prompt_restore_scope::target_and_draft && ctx_dft == nullptr) {
+                continue;
+            }
+
+            const size_t lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+            const auto plan_cur = server_prompt_make_restore_plan(
+                    it->coverage, it->prompt.tokens, lcp_cur, tokens_new.size());
+
+            SRV_TRC("   - prompt with length %7zu, raw lcp = %7zu, effective = %7zu, kind = %u\n",
+                    it->prompt.tokens.size(), lcp_cur, plan_cur.effective_tokens, (unsigned) plan_cur.kind);
+
+            if (plan_cur.kind != server_prompt_restore_kind::unusable &&
+                    plan_cur.effective_tokens > reusable_best) {
+                reusable_best = plan_cur.effective_tokens;
+                it_best = it;
+                plan_best = plan_cur;
+            }
+        }
+
+        return it_best;
+    };
+
     server_prompt_restore_plan plan_best;
-
-    // Rank only coverage-qualified effective tokens. A long state with an exact
-    // system/tool/user checkpoint is valuable even when that boundary is less
-    // than 25% of the serialized prompt, so raw f_keep is not an admission gate.
-    // Ties stay resident, avoiding a state restore with no reuse gain.
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        if (it->coverage.scope == server_prompt_restore_scope::target_and_draft && ctx_dft == nullptr) {
-            continue;
-        }
-
-        const size_t lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
-        const auto plan_cur = server_prompt_make_restore_plan(
-                it->coverage, it->prompt.tokens, lcp_cur, tokens_new.size());
-
-        SRV_TRC("   - prompt with length %7zu, raw lcp = %7zu, effective = %7zu, kind = %u\n",
-                it->prompt.tokens.size(), lcp_cur, plan_cur.effective_tokens, (unsigned) plan_cur.kind);
-
-        if (plan_cur.kind != server_prompt_restore_kind::unusable &&
-                plan_cur.effective_tokens > reusable_best) {
-            reusable_best = plan_cur.effective_tokens;
-            it_best = it;
-            plan_best = plan_cur;
-        }
-    }
-
+    auto it_best = find_best_candidate(plan_best);
     if (it_best == states.end()) {
-        // no cache entry beats the resident state
-        if (reusable_best > 0) {
+        // No cache entry beats the resident state.
+        if (plan_resident.effective_tokens > 0) {
             ++dash_hits_resident;
-            dash_last_load.source   = 0; // resident
-            dash_last_load.n_tokens = (uint64_t) reusable_best;
+            dash_last_load.source   = 0;
+            dash_last_load.n_tokens = (uint64_t) plan_resident.effective_tokens;
         } else {
             ++dash_misses;
         }
+        return true;
     }
 
-    if (it_best != states.end()) {
-        SRV_TRC(" - found better coverage-qualified prompt with %zu effective tokens\n", reusable_best);
+    // Restoring an entry requires clearing the destination sequence first.
+    // Capture the live resident bytes before the first attempt so a corrupt or
+    // semantically stale candidate cannot turn useful resident state into a
+    // full-prefill miss. If the snapshot itself cannot be captured, retain the
+    // untouched resident state and do not begin the destructive transaction.
+    server_prompt_data resident_data;
+    bool have_resident_fallback = false;
+    if (plan_resident.kind != server_prompt_restore_kind::unusable &&
+            plan_resident.effective_tokens > 0) {
+        bool snapshot_ok = false;
+        try {
+            const size_t size_tgt = seq_size(ctx_tgt);
+            const bool paired =
+                    coverage_resident.scope == server_prompt_restore_scope::target_and_draft;
+            const size_t size_dft = paired && ctx_dft ? seq_size(ctx_dft) : 0;
+
+            if (size_tgt > 0 && (!paired || size_dft > 0)) {
+                resident_data.main.resize(size_tgt);
+                resident_data.drft.resize(size_dft);
+                snapshot_ok = seq_get(ctx_tgt, resident_data.main.data(), size_tgt) == size_tgt;
+                if (snapshot_ok && paired) {
+                    snapshot_ok = seq_get(ctx_dft, resident_data.drft.data(), size_dft) == size_dft;
+                }
+            }
+        } catch (const std::bad_alloc &) {
+            snapshot_ok = false;
+        } catch (...) {
+            snapshot_ok = false;
+        }
+
+        if (!snapshot_ok) {
+            SRV_WRN("%s", " - could not snapshot resident state; keeping it instead of attempting cache restore\n");
+            ++dash_hits_resident;
+            dash_last_load.source   = 0;
+            dash_last_load.n_tokens = (uint64_t) plan_resident.effective_tokens;
+            return true;
+        }
+        have_resident_fallback = true;
+    }
+
+    // A failed entry is retired and selection is repeated, allowing the next
+    // ranked RAM or SSD candidate to win. Selection always uses the original
+    // resident plan as its floor; the quarantined resident snapshot is the
+    // final fallback once every strictly better candidate has failed.
+    while (it_best != states.end()) {
+        SRV_TRC(" - attempting coverage-qualified prompt with %zu effective tokens\n",
+                plan_best.effective_tokens);
 
         const bool from_disk    = it_best->on_disk();
         const bool from_payload = !from_disk && static_cast<bool>(it_best->io_payload);
-        const size_t tokens_restored = plan_best.effective_tokens;
 
-        if (from_disk && !load_from_disk(*it_best)) {
-            // unreadable or stale file - drop the entry so it is not retried
+        if ((from_disk && !load_from_disk(*it_best)) ||
+                (from_payload && !load_from_payload(*it_best))) {
+            // Decode/integrity failure happens before the destination is
+            // cleared. Retire only this candidate and continue the transaction.
             drop_entry(it_best);
-
-            ++dash_misses;
-            return false;
-        }
-        if (from_payload && !load_from_payload(*it_best)) {
-            // The immutable fallback is the only representation for an
-            // in-flight/failed/uncertain generation. Corruption therefore
-            // retires that exact generation and fails closed.
-            drop_entry(it_best);
-            ++dash_misses;
-            return false;
-        }
-
-        // clear the destination sequence before restoring: the transactional
-        // DSV4 restore requires an empty destination (or an empty staging
-        // sequence, which a busy second lane cannot provide under -np 2).
-        // The current slot state is already saved by the preceding
-        // prompt_save, so dropping it here loses nothing.
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
-        if (ctx_dft) {
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
+            plan_best = {};
+            it_best = find_best_candidate(plan_best);
+            continue;
         }
 
         const size_t bytes_restored = it_best->data.size();
+        clear_destination();
 
-        {
-            auto & data = it_best->data.main;
-
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu - dropping cache entry\n", size);
-
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
-                if (ctx_dft) {
-                    llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
-                }
-
-                // the entry failed to restore once - it will fail again, so
-                // drop it (and its file) instead of retrying it forever
-                drop_entry(it_best);
-
-                ++dash_misses;
-                return false;
-            }
-
-            data.clear();
-            data.shrink_to_fit();
+        const size_t target_expected = it_best->data.main.size();
+        const size_t target_actual = seq_set(ctx_tgt, it_best->data.main);
+        if (target_actual != target_expected) {
+            SRV_WRN("failed to restore target state (expected=%zu actual=%zu effective=%zu scope=%u); "
+                    "dropping cache entry\n",
+                    target_expected, target_actual, plan_best.effective_tokens, (unsigned) plan_best.scope);
+            clear_destination();
+            drop_entry(it_best);
+            plan_best = {};
+            it_best = find_best_candidate(plan_best);
+            continue;
         }
 
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu - dropping cache entry\n", size);
-
-                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
-                    llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
-
-                    drop_entry(it_best);
-
-                    ++dash_misses;
-                    return false;
-                }
-
-                data.clear();
-                data.shrink_to_fit();
+        bool draft_ok = true;
+        if (!it_best->data.drft.empty()) {
+            GGML_ASSERT(ctx_dft);
+            const size_t draft_expected = it_best->data.drft.size();
+            const size_t draft_actual = seq_set(ctx_dft, it_best->data.drft);
+            draft_ok = draft_actual == draft_expected;
+            if (!draft_ok) {
+                SRV_WRN("failed to restore draft state (expected=%zu actual=%zu effective=%zu); "
+                        "dropping cache entry\n",
+                        draft_expected, draft_actual, plan_best.effective_tokens);
             }
-            // else: target-only entry (saved from a slot whose speculative
-            // decoding was bypassed). The draft sequence was cleared above, so
-            // the speculative path re-prefills the draft instead of inheriting
-            // stale rows.
+        }
+        if (!draft_ok) {
+            clear_destination();
+            drop_entry(it_best);
+            plan_best = {};
+            it_best = find_best_candidate(plan_best);
+            continue;
         }
 
-        // Fail closed if the restored representation does not produce the
-        // same coverage decision advertised before the I/O. This is what
-        // prevents a screened cache hit from becoming an admission-time clear.
-        const auto coverage_actual = server_prompt_capture_restore_coverage(
-                it_best->prompt, ctx_tgt, ctx_dft, id_slot);
+        // Fail closed if the restored representation does not produce the same
+        // coverage decision advertised before the I/O.
+        const auto coverage_actual = capture_coverage(it_best->prompt);
         const size_t lcp_actual = it_best->prompt.tokens.get_common_prefix(tokens_new);
         const auto plan_actual = server_prompt_make_restore_plan(
                 coverage_actual, it_best->prompt.tokens, lcp_actual, tokens_new.size());
@@ -3906,26 +3970,39 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 plan_actual.kind != plan_best.kind ||
                 plan_actual.effective_tokens != plan_best.effective_tokens ||
                 plan_actual.checkpoint_index != plan_best.checkpoint_index) {
-            SRV_WRN("%s", "restored state did not satisfy its advertised coverage - dropping cache entry\n");
-            llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
-            if (ctx_dft) {
-                llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
-            }
+            SRV_WRN("restored state did not satisfy advertised coverage "
+                    "(expected scope=%u kind=%u effective=%zu tgt=[%d,%d] dft=[%d,%d]; "
+                    "actual scope=%u kind=%u effective=%zu tgt=[%d,%d] dft=[%d,%d]); "
+                    "dropping cache entry\n",
+                    (unsigned) it_best->coverage.scope, (unsigned) plan_best.kind,
+                    plan_best.effective_tokens,
+                    (int) it_best->coverage.target.pos_min, (int) it_best->coverage.target.pos_max,
+                    (int) it_best->coverage.draft.pos_min, (int) it_best->coverage.draft.pos_max,
+                    (unsigned) coverage_actual.scope, (unsigned) plan_actual.kind,
+                    plan_actual.effective_tokens,
+                    (int) coverage_actual.target.pos_min, (int) coverage_actual.target.pos_max,
+                    (int) coverage_actual.draft.pos_min, (int) coverage_actual.draft.pos_max);
+            clear_destination();
             drop_entry(it_best);
-            ++dash_misses;
-            return false;
+            plan_best = {};
+            it_best = find_best_candidate(plan_best);
+            continue;
         }
 
+        it_best->data.main.clear();
+        it_best->data.main.shrink_to_fit();
+        it_best->data.drft.clear();
+        it_best->data.drft.shrink_to_fit();
+
         ++dash_hits_entry;
-        dash_last_load.source   = from_disk ? 2 : 1; // disk : ram
-        dash_last_load.n_tokens = (uint64_t) tokens_restored;
-        dash_last_load.n_bytes  = bytes_restored;
+        dash_last_load.source         = from_disk ? 2 : 1;
+        dash_last_load.n_tokens       = (uint64_t) plan_best.effective_tokens;
+        dash_last_load.n_bytes        = bytes_restored;
         dash_last_load.restored_scope = plan_best.scope;
 
         if (from_disk) {
-            // keep the file and a slim index entry: the same prefix can be
-            // reloaded again later (other slots, branched conversations, or
-            // after a server restart) at SSD cost instead of a re-prefill
+            // Keep the file and a slim index entry so other slots and future
+            // branches can reload the same durable prefix.
             server_prompt_cache_state slim;
             slim.prompt.tokens = it_best->prompt.tokens.clone();
             slim.coverage      = it_best->coverage;
@@ -3944,16 +4021,48 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             slim.dash_req         = it_best->dash_req;
 
             prompt = std::move(it_best->prompt);
-
             *it_best = std::move(slim);
         } else {
             server_prompt restored = std::move(it_best->prompt);
             erase_entry(it_best, false);
             prompt = std::move(restored);
         }
+        return true;
     }
 
-    return true;
+    if (have_resident_fallback) {
+        clear_destination();
+        const bool target_ok = seq_set(ctx_tgt, resident_data.main) == resident_data.main.size();
+        const bool draft_ok = target_ok &&
+                (resident_data.drft.empty() ||
+                 seq_set(ctx_dft, resident_data.drft) == resident_data.drft.size());
+        const auto coverage_actual = target_ok && draft_ok ?
+                capture_coverage(prompt) : server_prompt_restore_coverage {};
+        const auto plan_actual = target_ok && draft_ok ?
+                server_prompt_make_restore_plan(
+                        coverage_actual, prompt.tokens, lcp_resident, tokens_new.size()) :
+                server_prompt_restore_plan {};
+        if (target_ok && draft_ok &&
+                pcache_coverage_equal(coverage_actual, coverage_resident) &&
+                plan_actual.kind == plan_resident.kind &&
+                plan_actual.effective_tokens == plan_resident.effective_tokens &&
+                plan_actual.checkpoint_index == plan_resident.checkpoint_index) {
+            ++dash_hits_resident;
+            dash_last_load.source         = 0;
+            dash_last_load.n_tokens       = (uint64_t) plan_resident.effective_tokens;
+            dash_last_load.restored_scope = plan_resident.scope;
+            return true;
+        }
+
+        SRV_WRN("failed to restore quarantined resident state "
+                "(target=%d draft=%d expected_effective=%zu actual_effective=%zu); failing closed\n",
+                (int) target_ok, (int) draft_ok,
+                plan_resident.effective_tokens, plan_actual.effective_tokens);
+    }
+
+    clear_destination();
+    ++dash_misses;
+    return false;
 }
 
 void server_prompt_cache::update() {
@@ -4073,6 +4182,10 @@ void server_prompt_cache::test_release_io_pause(uint64_t job_id) {
 
 void server_prompt_cache::test_reconcile_uncertain_for_test(server_prompt_cache_state & state) {
     begin_uncertain_reconciliation(state);
+}
+
+void server_prompt_cache::set_restore_test_hooks(restore_test_hooks hooks) {
+    restore_hooks_for_test = std::move(hooks);
 }
 
 void server_prompt_cache::publish_dashboard_state() {

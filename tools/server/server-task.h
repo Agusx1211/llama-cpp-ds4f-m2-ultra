@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -1076,12 +1077,27 @@ struct server_prompt_cache {
     // erase an entry and unlink its backing file (if any)
     std::list<server_prompt_cache_state>::iterator drop_entry(std::list<server_prompt_cache_state>::iterator it);
 
+    // Retire an allocated entry that could not be populated completely.
+    // Owner-thread only; the exact node (and durable generation, if any) is
+    // removed without publishing partially captured sequence bytes.
+    bool discard(server_prompt_cache_state * state);
+
     // Deterministic integration-test seams. Faults affect one subsequent write
     // admission only; the production default is inert.
     void set_next_io_faults_for_test(const server_prompt_cache_io_faults & faults);
     bool test_wait_for_io_pause(uint64_t job_id, server_prompt_cache_io_test_pause point, uint64_t timeout_ms);
     void test_release_io_pause(uint64_t job_id);
     void test_reconcile_uncertain_for_test(server_prompt_cache_state & state);
+
+    struct restore_test_hooks {
+        std::function<server_prompt_restore_coverage(
+                const server_prompt &, llama_context *, llama_context *, llama_seq_id)> capture_coverage;
+        std::function<size_t(llama_context *, llama_seq_id)> get_size;
+        std::function<size_t(llama_context *, uint8_t *, size_t, llama_seq_id)> get_data;
+        std::function<size_t(llama_context *, const uint8_t *, size_t, llama_seq_id)> set_data;
+        std::function<void(llama_context *, llama_seq_id)> clear;
+    };
+    void set_restore_test_hooks(restore_test_hooks hooks);
 
     // m2-dashboard introspection (main thread only; see server-dashboard-bus.h).
     // What the most recent load() consult did, read by get_available_slot to
@@ -1130,6 +1146,7 @@ struct server_prompt_cache {
 
     server_prompt_cache_io_faults next_io_faults_for_test;
     bool                          have_next_io_faults_for_test = false;
+    restore_test_hooks restore_hooks_for_test;
 };
 
 // used exclusively by router mode
