@@ -130,7 +130,7 @@ private:
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
-    bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+    bool state_read_data(llama_io_read_i & io, uint32_t cell_count, uint32_t serialized_depths);
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {
