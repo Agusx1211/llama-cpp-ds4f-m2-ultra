@@ -46,6 +46,218 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
     return ok;
 }
 
+static llama_token dsv4_test_token(int n_vocab, llama_seq_id seq_id, llama_pos pos) {
+    return (llama_token) ((11*(uint32_t) pos + 37*(uint32_t) seq_id + 3) % (uint32_t) n_vocab);
+}
+
+static bool dsv4_decode_sequence_range(
+        llama_context * ctx,
+        int             n_vocab,
+        llama_seq_id    seq_id,
+        llama_pos       pos_begin,
+        uint32_t        count,
+        bool            output) {
+    llama_batch batch = llama_batch_init(count, 0, 1);
+    for (uint32_t i = 0; i < count; ++i) {
+        const llama_pos pos = pos_begin + (llama_pos) i;
+        common_batch_add(batch, dsv4_test_token(n_vocab, seq_id, pos), pos, { seq_id }, output);
+    }
+    const bool ok = llama_decode(ctx, batch) == 0;
+    llama_batch_free(batch);
+    return ok;
+}
+
+static bool dsv4_decode_replay_batch(
+        llama_context *                 ctx,
+        int                             n_vocab,
+        const std::vector<llama_pos> &  pos_begin,
+        uint32_t                        count) {
+    llama_batch batch = llama_batch_init((int32_t) pos_begin.size()*count, 0, 1);
+    for (uint32_t s = 0; s < pos_begin.size(); ++s) {
+        for (uint32_t i = 0; i < count; ++i) {
+            const llama_pos pos = pos_begin[s] + (llama_pos) i;
+            common_batch_add(batch, dsv4_test_token(n_vocab, (llama_seq_id) s, pos), pos,
+                    { (llama_seq_id) s }, true);
+        }
+    }
+    const bool ok = llama_decode(ctx, batch) == 0;
+    llama_batch_free(batch);
+    return ok;
+}
+
+static bool dsv4_compare_replay_logits(
+        llama_context * ctx_actual,
+        llama_context * ctx_expected,
+        int             n_vocab,
+        uint32_t        n_outputs,
+        const char *    label) {
+    constexpr float eps = 1e-7f;
+
+    double   sse       = 0.0;
+    double   energy    = 0.0;
+    float    max_abs   = 0.0f;
+    uint32_t first_out = n_outputs;
+    int      first_tok = -1;
+
+    for (uint32_t i = 0; i < n_outputs; ++i) {
+        const float * actual   = llama_get_logits_ith(ctx_actual, i);
+        const float * expected = llama_get_logits_ith(ctx_expected, i);
+        if (actual == nullptr || expected == nullptr) {
+            fprintf(stderr, "%s : %s missing logits at output %u\n", __func__, label, i);
+            return false;
+        }
+        for (int tok = 0; tok < n_vocab; ++tok) {
+            if (!std::isfinite(actual[tok]) || !std::isfinite(expected[tok])) {
+                fprintf(stderr, "%s : %s produced non-finite logits at output %u token %d\n",
+                        __func__, label, i, tok);
+                return false;
+            }
+
+            const double delta = (double) actual[tok] - expected[tok];
+            const float abs_delta = (float) std::fabs(delta);
+            sse += delta*delta;
+            energy += (double) expected[tok]*expected[tok];
+            max_abs = std::max(max_abs, abs_delta);
+            if (abs_delta > eps && first_out == n_outputs) {
+                first_out = i;
+                first_tok = tok;
+            }
+        }
+    }
+
+    const double nmse = energy > 0.0 ? sse/energy : (sse == 0.0 ? 0.0 : std::numeric_limits<double>::infinity());
+    fprintf(stderr, "%s : %s NMSE %.3e, max abs %.3e\n", __func__, label, nmse, (double) max_abs);
+    if (max_abs > eps) {
+        fprintf(stderr, "%s : %s first mismatch at output %u token %d\n",
+                __func__, label, first_out, first_tok);
+        return false;
+    }
+
+    return true;
+}
+
+// DSV4 plans all ubatches before executing any of them. A pending rollback
+// must therefore be consumed by only the first ubatch that touches its
+// sequence. This is the production shape: four independent lanes, different
+// rejection depths, requested unified KV, and a replay long enough to span
+// several equal-split ubatches.
+//
+// The incremental case also protects the bounded snapshot shift-register:
+// deeper planes must continue to advance when the latest decode contributes
+// fewer tokens than the rollback capacity (normal single-token generation).
+static bool test_dsv4_multi_seq_rollback(const common_params & params, llama_model * model, int n_vocab) {
+    constexpr uint32_t  n_seqs     = 4;
+    constexpr uint32_t  n_ubatch   = 16;
+    constexpr uint32_t  n_prompt   = 19;
+    constexpr uint32_t  n_replay   = 40;
+    constexpr uint32_t  n_rs_seq   = 8;
+
+    const auto make_ctx_multi = [&]() {
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = n_seqs;
+        cparams.n_rs_seq   = n_rs_seq;
+        cparams.n_ctx      = 512;
+        cparams.n_batch    = 256;
+        cparams.n_ubatch   = n_ubatch;
+        cparams.kv_unified = params.kv_unified;
+        return llama_context_ptr(llama_init_from_model(model, cparams));
+    };
+
+    llama_context_ptr ctx_roll = make_ctx_multi();
+    llama_context_ptr ctx_ref  = make_ctx_multi();
+    if (ctx_roll == nullptr || ctx_ref == nullptr) {
+        fprintf(stderr, "%s : failed to initialize four-sequence contexts\n", __func__);
+        return false;
+    }
+    if (llama_n_rs_seq(ctx_roll.get()) < n_seqs) {
+        fprintf(stderr, "%s : need at least %u rollback snapshots, context has %u\n",
+                __func__, n_seqs, llama_n_rs_seq(ctx_roll.get()));
+        return false;
+    }
+
+    std::vector<llama_pos> replay_pos(n_seqs);
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        const uint32_t depth = s + 1;
+        const llama_pos p0 = (llama_pos) n_prompt - (llama_pos) depth;
+        replay_pos[s] = p0;
+
+        if (!dsv4_decode_sequence_range(ctx_roll.get(), n_vocab, (llama_seq_id) s, 0, p0, false) ||
+            !dsv4_decode_sequence_range(ctx_ref.get(),  n_vocab, (llama_seq_id) s, 0, p0, false) ||
+            !dsv4_decode_sequence_range(ctx_roll.get(), n_vocab, (llama_seq_id) s, p0, depth, false) ||
+            !llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), (llama_seq_id) s, p0, -1)) {
+            fprintf(stderr, "%s : failed to prepare sequence %u at rollback depth %u\n", __func__, s, depth);
+            return false;
+        }
+    }
+
+    if (!dsv4_decode_replay_batch(ctx_roll.get(), n_vocab, replay_pos, n_replay) ||
+        !dsv4_decode_replay_batch(ctx_ref.get(),  n_vocab, replay_pos, n_replay)) {
+        fprintf(stderr, "%s : four-sequence replay decode failed\n", __func__);
+        return false;
+    }
+    if (!dsv4_compare_replay_logits(
+                ctx_roll.get(), ctx_ref.get(), n_vocab, n_seqs*n_replay,
+                params.kv_unified ? "four-sequence requested-unified replay" : "four-sequence split replay")) {
+        return false;
+    }
+
+    // Four one-token calls must shift the depth-four snapshot back by four
+    // states. Replaying the same four-token batch then matches a context that
+    // never advanced beyond the rollback boundary.
+    llama_memory_clear(llama_get_memory(ctx_roll.get()), true);
+    llama_memory_clear(llama_get_memory(ctx_ref.get()),  true);
+    constexpr llama_seq_id chain_seq = 2;
+    constexpr llama_pos    chain_pos = 12;
+    constexpr uint32_t     chain_depth = 4;
+    if (!dsv4_decode_sequence_range(ctx_roll.get(), n_vocab, chain_seq, 0, chain_pos, false) ||
+        !dsv4_decode_sequence_range(ctx_ref.get(),  n_vocab, chain_seq, 0, chain_pos, false)) {
+        fprintf(stderr, "%s : failed to prepare incremental snapshot prefix\n", __func__);
+        return false;
+    }
+    for (uint32_t i = 0; i < chain_depth; ++i) {
+        if (!dsv4_decode_sequence_range(
+                    ctx_roll.get(), n_vocab, chain_seq, chain_pos + (llama_pos) i, 1, false)) {
+            fprintf(stderr, "%s : failed incremental snapshot step %u\n", __func__, i);
+            return false;
+        }
+    }
+    if (!llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), chain_seq, chain_pos, -1)) {
+        fprintf(stderr, "%s : failed depth-four incremental rollback\n", __func__);
+        return false;
+    }
+    const std::vector<llama_pos> chain_replay = { chain_pos };
+    if (!dsv4_decode_replay_batch(ctx_roll.get(), n_vocab, chain_replay, chain_depth) ||
+        !dsv4_decode_replay_batch(ctx_ref.get(),  n_vocab, chain_replay, chain_depth) ||
+        !dsv4_compare_replay_logits(
+                ctx_roll.get(), ctx_ref.get(), n_vocab, chain_depth, "incremental snapshot chain")) {
+        return false;
+    }
+
+    // A second partial removal cannot be composed while the first restore is
+    // still pending. Once a replay consumes it, a new rollback is valid.
+    llama_memory_clear(llama_get_memory(ctx_roll.get()), true);
+    constexpr llama_seq_id pending_seq = 3;
+    constexpr llama_pos    pending_pos = 16;
+    if (!dsv4_decode_sequence_range(ctx_roll.get(), n_vocab, pending_seq, 0, n_prompt, false) ||
+        !llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), pending_seq, pending_pos, -1)) {
+        fprintf(stderr, "%s : failed to arm pending rollback\n", __func__);
+        return false;
+    }
+    if (llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), pending_seq, pending_pos - 1, -1)) {
+        fprintf(stderr, "%s : accepted a second partial removal while rollback was pending\n", __func__);
+        return false;
+    }
+    if (!dsv4_decode_sequence_range(ctx_roll.get(), n_vocab, pending_seq, pending_pos, 1, false) ||
+        !llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), pending_seq, pending_pos, -1)) {
+        fprintf(stderr, "%s : rollback was not reusable after its restore was consumed\n", __func__);
+        return false;
+    }
+
+    fprintf(stderr, "%s : four-sequence rollback, incremental snapshot chain, and single-use guard passed\n",
+            __func__);
+    return true;
+}
+
 static bool copy_logits(llama_context *      ctx,
                         int                  n_vocab,
                         uint32_t             depth,
@@ -385,5 +597,18 @@ int main(int argc, char ** argv) {
     }
 
     fprintf(stderr, "%s : recurrent rollback depths 1-%u restored successfully\n", __func__, MAX_ROLLBACK_DEPTH);
+
+    if (is_dsv4) {
+        // Release the four single-sequence schedulers before constructing two
+        // four-lane contexts for the target-model regression.
+        ctx_src.reset();
+        ctx_dst.reset();
+        ctx_ref.reset();
+        ctx_dirty.reset();
+        if (!test_dsv4_multi_seq_rollback(params, model, n_vocab)) {
+            return 1;
+        }
+    }
+
     return 0;
 }
