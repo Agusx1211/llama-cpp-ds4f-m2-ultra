@@ -2061,6 +2061,61 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// Row-slice decomposition for the n_raw > 0 sparse-pack form.
+//
+// The kernel used to run one threadgroup per token and loop serially over all
+// n_raw + n_comp rows inside it. That saturates the GPU at prefill, where nt is
+// the ubatch, and collapses at a speculative-verify shape: nt = 4 leaves 148 of
+// the M2 Ultra's 152 cores idle and costs 104 us per token per layer against
+// 1.10 us at prefill - 95x worse - which is the single reason routing the
+// 2..7-row verify shape through the packed path lost
+// (notes/2026-08-09-sparse-pack-routing.md section 4.3).
+//
+// So slice the row range as well and dispatch (row slice, token). Raw and
+// compressed rows are sliced independently because they cost different things:
+// a compressed row is a pure indexed copy, while a raw slice must first
+// re-derive its own part of the SWA-mask compaction (a threadgroup-cooperative
+// scan of the n_raw_k mask row). Keeping raw slices coarse bounds how often
+// that scan is repeated; at the target shape it costs ~0.15 MB of extra mask
+// reads per layer against ~2.6 MB of real copy traffic.
+//
+// The decomposition never changes what is written, only which thread writes it,
+// so the packed output is byte-identical for any slice sizes.
+static void ggml_metal_dsv4_sparse_pack_slices(
+        int n_raw, int n_comp, int nt,
+        int32_t * n_raw_tg, int32_t * rows_raw, int32_t * rows_comp, int * n_tg_x) {
+    // measurement seams; the defaults are what was tuned in-graph, see
+    // notes/2026-08-09-sparse-pack-kernel.md
+    static const int tg_target = []() {
+        const char * v = std::getenv("GGML_DSV4_SPARSE_PACK_TG_TARGET");
+        const int n = v != nullptr ? atoi(v) : 512;
+        return n > 0 ? n : 1;
+    }();
+    static const int rows_raw_min = []() {
+        const char * v = std::getenv("GGML_DSV4_SPARSE_PACK_ROWS_RAW_MIN");
+        const int n = v != nullptr ? atoi(v) : 32;
+        return n > 0 ? n : 1;
+    }();
+
+    // the kernel stages one slice - not the whole working set - in threadgroup
+    // memory, so this bound is what keeps it safe for any n_raw + n_comp
+    constexpr int max_rows = 128 + 512;
+
+    // row slices per token needed to reach tg_target threadgroups
+    const int want = nt > 0 ? std::max(1, (tg_target + nt - 1)/nt) : 1;
+
+    int rr = std::max(rows_raw_min, (n_raw  + want - 1)/want);
+    int rc = std::max(1,            (n_comp + want - 1)/want);
+
+    rr = std::min(std::max(rr, 1), max_rows);
+    rc = std::min(std::max(rc, 1), max_rows);
+
+    *rows_raw  = rr;
+    *rows_comp = rc;
+    *n_raw_tg  = (n_raw + rr - 1)/rr;
+    *n_tg_x    = *n_raw_tg + (n_comp + rc - 1)/rc;
+}
+
 int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
     GGML_ASSERT(op->op == GGML_OP_DSV4_SPARSE_PACK);
@@ -2073,6 +2128,16 @@ int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * segment_ids = op->src[5];
     const bool indexed = segment_ids != nullptr;
 
+    const int nt = (int) op->ne[1];
+
+    int32_t n_raw_tg  = 0;
+    int32_t rows_raw  = 1;
+    int32_t rows_comp = 1;
+    int     n_tg_x    = 0;
+    ggml_metal_dsv4_sparse_pack_slices(
+            ggml_get_op_params_i32(op, 0), (int) comp_idx->ne[0], nt,
+            &n_raw_tg, &rows_raw, &rows_comp, &n_tg_x);
+
     ggml_metal_encoder_t enc = ctx->enc;
     if (!indexed) {
         ggml_metal_kargs_dsv4_sparse_pack args = {
@@ -2081,6 +2146,9 @@ int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
             /*.n_raw   =*/ ggml_get_op_params_i32(op, 0),
             /*.n_raw_k =*/ (int32_t) raw_k->ne[2],
             /*.n_comp  =*/ (int32_t) comp_idx->ne[0],
+            /*.n_raw_tg  =*/ n_raw_tg,
+            /*.rows_raw  =*/ rows_raw,
+            /*.rows_comp =*/ rows_comp,
             /*.nb_rk2  =*/ raw_k->nb[2],
             /*.nb_rk3  =*/ raw_k->nb[3],
             /*.nb_ck2  =*/ comp_k->nb[2],
@@ -2106,9 +2174,9 @@ int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
 
         const int nth = std::min(128, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
         if (args.n_raw == 0) {
-            ggml_metal_encoder_dispatch_threadgroups(enc, args.n_comp, op->ne[1], 1, nth, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, args.n_comp, nt, 1, nth, 1, 1);
         } else {
-            ggml_metal_encoder_dispatch_threadgroups(enc, op->ne[1], 1, 1, nth, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, n_tg_x, nt, 1, nth, 1, 1);
         }
         return 1;
     }
@@ -2121,6 +2189,9 @@ int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
         /*.n_comp  =*/ (int32_t) comp_idx->ne[0],
         /*.n_comp_k =*/ (int32_t) comp_mask->ne[0],
         /*.n_pool_segments =*/ (int32_t) (comp_k->ne[1]/64),
+        /*.n_raw_tg  =*/ n_raw_tg,
+        /*.rows_raw  =*/ rows_raw,
+        /*.rows_comp =*/ rows_comp,
         /*.nb_rk2  =*/ raw_k->nb[2],
         /*.nb_rk3  =*/ raw_k->nb[3],
         /*.nb_ck1  =*/ comp_k->nb[1],
@@ -2147,9 +2218,9 @@ int ggml_metal_op_dsv4_sparse_pack(ggml_metal_op_t ctx, int idx) {
 
     const int nth = std::min(128, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
     if (args.n_raw == 0) {
-        ggml_metal_encoder_dispatch_threadgroups(enc, args.n_comp, op->ne[1], 1, nth, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, args.n_comp, nt, 1, nth, 1, 1);
     } else {
-        ggml_metal_encoder_dispatch_threadgroups(enc, op->ne[1], 1, 1, nth, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, n_tg_x, nt, 1, nth, 1, 1);
     }
 
     return 1;
