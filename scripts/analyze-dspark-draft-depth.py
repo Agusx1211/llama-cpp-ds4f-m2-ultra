@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """Analyze DSpark drafter GPU cost at two live-context depths.
 
-The companion ``bench-dspark-draft-depth.sh`` produces fresh-process
-near-zero and deep-context replays.  This analyzer deliberately recognizes
-the DSpark graph from model tensors (the Markov/confidence head plus exactly
-three dense-attention layers); it never treats the target model's compressed
-attention as drafter work.
+The companion harness makes two unprofiled deep-context references and two
+fresh KPROF processes at each depth.  Every deep process consumes its own
+byte-identical LCPC clone, while an immutable template remains outside all
+``--cache-disk`` directories.
 
-The E1 decision statistic is the depth-dependent part of the steady-state,
-full-width DSpark proposal graph:
+The E1 response-level sensitivity statistic is computed for every combination
+of a near process mean, deep process mean, and unprofiled deep response:
 
-    (deep FA/indexer/compressor - same-width near cost) * calls/verify
-    -----------------------------------------------------------------
-                unprofiled deep speculative-step wall time
+    100 * (deep steady-width cost - near steady-width cost) * C
+    ----------------------------------------------------------------
+                   unprofiled deep predicted_ms
 
-GGML_METAL_KPROF=1 adds a fixed cost to every split pass.  Comparing the same
-three FA nodes at the same proposal width cancels that fixed term.  Results are
-rejected unless exact replay, cache restoration, KPROF association, and graph
-shape checks all pass.
+``C`` is the exact number of steady-width SPECTRACE draft calls in the
+identical 16-token deep response.  The eight combinations form an observed
+sensitivity envelope, not a confidence interval and not eight independent
+observations.
+The result is rejected unless replay, response, trace, graph, timestamp,
+scratch-buffer, and immutable-template gates all pass.
 """
 
 from __future__ import annotations
@@ -122,14 +123,16 @@ def is_indexer_node(node: dict[str, Any]) -> bool:
 def is_compressor_node(node: dict[str, Any]) -> bool:
     if node.get("op") == "DSV4_COMPRESS":
         return True
-    name = str(node.get("name", ""))
-    return "_state_compress" in name
+    return "_state_compress" in str(node.get("name", ""))
 
 
 def parse_kprof(log_path: Path, begin_line: int, end_line: int) -> list[DraftCompute]:
+    """Return all signed DSpark graphs for one request, in execution order."""
     graphs: dict[int, dict[int, dict[str, Any]]] = defaultdict(dict)
     starts: list[tuple[int, dict[str, Any]]] = []
-    flushes: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    timings: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    errors: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    scratch: dict[int, list[dict[str, Any]]] = defaultdict(list)
 
     with open_text(log_path) as handle:
         for line_no, line in enumerate(handle, 1):
@@ -139,35 +142,67 @@ def parse_kprof(log_path: Path, begin_line: int, end_line: int) -> list[DraftCom
                     graphs[int(record["uid"])][int(record["i"])] = record
                 elif line.startswith("KPROFS "):
                     starts.append((line_no, json.loads(line[7:])))
+                elif line.startswith("KPROFSB "):
+                    record = json.loads(line[8:])
+                    scratch[int(record["seq"])].append(record)
                 elif line.startswith("KPROF "):
                     record = json.loads(line[6:])
-                    if "error" not in record:
-                        flushes[int(record["seq"])].append(record)
+                    if "error" in record:
+                        errors[int(record["seq"])].append(record)
+                    else:
+                        timings[int(record["seq"])].append(record)
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise InvalidRun(f"malformed KPROF record at {log_path}:{line_no}: {exc}") from exc
 
-    seqs = sorted(flushes)
+    seqs = sorted(set(timings) | set(errors) | set(scratch))
     require(starts, f"no KPROFS records in {log_path}")
     require(len(starts) == len(seqs),
-            f"KPROF start/flush mismatch in {log_path}: {len(starts)} starts, {len(seqs)} sequences")
+            f"KPROF start/result mismatch in {log_path}: {len(starts)} starts, {len(seqs)} sequences")
 
     selected: list[DraftCompute] = []
+    accepted_sequences = 0
     for (line_no, start), seq in zip(starts, seqs):
         if not (begin_line <= line_no <= end_line):
             continue
+        accepted_sequences += 1
         uid = int(start["uid"])
+        require(not errors.get(seq),
+                f"KPROF error in accepted request: uid={uid} seq={seq} errors={errors[seq]}")
+        require(len(scratch.get(seq, [])) == 1,
+                f"uid={uid} seq={seq} has {len(scratch.get(seq, []))} KPROFSB records")
+        require(int(scratch[seq][0].get("failed", -1)) == 0,
+                f"uid={uid} seq={seq} KPROFSB failed={scratch[seq][0].get('failed')}")
+
         nodes = graphs.get(uid, {})
-        if not nodes:
-            # The graph dump is intentionally bounded. Missing unrelated graph
-            # definitions are harmless, but a missing DSpark definition would
-            # make the drafter disappear and is caught by the count gates below.
-            continue
-        if not is_dspark_graph(nodes):
+        if not nodes or not is_dspark_graph(nodes):
             continue
 
-        records = flushes[seq]
-        require(records, f"DSpark uid={uid} seq={seq} has no samples")
-        seen_nodes: set[int] = set()
+        expected_nodes = set(range(int(start["n_nodes"])))
+        require(set(nodes) == expected_nodes,
+                f"signed DSpark uid={uid} graph definition is incomplete: "
+                f"missing={sorted(expected_nodes - set(nodes))} "
+                f"extra={sorted(set(nodes) - expected_nodes)}")
+        unknown_timed = sorted({int(record["node"]) for record in timings.get(seq, [])
+                                if int(record["node"]) >= 0 and int(record["node"]) not in nodes})
+        require(not unknown_timed,
+                f"signed DSpark uid={uid} seq={seq} timed unknown nodes {unknown_timed}")
+
+        indexer_nodes = {i for i, node in nodes.items() if is_indexer_node(node)}
+        compressor_nodes = {i for i, node in nodes.items() if is_compressor_node(node)}
+        require(not indexer_nodes and not compressor_nodes,
+                f"pinned DSpark uid={uid} unexpectedly declares indexer={sorted(indexer_nodes)} "
+                f"compressor={sorted(compressor_nodes)}")
+
+        records = timings.get(seq, [])
+        require(records, f"signed DSpark uid={uid} seq={seq} has no timing samples")
+        fa_nodes = {i for i, node in nodes.items() if node.get("op") == "FLASH_ATTN_EXT"}
+        require(len(fa_nodes) == 3, f"signed DSpark uid={uid} has {len(fa_nodes)} FA nodes")
+        fa_counts = Counter(int(record["node"]) for record in records
+                            if int(record["node"]) in fa_nodes)
+        require(set(fa_counts) == fa_nodes and sorted(fa_counts.values()) == [2, 2, 2],
+                f"uid={uid} seq={seq} FA timestamp multiplicities are "
+                f"{[fa_counts.get(node, 0) for node in sorted(fa_nodes)]}, expected [2, 2, 2]")
+
         fa_ns = indexer_ns = compressor_ns = graph_ns = 0
         for record in records:
             node_index = int(record["node"])
@@ -177,17 +212,14 @@ def parse_kprof(log_path: Path, begin_line: int, end_line: int) -> list[DraftCom
             node = nodes.get(node_index)
             if node is None:
                 continue
-            seen_nodes.add(node_index)
             if node.get("op") == "FLASH_ATTN_EXT":
                 fa_ns += elapsed
             if is_indexer_node(node):
                 indexer_ns += elapsed
             if is_compressor_node(node):
                 compressor_ns += elapsed
-
-        fa_nodes = {i for i, node in nodes.items() if node.get("op") == "FLASH_ATTN_EXT"}
-        require(fa_nodes <= seen_nodes,
-                f"incomplete DSpark FA samples for uid={uid}: missing {sorted(fa_nodes - seen_nodes)}")
+        require(indexer_ns == 0 and compressor_ns == 0,
+                f"pinned DSpark uid={uid} measured nonzero indexer/compressor cost")
         selected.append(DraftCompute(
             uid=uid,
             seq=seq,
@@ -198,6 +230,8 @@ def parse_kprof(log_path: Path, begin_line: int, end_line: int) -> list[DraftCom
             total_graph_ns=graph_ns,
         ))
 
+    require(accepted_sequences > 0,
+            f"no KPROF sequences begin in request range {begin_line}:{end_line} of {log_path}")
     require(selected, f"no signed DSpark graphs in request range {begin_line}:{end_line} of {log_path}")
     return selected
 
@@ -207,9 +241,26 @@ def request_trace(log_path: Path, begin_line: int, end_line: int) -> list[str]:
     with open_text(log_path) as handle:
         for line_no, line in enumerate(handle, 1):
             if begin_line <= line_no <= end_line and line.startswith("SPECTRACE "):
-                value = re.sub(r"\b(slot|seq)=\d+", r"\1=*", line.rstrip())
-                trace.append(value)
+                trace.append(re.sub(r"\b(slot|seq)=\d+", r"\1=*", line.rstrip()))
     return trace
+
+
+def trace_draft_widths(trace: list[str], label: str) -> list[int]:
+    require(len(trace) >= 2, f"{label} has fewer than two SPECTRACE events")
+    require(trace[0].startswith("SPECTRACE tgt ") and
+            re.search(r"\bn_dec=0\b", trace[0]) is not None,
+            f"{label} first SPECTRACE event is not tgt n_dec=0: {trace[0]}")
+    require(trace[1].startswith("SPECTRACE draft "),
+            f"{label} second SPECTRACE event is not draft: {trace[1]}")
+    widths: list[int] = []
+    for event in trace:
+        if not event.startswith("SPECTRACE draft "):
+            continue
+        match = re.search(r"\bn_blk=(\d+)\b", event)
+        require(match is not None, f"{label} draft event lacks n_blk: {event}")
+        widths.append(int(match.group(1)))
+    require(widths, f"{label} has no SPECTRACE draft events")
+    return widths
 
 
 def cache_restore_evidence(log_path: Path, begin_line: int, end_line: int) -> dict[str, Any]:
@@ -244,11 +295,6 @@ def response_signature(response: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def mean(values: list[float], label: str) -> float:
-    require(values, f"no values for {label}")
-    return statistics.fmean(values)
-
-
 def sample_summary(values: list[float]) -> dict[str, float | int]:
     require(values, "cannot summarize an empty sample")
     return {
@@ -269,13 +315,16 @@ def read_run(root: Path, label: str) -> dict[str, Any]:
     end = int(meta["end_line"])
     require(begin > 0 and end >= begin, f"invalid request range for {label}: {begin}:{end}")
     trace = request_trace(log_path, begin, end)
+    signature = response_signature(response)
+    require(signature["predicted_n"] == 16,
+            f"{label} predicted_n={signature['predicted_n']}, expected 16")
     return {
         "label": label,
         "meta": meta,
         "response": response,
-        "signature": response_signature(response),
+        "signature": signature,
         "trace": trace,
-        "verify_steps": sum(line.startswith("SPECTRACE ver ") for line in trace),
+        "draft_widths": trace_draft_widths(trace, label),
         "restore": cache_restore_evidence(log_path, begin, end),
         "log_path": log_path,
     }
@@ -284,20 +333,107 @@ def read_run(root: Path, label: str) -> dict[str, Any]:
 def assert_exact(reference: dict[str, Any], candidate: dict[str, Any], family: str) -> None:
     require(reference["signature"] == candidate["signature"],
             f"{family} response mismatch: {reference['label']} != {candidate['label']}")
-    require(reference["trace"], f"{reference['label']} has no SPECTRACE evidence")
-    require(candidate["trace"], f"{candidate['label']} has no SPECTRACE evidence")
     require(reference["trace"] == candidate["trace"],
             f"{family} SPECTRACE mismatch: {reference['label']} != {candidate['label']}")
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise InvalidRun(f"cannot hash {path}: {exc}") from exc
+    return digest.hexdigest()
+
+
+def validate_replay_provenance(root: Path, labels: list[str]) -> dict[str, Any]:
+    template_meta = load_json(root / "deep-template.json")
+    template_path = root / "deep-template" / "deep-state.lcpc"
+    require(template_path.is_file(), "immutable deep template is missing after all replays")
+    template_real = template_path.resolve()
+    expected_size = int(template_meta.get("size", -1))
+    expected_sha = str(template_meta.get("sha256", ""))
+    require(template_meta.get("role") == "immutable-template" and
+            template_meta.get("cmp_equal") is True,
+            "immutable template provenance is incomplete")
+    require(Path(str(template_meta.get("destination", ""))) == template_real,
+            "immutable template provenance points to a different destination")
+    require(template_path.stat().st_size == expected_size,
+            "immutable template size changed during replay")
+    require(file_sha256(template_path) == expected_sha,
+            "immutable template hash changed during replay")
+
+    destinations: set[Path] = set()
+    seeds: dict[str, Any] = {}
+    for label in labels:
+        value = load_json(root / f"cache-seed-{label}.json")
+        source = Path(str(value.get("source", "")))
+        destination = Path(str(value.get("destination", "")))
+        require(value.get("role") == f"{label}-seed" and value.get("cmp_equal") is True,
+                f"{label} seed provenance is incomplete")
+        require(source == template_real, f"{label} was not seeded from the immutable template")
+        require(int(value.get("size", -1)) == expected_size and
+                value.get("sha256") == expected_sha,
+                f"{label} seed size/hash differs from the immutable template")
+        require(destination not in destinations, f"reused destructive cache destination: {destination}")
+        destinations.add(destination)
+        require(destination.parent == (root / f"cache-{label}").resolve(),
+                f"{label} seed is outside its unique cache directory")
+        require(template_real.parent not in destination.parents,
+                f"{label} destructive seed overlaps the immutable template")
+        seeds[label] = value
+    return {"template": template_meta, "seeds": seeds}
+
+
+def classify_envelope(shares: list[float], threshold: float) -> dict[str, Any]:
+    require(len(shares) == 8, f"expected 2x2x2=8 sensitivity values, got {len(shares)}")
+    low = min(shares)
+    high = max(shares)
+    width = high - low
+    if high < threshold:
+        edge_distance = threshold - high
+        decision = "reject-windowing" if edge_distance >= width else "inconclusive"
+    elif low >= threshold:
+        edge_distance = low - threshold
+        decision = "extend-review" if edge_distance >= width else "inconclusive"
+    else:
+        edge_distance = 0.0
+        decision = "inconclusive"
+    return {
+        "kind": "observed-sensitivity-envelope-not-ci",
+        "n_combinations": len(shares),
+        "min_pct": low,
+        "max_pct": high,
+        "width_pct": width,
+        "closest_edge_distance_pct": edge_distance,
+        "margin_sufficient": edge_distance >= width,
+        "values_pct": shares,
+        "decision": decision,
+    }
+
+
+def steady_call_count(widths: list[int], steady_width: int) -> int:
+    count = sum(width == steady_width for width in widths)
+    require(count > 0, "exact deep trace contains no steady-width draft calls")
+    return count
+
+
 def analyze(root: Path) -> dict[str, Any]:
     manifest = load_json(root / "manifest.json")
+    require(manifest.get("schema") == 2, "unexpected manifest schema")
     require(manifest.get("decision_threshold_pct") == 5.0,
             "manifest does not predeclare the E1 5% decision threshold")
+    require(manifest.get("kprof_stride") == 1,
+            "FA timestamp multiplicity invariant requires KPROF stride=1")
+    require(manifest.get("deep_replay_cache_mode") ==
+            "immutable-template+unique-per-run-clone",
+            "manifest does not require immutable per-run deep replay clones")
+
     replay_tokens = load_json(root / "deep-replay-tokens.json")
     require(isinstance(replay_tokens, list) and len(replay_tokens) >= 90_000,
             "deep replay is not near 100k live tokens")
-
     cache_header = load_json(root / "deep-cache-header.json")
     cache_tokens = int(cache_header.get("n_tokens", -1))
     cache_tail_gap = len(replay_tokens) - cache_tokens
@@ -307,10 +443,15 @@ def analyze(root: Path) -> dict[str, Any]:
     require(int(cache_header.get("size_drft", 0)) > 0,
             "disk cache entry is target-only; drafter state was not preserved")
 
+    deep_labels = [f"deep-ref-{index}" for index in (1, 2)] + [
+        f"deep-kprof-{index}" for index in (1, 2)]
+    replay_provenance = validate_replay_provenance(root, deep_labels)
+
     near_ref = read_run(root, "near-ref")
     deep_refs = [read_run(root, f"deep-ref-{index}") for index in (1, 2)]
     near_profiles = [read_run(root, f"near-kprof-{index}") for index in (1, 2)]
     deep_profiles = [read_run(root, f"deep-kprof-{index}") for index in (1, 2)]
+    all_runs = [near_ref] + deep_refs + near_profiles + deep_profiles
 
     for candidate in near_profiles:
         assert_exact(near_ref, candidate, "near")
@@ -318,7 +459,11 @@ def analyze(root: Path) -> dict[str, Any]:
     for candidate in deep_profiles:
         assert_exact(deep_refs[0], candidate, "deep")
 
+    steady_width = int(manifest.get("spec_draft_n_max", 5))
+    call_count = steady_call_count(deep_refs[0]["draft_widths"], steady_width)
     for run in deep_refs + deep_profiles:
+        require(steady_call_count(run["draft_widths"], steady_width) == call_count,
+                f"{run['label']} steady draft-call count differs from exact deep reference")
         timing = run["response"]["timings"]
         prompt_n = int(timing.get("prompt_n", 1 << 30))
         require(prompt_n <= 2, f"{run['label']} reprocessed {prompt_n} prompt tokens")
@@ -333,105 +478,97 @@ def analyze(root: Path) -> dict[str, Any]:
     profile_computes: dict[str, list[DraftCompute]] = {}
     for run in near_profiles + deep_profiles:
         meta = run["meta"]
-        profile_computes[run["label"]] = parse_kprof(
-            run["log_path"], int(meta["begin_line"]), int(meta["end_line"]))
+        computes = parse_kprof(run["log_path"], int(meta["begin_line"]), int(meta["end_line"]))
+        graph_widths = [compute.width for compute in computes]
+        require(graph_widths == run["draft_widths"],
+                f"{run['label']} ordered DSpark widths {graph_widths} != "
+                f"SPECTRACE draft widths {run['draft_widths']}")
+        profile_computes[run["label"]] = computes
 
-    # Steady-state DSpark is one batched proposal graph, normally width 5.
-    # Terminal partial-budget calls are reported but excluded from the paired
-    # depth delta so proposal width cannot masquerade as a context effect.
     all_widths = [compute.width for values in profile_computes.values() for compute in values]
     width_counts = Counter(all_widths)
-    steady_width = max(width_counts, key=lambda value: (width_counts[value], value))
-    require(steady_width == int(manifest.get("spec_draft_n_max", 5)),
-            f"modal DSpark width is {steady_width}, expected spec n_max")
+    require(steady_width in width_counts,
+            f"no full-width DSpark graph at declared n_max={steady_width}")
 
-    near_steady = [
-        compute for run in near_profiles for compute in profile_computes[run["label"]]
-        if compute.width == steady_width
-    ]
-    deep_steady = [
-        compute for run in deep_profiles for compute in profile_computes[run["label"]]
-        if compute.width == steady_width
-    ]
-    require(len(near_steady) >= 4 and len(deep_steady) >= 4,
-            f"too few steady DSpark samples: near={len(near_steady)} deep={len(deep_steady)}")
+    process_means: dict[str, float] = {}
+    process_samples: dict[str, list[float]] = {}
+    for run in near_profiles + deep_profiles:
+        values = [compute.measured_ns / 1e6 for compute in profile_computes[run["label"]]
+                  if compute.width == steady_width]
+        require(values, f"{run['label']} has no steady-width DSpark samples")
+        process_samples[run["label"]] = values
+        process_means[run["label"]] = statistics.fmean(values)
 
-    # Architecture reality check. This DSpark artifact contains the first
-    # three dense-attention layers and no lightning-indexer/compressor nodes.
-    # Reporting zero is important: target-model CSA must not be charged here.
-    near_indexer = [compute.indexer_ns for compute in near_steady]
-    deep_indexer = [compute.indexer_ns for compute in deep_steady]
-    near_compressor = [compute.compressor_ns for compute in near_steady]
-    deep_compressor = [compute.compressor_ns for compute in deep_steady]
-
-    near_cost_ms = [compute.measured_ns / 1e6 for compute in near_steady]
-    deep_cost_ms = [compute.measured_ns / 1e6 for compute in deep_steady]
-    delta_ms = mean(deep_cost_ms, "deep cost") - mean(near_cost_ms, "near cost")
-
-    verify_counts = [run["verify_steps"] for run in deep_profiles]
-    graph_counts = [len(profile_computes[run["label"]]) for run in deep_profiles]
-    require(all(value > 0 for value in verify_counts), f"missing deep verification traces: {verify_counts}")
-    calls_per_verify_samples = [graphs / verifies for graphs, verifies in zip(graph_counts, verify_counts)]
-    calls_per_verify = mean(calls_per_verify_samples, "calls per verify")
-    require(0.8 <= calls_per_verify <= 1.2,
-            f"DSpark graph/verify association is not one-to-one: {calls_per_verify_samples}")
-
-    step_ms_samples: list[float] = []
+    near_means = [process_means[run["label"]] for run in near_profiles]
+    deep_means = [process_means[run["label"]] for run in deep_profiles]
+    predicted_ms: list[float] = []
     for run in deep_refs:
-        predicted_ms = float(run["response"]["timings"].get("predicted_ms", 0.0))
-        require(predicted_ms > 0 and run["verify_steps"] > 0,
-                f"invalid unprofiled timing for {run['label']}")
-        step_ms_samples.append(predicted_ms / run["verify_steps"])
-    step_ms = mean(step_ms_samples, "unprofiled speculative step")
+        value = float(run["response"]["timings"].get("predicted_ms", 0.0))
+        require(value > 0, f"invalid unprofiled predicted_ms for {run['label']}")
+        predicted_ms.append(value)
 
-    share_pct = 100.0 * delta_ms * calls_per_verify / step_ms
+    sensitivity_rows: list[dict[str, Any]] = []
+    for near_run, near_cost in zip(near_profiles, near_means):
+        for deep_run, deep_cost in zip(deep_profiles, deep_means):
+            delta = deep_cost - near_cost
+            for reference, response_ms in zip(deep_refs, predicted_ms):
+                share = 100.0 * delta * call_count / response_ms
+                sensitivity_rows.append({
+                    "near_process": near_run["label"],
+                    "deep_process": deep_run["label"],
+                    "unprofiled_response": reference["label"],
+                    "near_mean_ms": near_cost,
+                    "deep_mean_ms": deep_cost,
+                    "raw_delta_ms_per_steady_call": delta,
+                    "steady_draft_calls_per_16_token_response": call_count,
+                    "unprofiled_predicted_ms": response_ms,
+                    "share_pct": share,
+                })
     threshold = float(manifest["decision_threshold_pct"])
-    decision = "reject-windowing" if share_pct < threshold else "extend-to-500k-after-review"
+    envelope = classify_envelope([row["share_pct"] for row in sensitivity_rows], threshold)
 
     def compute_rows(values: list[DraftCompute]) -> list[dict[str, Any]]:
-        return [
-            {
-                "uid": value.uid,
-                "seq": value.seq,
-                "width": value.width,
-                "fa_ms": value.fa_ns / 1e6,
-                "indexer_ms": value.indexer_ns / 1e6,
-                "compressor_ms": value.compressor_ns / 1e6,
-                "measured_ms": value.measured_ns / 1e6,
-                "graph_ms": value.total_graph_ns / 1e6,
-            }
-            for value in values
-        ]
+        return [{
+            "uid": value.uid,
+            "seq": value.seq,
+            "width": value.width,
+            "fa_ms": value.fa_ns / 1e6,
+            "indexer_ms": value.indexer_ns / 1e6,
+            "compressor_ms": value.compressor_ns / 1e6,
+            "measured_ms": value.measured_ns / 1e6,
+            "graph_ms": value.total_graph_ns / 1e6,
+        } for value in values]
 
+    near_all = [value for run in near_profiles for value in process_samples[run["label"]]]
+    deep_all = [value for run in deep_profiles for value in process_samples[run["label"]]]
     result = {
-        "schema": 1,
-        "decision": decision,
+        "schema": 2,
+        "decision": envelope["decision"],
+        "decision_scope": ">=5% authorizes review only; analyzer never authorizes a 500k run",
         "threshold_pct": threshold,
-        "share_pct": share_pct,
         "deep_tokens": len(replay_tokens),
         "cache_tokens": cache_tokens,
         "cache_tail_gap_tokens": cache_tail_gap,
         "steady_draft_width": steady_width,
-        "drafter_graph_signature": "markov_w1+conf_proj+3xFLASH_ATTN_EXT",
-        "near_cost_ms": sample_summary(near_cost_ms),
-        "deep_cost_ms": sample_summary(deep_cost_ms),
-        "context_delta_ms_per_draft_call": delta_ms,
-        "calls_per_verify": sample_summary(calls_per_verify_samples),
-        "unprofiled_step_ms": sample_summary(step_ms_samples),
-        "indexer_ns": {"near": sample_summary(near_indexer), "deep": sample_summary(deep_indexer)},
-        "compressor_ns": {
-            "near": sample_summary(near_compressor),
-            "deep": sample_summary(deep_compressor),
-        },
-        "response_signatures": {
-            run["label"]: run["signature"]
-            for run in [near_ref] + deep_refs + near_profiles + deep_profiles
-        },
-        "verify_steps": {run["label"]: run["verify_steps"] for run in deep_refs + deep_profiles},
+        "steady_draft_calls_per_16_token_response": call_count,
+        "drafter_graph_signature": "markov_w1+conf_proj+3xFLASH_ATTN_EXT; zero indexer/compressor",
+        "fa_timestamp_multiplicity": "exactly 2 records for each of 3 FA nodes at stride=1",
+        "near_cost_ms": sample_summary(near_all),
+        "deep_cost_ms": sample_summary(deep_all),
+        "process_mean_ms": process_means,
+        "process_samples_ms": process_samples,
+        "unprofiled_deep_predicted_ms": sample_summary(predicted_ms),
+        "observed_sensitivity_envelope": envelope,
+        "sensitivity_combinations": sensitivity_rows,
+        "indexer_ns": {"declared_nodes": 0, "measured": 0},
+        "compressor_ns": {"declared_nodes": 0, "measured": 0},
+        "response_signatures": {run["label"]: run["signature"] for run in all_runs},
+        "draft_width_sequences": {run["label"]: run["draft_widths"] for run in all_runs},
         "width_counts": dict(sorted(width_counts.items())),
         "raw_computes": {
             label: compute_rows(values) for label, values in profile_computes.items()
         },
+        "replay_provenance": replay_provenance,
     }
     return result
 
@@ -439,38 +576,49 @@ def analyze(root: Path) -> dict[str, Any]:
 def render(result: dict[str, Any]) -> str:
     near = result["near_cost_ms"]
     deep = result["deep_cost_ms"]
-    step = result["unprofiled_step_ms"]
-    calls = result["calls_per_verify"]
+    response = result["unprofiled_deep_predicted_ms"]
+    envelope = result["observed_sensitivity_envelope"]
     lines = [
         f"decision={result['decision']}",
+        f"decision_scope={result['decision_scope']}",
         f"deep_tokens={result['deep_tokens']}",
         f"steady_draft_width={result['steady_draft_width']}",
-        ("near_drafter_fa_indexer_compressor_ms "
+        ("steady_draft_calls_per_16_token_response="
+         f"{result['steady_draft_calls_per_16_token_response']}"),
+        ("near_process_steady_cost_ms "
          f"n={near['n']} mean={near['mean']:.6f} median={near['median']:.6f} "
          f"range=[{near['min']:.6f},{near['max']:.6f}] stdev={near['stdev']:.6f}"),
-        ("deep_drafter_fa_indexer_compressor_ms "
+        ("deep_process_steady_cost_ms "
          f"n={deep['n']} mean={deep['mean']:.6f} median={deep['median']:.6f} "
          f"range=[{deep['min']:.6f},{deep['max']:.6f}] stdev={deep['stdev']:.6f}"),
-        f"context_delta_ms_per_draft_call={result['context_delta_ms_per_draft_call']:.6f}",
-        ("draft_calls_per_verify "
-         f"samples={calls['n']} mean={calls['mean']:.6f} "
-         f"range=[{calls['min']:.6f},{calls['max']:.6f}]"),
-        ("unprofiled_spec_step_ms "
-         f"samples={step['n']} mean={step['mean']:.6f} "
-         f"range=[{step['min']:.6f},{step['max']:.6f}]"),
-        f"context_proportional_share_pct={result['share_pct']:.6f}",
+        ("unprofiled_deep_16_token_predicted_ms "
+         f"n={response['n']} mean={response['mean']:.6f} "
+         f"range=[{response['min']:.6f},{response['max']:.6f}]"),
+        ("observed_sensitivity_envelope_pct "
+         f"combinations={envelope['n_combinations']} min={envelope['min_pct']:.6f} "
+         f"max={envelope['max_pct']:.6f} width={envelope['width_pct']:.6f} "
+         f"closest_edge_distance={envelope['closest_edge_distance_pct']:.6f} "
+         f"margin_sufficient={str(envelope['margin_sufficient']).lower()}"),
         f"decision_threshold_pct={result['threshold_pct']:.6f}",
-        ("drafter_indexer_compressor_presence "
-         f"indexer_deep_mean_ns={result['indexer_ns']['deep']['mean']:.3f} "
-         f"compressor_deep_mean_ns={result['compressor_ns']['deep']['mean']:.3f}"),
-        "correctness=PASS (tokens, content, draft counts, and SPECTRACE exact within each depth)",
-        ("cache_replay=PASS (exact numeric prefix, non-empty draft state, "
-         f"tail_gap={result['cache_tail_gap_tokens']}, <=2 prompt tokens reprocessed)"),
+        "uncertainty=observed process-level sensitivity envelope; not a CI and not independent n=8",
+        "drafter_indexer_compressor_presence declared_indexer=0 declared_compressor=0 measured_both_ns=0",
+        "kprof_integrity=PASS (ordered graph/trace 1:1; no errors; KPROFSB failed=0; FA counts [2,2,2])",
+        "correctness=PASS (predicted_n=16; tokens, content, draft counts, and SPECTRACE exact by depth)",
+        ("cache_replay=PASS (immutable template plus unique destructive clones; exact prefix; "
+         f"non-empty draft state; tail_gap={result['cache_tail_gap_tokens']}; <=2 tokens reprocessed)"),
     ]
     return "\n".join(lines) + "\n"
 
 
-def self_test() -> None:
+def expect_invalid(action, label: str) -> None:
+    try:
+        action()
+    except InvalidRun:
+        return
+    raise InvalidRun(f"fail-closed self-test did not reject {label}")
+
+
+def synthetic_nodes(width: int = 5) -> dict[int, dict[str, Any]]:
     nodes: dict[int, dict[str, Any]] = {}
     for index in range(3):
         nodes[index] = {
@@ -478,49 +626,103 @@ def self_test() -> None:
             "i": index,
             "op": "FLASH_ATTN_EXT",
             "name": f"fa-{index}",
-            "src": [{"name": f"q-{index}", "ne": [512, 5, 64, 1]}],
+            "src": [{"name": f"q-{index}", "ne": [512, width, 64, 1]}],
         }
     nodes[3] = {
-        "uid": 7,
-        "i": 3,
-        "op": "MUL_MAT",
-        "name": "markov",
+        "uid": 7, "i": 3, "op": "MUL_MAT", "name": "markov",
         "src": [{"name": "markov_w1.weight", "ne": [256, 129280, 1, 1]}],
     }
     nodes[4] = {
-        "uid": 7,
-        "i": 4,
-        "op": "MUL_MAT",
-        "name": "confidence",
+        "uid": 7, "i": 4, "op": "MUL_MAT", "name": "confidence",
         "src": [{"name": "conf_proj.weight", "ne": [4352, 1, 1, 1]}],
     }
+    nodes[5] = {
+        "uid": 7, "i": 5, "op": "ADD", "name": "harmless", "src": [],
+    }
+    return nodes
+
+
+def synthetic_kprof_lines(nodes: dict[int, dict[str, Any]]) -> list[str]:
+    lines = ["KPROFG " + json.dumps(node, separators=(",", ":")) for node in nodes.values()]
+    lines.append("KPROFS " + json.dumps({
+        "uid": 7, "n_nodes": len(nodes), "n_cb": 2,
+    }, separators=(",", ":")))
+    segment = 0
+    for batch in (0, 1):
+        for node_index in range(3):
+            lines.append("KPROF " + json.dumps({
+                "seq": 0, "b": batch, "seg": segment, "node": node_index,
+                "t0": segment * 100, "ns": 100,
+            }, separators=(",", ":")))
+            segment += 1
+    lines.append('KPROFSB {"seq":0,"batches":2,"created":2,"reused":0,"failed":0,"free":2}')
+    return lines
+
+
+def self_test() -> None:
+    nodes = synthetic_nodes()
     require(is_dspark_graph(nodes), "synthetic DSpark signature rejected")
     require(draft_width(nodes) == 5, "synthetic DSpark width rejected")
+    trace = [
+        "SPECTRACE tgt slot=* n_dec=0 n_blk=1",
+        "SPECTRACE draft seq=* n_blk=5",
+        "SPECTRACE ver slot=* n_dec=5",
+        "SPECTRACE draft seq=* n_blk=2",
+    ]
+    require(trace_draft_widths(trace, "synthetic") == [5, 2],
+            "synthetic SPECTRACE width parse failed")
+    require(steady_call_count([5, 5, 2], 5) == 2,
+            "terminal partial-width call was counted as steady work")
+    expect_invalid(lambda: trace_draft_widths(trace[1:], "missing-boundary"),
+                   "missing request boundary")
 
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "kprof.log"
-        lines: list[str] = []
-        for node in nodes.values():
-            lines.append("KPROFG " + json.dumps(node, separators=(",", ":")))
-        lines.append('KPROFS {"uid":7,"n_nodes":5,"n_cb":1}')
-        for node_index in range(5):
-            lines.append("KPROF " + json.dumps({
-                "seq": 0, "b": 0, "seg": node_index, "node": node_index,
-                "t0": node_index * 100, "ns": 100,
-            }, separators=(",", ":")))
+        lines = synthetic_kprof_lines(nodes)
         path.write_text("\n".join(lines) + "\n")
         values = parse_kprof(path, 1, len(lines))
-        require(len(values) == 1 and values[0].fa_ns == 300, "synthetic KPROF sum failed")
+        require(len(values) == 1 and values[0].fa_ns == 600,
+                "synthetic two-segment FA sum failed")
 
-        broken = Path(tmp) / "broken.log"
-        broken.write_text(path.read_text().replace('KPROFS {"uid":7,"n_nodes":5,"n_cb":1}\n', ""))
-        try:
-            parse_kprof(broken, 1, len(lines))
-        except InvalidRun:
-            pass
-        else:
-            raise InvalidRun("fail-closed KPROF association test did not fail")
+        def reject_mutation(name: str, mutate) -> None:
+            broken_lines = mutate(lines.copy())
+            broken = Path(tmp) / f"{name}.log"
+            broken.write_text("\n".join(broken_lines) + "\n")
+            expect_invalid(lambda: parse_kprof(broken, 1, len(broken_lines)), name)
 
+        reject_mutation("missing-fa-segment", lambda value: [
+            line for line in value
+            if not (line.startswith("KPROF ") and '"b":1' in line and '"node":2' in line)
+        ])
+        reject_mutation("explicit-error", lambda value: value[:-1] + [
+            'KPROF {"seq":0,"b":1,"error":"resolve failed","sb":1,"n_seg":3}',
+            value[-1],
+        ])
+        reject_mutation("scratch-failure", lambda value: [
+            line.replace('"failed":0', '"failed":1') if line.startswith("KPROFSB ") else line
+            for line in value
+        ])
+        reject_mutation("incomplete-graph-definition", lambda value: [
+            line for line in value
+            if not (line.startswith("KPROFG ") and '"i":5' in line)
+        ])
+        reject_mutation("timed-unknown-node", lambda value: value[:-1] + [
+            'KPROF {"seq":0,"b":0,"seg":99,"node":999,"t0":999,"ns":1}',
+            value[-1],
+        ])
+        indexer_nodes = synthetic_nodes()
+        indexer_nodes[5] = {
+            "uid": 7, "i": 5, "op": "LIGHTNING_INDEXER", "name": "indexer", "src": []}
+        reject_mutation("declared-indexer", lambda _value: synthetic_kprof_lines(indexer_nodes))
+
+    below = classify_envelope([-1.0, 0.0, 0.2, 0.5, 0.6, 0.7, 0.8, 1.0], 5.0)
+    require(below["decision"] == "reject-windowing", "below-threshold envelope was not rejected")
+    near_edge = classify_envelope([4.0, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.8], 5.0)
+    require(near_edge["decision"] == "inconclusive", "near-edge envelope ignored uncertainty")
+    above = classify_envelope([7.0, 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 8.0], 5.0)
+    require(above["decision"] == "extend-review", "above-threshold envelope was not reviewable")
+    crossing = classify_envelope([4.0, 4.5, 5.0, 5.1, 5.2, 5.3, 5.4, 5.5], 5.0)
+    require(crossing["decision"] == "inconclusive", "crossing envelope was not inconclusive")
     print("self-test PASS")
 
 

@@ -22,13 +22,19 @@ draft=/Users/agusx1211/unsloth/gguf-m2/dspark-0731-expertsonly.m2.gguf
 binary=$lane_root/build-m2/bin/llama-server
 analyzer=$lane_root/scripts/analyze-dspark-draft-depth.py
 bench_port=${DWIN_PORT:-8093}
+prod_port=8080
 api_key=llamacpp
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 tag=${DWIN_TAG:-gate100k-$stamp}
 result_root=/Users/agusx1211/dwin-results/$tag
 deep_cache_dir=$result_root/cache-deep
 near_cache_dir=$result_root/cache-near
+deep_template_dir=$result_root/deep-template
+deep_template_file=$deep_template_dir/deep-state.lcpc
 window_lock=/Users/agusx1211/m2-window.lock
+prod_start_script=/Users/agusx1211/start-llama-server.sh
+lsof_bin=/usr/sbin/lsof
+self_test_mode=${DWIN_SELF_TEST:-0}
 
 depth_chars=${DWIN_DEPTH_CHARS:-530000}
 stage_tokens=${DWIN_STAGE_TOKENS:-96}
@@ -62,11 +68,17 @@ if [ "${DWIN_DRY_RUN:-0}" = "1" ]; then
         "cache_ram_mib=$cache_ram_mib" \
         "max_fillers=$max_fillers" \
         "filler_hard_cap=$filler_hard_cap" \
+        "deep_replay_cache=immutable-template+unique-per-run-clone" \
         "profile_order=near1,deep1,deep2,near2" \
-        "decision=<5.0% reject; >=5.0% stop for explicit 500k review"
+        "decision=observed-envelope with margin gate at 5%; never auto-run 500k"
     exit 0
 fi
 
+log() {
+    echo "[dwin $(date -u +%H:%M:%S)] $*" | tee -a "$result_root/harness.log"
+}
+
+if [ "$self_test_mode" != "1" ]; then
 for path in "$model" "$draft" "$binary" "$analyzer"; do
     if [ ! -e "$path" ]; then
         echo "required path missing: $path" >&2
@@ -90,10 +102,6 @@ fi
 
 mkdir -p "$result_root" "$deep_cache_dir" "$near_cache_dir"
 
-log() {
-    echo "[dwin $(date -u +%H:%M:%S)] $*" | tee -a "$result_root/harness.log"
-}
-
 python3 - "$result_root/manifest.json" "$depth_chars" "$stage_tokens" \
         "$profile_tokens" "$cache_ram_mib" "$max_fillers" "$filler_hard_cap" <<'PY'
 import json
@@ -102,10 +110,14 @@ import sys
 (path, depth_chars, stage_tokens, profile_tokens, cache_ram_mib, max_fillers,
  filler_hard_cap) = sys.argv[1:]
 value = {
-    "schema": 1,
+    "schema": 2,
     "objective": "E1 DSpark context-proportional drafter cost gate",
     "decision_threshold_pct": 5.0,
-    "decision_rule": "<5% reject; >=5% stop and request review before 500k",
+    "decision_rule": (
+        "reject only when max envelope <5% and edge margin >= envelope width; "
+        "review only when min envelope >=5% and edge margin >= envelope width; "
+        "otherwise inconclusive; never automatically run 500k"
+    ),
     "depth_chars": int(depth_chars),
     "stage_tokens": int(stage_tokens),
     "profile_tokens": int(profile_tokens),
@@ -118,6 +130,7 @@ value = {
     "kprof_stride": 1,
     "ctx_checkpoints": 0,
     "allowed_cache_tail_gap_tokens": [0, 1],
+    "deep_replay_cache_mode": "immutable-template+unique-per-run-clone",
 }
 with open(path, "w") as handle:
     json.dump(value, handle, indent=2, sort_keys=True)
@@ -147,39 +160,138 @@ PY
 } > "$result_root/metadata.txt"
 
 lock_owner="$lane pid=$$ tag=$tag"
-if ! (set -C; printf '%s\n' "$lock_owner" > "$window_lock") 2>/dev/null; then
-    echo "production window lock held by: $(head -n 1 "$window_lock" 2>/dev/null || true)" >&2
-    exit 1
+else
+    # Self-tests replace all stateful paths before invoking any helper.
+    lock_owner="$lane pid=$$ tag=self-test"
 fi
 
 server_pid=
 sampler_pid=
+request_pid=
 server_log=
 server_label=
 server_profile=0
 production_taken=0
+production_listener_pids=
+restoration_started=0
+
+stop_pid() {
+    local pid=$1
+    local description=$2
+    local attempts=${3:-30}
+    local i
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid" 2>/dev/null || true
+        return 0
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    for i in $(seq 1 "$attempts"); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        log "$description pid=$pid did not exit after SIGTERM; sending SIGKILL"
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+}
 
 stop_server() {
+    if [ -n "$request_pid" ]; then
+        stop_pid "$request_pid" "request client" 5
+        request_pid=
+    fi
     if [ -n "$sampler_pid" ]; then
-        kill "$sampler_pid" 2>/dev/null || true
-        wait "$sampler_pid" 2>/dev/null || true
+        stop_pid "$sampler_pid" "resource sampler" 2
         sampler_pid=
     fi
     if [ -n "$server_pid" ]; then
-        kill "$server_pid" 2>/dev/null || true
-        local i
-        for i in $(seq 1 30); do
-            kill -0 "$server_pid" 2>/dev/null || break
-            sleep 1
-        done
-        if kill -0 "$server_pid" 2>/dev/null; then
-            log "server $server_label did not exit after SIGTERM; sending SIGKILL"
-            kill -9 "$server_pid" 2>/dev/null || true
-        fi
-        wait "$server_pid" 2>/dev/null || true
+        stop_pid "$server_pid" "server $server_label" 30
         server_pid=
     fi
     pkill -f "$lane/build-m2/bin/llama-server.*--port $bench_port" 2>/dev/null || true
+}
+
+listener_pids() {
+    "$lsof_bin" -nP -t -iTCP:"$prod_port" -sTCP:LISTEN 2>/dev/null \
+        | awk '/^[0-9]+$/ { print }' | sort -n -u
+}
+
+pid_running() {
+    local pid=$1
+    local state
+    kill -0 "$pid" 2>/dev/null || return 1
+    state=$(ps -p "$pid" -o stat= 2>/dev/null | tr -d ' ')
+    [ -n "$state" ] && [ "${state#Z}" = "$state" ]
+}
+
+record_production_listeners() {
+    local pid
+    local command
+
+    production_listener_pids=$(listener_pids)
+    if [ -z "$production_listener_pids" ]; then
+        log "ERROR: production /health was ready but port $prod_port has no recorded listener PID"
+        return 1
+    fi
+    : > "$result_root/prod-listeners-before.txt"
+    for pid in $production_listener_pids; do
+        case $pid in
+            *[!0-9]*) log "ERROR: invalid production listener PID: $pid"; return 1 ;;
+        esac
+        command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+        case $command in
+            *llama-server*"--port $prod_port"*|*llama-server*"--port=$prod_port"*) ;;
+            *)
+                log "ERROR: listener pid=$pid is not the expected production llama-server: $command"
+                return 1
+                ;;
+        esac
+        printf 'pid=%s command=%s\n' "$pid" "$command" \
+            >> "$result_root/prod-listeners-before.txt"
+    done
+}
+
+recorded_listeners_gone() {
+    local pid
+    for pid in $production_listener_pids; do
+        if pid_running "$pid"; then
+            return 1
+        fi
+    done
+    [ -z "$(listener_pids)" ]
+}
+
+stop_production() {
+    local pid
+    local i
+
+    log "stopping recorded production listener pid(s): $(echo "$production_listener_pids" | tr '\n' ' ')"
+    for pid in $production_listener_pids; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    tmux kill-session -t llama-server 2>/dev/null || true
+    pkill -TERM -f "llama-server.*--port $prod_port" 2>/dev/null || true
+    for i in $(seq 1 30); do
+        if recorded_listeners_gone; then
+            log "production listener shutdown confirmed (recorded PIDs exited; port $prod_port absent)"
+            return 0
+        fi
+        sleep 1
+    done
+    for pid in $production_listener_pids; do
+        if pid_running "$pid"; then
+            log "production listener pid=$pid survived SIGTERM; sending SIGKILL"
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+    for i in $(seq 1 10); do
+        recorded_listeners_gone && return 0
+        sleep 1
+    done
+    log "ERROR: production shutdown not confirmed; live port pid(s): $(listener_pids | tr '\n' ' ')"
+    return 1
 }
 
 finish_server() {
@@ -192,10 +304,121 @@ finish_server() {
     server_label=
 }
 
+file_size() {
+    wc -c < "$1" | tr -d ' '
+}
+
+file_sha256() {
+    shasum -a 256 "$1" | awk '{ print $1 }'
+}
+
+copy_and_verify() {
+    local source=$1
+    local destination=$2
+    local provenance=$3
+    local role=$4
+    local method=copy
+    local source_size source_sha destination_size destination_sha
+
+    if /bin/cp -c "$source" "$destination" 2>/dev/null; then
+        method=clone
+    else
+        /bin/cp "$source" "$destination"
+    fi
+    source_size=$(file_size "$source")
+    destination_size=$(file_size "$destination")
+    source_sha=$(file_sha256 "$source")
+    destination_sha=$(file_sha256 "$destination")
+    if [ "$source_size" != "$destination_size" ] || \
+            [ "$source_sha" != "$destination_sha" ] || \
+            ! cmp -s "$source" "$destination"; then
+        log "ERROR: $role copy is not byte-identical to its source"
+        return 1
+    fi
+    python3 - "$provenance" "$role" "$method" "$source" "$destination" \
+            "$source_size" "$source_sha" <<'PY'
+import json
+import os
+import sys
+
+path, role, method, source, destination, size, sha256 = sys.argv[1:]
+value = {
+    "role": role,
+    "copy_method": method,
+    "source": os.path.realpath(source),
+    "destination": os.path.realpath(destination),
+    "size": int(size),
+    "sha256": sha256,
+    "cmp_equal": True,
+}
+with open(path, "w") as handle:
+    json.dump(value, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+}
+
+verify_template() {
+    local expected_size expected_sha
+
+    expected_size=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["size"])' \
+        "$result_root/deep-template.json")
+    expected_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' \
+        "$result_root/deep-template.json")
+    [ -f "$deep_template_file" ] && \
+        [ "$(file_size "$deep_template_file")" = "$expected_size" ] && \
+        [ "$(file_sha256 "$deep_template_file")" = "$expected_sha" ]
+}
+
+create_deep_template() {
+    local source=$1
+
+    if [ -e "$deep_template_dir" ]; then
+        log "ERROR: immutable deep template directory already exists"
+        return 1
+    fi
+    mkdir "$deep_template_dir"
+    copy_and_verify "$source" "$deep_template_file" \
+        "$result_root/deep-template.json" immutable-template
+    chmod 0444 "$deep_template_file"
+    verify_template || {
+        log "ERROR: immutable deep template verification failed"
+        return 1
+    }
+    log "created immutable deep template size=$(file_size "$deep_template_file") sha256=$(file_sha256 "$deep_template_file")"
+}
+
+seed_deep_cache() {
+    local label=$1
+    local cache_dir=$result_root/cache-$label
+    local destination=$cache_dir/deep-state.lcpc
+
+    verify_template || {
+        log "ERROR: immutable template changed before $label"
+        return 1
+    }
+    if [ -e "$cache_dir" ]; then
+        log "ERROR: per-run cache directory already exists: $cache_dir"
+        return 1
+    fi
+    mkdir "$cache_dir"
+    copy_and_verify "$deep_template_file" "$destination" \
+        "$result_root/cache-seed-$label.json" "$label-seed"
+    chmod 0444 "$destination"
+    printf '%s\n' "$cache_dir"
+}
+
 restore_prod() {
-    local primary_rc=$?
+    local primary_rc=$1
     local restore_rc=0
     local final_rc
+    local healthy=0
+    local restored_pids
+    local pid
+
+    if [ "$restoration_started" = "1" ]; then
+        exit "$primary_rc"
+    fi
+    restoration_started=1
     trap - EXIT INT TERM
     set +e
     stop_server
@@ -205,17 +428,16 @@ restore_prod() {
         # The restored service must outlive this queue job and therefore must
         # not retain queue ownership in its tmux environment.
         if ! env -u M2_ULTRA_QUEUE_TOKEN \
-                /Users/agusx1211/start-llama-server.sh elastic4 \
+                "$prod_start_script" elastic4 \
                 >> "$result_root/restore.log" 2>&1; then
             restore_rc=1
         fi
 
-        local healthy=0
-        local i
-        for i in $(seq 1 180); do
-            if [ "$(curl -s -o /dev/null -w '%{http_code}' \
+        local deadline=$((SECONDS + 900))
+        while [ "$SECONDS" -lt "$deadline" ]; do
+            if [ "$(curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' \
                     -H "Authorization: Bearer $api_key" \
-                    http://127.0.0.1:8080/health || true)" = "200" ]; then
+                    "http://127.0.0.1:$prod_port/health" || true)" = "200" ]; then
                 healthy=1
                 break
             fi
@@ -224,11 +446,14 @@ restore_prod() {
 
         if [ "$healthy" = "1" ]; then
             log "production /health returned 200; issuing one-token completion"
-            if ! curl -sS --fail --max-time 180 \
+            printf '%s\n' \
+                '{"prompt":"ping","n_predict":1,"temperature":0,"ignore_eos":true}' \
+                > "$result_root/prod-health-request.json"
+            if ! curl -sS --fail --connect-timeout 5 --max-time 180 \
                     -H "Authorization: Bearer $api_key" \
                     -H 'Content-Type: application/json' \
-                    -d '{"prompt":"ping","n_predict":1,"temperature":0,"ignore_eos":true}' \
-                    http://127.0.0.1:8080/completion \
+                    --data-binary "@$result_root/prod-health-request.json" \
+                    "http://127.0.0.1:$prod_port/completion" \
                     > "$result_root/prod-health-completion.json"; then
                 restore_rc=1
             elif ! python3 - "$result_root/prod-health-completion.json" <<'PY' \
@@ -251,6 +476,22 @@ PY
             log "ERROR: production /health did not return 200 within 15 minutes"
             restore_rc=1
         fi
+
+        restored_pids=$(listener_pids)
+        if [ -z "$restored_pids" ]; then
+            log "ERROR: restored production has no listener PID"
+            restore_rc=1
+        else
+            : > "$result_root/prod-listeners-restored.txt"
+            for pid in $restored_pids; do
+                ps eww -p "$pid" -o command= \
+                    >> "$result_root/prod-listeners-restored.txt" 2>/dev/null
+            done
+            if grep -q 'M2_ULTRA_QUEUE_TOKEN=' "$result_root/prod-listeners-restored.txt"; then
+                log "ERROR: restored production retained M2_ULTRA_QUEUE_TOKEN"
+                restore_rc=1
+            fi
+        fi
     fi
 
     if [ "$(cat "$window_lock" 2>/dev/null)" = "$lock_owner" ]; then
@@ -272,14 +513,15 @@ PY
     exit "$final_rc"
 }
 
-trap restore_prod EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+on_exit() {
+    local exit_rc=$?
+    restore_prod "$exit_rc"
+}
 
 wait_health() {
-    local i
-    for i in $(seq 1 240); do
-        if [ "$(curl -s -o /dev/null -w '%{http_code}' \
+    local deadline=$((SECONDS + 720))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if [ "$(curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' \
                 -H "Authorization: Bearer $api_key" \
                 "http://127.0.0.1:$bench_port/health" || true)" = "200" ]; then
             return 0
@@ -318,7 +560,11 @@ capture_system() {
         if [ -n "$server_pid" ]; then
             ps -p "$server_pid" -o pid=,rss=,vsz=,%cpu=,time=,command= || true
         fi
-        du -sk "$deep_cache_dir" 2>/dev/null || true
+        du -sk "$result_root" 2>/dev/null || true
+        if [ -f "$deep_template_file" ]; then
+            ls -lO "$deep_template_file" 2>/dev/null || ls -l "$deep_template_file"
+            shasum -a 256 "$deep_template_file"
+        fi
     } > "$result_root/system-$label.txt"
 }
 
@@ -413,12 +659,12 @@ run_request() {
     local cache_prompt=$5
     local response=$result_root/request-$label.json
     local meta=$result_root/request-$label.meta.json
-    local begin_line end_line wall_start wall_end
+    local begin_line end_line wall_start wall_end request_rc
 
     begin_line=$(( $(wc -l < "$server_log") + 1 ))
     wall_start=$(python3 -c 'import time; print(time.monotonic_ns())')
     python3 - "$prompt_file" "$response" "$n_predict" "$slot" "$cache_prompt" \
-            "$bench_port" "$api_key" <<'PY'
+            "$bench_port" "$api_key" <<'PY' &
 import json
 import sys
 import urllib.request
@@ -451,6 +697,15 @@ with open(response_path, "w") as handle:
     json.dump(value, handle, indent=2, sort_keys=True)
     handle.write("\n")
 PY
+    request_pid=$!
+    if wait "$request_pid"; then
+        request_rc=0
+    else
+        request_rc=$?
+        request_pid=
+        return "$request_rc"
+    fi
+    request_pid=
     wall_end=$(python3 -c 'import time; print(time.monotonic_ns())')
     sleep 1
     end_line=$(wc -l < "$server_log")
@@ -506,23 +761,162 @@ PY
 
 cache_state() {
     local output=$1
-    curl -sS --fail --max-time 60 \
+    curl -sS --fail --connect-timeout 5 --max-time 60 \
         -H "Authorization: Bearer $api_key" \
         "http://127.0.0.1:$bench_port/m2-dashboard/cache-state" > "$output"
 }
 
-preflight_code=$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Authorization: Bearer $api_key" http://127.0.0.1:8080/health || true)
+signal_restore_self_test_case() {
+    local test_root=$1
+    local result_root=$test_root/signal-results
+    local window_lock=$test_root/signal.lock
+    local lock_owner="$lane pid=$BASHPID tag=self-test-signal"
+    local production_taken=1
+    local restoration_started=0
+    local server_pid=
+    local sampler_pid=
+    local request_pid
+
+    mkdir "$result_root"
+    printf '%s\n' "$lock_owner" > "$window_lock"
+    sleep 30 &
+    request_pid=$!
+    printf '%s\n' "$request_pid" > "$test_root/signal-child.pid"
+    trap 'restore_prod 130' INT
+    trap 'restore_prod 143' TERM
+    trap on_exit EXIT
+    wait "$request_pid"
+}
+
+harness_self_test() {
+    local test_root mock_bin source seed_one seed_two
+    local listener_pid restored_pid harness_pid signal_child signal_rc i
+    local original_path
+    local result_root deep_cache_dir near_cache_dir deep_template_dir deep_template_file
+    local window_lock prod_port lsof_bin prod_start_script production_listener_pids
+
+    original_path=$PATH
+    local PATH
+    PATH=$original_path
+
+    test_root=$(mktemp -d "${TMPDIR:-/tmp}/dwin-self-test.XXXXXX")
+    result_root=$test_root/results
+    deep_cache_dir=$result_root/cache-deep
+    near_cache_dir=$result_root/cache-near
+    deep_template_dir=$result_root/deep-template
+    deep_template_file=$deep_template_dir/deep-state.lcpc
+    window_lock=$test_root/window.lock
+    prod_port=18080
+    mock_bin=$test_root/bin
+    mkdir -p "$result_root" "$mock_bin"
+
+    source=$test_root/source.lcpc
+    printf 'synthetic immutable target+draft state\n' > "$source"
+    create_deep_template "$source"
+    seed_one=$(seed_deep_cache deep-ref-1)
+    cmp -s "$deep_template_file" "$seed_one/deep-state.lcpc" || return 1
+    /bin/rm -f "$seed_one/deep-state.lcpc"
+    verify_template || return 1
+    seed_two=$(seed_deep_cache deep-ref-2)
+    cmp -s "$deep_template_file" "$seed_two/deep-state.lcpc" || return 1
+    [ "$seed_one" != "$seed_two" ] || return 1
+
+    # Single quotes preserve variable expansion for the generated mock itself.
+    # shellcheck disable=SC2016
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'read -r pid < "$DWIN_TEST_PID_FILE"' \
+        'state=$(ps -p "$pid" -o stat= 2>/dev/null | tr -d " ")' \
+        'case $state in ""|Z*) exit 1 ;; esac' \
+        'printf "%s\n" "$pid"' > "$mock_bin/lsof"
+    printf '%s\n' '#!/bin/bash' 'exit 0' > "$mock_bin/tmux"
+    printf '%s\n' '#!/bin/bash' 'exit 0' > "$mock_bin/pkill"
+    # shellcheck disable=SC2016
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'case "$*" in' \
+        '  *"/health"*) printf 200 ;;' \
+        '  *"/completion"*) printf "%s\n" '\''{"content":"x","timings":{"predicted_n":1}}'\'' ;;' \
+        '  *) exit 2 ;;' \
+        'esac' > "$mock_bin/curl"
+    # shellcheck disable=SC2016
+    printf '%s\n' \
+        '#!/bin/bash' \
+        '[ -z "${M2_ULTRA_QUEUE_TOKEN:-}" ] || exit 91' \
+        ': > "$DWIN_TEST_START_MARKER"' > "$mock_bin/start-prod"
+    chmod +x "$mock_bin"/*
+    PATH=$mock_bin:$PATH
+    lsof_bin=$mock_bin/lsof
+    prod_start_script=$mock_bin/start-prod
+    export DWIN_TEST_PID_FILE=$test_root/listener.pid
+    export DWIN_TEST_START_MARKER=$test_root/start-called
+
+    bash -c 'exec -a "llama-server --port 18080" sleep 30' &
+    listener_pid=$!
+    printf '%s\n' "$listener_pid" > "$DWIN_TEST_PID_FILE"
+    record_production_listeners
+    stop_production
+    wait "$listener_pid" 2>/dev/null || true
+    recorded_listeners_gone || return 1
+
+    env -u M2_ULTRA_QUEUE_TOKEN bash -c 'exec -a "restored llama-server" sleep 30' &
+    restored_pid=$!
+    printf '%s\n' "$restored_pid" > "$DWIN_TEST_PID_FILE"
+    signal_restore_self_test_case "$test_root" &
+    harness_pid=$!
+    for i in $(seq 1 50); do
+        [ -s "$test_root/signal-child.pid" ] && break
+        sleep 0.1
+    done
+    [ -s "$test_root/signal-child.pid" ] || return 1
+    read -r signal_child < "$test_root/signal-child.pid"
+    kill -TERM "$harness_pid"
+    set +e
+    wait "$harness_pid"
+    signal_rc=$?
+    set -e
+    [ "$signal_rc" = "143" ] || return 1
+    ! kill -0 "$signal_child" 2>/dev/null || return 1
+    [ ! -e "$test_root/signal.lock" ] || return 1
+    [ -e "$DWIN_TEST_START_MARKER" ] || return 1
+    python3 - "$test_root/signal-results/prod-health-completion.json" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1]))
+assert value["timings"]["predicted_n"] == 1 and value["content"]
+PY
+    kill -TERM "$restored_pid" 2>/dev/null || true
+    wait "$restored_pid" 2>/dev/null || true
+    /bin/rm -rf "$test_root"
+    echo "harness self-test PASS"
+}
+
+if [ "$self_test_mode" = "1" ]; then
+    trap - EXIT INT TERM
+    harness_self_test
+    exit 0
+fi
+
+if ! (set -C; printf '%s\n' "$lock_owner" > "$window_lock") 2>/dev/null; then
+    echo "production window lock held by: $(head -n 1 "$window_lock" 2>/dev/null || true)" >&2
+    exit 1
+fi
+trap on_exit EXIT
+trap 'restore_prod 130' INT
+trap 'restore_prod 143' TERM
+
+preflight_code=$(curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $api_key" "http://127.0.0.1:$prod_port/health" || true)
 if [ "$preflight_code" != "200" ]; then
     log "ERROR: production preflight /health returned $preflight_code; refusing takeover"
     exit 1
 fi
 log "production preflight /health 200"
+record_production_listeners
 production_taken=1
 log "taking production window"
-tmux kill-session -t llama-server 2>/dev/null || true
-pkill -f 'llama-server.*--port 8080' 2>/dev/null || true
-sleep 8
+stop_production
 capture_system before
 
 start_server stage 0 "$deep_cache_dir"
@@ -661,23 +1055,33 @@ with open(output_path, "w") as handle:
 PY
 capture_system staged-deep
 finish_server
+deep_source_file=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["file"])' \
+    "$result_root/deep-cache-header.json")
+create_deep_template "$deep_source_file"
 
 for i in 1 2; do
-    start_server "deep-ref-$i" 0 "$deep_cache_dir"
+    deep_run_cache=$(seed_deep_cache "deep-ref-$i")
+    start_server "deep-ref-$i" 0 "$deep_run_cache"
     run_request "deep-ref-$i" "$result_root/deep-replay-tokens.json" "$profile_tokens" 0 1
     capture_system "deep-ref-$i"
     finish_server
+    verify_template || { log "ERROR: immutable template changed after deep-ref-$i"; exit 1; }
 done
 
 for label in near-kprof-1 deep-kprof-1 deep-kprof-2 near-kprof-2; do
     case "$label" in
         near-*) prompt=$result_root/near-base-tokens.json; cache=$near_cache_dir; use_cache=0 ;;
-        deep-*) prompt=$result_root/deep-replay-tokens.json; cache=$deep_cache_dir; use_cache=1 ;;
+        deep-*)
+            prompt=$result_root/deep-replay-tokens.json
+            cache=$(seed_deep_cache "$label")
+            use_cache=1
+            ;;
     esac
     start_server "$label" 1 "$cache"
     run_request "$label" "$prompt" "$profile_tokens" 0 "$use_cache"
     capture_system "$label"
     finish_server
+    verify_template || { log "ERROR: immutable template changed after $label"; exit 1; }
 done
 
 capture_system after
