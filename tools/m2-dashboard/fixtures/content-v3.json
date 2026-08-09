@@ -1,0 +1,363 @@
+{
+ "v": 1,
+ "requests": {
+  "101": {
+   "v": 1,
+   "req": 101,
+   "found": true,
+   "state": "live",
+   "slot": 0,
+   "t_ms": 1786265254295,
+   "caps": {
+    "in_head_tokens": 512,
+    "in_tail_tokens": 256,
+    "out_head_bytes": 4096,
+    "out_tail_bytes": 2048,
+    "max_requests": 64,
+    "max_bytes": 1048576
+   },
+   "store": {
+    "requests": 37,
+    "bytes": 412344,
+    "evicted": 12
+   },
+   "input": {
+    "n_tokens": 281400,
+    "head": "You are a coding agent operating inside a checked-out repository.\n\n<environment>\n  workspace: /srv/work/llama-cpp-m2-ultra\n  branch:    dashboard-v3\n  platform:  darwin arm64 (Apple M2 Ultra, 192 GiB unified)\n</environment>\n\n<tools>\n  read(path, offset?, limit?)     - read a file\n  edit(path, old, new)            - exact string replacement\n  bash(command, timeout_ms?)      - run a command in the workspace\n  grep(pattern, glob?)            - ripgrep across the tree\n</tools>\n\nRules:\n- Read the relevant implementation before changing it.\n- Never fabricate a benchmark number. Measure, then report the command.\n- Keep the decode hot path allocation-free.\n\n[tool:bash] cmake --build build -j 24 --target llama-server\n  [ 12%] Building CXX object tools/server/CMakeFiles/llama-server.dir/server-context.cpp.o\n  [ 78%] Building CXX object tools/server/CMakeFiles/llama-server.dir/server-dashboard-bus.cpp.o\n  [100%] Linking CXX executable ../../bin/llama-server\n  exit 0 in 94.2s\n\n[tool:bash] ctest --test-dir build -R server\n  Test project /srv/work/llama-cpp-m2-ultra/build\n        Start  1: test-server-dashboard-bus\n   1/16 Test  #1: test-server-dashboard-bus ......   Passed    0.31 sec\n  100% tests passed, 0 tests failed out of 16\n\nuser: good. now walk the prefill path and tell me where the 4.1 s restore is\nbeing thrown away, and whether the fix belongs in admission or in the consult.",
+    "tail": "assistant: The consult happens in get_available_slot before prepare_dsv4_admission\nruns, so by the time admission decides to clear, the SSD read has already been\npaid for. Two candidate fixes:\n\n  1. move the consult after admission — cheapest, but admission needs the\n     restored prefix length to make its own decision, so this is circular;\n  2. give admission a veto that runs *before* the consult using only the\n     resident/LCP numbers it already has.\n\n(2) is the one that actually works. Let me show you the ordering.\n\nuser: show me the ordering, with line numbers, and then stop.",
+    "head_tokens": 512,
+    "tail_tokens": 256,
+    "elided_tokens": 280632,
+    "truncated": true
+   },
+   "output": null
+  },
+  "102": {
+   "v": 1,
+   "req": 102,
+   "found": true,
+   "state": "final",
+   "slot": 2,
+   "t_ms": 1786264634295,
+   "caps": {
+    "in_head_tokens": 512,
+    "in_tail_tokens": 256,
+    "out_head_bytes": 4096,
+    "out_tail_bytes": 2048,
+    "max_requests": 64,
+    "max_bytes": 1048576
+   },
+   "store": {
+    "requests": 37,
+    "bytes": 412344,
+    "evicted": 12
+   },
+   "input": {
+    "n_tokens": 14350,
+    "head": "user: what does --cache-disk-limit default to, and is it per-file or total?",
+    "tail": "",
+    "head_tokens": 512,
+    "tail_tokens": 256,
+    "elided_tokens": 13582,
+    "truncated": true
+   },
+   "output": {
+    "n_tokens": 180,
+    "n_bytes": 308,
+    "head": "It defaults to **256** (GiB) and it is a **total** budget for the SSD tier, not a\nper-file cap — see `common/arg.cpp`, `--cache-disk-limit`, which writes\n`params.cache_disk_limit_gib`. `-1` disables the limit. Per-entry ceilings are\nseparate hard bounds in `server-task.h` (`PCACHE_MAX_FILE_BYTES`, 512 GiB).",
+    "tail": "",
+    "elided_bytes": 0,
+    "truncated": false
+   }
+  },
+  "103": {
+   "v": 1,
+   "req": 103,
+   "found": true,
+   "state": "final",
+   "slot": 1,
+   "t_ms": 1786264954295,
+   "caps": {
+    "in_head_tokens": 512,
+    "in_tail_tokens": 256,
+    "out_head_bytes": 4096,
+    "out_tail_bytes": 2048,
+    "max_requests": 64,
+    "max_bytes": 1048576
+   },
+   "store": {
+    "requests": 37,
+    "bytes": 412344,
+    "evicted": 12
+   },
+   "input": {
+    "n_tokens": 31900,
+    "head": "You are a coding agent operating inside a checked-out repository.\n\n<environment>\n  workspace: /srv/work/llama-cpp-m2-ultra\n  branch:    dashboard-v3\n  platform:  darwin arm64 (Apple M2 Ultra, 192 GiB unified)\n</environment>\n\n<tools>\n  read(path, offset?, limit?)     - read a file\n  edit(path, old, new)            - exact string replacement\n  bash(command, timeout_ms?)      - run a command in the workspace\n  grep(pattern, glob?)            - ripgrep across the tree\n</tools>\n\nRules:\n- Read the relevant implementation before changing it.\n- Never fabricate a benchmark number. Measure, then report the command.\n- Keep the decode hot path allocation-free.\n",
+    "tail": "assistant: The consult happens in get_available_slot before prepare_dsv4_admission\nruns, so by the time admission decides to clear, the SSD read has already been\npaid for. Two candidate fixes:\n\n  1. move the consult after admission — cheapest, but admission needs the\n     restored prefix length to make its own decision, so this is circular;\n  2. give admission a veto that runs *before* the consult using only the\n     resident/LCP numbers it already has.\n\n(2) is the one that actually works. Let me show you the ordering.\n\nuser: show me the ordering, with line numbers, and then stop.",
+    "head_tokens": 512,
+    "tail_tokens": 256,
+    "elided_tokens": 31132,
+    "truncated": true
+   },
+   "output": {
+    "n_tokens": 800,
+    "n_bytes": 2627,
+    "head": "Walking the ordering in `tools/server/server-context.cpp`:\n\n1. `get_available_slot()` picks the slot (`:2068`), records the selection, and\n   then — still inside the same function — runs the prompt-cache consult at\n   `:2279` (`ret->prompt_load(*prompt_cache, task.tokens)`). For an SSD-tier\n   entry that call is a multi-GiB `pread` plus a `llama_state_seq_set_data_ext`;\n   in the capture you sent it took **4119 ms**.\n\n2. `prepare_dsv4_admission()` (`:2446`) then evaluates `reuse_resident`. On the\n   `no_covering_checkpoint` branch it takes the full-clear path at `:2666` and\n   calls `slot.prompt_clear()`.\n\n3. `prompt_clear()` drops `prompt.tokens` and the checkpoints outright. Nothing\n   downstream can recover the restored prefix, so `n_past` lands at 0 and the\n   whole 118k-token prompt is re-prefilled.\n\nSo the read, the bytes, and the 4.1 s are pure waste, and no single event\nrecords it — you can only see it by joining `cache_restore` against the\n`admission` outcome and the `prompt_start` landing.\n\n**Where the fix belongs.** Not in the consult: it has no way to know what\nadmission will decide. Not in `prompt_clear()` either — by then the state is\nalready in the slot. It belongs in `prepare_dsv4_admission`, split into a\ncheap predicate that runs *before* the consult:\n\n```cpp\n// server-context.cpp, inside get_available_slot, before the consult\nif (const auto veto = dsv4_admission_would_clear(*ret, task); veto) {\n    // the elastic admission is going to clear this slot anyway; skipping the\n    // consult saves the SSD read and the seq_cp, and costs one predicate\n    SRV_TRC(\"skipping prompt-cache consult: admission will clear (%s)\\n\",\n            clear_code_name(veto.code));\n    consult_cache = false;\n}\n```\n\nThe predicate needs only `resident`, `lcp`, `span_end` and the checkpoint list —\nall available before the consult. Everything else in `reuse_resident` is\ndownstream of state the consult produces, and those branches cannot fire when\nthe slot is about to be cleared for a *structural* reason (family admission,\n`no_lcp`, `mtmd`, `no_cache_prompt`).\n\nRisk: `no_covering_checkpoint` depends on the checkpoint list of the *restored*\nstate, which does not exist before the consult. That one case must stay where it\nis, so this is a partial fix — it removes the family/no_lcp/mtmd/reuse-opt\nwastage but not the checkpoint case, which is the one your capture hit.\n\nRecommendation: land the veto for the structural reasons (cheap, obviously\ncorrect), and separately teach the SSD tier to load the checkpoint index without\nthe state blobs so `no_covering_checkpoint` can also be decided pre-consult.\n",
+    "tail": "",
+    "elided_bytes": 0,
+    "truncated": false
+   }
+  },
+  "104": {
+   "v": 1,
+   "req": 104,
+   "found": true,
+   "state": "final",
+   "slot": 3,
+   "t_ms": 1786265074295,
+   "caps": {
+    "in_head_tokens": 512,
+    "in_tail_tokens": 256,
+    "out_head_bytes": 4096,
+    "out_tail_bytes": 2048,
+    "max_requests": 64,
+    "max_bytes": 1048576
+   },
+   "store": {
+    "requests": 37,
+    "bytes": 412344,
+    "evicted": 12
+   },
+   "input": {
+    "n_tokens": 97200,
+    "head": "You are a coding agent operating inside a checked-out repository.\n\n<environment>\n  workspace: /srv/work/llama-cpp-m2-ultra\n  branch:    dashboard-v3\n  platform:  darwin arm64 (Apple M2 Ultra, 192 GiB unified)\n</environment>\n\n<tools>\n  read(path, offset?, limit?)     - read a file\n  edit(path, old, new)            - exact string replacement\n  bash(command, timeout_ms?)      - run a command in the workspace\n  grep(pattern, glob?)            - ripgrep across the tree\n</tools>\n\nRules:\n- Read the relevant implementation before changing it.\n- Never fabricate a benchmark number. Measure, then report the command.\n- Keep the decode hot path allocation-free.\n\n[tool:bash] cmake --build build -j 24 --target llama-server\n  [ 12%] Building CXX object tools/server/CMakeFiles/llama-server.dir/server-context.cpp.o\n  [ 78%] Building CXX object tools/server/CMakeFiles/llama-server.dir/server-dashboard-bus.cpp.o\n  [100%] Linking CXX executable ../../bin/llama-server\n  exit 0 in 94.2s\n\n[tool:bash] ctest --test-dir build -R server\n  Test project /srv/work/llama-cpp-m2-ultra/build\n        Start  1: test-server-dashboard-bus\n   1/16 Test  #1: test-server-dashboard-bus ......   Passed    0.31 sec\n  100% tests passed, 0 tests failed out of 16\n\nuser: good. now walk the prefill path and tell me where the 4.1 s restore is\nbeing thrown away, and whether the fix belongs in admission or in the consult.",
+    "tail": "assistant: The consult happens in get_available_slot before prepare_dsv4_admission\nruns, so by the time admission decides to clear, the SSD read has already been\npaid for. Two candidate fixes:\n\n  1. move the consult after admission — cheapest, but admission needs the\n     restored prefix length to make its own decision, so this is circular;\n  2. give admission a veto that runs *before* the consult using only the\n     resident/LCP numbers it already has.\n\n(2) is the one that actually works. Let me show you the ordering.\n\nuser: show me the ordering, with line numbers, and then stop.",
+    "head_tokens": 512,
+    "tail_tokens": 256,
+    "elided_tokens": 96432,
+    "truncated": true
+   },
+   "output": {
+    "n_tokens": 2400,
+    "n_bytes": 36963,
+    "head": "## Pass 1\n\nWalking the ordering in `tools/server/server-context.cpp`:\n\n1. `get_available_slot()` picks the slot (`:2068`), records the selection, and\n   then — still inside the same function — runs the prompt-cache consult at\n   `:2279` (`ret->prompt_load(*prompt_cache, task.tokens)`). For an SSD-tier\n   entry that call is a multi-GiB `pread` plus a `llama_state_seq_set_data_ext`;\n   in the capture you sent it took **4119 ms**.\n\n2. `prepare_dsv4_admission()` (`:2446`) then evaluates `reuse_resident`. On the\n   `no_covering_checkpoint` branch it takes the full-clear path at `:2666` and\n   calls `slot.prompt_clear()`.\n\n3. `prompt_clear()` drops `prompt.tokens` and the checkpoints outright. Nothing\n   downstream can recover the restored prefix, so `n_past` lands at 0 and the\n   whole 118k-token prompt is re-prefilled.\n\nSo the read, the bytes, and the 4.1 s are pure waste, and no single event\nrecords it — you can only see it by joining `cache_restore` against the\n`admission` outcome and the `prompt_start` landing.\n\n**Where the fix belongs.** Not in the consult: it has no way to know what\nadmission will decide. Not in `prompt_clear()` either — by then the state is\nalready in the slot. It belongs in `prepare_dsv4_admission`, split into a\ncheap predicate that runs *before* the consult:\n\n```cpp\n// server-context.cpp, inside get_available_slot, before the consult\nif (const auto veto = dsv4_admission_would_clear(*ret, task); veto) {\n    // the elastic admission is going to clear this slot anyway; skipping the\n    // consult saves the SSD read and the seq_cp, and costs one predicate\n    SRV_TRC(\"skipping prompt-cache consult: admission will clear (%s)\\n\",\n            clear_code_name(veto.code));\n    consult_cache = false;\n}\n```\n\nThe predicate needs only `resident`, `lcp`, `span_end` and the checkpoint list —\nall available before the consult. Everything else in `reuse_resident` is\ndownstream of state the consult produces, and those branches cannot fire when\nthe slot is about to be cleared for a *structural* reason (family admission,\n`no_lcp`, `mtmd`, `no_cache_prompt`).\n\nRisk: `no_covering_checkpoint` depends on the checkpoint list of the *restored*\nstate, which does not exist before the consult. That one case must stay where it\nis, so this is a partial fix — it removes the family/no_lcp/mtmd/reuse-opt\nwastage but not the checkpoint case, which is the one your capture hit.\n\nRecommendation: land the veto for the structural reasons (cheap, obviously\ncorrect), and separately teach the SSD tier to load the checkpoint index without\nthe state blobs so `no_covering_checkpoint` can also be decided pre-consult.\n\n\n## Pass 2\n\nWalking the ordering in `tools/server/server-context.cpp`:\n\n1. `get_available_slot()` picks the slot (`:2068`), records the selection, and\n   then — still inside the same function — runs the prompt-cache consult at\n   `:2279` (`ret->prompt_load(*prompt_cache, task.tokens)`). For an SSD-tier\n   entry that call is a multi-GiB `pread` plus a `llama_state_seq_set_data_ext`;\n   in the capture you sent it took **4119 ms**.\n\n2. `prepare_dsv4_admission()` (`:2446`) then evaluates `reuse_resident`. On the\n   `no_covering_checkpoint` branch it takes the full-clear path at `:2666` and\n   calls `slot.prompt_clear()`.\n\n3. `prompt_clear()` drops `prompt.tokens` and the checkpoints outright. Nothing\n   downstream can recover the restored prefix, so `n_past` lands at 0 and the\n   whole 118k-token prompt is re-prefilled.\n\nSo the read, the bytes, and the 4.1 s are pure waste, and no single event\nrecords it — you can only see it by joining `cache_restore` against the\n`admission` outcome and the `prompt_start` landing.\n\n**Where the fix belongs.** Not in the consult: it has no way to know what\nadmission will decide. Not in `prompt_clear()` either — by then the state is\nalready in the slot. It belongs in `prepare_dsv4_admission`, split into a\ncheap predicate that runs *before* the consult:\n\n```cpp\n// server-context.cpp, inside get_available_slot, before the consult\nif (const auto veto = dsv4_admission_would_clear(*ret, task); veto) {\n    // th",
+    "tail": "d\n   calls `slot.prompt_clear()`.\n\n3. `prompt_clear()` drops `prompt.tokens` and the checkpoints outright. Nothing\n   downstream can recover the restored prefix, so `n_past` lands at 0 and the\n   whole 118k-token prompt is re-prefilled.\n\nSo the read, the bytes, and the 4.1 s are pure waste, and no single event\nrecords it — you can only see it by joining `cache_restore` against the\n`admission` outcome and the `prompt_start` landing.\n\n**Where the fix belongs.** Not in the consult: it has no way to know what\nadmission will decide. Not in `prompt_clear()` either — by then the state is\nalready in the slot. It belongs in `prepare_dsv4_admission`, split into a\ncheap predicate that runs *before* the consult:\n\n```cpp\n// server-context.cpp, inside get_available_slot, before the consult\nif (const auto veto = dsv4_admission_would_clear(*ret, task); veto) {\n    // the elastic admission is going to clear this slot anyway; skipping the\n    // consult saves the SSD read and the seq_cp, and costs one predicate\n    SRV_TRC(\"skipping prompt-cache consult: admission will clear (%s)\\n\",\n            clear_code_name(veto.code));\n    consult_cache = false;\n}\n```\n\nThe predicate needs only `resident`, `lcp`, `span_end` and the checkpoint list —\nall available before the consult. Everything else in `reuse_resident` is\ndownstream of state the consult produces, and those branches cannot fire when\nthe slot is about to be cleared for a *structural* reason (family admission,\n`no_lcp`, `mtmd`, `no_cache_prompt`).\n\nRisk: `no_covering_checkpoint` depends on the checkpoint list of the *restored*\nstate, which does not exist before the consult. That one case must stay where it\nis, so this is a partial fix — it removes the family/no_lcp/mtmd/reuse-opt\nwastage but not the checkpoint case, which is the one your capture hit.\n\nRecommendation: land the veto for the structural reasons (cheap, obviously\ncorrect), and separately teach the SSD tier to load the checkpoint index without\nthe state blobs so `no_covering_checkpoint` can also be decided pre-consult.\n",
+    "elided_bytes": 30819,
+    "truncated": true
+   }
+  },
+  "105": {
+   "v": 1,
+   "req": 105,
+   "found": true,
+   "state": "final",
+   "slot": 2,
+   "t_ms": 1786265164295,
+   "caps": {
+    "in_head_tokens": 512,
+    "in_tail_tokens": 256,
+    "out_head_bytes": 4096,
+    "out_tail_bytes": 2048,
+    "max_requests": 64,
+    "max_bytes": 1048576
+   },
+   "store": {
+    "requests": 37,
+    "bytes": 412344,
+    "evicted": 12
+   },
+   "input": {
+    "n_tokens": 52400,
+    "head": "You are a coding agent operating inside a checked-out repository.\n\n<environment>\n  workspace: /srv/work/llama-cpp-m2-ultra\n  branch:    dashboard-v3\n  platform:  darwin arm64 (Apple M2 Ultra, 192 GiB unified)\n</environment>\n\n<tools>\n  read(path, offset?, limit?)     - read a file\n  edit(path, old, new)            - exact string replacement\n  bash(command, timeout_ms?)      - run a command in the workspace\n  grep(pattern, glob?)            - ripgrep across the tree\n</tools>\n\nRules:\n- Read the relevant implementation before changing it.\n- Never fabricate a benchmark number. Measure, then report the command.\n- Keep the decode hot path allocation-free.\n",
+    "tail": "assistant: The consult happens in get_available_slot before prepare_dsv4_admission\nruns, so by the time admission decides to clear, the SSD read has already been\npaid for. Two candidate fixes:\n\n  1. move the consult after admission — cheapest, but admission needs the\n     restored prefix length to make its own decision, so this is circular;\n  2. give admission a veto that runs *before* the consult using only the\n     resident/LCP numbers it already has.\n\n(2) is the one that actually works. Let me show you the ordering.\n\nuser: show me the ordering, with line numbers, and then stop.",
+    "head_tokens": 512,
+    "tail_tokens": 256,
+    "elided_tokens": 51632,
+    "truncated": true
+   },
+   "output": {
+    "n_tokens": 4096,
+    "n_bytes": 36963,
+    "head": "## Pass 1\n\nWalking the ordering in `tools/server/server-context.cpp`:\n\n1. `get_available_slot()` picks the slot (`:2068`), records the selection, and\n   then — still inside the same function — runs the prompt-cache consult at\n   `:2279` (`ret->prompt_load(*prompt_cache, task.tokens)`). For an SSD-tier\n   entry that call is a multi-GiB `pread` plus a `llama_state_seq_set_data_ext`;\n   in the capture you sent it took **4119 ms**.\n\n2. `prepare_dsv4_admission()` (`:2446`) then evaluates `reuse_resident`. On the\n   `no_covering_checkpoint` branch it takes the full-clear path at `:2666` and\n   calls `slot.prompt_clear()`.\n\n3. `prompt_clear()` drops `prompt.tokens` and the checkpoints outright. Nothing\n   downstream can recover the restored prefix, so `n_past` lands at 0 and the\n   whole 118k-token prompt is re-prefilled.\n\nSo the read, the bytes, and the 4.1 s are pure waste, and no single event\nrecords it — you can only see it by joining `cache_restore` against the\n`admission` outcome and the `prompt_start` landing.\n\n**Where the fix belongs.** Not in the consult: it has no way to know what\nadmission will decide. Not in `prompt_clear()` either — by then the state is\nalready in the slot. It belongs in `prepare_dsv4_admission`, split into a\ncheap predicate that runs *before* the consult:\n\n```cpp\n// server-context.cpp, inside get_available_slot, before the consult\nif (const auto veto = dsv4_admission_would_clear(*ret, task); veto) {\n    // the elastic admission is going to clear this slot anyway; skipping the\n    // consult saves the SSD read and the seq_cp, and costs one predicate\n    SRV_TRC(\"skipping prompt-cache consult: admission will clear (%s)\\n\",\n            clear_code_name(veto.code));\n    consult_cache = false;\n}\n```\n\nThe predicate needs only `resident`, `lcp`, `span_end` and the checkpoint list —\nall available before the consult. Everything else in `reuse_resident` is\ndownstream of state the consult produces, and those branches cannot fire when\nthe slot is about to be cleared for a *structural* reason (family admission,\n`no_lcp`, `mtmd`, `no_cache_prompt`).\n\nRisk: `no_covering_checkpoint` depends on the checkpoint list of the *restored*\nstate, which does not exist before the consult. That one case must stay where it\nis, so this is a partial fix — it removes the family/no_lcp/mtmd/reuse-opt\nwastage but not the checkpoint case, which is the one your capture hit.\n\nRecommendation: land the veto for the structural reasons (cheap, obviously\ncorrect), and separately teach the SSD tier to load the checkpoint index without\nthe state blobs so `no_covering_checkpoint` can also be decided pre-consult.\n\n\n## Pass 2\n\nWalking the ordering in `tools/server/server-context.cpp`:\n\n1. `get_available_slot()` picks the slot (`:2068`), records the selection, and\n   then — still inside the same function — runs the prompt-cache consult at\n   `:2279` (`ret->prompt_load(*prompt_cache, task.tokens)`). For an SSD-tier\n   entry that call is a multi-GiB `pread` plus a `llama_state_seq_set_data_ext`;\n   in the capture you sent it took **4119 ms**.\n\n2. `prepare_dsv4_admission()` (`:2446`) then evaluates `reuse_resident`. On the\n   `no_covering_checkpoint` branch it takes the full-clear path at `:2666` and\n   calls `slot.prompt_clear()`.\n\n3. `prompt_clear()` drops `prompt.tokens` and the checkpoints outright. Nothing\n   downstream can recover the restored prefix, so `n_past` lands at 0 and the\n   whole 118k-token prompt is re-prefilled.\n\nSo the read, the bytes, and the 4.1 s are pure waste, and no single event\nrecords it — you can only see it by joining `cache_restore` against the\n`admission` outcome and the `prompt_start` landing.\n\n**Where the fix belongs.** Not in the consult: it has no way to know what\nadmission will decide. Not in `prompt_clear()` either — by then the state is\nalready in the slot. It belongs in `prepare_dsv4_admission`, split into a\ncheap predicate that runs *before* the consult:\n\n```cpp\n// server-context.cpp, inside get_available_slot, before the consult\nif (const auto veto = dsv4_admission_would_clear(*ret, task); veto) {\n    // th",
+    "tail": "d\n   calls `slot.prompt_clear()`.\n\n3. `prompt_clear()` drops `prompt.tokens` and the checkpoints outright. Nothing\n   downstream can recover the restored prefix, so `n_past` lands at 0 and the\n   whole 118k-token prompt is re-prefilled.\n\nSo the read, the bytes, and the 4.1 s are pure waste, and no single event\nrecords it — you can only see it by joining `cache_restore` against the\n`admission` outcome and the `prompt_start` landing.\n\n**Where the fix belongs.** Not in the consult: it has no way to know what\nadmission will decide. Not in `prompt_clear()` either — by then the state is\nalready in the slot. It belongs in `prepare_dsv4_admission`, split into a\ncheap predicate that runs *before* the consult:\n\n```cpp\n// server-context.cpp, inside get_available_slot, before the consult\nif (const auto veto = dsv4_admission_would_clear(*ret, task); veto) {\n    // the elastic admission is going to clear this slot anyway; skipping the\n    // consult saves the SSD read and the seq_cp, and costs one predicate\n    SRV_TRC(\"skipping prompt-cache consult: admission will clear (%s)\\n\",\n            clear_code_name(veto.code));\n    consult_cache = false;\n}\n```\n\nThe predicate needs only `resident`, `lcp`, `span_end` and the checkpoint list —\nall available before the consult. Everything else in `reuse_resident` is\ndownstream of state the consult produces, and those branches cannot fire when\nthe slot is about to be cleared for a *structural* reason (family admission,\n`no_lcp`, `mtmd`, `no_cache_prompt`).\n\nRisk: `no_covering_checkpoint` depends on the checkpoint list of the *restored*\nstate, which does not exist before the consult. That one case must stay where it\nis, so this is a partial fix — it removes the family/no_lcp/mtmd/reuse-opt\nwastage but not the checkpoint case, which is the one your capture hit.\n\nRecommendation: land the veto for the structural reasons (cheap, obviously\ncorrect), and separately teach the SSD tier to load the checkpoint index without\nthe state blobs so `no_covering_checkpoint` can also be decided pre-consult.\n",
+    "elided_bytes": 30819,
+    "truncated": true
+   }
+  },
+  "106": {
+   "v": 1,
+   "req": 106,
+   "found": true,
+   "state": "live",
+   "slot": 1,
+   "t_ms": 1786264854295,
+   "caps": {
+    "in_head_tokens": 512,
+    "in_tail_tokens": 256,
+    "out_head_bytes": 4096,
+    "out_tail_bytes": 2048,
+    "max_requests": 64,
+    "max_bytes": 1048576
+   },
+   "store": {
+    "requests": 37,
+    "bytes": 412344,
+    "evicted": 12
+   },
+   "input": {
+    "n_tokens": 44100,
+    "head": "user: run the 1M-context draft-decode reproduction and report where it OOMs",
+    "tail": "",
+    "head_tokens": 512,
+    "tail_tokens": 256,
+    "elided_tokens": 43332,
+    "truncated": true
+   },
+   "output": null
+  },
+  "107": {
+   "v": 1,
+   "req": 107,
+   "found": false,
+   "reason": "absent",
+   "caps": {
+    "in_head_tokens": 512,
+    "in_tail_tokens": 256,
+    "out_head_bytes": 4096,
+    "out_tail_bytes": 2048,
+    "max_requests": 64,
+    "max_bytes": 1048576
+   },
+   "store": {
+    "requests": 37,
+    "bytes": 412344,
+    "evicted": 12
+   }
+  },
+  "108": {
+   "v": 1,
+   "req": 108,
+   "found": false,
+   "reason": "evicted",
+   "caps": {
+    "in_head_tokens": 512,
+    "in_tail_tokens": 256,
+    "out_head_bytes": 4096,
+    "out_tail_bytes": 2048,
+    "max_requests": 64,
+    "max_bytes": 1048576
+   },
+   "store": {
+    "requests": 37,
+    "bytes": 412344,
+    "evicted": 12
+   }
+  }
+ },
+ "cache": {
+  "3": {
+   "v": 1,
+   "id": 3,
+   "found": true,
+   "tier": "disk",
+   "tokens": 31000,
+   "head": "You are a coding agent operating inside a checked-out repository.\n\n<environment>\n  workspace: /srv/work/llama-cpp-m2-ultra\n  branch:    dashboard-v3\n  platform:  darwin arm64 (Apple M2 Ultra, 192 GiB unified)\n</environment>\n\n<tools>\n  read(path, offset?, limit?)     - read a file\n  edit(path, old, new)            - exact string replacement\n  bash(command, timeout_ms?)      - run a command in the workspace\n  grep(patt",
+   "tail": "to that runs *before* the consult using only the\n     resident/LCP numbers it already has.\n\n(2) is the one that actually works. Let me show you the ordering.\n\nuser: show me the ordering, with line numbers, and then stop.",
+   "head_tokens": 64,
+   "tail_tokens": 32,
+   "elided_tokens": 30904,
+   "truncated": true,
+   "age_ms": 1200,
+   "req": 103
+  },
+  "5": {
+   "v": 1,
+   "id": 5,
+   "found": true,
+   "tier": "disk",
+   "tokens": 148800,
+   "head": "You are a coding agent operating inside a checked-out repository.\n\n<environment>\n  workspace: /srv/work/llama-cpp-m2-ultra\n  branch:    dashboard-v3\n  platform:  darwin arm64 (Apple M2 Ultra, 192 GiB unified)\n</environment>\n\n<tools>\n  read(path, offset?, limit?)     - read a file\n  edit(path, old, new)            - exact string replacement\n  bash(command, timeout_ms?)      - run a command in the workspace\n  grep(patt",
+   "tail": "to that runs *before* the consult using only the\n     resident/LCP numbers it already has.\n\n(2) is the one that actually works. Let me show you the ordering.\n\nuser: show me the ordering, with line numbers, and then stop.",
+   "head_tokens": 64,
+   "tail_tokens": 32,
+   "elided_tokens": 148704,
+   "truncated": true,
+   "age_ms": 1200,
+   "req": 108
+  },
+  "6": {
+   "v": 1,
+   "id": 6,
+   "found": true,
+   "tier": "disk",
+   "tokens": 202150,
+   "head": "You are a coding agent operating inside a checked-out repository.\n\n<environment>\n  workspace: /srv/work/llama-cpp-m2-ultra\n  branch:    dashboard-v3\n  platform:  darwin arm64 (Apple M2 Ultra, 192 GiB unified)\n</environment>\n\n<tools>\n  read(path, offset?, limit?)     - read a file\n  edit(path, old, new)            - exact string replacement\n  bash(command, timeout_ms?)      - run a command in the workspace\n  grep(patt",
+   "tail": "to that runs *before* the consult using only the\n     resident/LCP numbers it already has.\n\n(2) is the one that actually works. Let me show you the ordering.\n\nuser: show me the ordering, with line numbers, and then stop.",
+   "head_tokens": 64,
+   "tail_tokens": 32,
+   "elided_tokens": 202054,
+   "truncated": true,
+   "age_ms": 1200
+  },
+  "9": {
+   "v": 1,
+   "id": 9,
+   "found": true,
+   "tier": "ram",
+   "tokens": 212300,
+   "head": "You are a coding agent operating inside a checked-out repository.\n\n<environment>\n  workspace: /srv/work/llama-cpp-m2-ultra\n  branch:    dashboard-v3\n  platform:  darwin arm64 (Apple M2 Ultra, 192 GiB unified)\n</environment>\n\n<tools>\n  read(path, offset?, limit?)     - read a file\n  edit(path, old, new)            - exact string replacement\n  bash(command, timeout_ms?)      - run a command in the workspace\n  grep(patt",
+   "tail": "to that runs *before* the consult using only the\n     resident/LCP numbers it already has.\n\n(2) is the one that actually works. Let me show you the ordering.\n\nuser: show me the ordering, with line numbers, and then stop.",
+   "head_tokens": 64,
+   "tail_tokens": 32,
+   "elided_tokens": 212204,
+   "truncated": true,
+   "age_ms": 1200,
+   "req": 104
+  },
+  "12": {
+   "v": 1,
+   "id": 12,
+   "found": true,
+   "tier": "ram",
+   "tokens": 96100,
+   "head": "You are a coding agent operating inside a checked-out repository.\n\n<environment>\n  workspace: /srv/work/llama-cpp-m2-ultra\n  branch:    dashboard-v3\n  platform:  darwin arm64 (Apple M2 Ultra, 192 GiB unified)\n</environment>\n\n<tools>\n  read(path, offset?, limit?)     - read a file\n  edit(path, old, new)            - exact string replacement\n  bash(command, timeout_ms?)      - run a command in the workspace\n  grep(patt",
+   "tail": "to that runs *before* the consult using only the\n     resident/LCP numbers it already has.\n\n(2) is the one that actually works. Let me show you the ordering.\n\nuser: show me the ordering, with line numbers, and then stop.",
+   "head_tokens": 64,
+   "tail_tokens": 32,
+   "elided_tokens": 96004,
+   "truncated": true,
+   "age_ms": 1200,
+   "req": 101
+  },
+  "14": {
+   "v": 1,
+   "id": 14,
+   "found": true,
+   "tier": "ram",
+   "tokens": 43700,
+   "head": "user: what does --cache-disk-limit default to, and is it per-file or total?\n\nIt defaults to **256** (GiB) and it is a **total** budget for the SSD tier, not a\nper-file cap — see `common/arg.cpp`, `--cache-disk-limit`, which writes\n`params.cache_disk_limit_gib`. `-1` disables the limit. Per-entry ceilings are\nseparate hard bounds in `server-task.h` (`PCACHE_MAX_FILE_BYTES`, 512 GiB).",
+   "tail": "",
+   "head_tokens": 64,
+   "tail_tokens": 32,
+   "elided_tokens": 43604,
+   "truncated": true,
+   "age_ms": 1200,
+   "req": 102
+  },
+  "15": {
+   "v": 1,
+   "id": 15,
+   "found": true,
+   "tier": "disk",
+   "tokens": 56496,
+   "head": "You are a coding agent operating inside a checked-out repository.\n\n<environment>\n  workspace: /srv/work/llama-cpp-m2-ultra\n  branch:    dashboard-v3\n  platform:  darwin arm64 (Apple M2 Ultra, 192 GiB unified)\n</environment>\n\n<tools>\n  read(path, offset?, limit?)     - read a file\n  edit(path, old, new)            - exact string replacement\n  bash(command, timeout_ms?)      - run a command in the workspace\n  grep(patt",
+   "tail": "to that runs *before* the consult using only the\n     resident/LCP numbers it already has.\n\n(2) is the one that actually works. Let me show you the ordering.\n\nuser: show me the ordering, with line numbers, and then stop.",
+   "head_tokens": 64,
+   "tail_tokens": 32,
+   "elided_tokens": 56400,
+   "truncated": true,
+   "age_ms": 1200,
+   "req": 105
+  }
+ }
+}

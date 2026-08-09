@@ -690,6 +690,7 @@ struct server_prompt_cache_state {
     int64_t  dash_created_us  = 0;
     int64_t  dash_last_hit_us = 0; // 0 = never hit
     uint32_t dash_hits        = 0;
+    uint64_t dash_req         = 0; // request whose save created it (0 = rebuilt from disk)
 
     bool on_disk() const { return !file.empty(); }
 

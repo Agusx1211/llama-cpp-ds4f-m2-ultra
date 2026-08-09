@@ -1685,6 +1685,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_LIMIT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--dashboard-content"},
+        {"--no-dashboard-content"},
+        "let the m2-dashboard show request content: retains a bounded, evicting preview of each "
+        "request's prompt (head/tail token ids) and generated text, and enables the live token "
+        "mirror at /m2-dashboard/watch and the prompt-cache text preview. All three routes sit "
+        "behind the API key and are only read when the dashboard is explicitly asked for one "
+        "request or entry. --no-dashboard-content keeps the store empty and makes them 501 "
+        "(default: enabled)",
+        [](common_params & params, bool value) {
+            params.dashboard_content = value;
+        }
+    ).set_env("LLAMA_ARG_DASHBOARD_CONTENT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

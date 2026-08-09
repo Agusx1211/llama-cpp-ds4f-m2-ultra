@@ -440,6 +440,397 @@ static void test_emit_overhead() {
     CHECK(snap.dropped == (uint64_t) n - ring_capacity_default);
 }
 
+// ---------------------------------------------------------------------------
+// dashboard v3: content store, live token mirror, cache preview
+// ---------------------------------------------------------------------------
+
+static std::vector<int32_t> ids(size_t n, int32_t base = 100) {
+    std::vector<int32_t> out;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        out.push_back(base + (int32_t) i);
+    }
+    return out;
+}
+
+// the tests never link llama, so the detokenizer is a stand-in that makes the
+// token ids visible in the output
+static std::string fake_detok(const std::vector<int32_t> & tokens) {
+    std::string out;
+    for (const int32_t t : tokens) {
+        if (!out.empty()) {
+            out += ' ';
+        }
+        out += (t < 0 ? std::string("[media]") : std::to_string(t));
+    }
+    return out;
+}
+
+static void test_utf8_truncation() {
+    // "aé€𝄞" - 1, 2, 3 and 4 byte sequences back to back
+    const std::string s = "a\xc3\xa9\xe2\x82\xac\xf0\x9d\x84\x9e";
+    CHECK(s.size() == 10);
+
+    // never cut inside a sequence
+    CHECK(utf8_prefix_len(s, 10) == 10);
+    CHECK(utf8_prefix_len(s, 9) == 6);  // would land inside the 4-byte char
+    CHECK(utf8_prefix_len(s, 5) == 3);  // would land inside the 3-byte char
+    CHECK(utf8_prefix_len(s, 2) == 1);  // would land inside the 2-byte char
+    CHECK(utf8_prefix_len(s, 0) == 0);
+
+    // the suffix start moves FORWARD past a partial sequence: a tail never
+    // begins mid-character, and it is shorter than the budget when it has to be
+    CHECK(utf8_suffix_start(s, 10) == 0);
+    CHECK(utf8_suffix_start(s, 4) == 6);  // exactly the 4-byte char
+    CHECK(utf8_suffix_start(s, 3) == 10); // cannot fit it: empty tail, not garbage
+    CHECK(utf8_suffix_start(s, 1) == 10);
+}
+
+static void test_content_capture_and_caps() {
+    content_store store;
+    store.set_enabled(true);
+
+    // a prompt longer than the head+tail budget keeps only the ends
+    capture_prompt_into(store, 1, 3, ids(content_in_head_tokens + content_in_tail_tokens + 500));
+
+    request_content got;
+    CHECK(store.lookup(1, got));
+    CHECK(got.has_input);
+    CHECK(got.in_tokens == content_in_head_tokens + content_in_tail_tokens + 500);
+    CHECK(got.in_head.size() == content_in_head_tokens);
+    CHECK(got.in_tail.size() == content_in_tail_tokens);
+    CHECK(got.in_head.front() == 100);
+    CHECK(got.complete == false); // no output yet: the request is still live
+
+    // the generation is capped in bytes at both ends, on code-point boundaries
+    const std::string long_out(content_out_head_bytes + content_out_tail_bytes + 4096, 'x');
+    store.capture_output(1, 3, long_out, 4321);
+    CHECK(store.lookup(1, got));
+    CHECK(got.complete);
+    CHECK(got.out_tokens == 4321);
+    CHECK(got.out_bytes == long_out.size());
+    CHECK(got.out_head.size() == content_out_head_bytes);
+    CHECK(got.out_tail.size() == content_out_tail_bytes);
+
+    // a short generation is kept whole with no tail
+    store.capture_output(2, 0, "short answer", 3);
+    CHECK(store.lookup(2, got));
+    CHECK(got.out_head == "short answer");
+    CHECK(got.out_tail.empty());
+
+    // request id 0 is never a runtime id and must not create an entry
+    store.capture_output(0, 0, "nope", 1);
+    CHECK(!store.lookup(0, got));
+}
+
+static void test_content_eviction_bounds() {
+    content_store store;
+    store.set_enabled(true);
+
+    // one live request, then far more finished ones than the cap
+    capture_prompt_into(store, 1, 0, ids(64));
+    for (uint64_t r = 2; r < content_max_requests * 2; ++r) {
+        capture_prompt_into(store, r, 1, ids(64));
+        store.capture_output(r, 1, std::string(2048, 'y'), 100);
+    }
+
+    const auto usage = store.usage();
+    CHECK(usage.requests <= content_max_requests);
+    CHECK(usage.bytes <= content_max_bytes);
+    CHECK(usage.evicted > 0);
+
+    // the live request survives FIFO pressure: it is the OLDEST record, and it
+    // is the one an operator is most likely to be watching right now
+    request_content got;
+    CHECK(store.lookup(1, got));
+    CHECK(!got.complete);
+
+    // an evicted id is reported as evicted, an unseen one as merely absent
+    CHECK(store.was_evicted(2));
+    CHECK(!store.was_evicted(999999));
+
+    // once the live request reaches a terminal state it becomes evictable
+    store.mark_final(1);
+    for (uint64_t r = 1000; r < 1000 + content_max_requests; ++r) {
+        capture_prompt_into(store, r, 1, ids(64));
+        store.capture_output(r, 1, std::string(2048, 'z'), 100);
+    }
+    CHECK(!store.lookup(1, got));
+    CHECK(store.usage().requests <= content_max_requests);
+
+    // the hard ceiling still applies when nothing ever completes
+    content_store live_only;
+    live_only.set_enabled(true);
+    for (uint64_t r = 1; r <= content_max_requests * 3; ++r) {
+        capture_prompt_into(live_only, r, 1, ids(64));
+    }
+    CHECK(live_only.usage().requests <= content_max_requests * 2 + 1);
+}
+
+static void test_content_disable_clears_everything() {
+    content_store store;
+    store.set_enabled(true);
+    capture_prompt_into(store, 7, 0, ids(8));
+    store.capture_output(7, 0, "text", 1);
+    CHECK(store.usage().requests == 1);
+
+    store.set_enabled(false);
+    request_content got;
+    CHECK(!store.enabled());
+    CHECK(!store.lookup(7, got));
+    CHECK(store.usage().requests == 0);
+    CHECK(store.usage().bytes == 0);
+
+    // and nothing new is retained while it stays off
+    capture_prompt_into(store, 8, 0, ids(8));
+    store.capture_output(8, 0, "text", 1);
+    CHECK(store.usage().requests == 0);
+}
+
+static void test_content_json() {
+    content_store store;
+    store.set_enabled(true);
+    capture_prompt_into(store, 11, 2, ids(content_in_head_tokens + content_in_tail_tokens + 10));
+    store.capture_output(11, 2, "generated", 4);
+
+    request_content got;
+    CHECK(store.lookup(11, got));
+    const json body = content_to_json(11, &got, nullptr, store.usage(), fake_detok);
+
+    CHECK(body["v"] == schema_version);
+    CHECK(body["req"] == 11);
+    CHECK(body["found"] == true);
+    CHECK(body["state"] == "final");
+    CHECK(body["slot"] == 2);
+    CHECK(body["caps"]["in_head_tokens"] == content_in_head_tokens);
+    CHECK(body["caps"]["max_requests"] == content_max_requests);
+    CHECK(body["caps"]["max_bytes"] == content_max_bytes);
+    CHECK(body["store"]["requests"] == 1);
+    CHECK(body["input"]["n_tokens"] == content_in_head_tokens + content_in_tail_tokens + 10);
+    CHECK(body["input"]["head_tokens"] == content_in_head_tokens);
+    CHECK(body["input"]["elided_tokens"] == 10);
+    CHECK(body["input"]["truncated"] == true);
+    CHECK(body["input"]["head"].get<std::string>().rfind("100 101", 0) == 0);
+    CHECK(body["output"]["head"] == "generated");
+    CHECK(body["output"]["truncated"] == false);
+
+    // the not-retained body carries a reason and NO content keys at all
+    const json missing = content_to_json(12, nullptr, "evicted", store.usage(), fake_detok);
+    CHECK(missing["found"] == false);
+    CHECK(missing["reason"] == "evicted");
+    CHECK(!missing.contains("input"));
+    CHECK(!missing.contains("output"));
+
+    // a media placeholder is named, never handed to the vocab
+    request_content media;
+    media.request_id = 13;
+    media.has_input  = true;
+    media.in_tokens  = 3;
+    media.in_head    = { 5, -1, 6 };
+    const json with_media = content_to_json(13, &media, nullptr, store.usage(), fake_detok);
+    CHECK(with_media["input"]["head"] == "5 [media] 6");
+}
+
+static void test_watch_mirror() {
+    watch_registry reg;
+    reg.reset();
+    CHECK(!watching());
+
+    const int a = reg.attach(77);
+    CHECK(a >= 0);
+    CHECK(watching());
+    CHECK(reg.active() == 1);
+
+    // the cap is deliberately tighter than the event feed's: this is the only
+    // per-token hook in the server
+    const int b = reg.attach(78);
+    CHECK(b >= 0);
+    CHECK(reg.attach(79) < 0);
+    reg.detach(b);
+    CHECK(reg.active() == 1);
+
+    // the producer hands over the whole generated text; only the new suffix moves
+    watch_view view;
+    reg.sync(77, 4, "Hello", 1);
+    CHECK(reg.drain(a, view));
+    CHECK(view.text == "Hello");
+    CHECK(view.cursor == 5);
+    CHECK(view.offset == 0);
+    CHECK(view.replace); // the first drain after attach is authoritative
+    CHECK(view.slot == 4);
+
+    reg.sync(77, 4, "Hello world", 2);
+    CHECK(reg.drain(a, view));
+    CHECK(view.text == " world");
+    CHECK(!view.replace);
+    CHECK(view.offset == 5);
+    CHECK(view.cursor == 11);
+
+    // nothing new: an empty, non-terminal frame
+    CHECK(reg.drain(a, view));
+    CHECK(view.text.empty());
+    CHECK(!view.ended);
+
+    // a stop-word trim shortens the slot's own text: the reader is resynced
+    reg.sync(77, 4, "Hello wor", 2);
+    CHECK(reg.drain(a, view));
+    CHECK(view.replace);
+    CHECK(view.text == "Hello wor");
+    CHECK(view.offset == 0);
+
+    // a different request's tokens never reach this watcher
+    reg.sync(999, 5, "not for you", 9);
+    CHECK(reg.drain(a, view));
+    CHECK(view.text.empty());
+
+    reg.finish(77, 512);
+    CHECK(reg.drain(a, view));
+    CHECK(view.ended);
+    CHECK(view.n_dec == 512);
+
+    reg.detach(a);
+    CHECK(!watching());
+    CHECK(!reg.drain(a, view));
+}
+
+static void test_watch_mirror_is_bounded() {
+    watch_registry reg;
+    reg.reset();
+    const int lease = reg.attach(5);
+    CHECK(lease >= 0);
+
+    // a reader that never drains must not make the server grow: the mirror
+    // keeps the newest window and says how much it discarded
+    std::string generated;
+    while (generated.size() < watch_mirror_bytes * 3) {
+        generated += "0123456789";
+        reg.sync(5, 0, generated, (int32_t) (generated.size() / 4));
+    }
+    watch_view view;
+    CHECK(reg.drain(lease, view));
+    CHECK(view.text.size() <= watch_mirror_bytes);
+    CHECK(view.dropped > 0);
+    CHECK(view.replace); // a trimmed reader cannot splice; it must resync
+    CHECK(view.offset == view.dropped);
+    CHECK(view.cursor == generated.size());
+    reg.detach(lease);
+}
+
+// The mirror hook sits in process_token, i.e. on the per-token path. When
+// nobody is watching it must cost a single relaxed load - measure it rather
+// than assert it, exactly like test_emit_overhead does for the bus.
+static void test_watch_guard_overhead() {
+    watches().reset();
+    const int n = 5000000;
+    volatile int sink = 0;
+
+    const int64_t t0 = ggml_time_us();
+    for (int i = 0; i < n; ++i) {
+        if (watching()) {
+            sink += 1;
+        }
+    }
+    const int64_t dt = ggml_time_us() - t0;
+    const double ns = (double) dt * 1000.0 / n;
+    std::printf("  watch guard (unwatched): %.2f ns/token (%d iterations in %.1f ms)\n", ns, n, dt / 1000.0);
+    CHECK(sink == 0);
+    // a relaxed atomic load is sub-nanosecond; anything that takes a lock or
+    // allocates here would be orders of magnitude above this bound
+    CHECK(ns < 50.0);
+}
+
+static void test_watch_frames() {
+    watch_view view;
+    view.req    = 9;
+    view.slot   = 2;
+    view.n_dec  = 12;
+    view.cursor = 40;
+    view.offset = 30;
+    view.text   = " more";
+
+    const std::string delta = make_watch_frame(view);
+    CHECK(delta.rfind("data: ", 0) == 0);
+    const json d = json::parse(delta.substr(6));
+    CHECK(d["k"] == "delta");
+    CHECK(d["cursor"] == 40);   // delta: END offset
+    CHECK(d["offset"] == 30);
+    CHECK(d["text"] == " more");
+
+    view.replace = true;
+    const json r = json::parse(make_watch_frame(view).substr(6));
+    CHECK(r["k"] == "rewind");
+    CHECK(r["cursor"] == 30);   // rewind: START offset
+    CHECK(r["offset"] == 30);
+
+    const std::string hello = make_watch_hello_frame(9, view, "live", json(nullptr));
+    CHECK(hello.rfind("event: watch-hello\ndata: ", 0) == 0);
+    const json h = json::parse(hello.substr(std::string("event: watch-hello\ndata: ").size()));
+    CHECK(h["k"] == "watch-hello");
+    CHECK(h["state"] == "live");
+    CHECK(h["input"].is_null());
+    CHECK(h["caps"]["max_streams"] == maximum_watch_streams);
+    CHECK(h["caps"]["mirror_bytes"] == watch_mirror_bytes);
+
+    const std::string end = make_watch_end_frame(9, "finished", 512);
+    CHECK(end.rfind("event: watch-end\ndata: ", 0) == 0);
+    const json e = json::parse(end.substr(std::string("event: watch-end\ndata: ").size()));
+    CHECK(e["k"] == "end");
+    CHECK(e["reason"] == "finished");
+    CHECK(e["n_dec"] == 512);
+}
+
+static void test_cache_preview() {
+    cache_state state;
+    state.enabled = true;
+    state.at_us   = 1000;
+
+    cache_entry_state ram;
+    ram.id         = 4;
+    ram.tokens     = 100000;
+    ram.bytes_ram  = 1 << 20;
+    ram.request_id = 88;
+    ram.head_ids   = ids(cache_preview_head_tokens, 10);
+    ram.tail_ids   = ids(cache_preview_tail_tokens, 900);
+    state.entries.push_back(ram);
+
+    cache_entry_state bare; // an entry with no retained tokens
+    bare.id      = 5;
+    bare.tokens  = 12;
+    bare.on_disk = true;
+    state.entries.push_back(bare);
+
+    // the bulk snapshot advertises previewability and provenance but carries
+    // NO text at all
+    const json snap = cache_state_to_json(state, 2000);
+    CHECK(snap["entries"][0]["preview"] == true);
+    CHECK(snap["entries"][0]["req"] == 88);
+    CHECK(snap["entries"][1]["preview"] == false);
+    CHECK(!snap["entries"][1].contains("req"));
+    const std::string dumped = snap.dump();
+    CHECK(dumped.find("\"head\"") == std::string::npos);
+    CHECK(dumped.find("\"tail\"") == std::string::npos);
+
+    const json preview = cache_preview_to_json(4, &state.entries[0], 2000, state.at_us, fake_detok);
+    CHECK(preview["found"] == true);
+    CHECK(preview["tier"] == "ram");
+    CHECK(preview["tokens"] == 100000);
+    CHECK(preview["head_tokens"] == cache_preview_head_tokens);
+    CHECK(preview["tail_tokens"] == cache_preview_tail_tokens);
+    CHECK(preview["elided_tokens"] == 100000 - cache_preview_head_tokens - cache_preview_tail_tokens);
+    CHECK(preview["truncated"] == true);
+    CHECK(preview["req"] == 88);
+    CHECK(preview["age_ms"] == 1);
+    CHECK(preview["head"].get<std::string>().rfind("10 11", 0) == 0);
+
+    // no tokens retained, or no such entry: not previewable, and no empty
+    // strings pretending to be content
+    const json bare_json = cache_preview_to_json(5, &state.entries[1], 2000, state.at_us, fake_detok);
+    CHECK(bare_json["found"] == false);
+    CHECK(!bare_json.contains("head"));
+    const json missing = cache_preview_to_json(99, nullptr, 2000, state.at_us, fake_detok);
+    CHECK(missing["found"] == false);
+}
+
 int main() {
     test_ring_basics();
     test_event_serialization();
@@ -448,6 +839,17 @@ int main() {
     test_cache_state_publish();
     test_stream_leases();
     test_emit_overhead();
+    // v3
+    test_utf8_truncation();
+    test_content_capture_and_caps();
+    test_content_eviction_bounds();
+    test_content_disable_clears_everything();
+    test_content_json();
+    test_watch_mirror();
+    test_watch_mirror_is_bounded();
+    test_watch_guard_overhead();
+    test_watch_frames();
+    test_cache_preview();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

@@ -518,6 +518,233 @@ td .tier-tag { font-size: 11px; padding: 1px 6px; border-radius: 3px; color: var
 td .tier-tag.ram  { background: var(--cache-1); }
 td .tier-tag.disk { background: var(--cache-2); }
 
+/* ---- content (v3): prompt in / generation out ----
+ *
+ * No new hues. INPUT wears --pp and OUTPUT wears --gen, the same two
+ * categorical slots the timeline already uses for prefill and decode, so the
+ * colour keeps meaning the same thing across every view. Text itself is ink,
+ * never a series colour. */
+
+.content-block { margin-top: 2px; }
+
+.content-closed {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 6px 0 2px;
+}
+.reveal-btn {
+  background: var(--surface);
+  border: 1px solid var(--baseline);
+  border-radius: 4px;
+  color: var(--ink);
+  padding: 3px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.reveal-btn:hover { border-color: var(--muted); }
+.reveal-btn:focus-visible { outline: 2px solid var(--gen); outline-offset: 1px; }
+
+.content-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 6px 0 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--grid);
+}
+.content-bar button {
+  background: var(--surface);
+  border: 1px solid var(--baseline);
+  border-radius: 4px;
+  color: var(--ink-2);
+  padding: 2px 9px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.content-bar button:hover { color: var(--ink); border-color: var(--muted); }
+.content-bar button:focus-visible { outline: 2px solid var(--gen); outline-offset: 1px; }
+
+/* the "content is on screen" marker: a filled dot plus the words, never colour
+ * alone, and it wears --warning because a disclosure is a state worth noticing */
+.reveal-flag { color: var(--ink-2); font-size: 12px; white-space: nowrap; }
+.reveal-flag::before {
+  content: "";
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--warning);
+  margin-right: 6px;
+  vertical-align: 0;
+}
+.content-flag { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.content-flag[hidden] { display: none; }
+.content-flag button {
+  background: none;
+  border: 1px solid var(--baseline);
+  border-radius: 4px;
+  color: var(--ink-2);
+  padding: 1px 8px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.content-flag button:hover { color: var(--ink); border-color: var(--muted); }
+
+.content-policy { font-size: 11px; }
+
+.content-side {
+  border-left: 3px solid var(--baseline);
+  padding-left: 10px;
+  margin: 8px 0 4px;
+}
+.content-side.in  { border-left-color: var(--pp); }
+.content-side.out { border-left-color: var(--gen); }
+
+.cs-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+.cs-head b {
+  color: var(--ink);
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.cs-extent { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.cs-empty { color: var(--muted); font-size: 12px; padding: 4px 0; }
+.cs-head button {
+  background: var(--surface);
+  border: 1px solid var(--baseline);
+  border-radius: 4px;
+  color: var(--ink-2);
+  padding: 1px 8px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.cs-body {
+  background: var(--page);
+  border: 1px solid var(--grid);
+  border-radius: 4px;
+  padding: 8px 10px;
+}
+/* the live mirror is one continuous pane pinned to its newest tokens */
+.cs-body.scroll { max-height: 300px; overflow: auto; }
+
+/* Each pane scrolls on its own, so the elision rule between head and tail is a
+ * fixed landmark instead of something you only find by scrolling. Without this
+ * a capped preview looks exactly like a complete one until you scroll 300 px. */
+.content-pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  margin: 0;
+}
+
+/* A clamped pane is masked, not scrolled: a scrollbar is an overlay the reader
+ * may never see, whereas the fade plus the "show all" control below make the
+ * remainder impossible to miss. */
+.pane-wrap { position: relative; }
+.content-pre.clamped {
+  max-height: 252px;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 78%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 78%, transparent 100%);
+}
+.pane-more {
+  display: block;
+  margin: 6px 0 0;
+  background: none;
+  border: 1px solid var(--baseline);
+  border-radius: 4px;
+  color: var(--ink-2);
+  padding: 2px 9px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.pane-more:hover { color: var(--ink); border-color: var(--muted); }
+.pane-more:focus-visible { outline: 2px solid var(--gen); outline-offset: 1px; }
+
+.cs-body::-webkit-scrollbar { width: 9px; }
+.cs-body::-webkit-scrollbar-track { background: transparent; }
+.cs-body::-webkit-scrollbar-thumb {
+  background: var(--baseline);
+  border-radius: 5px;
+  border: 2px solid var(--page);
+}
+.cs-body { scrollbar-width: thin; scrollbar-color: var(--baseline) transparent; }
+
+/* the elision rule is load-bearing: it is what stops a capped preview from
+ * reading as the complete prompt */
+.elision {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+.elision::before, .elision::after {
+  content: "";
+  flex: 1;
+  border-top: 1px dashed var(--baseline);
+}
+
+.live-tag { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.live-tag::before {
+  content: "";
+  display: inline-block;
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  margin-right: 5px;
+}
+.live-tag.on::before   { background: var(--gen); }
+.live-tag.on           { color: var(--ink-2); }
+.live-tag.done::before { background: var(--baseline); }
+
+/* typing caret on the live mirror: the only motion on the page, and only while
+ * a stream is actually open */
+.caret {
+  display: inline-block;
+  width: 7px;
+  height: 13px;
+  background: var(--gen);
+  vertical-align: -2px;
+  margin-left: 1px;
+  animation: caret-blink 1.1s steps(2, start) infinite;
+}
+@keyframes caret-blink { to { visibility: hidden; } }
+@media (prefers-reduced-motion: reduce) {
+  .caret { animation: none; }
+}
+
+/* ---- cache entry preview ---- */
+
+.cache-hint { font-size: 11px; margin: 0 0 4px; }
+#cache-table tr.clickable { cursor: pointer; }
+#cache-table tr.clickable:hover td { background: color-mix(in srgb, var(--surface) 70%, transparent); }
+#cache-table tr.clickable:focus-visible td { outline: 2px solid var(--gen); outline-offset: -2px; }
+#cache-table tr.expanded td { border-bottom-color: transparent; }
+.cache-detail-row td { padding: 0 0 10px; border-bottom: 1px solid var(--grid); white-space: normal; }
+.cache-detail {
+  background: var(--surface);
+  border: 1px solid var(--ring);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 12px;
+}
+
 @media (max-width: 720px) {
   body { padding: 12px; }
   .model { max-width: 100%; }

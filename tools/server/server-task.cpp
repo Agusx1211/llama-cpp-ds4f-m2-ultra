@@ -2783,6 +2783,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             slim.dash_created_us  = it_best->dash_created_us;
             slim.dash_last_hit_us = ggml_time_us();
             slim.dash_hits        = it_best->dash_hits + 1;
+            slim.dash_req         = it_best->dash_req;
 
             prompt = std::move(it_best->prompt);
 
@@ -2873,8 +2874,30 @@ void server_prompt_cache::publish_dashboard_state() {
         entry.created_us  = (uint64_t) std::max<int64_t>(0, state.dash_created_us);
         entry.last_hit_us = (uint64_t) std::max<int64_t>(0, state.dash_last_hit_us);
         entry.hits        = state.dash_hits;
+        entry.request_id  = state.dash_req;
         if (state.on_disk()) {
             entry.file = std::filesystem::path(state.file).filename().string();
+        }
+        // m2-dashboard v3: a bounded head/tail slice of the entry's token IDS
+        // rides along so GET /m2-dashboard/cache-preview can render what is
+        // actually in the entry. Both tiers keep prompt.tokens resident (the
+        // SSD tier only spills the state blobs), so this never touches disk.
+        // No decoded text is stored: detokenization happens on the HTTP thread
+        // for one entry at a time, only when a preview is requested.
+        {
+            const size_t n  = state.prompt.tokens.size();
+            const size_t nh = std::min(n, server_dashboard::cache_preview_head_tokens);
+            entry.head_ids.reserve(nh);
+            for (size_t i = 0; i < nh; ++i) {
+                entry.head_ids.push_back((int32_t) state.prompt.tokens[i]);
+            }
+            if (n > nh) {
+                const size_t nt = std::min(n - nh, server_dashboard::cache_preview_tail_tokens);
+                entry.tail_ids.reserve(nt);
+                for (size_t i = n - nt; i < n; ++i) {
+                    entry.tail_ids.push_back((int32_t) state.prompt.tokens[i]);
+                }
+            }
         }
         out.entries.push_back(std::move(entry));
     }
