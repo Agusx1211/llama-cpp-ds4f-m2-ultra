@@ -68,16 +68,17 @@ static bool dsv4_decode_sequence_range(
 }
 
 static bool dsv4_decode_replay_batch(
-        llama_context *                 ctx,
-        int                             n_vocab,
-        const std::vector<llama_pos> &  pos_begin,
-        uint32_t                        count) {
+        llama_context *                     ctx,
+        int                                 n_vocab,
+        const std::vector<llama_seq_id> &   seq_ids,
+        const std::vector<llama_pos> &      pos_begin,
+        uint32_t                            count) {
+    GGML_ASSERT(seq_ids.size() == pos_begin.size());
     llama_batch batch = llama_batch_init((int32_t) pos_begin.size()*count, 0, 1);
     for (uint32_t s = 0; s < pos_begin.size(); ++s) {
         for (uint32_t i = 0; i < count; ++i) {
             const llama_pos pos = pos_begin[s] + (llama_pos) i;
-            common_batch_add(batch, dsv4_test_token(n_vocab, (llama_seq_id) s, pos), pos,
-                    { (llama_seq_id) s }, true);
+            common_batch_add(batch, dsv4_test_token(n_vocab, seq_ids[s], pos), pos, { seq_ids[s] }, true);
         }
     }
     const bool ok = llama_decode(ctx, batch) == 0;
@@ -142,9 +143,8 @@ static bool dsv4_compare_replay_logits(
 // rejection depths, requested unified KV, and a replay long enough to span
 // several equal-split ubatches.
 //
-// The incremental case also protects the bounded snapshot shift-register:
-// deeper planes must continue to advance when the latest decode contributes
-// fewer tokens than the rollback capacity (normal single-token generation).
+// The incremental case also exercises the bounded snapshot shift-register
+// after normal single-token generation.
 static bool test_dsv4_multi_seq_rollback(const common_params & params, llama_model * model, int n_vocab) {
     constexpr uint32_t  n_seqs     = 4;
     constexpr uint32_t  n_ubatch   = 16;
@@ -192,8 +192,9 @@ static bool test_dsv4_multi_seq_rollback(const common_params & params, llama_mod
         }
     }
 
-    if (!dsv4_decode_replay_batch(ctx_roll.get(), n_vocab, replay_pos, n_replay) ||
-        !dsv4_decode_replay_batch(ctx_ref.get(),  n_vocab, replay_pos, n_replay)) {
+    const std::vector<llama_seq_id> replay_seqs = { 0, 1, 2, 3 };
+    if (!dsv4_decode_replay_batch(ctx_roll.get(), n_vocab, replay_seqs, replay_pos, n_replay) ||
+        !dsv4_decode_replay_batch(ctx_ref.get(),  n_vocab, replay_seqs, replay_pos, n_replay)) {
         fprintf(stderr, "%s : four-sequence replay decode failed\n", __func__);
         return false;
     }
@@ -227,16 +228,20 @@ static bool test_dsv4_multi_seq_rollback(const common_params & params, llama_mod
         fprintf(stderr, "%s : failed depth-four incremental rollback\n", __func__);
         return false;
     }
+    const std::vector<llama_seq_id> chain_replay_seqs = { chain_seq };
     const std::vector<llama_pos> chain_replay = { chain_pos };
-    if (!dsv4_decode_replay_batch(ctx_roll.get(), n_vocab, chain_replay, chain_depth) ||
-        !dsv4_decode_replay_batch(ctx_ref.get(),  n_vocab, chain_replay, chain_depth) ||
+    if (!dsv4_decode_replay_batch(ctx_roll.get(), n_vocab, chain_replay_seqs, chain_replay, n_replay) ||
+        !dsv4_decode_replay_batch(ctx_ref.get(),  n_vocab, chain_replay_seqs, chain_replay, n_replay) ||
         !dsv4_compare_replay_logits(
-                ctx_roll.get(), ctx_ref.get(), n_vocab, chain_depth, "incremental snapshot chain")) {
+                ctx_roll.get(), ctx_ref.get(), n_vocab, n_replay, "incremental snapshot chain")) {
         return false;
     }
 
     // A second partial removal cannot be composed while the first restore is
     // still pending. Once a replay consumes it, a new rollback is valid.
+    // This contract needs only the rollback context; release the reference
+    // context before another decode to bound real-model Metal memory pressure.
+    ctx_ref.reset();
     llama_memory_clear(llama_get_memory(ctx_roll.get()), true);
     constexpr llama_seq_id pending_seq = 3;
     constexpr llama_pos    pending_pos = 16;
