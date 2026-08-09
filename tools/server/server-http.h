@@ -83,8 +83,8 @@ struct server_http_context {
     std::string hostname;
     int port    = 8080;
     bool is_ssl = false;
-    // LLAMA_SERVER_TRUST_LAN: also register /{low,normal,fast}<route> path-prefix
-    // routes that inject the scheduling lane, for a trusted single-operator LAN.
+    // LLAMA_SERVER_TRUST_LAN: preserve the private-dashboard policy and enable
+    // exact model-profile scheduling on the standard endpoint surface.
     bool trust_lan = false;
 
     server_http_context();

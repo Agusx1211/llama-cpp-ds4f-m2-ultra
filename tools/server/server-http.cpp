@@ -2,7 +2,6 @@
 #include "http.h"
 #include "server-http.h"
 #include "server-common.h"
-#include "server-trusted-scheduling.h"
 #include "ui.h"
 
 #include <cpp-httplib/httplib.h>
@@ -716,7 +715,7 @@ static void process_handler_response(server_http_req_ptr && request, server_http
 
 void server_http_context::get(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto serve = [handler, path, prefix = path_prefix](const httplib::Request & req, httplib::Response & res, const std::string & lane) {
+    auto serve = [handler](const httplib::Request & req, httplib::Response & res) {
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -730,24 +729,15 @@ void server_http_context::get(const std::string & path, const server_http_contex
             has_ambiguous_last_event_id_header(req),
             has_ambiguous_dashboard_security_headers(req)
         });
-        if (!lane.empty()) {
-            request->headers[server_trusted_scheduling::lane_header] = lane;
-            request->path = prefix + path;
-        }
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     };
-    pimpl->srv->Get(path_prefix + path, [serve](const httplib::Request & req, httplib::Response & res) { serve(req, res, ""); });
-    if (trust_lan) {
-        for (const char * lane : {"low", "normal", "fast"}) {
-            pimpl->srv->Get(path_prefix + "/" + lane + path, [serve, lane](const httplib::Request & req, httplib::Response & res) { serve(req, res, lane); });
-        }
-    }
+    pimpl->srv->Get(path_prefix + path, std::move(serve));
 }
 
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto serve = [handler, path, prefix = path_prefix](const httplib::Request & req, httplib::Response & res, const std::string & lane) {
+    auto serve = [handler](const httplib::Request & req, httplib::Response & res) {
         std::string body = req.body;
         std::map<std::string, uploaded_file> files;
 
@@ -791,24 +781,15 @@ void server_http_context::post(const std::string & path, const server_http_conte
             has_ambiguous_last_event_id_header(req),
             has_ambiguous_dashboard_security_headers(req)
         });
-        if (!lane.empty()) {
-            request->headers[server_trusted_scheduling::lane_header] = lane;
-            request->path = prefix + path;
-        }
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     };
-    pimpl->srv->Post(path_prefix + path, [serve](const httplib::Request & req, httplib::Response & res) { serve(req, res, ""); });
-    if (trust_lan) {
-        for (const char * lane : {"low", "normal", "fast"}) {
-            pimpl->srv->Post(path_prefix + "/" + lane + path, [serve, lane](const httplib::Request & req, httplib::Response & res) { serve(req, res, lane); });
-        }
-    }
+    pimpl->srv->Post(path_prefix + path, std::move(serve));
 }
 
 void server_http_context::del(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto serve = [handler, path, prefix = path_prefix](const httplib::Request & req, httplib::Response & res, const std::string & lane) {
+    auto serve = [handler](const httplib::Request & req, httplib::Response & res) {
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -822,19 +803,10 @@ void server_http_context::del(const std::string & path, const server_http_contex
             has_ambiguous_last_event_id_header(req),
             has_ambiguous_dashboard_security_headers(req)
         });
-        if (!lane.empty()) {
-            request->headers[server_trusted_scheduling::lane_header] = lane;
-            request->path = prefix + path;
-        }
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     };
-    pimpl->srv->Delete(path_prefix + path, [serve](const httplib::Request & req, httplib::Response & res) { serve(req, res, ""); });
-    if (trust_lan) {
-        for (const char * lane : {"low", "normal", "fast"}) {
-            pimpl->srv->Delete(path_prefix + "/" + lane + path, [serve, lane](const httplib::Request & req, httplib::Response & res) { serve(req, res, lane); });
-        }
-    }
+    pimpl->srv->Delete(path_prefix + path, std::move(serve));
 }
 
 //

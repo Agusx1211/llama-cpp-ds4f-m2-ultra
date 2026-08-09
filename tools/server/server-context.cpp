@@ -6600,10 +6600,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
     res->set_req(&req); // will also set spipe if needed
 
-    const auto scheduling = server_trusted_scheduling::classify_http_request(
-        ctx_server.trusted_scheduling, req);
+    const bool profile_mode = ctx_server.trusted_scheduling.trust_lan();
+    const auto scheduling =
+        profile_mode ?
+            server_trusted_scheduling::classify_http_model_profile(ctx_server.trusted_scheduling, req, data) :
+            server_trusted_scheduling::classify_http_request(ctx_server.trusted_scheduling, req);
     if (!scheduling) {
-        res->error(format_error_response(scheduling.error, ERROR_TYPE_PERMISSION));
+        res->error(
+            format_error_response(scheduling.error, profile_mode ? ERROR_TYPE_INVALID_REQUEST : ERROR_TYPE_PERMISSION));
         return res;
     }
 
@@ -6652,7 +6656,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.id = rd.get_new_id();
 
             task.tokens = std::move(inputs[i]);
-            GGML_ASSERT(server_trusted_scheduling::apply_to_task(scheduling, task));
             task.params = server_schema::eval_llama_cmpl_schema(
                     ctx_server.vocab,
                     params,
@@ -6668,6 +6671,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+            GGML_ASSERT(server_trusted_scheduling::apply_to_task(scheduling, task));
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {
@@ -6884,6 +6888,49 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
           queue_tasks(ctx_server.impl->queue_tasks),
           queue_results(ctx_server.impl->queue_results) {
     init_routes();
+}
+
+json server_build_model_listing(const json &        ollama_model,
+                                const json &        openai_model,
+                                const std::string & underlying_model,
+                                bool                advertise_profiles) {
+    json ollama_models = json::array();
+    json openai_models = json::array();
+    if (advertise_profiles) {
+        for (const auto & profile : server_trusted_scheduling::model_profiles()) {
+            const json annotation = {
+                { "name",             profile.public_profile                                 },
+                { "scheduler_lane",   server_trusted_scheduling::to_string(profile.priority) },
+                { "underlying_model", underlying_model                                       },
+            };
+
+            json ollama_profile     = ollama_model;
+            ollama_profile["name"]  = profile.public_model;
+            ollama_profile["model"] = profile.public_model;
+            ollama_profile["description"] =
+                string_format("DeepSeek V4 Flash %s scheduling profile (internal lane: %s)", profile.public_profile,
+                              server_trusted_scheduling::to_string(profile.priority));
+            ollama_profile["tags"]                    = { profile.public_profile };
+            ollama_profile["details"]["parent_model"] = underlying_model;
+            ollama_profile["profile"]                 = annotation;
+            ollama_models.push_back(std::move(ollama_profile));
+
+            json openai_profile                        = openai_model;
+            openai_profile["id"]                       = profile.public_model;
+            openai_profile["aliases"]                  = json::array();
+            openai_profile["profile"]                  = annotation;
+            openai_profile["meta"]["underlying_model"] = underlying_model;
+            openai_models.push_back(std::move(openai_profile));
+        }
+    } else {
+        ollama_models.push_back(ollama_model);
+        openai_models.push_back(openai_model);
+    }
+    return {
+        { "models", std::move(ollama_models) },
+        { "object", "list"                   },
+        { "data",   std::move(openai_models) },
+    };
 }
 
 void server_routes::init_routes() {
@@ -8044,7 +8091,8 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->get_models = [this](const server_http_req &) {
+    const bool advertise_model_profiles = ctx_server.trusted_scheduling.trust_lan();
+    this->get_models                    = [this, advertise_model_profiles](const server_http_req &) {
         auto res = create_response(true);
 
         // this endpoint can be accessed during sleeping
@@ -8052,36 +8100,27 @@ void server_routes::init_routes() {
         bool ctx_server; // do NOT delete this line
         GGML_UNUSED(ctx_server);
 
-        json models = {
-            {"models", {
-                {
-                    {"name",  meta->model_name},
-                    {"model", meta->model_name},
-                    {"modified_at", ""},
-                    {"size", ""},
-                    {"digest", ""}, // dummy value, llama.cpp does not support managing model file's hash
-                    {"type", "model"},
-                    {"description", ""},
-                    {"tags", {""}},
-                    {"capabilities", meta->has_mtmd ? json({"completion","multimodal"}) : json({"completion"})},
-                    {"parameters", ""},
-                    {"details", {
-                        {"parent_model", ""},
-                        {"format", "gguf"},
-                        {"family", ""},
-                        {"families", {""}},
-                        {"parameter_size", ""},
-                        {"quantization_level", ""}
-                    }}
-                }
-            }},
-            {"object", "list"},
-            {"data", {
-                get_model_info(),
-            }}
+        const json ollama_model = {
+            { "name",         meta->model_name                                                               },
+            { "model",        meta->model_name                                                               },
+            { "modified_at",  ""                                                                             },
+            { "size",         ""                                                                             },
+            { "digest",       ""                                                                             }, // dummy value, llama.cpp does not support managing model file's hash
+            { "type",         "model"                                                                        },
+            { "description",  ""                                                                             },
+            { "tags",         { "" }                                                                         },
+            { "capabilities", meta->has_mtmd ? json({ "completion", "multimodal" }) : json({ "completion" }) },
+            { "parameters",   ""                                                                             },
+            { "details",
+             { { "parent_model", "" },
+                { "format", "gguf" },
+                { "family", "" },
+                { "families", { "" } },
+                { "parameter_size", "" },
+                { "quantization_level", "" } }                                                               }
         };
-
-        res->ok(models);
+        const json openai_model = get_model_info();
+        res->ok(server_build_model_listing(ollama_model, openai_model, meta->model_name, advertise_model_profiles));
         return res;
     };
 

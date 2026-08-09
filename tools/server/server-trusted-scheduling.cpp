@@ -10,6 +10,14 @@ namespace server_trusted_scheduling {
 
 namespace {
 
+constexpr std::array<model_profile, model_profile_count> public_model_profiles{
+    {
+     { "deepseek-v4-flash-slow", "slow", lane::low },
+     { "deepseek-v4-flash", "normal", lane::normal },
+     { "deepseek-v4-flash-fast", "fast", lane::fast },
+     }
+};
+
 std::string ascii_lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
         return static_cast<char>(std::tolower(character));
@@ -110,6 +118,38 @@ bool authorized(
 
 } // namespace
 
+const std::array<model_profile, model_profile_count> & model_profiles() {
+    return public_model_profiles;
+}
+
+classification classify_model_profile(bool enabled, const std::optional<std::string> & requested_model) {
+    if (!enabled) {
+        return {};
+    }
+
+    const model_profile * selected = requested_model ? nullptr : &public_model_profiles[1];
+    if (requested_model) {
+        for (const auto & profile : public_model_profiles) {
+            if (*requested_model == profile.public_model) {
+                selected = &profile;
+                break;
+            }
+        }
+    }
+    if (selected != nullptr) {
+        return {
+            classification_status::trusted, selected->priority, {}, {}, selected->public_model,
+        };
+    }
+    return {
+        classification_status::rejected,
+        lane::normal,
+        {},
+        "unknown model ID; expected deepseek-v4-flash-slow, deepseek-v4-flash, or deepseek-v4-flash-fast",
+        {},
+    };
+}
+
 const char * to_string(lane value) {
     switch (value) {
         case lane::low:    return "low";
@@ -167,6 +207,10 @@ bool has_reserved_headers(const std::map<std::string, std::string> & headers) {
            find_header(headers, tag_header).present;
 }
 
+bool has_lane_header(const std::map<std::string, std::string> & headers) {
+    return find_header(headers, lane_header).present;
+}
+
 control::control(config config) : cfg(std::move(config)) {
     if (!cfg.token.empty() && (cfg.token.size() < 32 || cfg.token.size() > 256)) {
         throw std::invalid_argument("trusted scheduling token must contain 32 to 256 bytes");
@@ -189,20 +233,14 @@ classification control::classify(
     if (requested_lane.ambiguous) {
         return { classification_status::rejected, lane::normal, {}, "ambiguous trusted scheduling lane header" };
     }
-    // Trusted-LAN bypass: a single-operator LAN/Tailscale deployment that sets
-    // LLAMA_SERVER_TRUST_LAN does not require loopback ingress or the operator
-    // secret.  Lane selection still flows through the request lane header
-    // (injected by the path-prefix routes in server-http when trust_lan is on).
+    // Trusted-LAN mode has one scheduling authority: the exact public model ID
+    // selected by classify_model_profile(). Do not retain a second header path
+    // that could conflict with, or bypass, that allowlist.
     if (cfg.trust_lan) {
-        lane priority;
-        if (!parse_lane(requested_lane.value, priority)) {
-            return { classification_status::rejected, lane::normal, {}, "invalid trusted scheduling lane" };
-        }
-        const auto tag = find_header(headers, tag_header);
-        if (tag.ambiguous || (tag.present && !valid_tag(tag.value))) {
-            return { classification_status::rejected, lane::normal, {}, "invalid trusted scheduling benchmark tag" };
-        }
-        return { classification_status::trusted, priority, tag.present ? tag.value : std::string(), {} };
+        return { classification_status::rejected,
+                 lane::normal,
+                 {},
+                 "trusted-LAN scheduling is selected by model ID; lane headers are not accepted" };
     }
     if (!enabled()) {
         return { classification_status::rejected, lane::normal, {}, "trusted scheduling lanes are disabled" };

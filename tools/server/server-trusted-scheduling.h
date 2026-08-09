@@ -1,10 +1,13 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace server_trusted_scheduling {
@@ -27,6 +30,19 @@ enum class lane : uint8_t {
 };
 
 const char * to_string(lane value);
+
+// Public model IDs are the only trusted-LAN scheduling selector. Keep the
+// spelling independent from the internal scheduler lane: "slow" is public,
+// while the scheduler continues to call that lane "low".
+struct model_profile {
+    const char * public_model;
+    const char * public_profile;
+    lane         priority;
+};
+
+constexpr size_t model_profile_count = 3;
+
+const std::array<model_profile, model_profile_count> & model_profiles();
 
 struct config {
     // Empty disables trusted classification and tracing.  A configured secret
@@ -53,12 +69,33 @@ struct classification {
     lane                  priority = lane::normal;
     std::string           tag;
     std::string           error;
+    // Non-empty only for an exact trusted-LAN public model profile. Response
+    // serializers echo this value rather than the underlying model artifact.
+    std::string           public_model;
+
+    classification() = default;
+
+    classification(classification_status status,
+                   lane                  priority,
+                   std::string           tag,
+                   std::string           error,
+                   std::string           public_model = {}) :
+        status(status),
+        priority(priority),
+        tag(std::move(tag)),
+        error(std::move(error)),
+        public_model(std::move(public_model)) {}
 
     explicit operator bool() const { return status != classification_status::rejected; }
 };
 
+// Pure exact classifier. When enabled, omission selects the normal public
+// profile. When disabled, it is inert and preserves ordinary server behavior.
+classification classify_model_profile(bool enabled, const std::optional<std::string> & requested_model);
+
 bool is_loopback_address(const std::string & address);
 bool has_reserved_headers(const std::map<std::string, std::string> & headers);
+bool has_lane_header(const std::map<std::string, std::string> & headers);
 
 enum class trace_kind : uint8_t {
     request_registered = 0,

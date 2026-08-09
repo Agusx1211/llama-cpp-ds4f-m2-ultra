@@ -53,6 +53,14 @@ struct server_context_meta {
     std::string model_ftype;
 };
 
+// Pure model-list builder used by both /models and /v1/models. In trusted-LAN
+// profile mode it clones shared underlying metadata into exactly three public
+// scheduling variants; ordinary single-model behavior remains unchanged.
+json server_build_model_listing(const json &        ollama_model,
+                                const json &        openai_model,
+                                const std::string & underlying_model,
+                                bool                advertise_profiles);
+
 enum server_state {
     SERVER_STATE_DOWNLOADING,
     SERVER_STATE_LOADING,

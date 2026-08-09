@@ -174,7 +174,7 @@ target_include_directories(test-server-trusted-scheduling PRIVATE
     ${PROJECT_SOURCE_DIR}
     ${PROJECT_SOURCE_DIR}/tools/mtmd
     ${PROJECT_SOURCE_DIR}/tools/server)
-target_link_libraries(test-server-trusted-scheduling PRIVATE server-context)
+target_link_libraries(test-server-trusted-scheduling PRIVATE llama-server-impl)
 target_compile_features(test-server-trusted-scheduling PRIVATE cxx_std_17)
 
 llama_build_and_test(test-server-admin-dashboard.cpp)
