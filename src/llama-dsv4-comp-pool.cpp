@@ -559,9 +559,16 @@ llama_dsv4_comp_handle_result llama_dsv4_comp_pool::create_handle() {
         return { llama_dsv4_comp_status::generation_exhausted, 0 };
     }
     resident_handle handle;
-    handle.id             = pimpl->next_handle_id;
+    handle.id = pimpl->next_handle_id;
+    try {
+        const auto inserted = pimpl->handles.emplace(handle.id, handle);
+        if (!inserted.second) {
+            return { llama_dsv4_comp_status::stale_handle, 0 };
+        }
+    } catch (const std::bad_alloc &) {
+        return { llama_dsv4_comp_status::resource_exhausted, 0 };
+    }
     pimpl->next_handle_id = handle.id == std::numeric_limits<llama_dsv4_comp_handle_id>::max() ? 0 : handle.id + 1;
-    pimpl->handles.emplace(handle.id, handle);
     ++pimpl->epoch;
     return { llama_dsv4_comp_status::ok, handle.id };
 }
@@ -670,6 +677,114 @@ llama_dsv4_comp_status llama_dsv4_comp_pool::get_binding(uint32_t               
         return llama_dsv4_comp_status::binding_not_found;
     }
     handle = it->second;
+    return llama_dsv4_comp_status::ok;
+}
+
+llama_dsv4_comp_status llama_dsv4_comp_pool::replace_binding(
+        uint32_t                  execution_id,
+        llama_dsv4_comp_handle_id expected_handle,
+        uint64_t                  expected_generation,
+        llama_dsv4_comp_handle_id replacement_handle,
+        uint64_t                  replacement_generation) {
+    if (pimpl->busy()) {
+        return llama_dsv4_comp_status::busy;
+    }
+    if (execution_id >= LLAMA_DSV4_COMP_GRAPH_STREAMS || expected_handle == 0 ||
+            replacement_handle == 0 || expected_handle == replacement_handle) {
+        return llama_dsv4_comp_status::invalid_argument;
+    }
+    const auto binding = pimpl->bindings.find(execution_id);
+    const auto expected = pimpl->handles.find(expected_handle);
+    const auto replacement = pimpl->handles.find(replacement_handle);
+    if (binding == pimpl->bindings.end()) {
+        return llama_dsv4_comp_status::binding_not_found;
+    }
+    if (expected == pimpl->handles.end() || replacement == pimpl->handles.end()) {
+        return llama_dsv4_comp_status::handle_not_found;
+    }
+    if (binding->second != expected_handle || expected->second.generation != expected_generation ||
+            replacement->second.generation != replacement_generation) {
+        return llama_dsv4_comp_status::stale_handle;
+    }
+    if (expected->second.resident_owned || replacement->second.resident_owned) {
+        return llama_dsv4_comp_status::handle_resident;
+    }
+    if (pimpl->is_bound(replacement_handle)) {
+        return llama_dsv4_comp_status::handle_bound;
+    }
+    if (!pimpl->releasable(expected->second.c4_segment_ids, llama_dsv4_comp_family::c4) ||
+            !pimpl->releasable(expected->second.hca_segment_ids, llama_dsv4_comp_family::hca)) {
+        return llama_dsv4_comp_status::stale_handle;
+    }
+
+    // std::map value assignment, segment release, and erasure cannot allocate.
+    // No operation above this point has changed externally visible ownership.
+    binding->second = replacement_handle;
+    pimpl->release(expected->second.c4_segment_ids, llama_dsv4_comp_family::c4);
+    pimpl->release(expected->second.hca_segment_ids, llama_dsv4_comp_family::hca);
+    pimpl->handles.erase(expected);
+    ++pimpl->epoch;
+    return llama_dsv4_comp_status::ok;
+}
+
+llama_dsv4_comp_status llama_dsv4_comp_pool::abort_empty_detached_handle(
+        llama_dsv4_comp_handle_id handle,
+        uint64_t                  create_epoch) {
+    if (pimpl->busy() || pimpl->epoch <= create_epoch) {
+        return llama_dsv4_comp_status::stale_quote;
+    }
+    const auto it = pimpl->handles.find(handle);
+    if (it == pimpl->handles.end() || it->second.id != handle || it->second.generation != 1 ||
+            it->second.resident_owned || !it->second.c4_segment_ids.empty() ||
+            !it->second.hca_segment_ids.empty() || it->second.visible_c4_rows != 0 ||
+            it->second.visible_hca_rows != 0 || pimpl->is_bound(handle)) {
+        return llama_dsv4_comp_status::stale_handle;
+    }
+    pimpl->handles.erase(it);
+    ++pimpl->epoch;
+    return llama_dsv4_comp_status::ok;
+}
+
+llama_dsv4_comp_status llama_dsv4_comp_pool::abort_detached_import(
+        llama_dsv4_comp_handle_id handle,
+        llama_dsv4_comp_ticket    ticket,
+        uint64_t                  create_epoch) {
+    auto * record = pimpl->find_ticket(ticket);
+    if (record == nullptr || record->state != ticket_state::active ||
+            pimpl->active_ticket_id != ticket.id || pimpl->epoch <= create_epoch) {
+        return llama_dsv4_comp_status::stale_ticket;
+    }
+    const auto handle_it = pimpl->handles.find(handle);
+    if (handle_it == pimpl->handles.end() || handle_it->second.generation != 1 ||
+            handle_it->second.resident_owned || pimpl->is_bound(handle) ||
+            !handle_it->second.c4_segment_ids.empty() || !handle_it->second.hca_segment_ids.empty()) {
+        return llama_dsv4_comp_status::stale_handle;
+    }
+    if (record->plan->candidates.empty() || std::any_of(
+                record->plan->candidates.begin(), record->plan->candidates.end(),
+                [handle](const planned_candidate & candidate) {
+                    return candidate.handle != handle || !candidate.old_segment_ids.empty() ||
+                           candidate.old_visible_rows != 0;
+                })) {
+        return llama_dsv4_comp_status::stale_quote;
+    }
+    for (const planned_reservation & reservation : record->plan->reservations) {
+        const auto & segment = pimpl->family(reservation.allocation.family)
+                                      .segments.at(reservation.allocation.destination_segment);
+        if (segment.state != segment_state::reserved || segment.owner_ticket != ticket.id ||
+                segment.generation != reservation.expected_segment_generation + 1) {
+            return llama_dsv4_comp_status::stale_ticket;
+        }
+    }
+
+    const auto cancelled = pimpl->terminal_release(ticket, ticket_state::cancelled);
+    if (cancelled != llama_dsv4_comp_status::ok) {
+        return cancelled;
+    }
+    // The cancelled ticket remains as a tombstone, segment generations have
+    // advanced, and the detached handle ID is never reused.
+    pimpl->handles.erase(handle_it);
+    ++pimpl->epoch;
     return llama_dsv4_comp_status::ok;
 }
 
@@ -1502,8 +1617,26 @@ llama_dsv4_comp_reserve_result llama_dsv4_comp_pool::try_reserve(const llama_dsv
         }
     }
 
-    const uint64_t ticket_id         = pimpl->next_ticket_id++;
-    const uint64_t ticket_generation = pimpl->next_ticket_generation++;
+    if (pimpl->next_ticket_id == 0 || pimpl->next_ticket_generation == 0) {
+        result.status = llama_dsv4_comp_status::generation_exhausted;
+        return result;
+    }
+    const uint64_t ticket_id         = pimpl->next_ticket_id;
+    const uint64_t ticket_generation = pimpl->next_ticket_generation;
+    try {
+        const auto inserted = pimpl->tickets.emplace(ticket_id, impl::ticket_record{
+                ticket_generation,
+                ticket_state::active,
+                quote.plan,
+        });
+        if (!inserted.second) {
+            result.status = llama_dsv4_comp_status::stale_ticket;
+            return result;
+        }
+    } catch (const std::bad_alloc &) {
+        result.status = llama_dsv4_comp_status::resource_exhausted;
+        return result;
+    }
     for (const planned_reservation & reservation : quote.plan->reservations) {
         segment_record & segment =
             pimpl->family(reservation.allocation.family).segments.at(reservation.allocation.destination_segment);
@@ -1512,11 +1645,9 @@ llama_dsv4_comp_reserve_result llama_dsv4_comp_pool::try_reserve(const llama_dsv
         segment.cow          = false;
         ++segment.generation;
     }
-    pimpl->tickets.emplace(ticket_id, impl::ticket_record{
-                                          ticket_generation,
-                                          ticket_state::active,
-                                          quote.plan,
-                                      });
+    pimpl->next_ticket_id         = ticket_id == std::numeric_limits<uint64_t>::max() ? 0 : ticket_id + 1;
+    pimpl->next_ticket_generation = ticket_generation == std::numeric_limits<uint64_t>::max() ?
+            0 : ticket_generation + 1;
     pimpl->active_ticket_id    = ticket_id;
     pimpl->scratch_rows_in_use = static_cast<uint32_t>(quote.plan->graph_execution_ids.size());
     ++pimpl->epoch;

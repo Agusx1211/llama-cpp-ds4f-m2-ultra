@@ -7,7 +7,9 @@
 
 #include <unordered_map>
 #include <vector>
+#include <condition_variable>
 #include <mutex>
+#include <thread>
 
 struct llama_cparams;
 struct llama_hparams;
@@ -16,17 +18,20 @@ struct llama_context;
 
 void llama_kv_cache_fail_stream_copy_after_for_test(int successful_cache_updates);
 
-// Shared only by the dormant raw/SWA resident path. Keeping this separate from
-// the ordinary cache state makes the disabled path pay no locking or mutation-
-// tracking cost.
+// Shared by the opt-in DSV4 raw/SWA resident and logical-transaction paths.
+// Keeping this separate from ordinary cache state makes disabled paths pay no
+// locking or mutation-tracking cost.
 struct llama_kv_cache_resident_guard {
     std::recursive_mutex mutex;
+    std::condition_variable_any transaction_released;
     uint64_t version[2] = { 1, 1 };
     uint32_t pending_updates[2] = { 0, 0 };
     bool update_active[2] = { false, false };
     uint32_t active_batches = 0;
     uint32_t parked_handles = 0;
     bool resident_transaction_active = false;
+    uint64_t resident_transaction_generation = 0;
+    std::thread::id resident_transaction_owner;
 };
 
 //

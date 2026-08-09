@@ -262,6 +262,28 @@ class llama_dsv4_comp_pool {
     llama_dsv4_comp_status unbind(uint32_t execution_id);
     llama_dsv4_comp_status get_binding(uint32_t execution_id, llama_dsv4_comp_handle_id & handle) const;
 
+    // Generation-checked, allocation-free publication of a fully materialized
+    // unbound root.  Every condition, including releasability of the previous
+    // root, is validated before the binding or any segment reference changes.
+    llama_dsv4_comp_status replace_binding(
+            uint32_t                   execution_id,
+            llama_dsv4_comp_handle_id  expected_handle,
+            uint64_t                   expected_generation,
+            llama_dsv4_comp_handle_id  replacement_handle,
+            uint64_t                   replacement_generation);
+
+    // Logical-state restore owns a newly created, unbound handle until its
+    // publication boundary. These narrow abort helpers release every staged
+    // segment/reference while deliberately preserving monotonic epochs, IDs,
+    // ticket tombstones, and generations so stale capabilities cannot revive.
+    llama_dsv4_comp_status abort_empty_detached_handle(
+            llama_dsv4_comp_handle_id handle,
+            uint64_t                  create_epoch);
+    llama_dsv4_comp_status abort_detached_import(
+            llama_dsv4_comp_handle_id handle,
+            llama_dsv4_comp_ticket    ticket,
+            uint64_t                  create_epoch);
+
     // quote_detach is a fail-before-mutation preflight. detach consumes the
     // exact quote and transfers one uniquely bound compressed root into a
     // generation-checked resident lease. rollback_detach restores the original

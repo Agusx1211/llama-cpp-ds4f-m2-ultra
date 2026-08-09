@@ -52,6 +52,7 @@ static std::atomic<bool>                       dsv4_test_page_delta_audit_enable
 static std::mutex                              dsv4_test_page_delta_audit_mutex;
 static llama_dsv4_sparse_page_delta_test_audit dsv4_test_page_delta_audit;
 static thread_local int                        dsv4_test_comp_state_copy_after = -1;
+static thread_local int                        dsv4_test_logical_import_checkpoint = -1;
 
 static uint64_t dsv4_hash_u64(uint64_t hash, uint64_t value) {
     // FNV-1a over an explicit little-endian integer encoding. This keeps the
@@ -70,6 +71,110 @@ static uint64_t dsv4_hash_string(uint64_t hash, const std::string & value) {
         hash *= UINT64_C(1099511628211);
     }
     return hash;
+}
+
+static uint64_t dsv4_hash_bytes(uint64_t hash, const uint8_t * data, size_t size) {
+    hash = dsv4_hash_u64(hash, size);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t dsv4_logical_chunk_checksum(const llama_dsv4_logical_row_chunk & chunk) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    hash = dsv4_hash_string(hash, "llama.cpp-dsv4-logical-row-chunk-v1");
+    hash = dsv4_hash_u64(hash, chunk.row_begin);
+    hash = dsv4_hash_u64(hash, chunk.row_count);
+    return dsv4_hash_bytes(hash, chunk.bytes.data(), chunk.bytes.size());
+}
+
+static uint64_t dsv4_hash_iswa_plane(
+        uint64_t hash,
+        const llama_kv_iswa_logical_plane_state & plane) {
+    hash = dsv4_hash_u64(hash, plane.schema_version);
+    hash = dsv4_hash_u64(hash, plane.positions.size());
+    for (llama_pos pos : plane.positions) {
+        hash = dsv4_hash_u64(hash, static_cast<uint64_t>(pos));
+    }
+    hash = dsv4_hash_u64(hash, plane.extensions.size());
+    for (const auto & ext : plane.extensions) {
+        hash = dsv4_hash_u64(hash, static_cast<uint64_t>(ext.x));
+        hash = dsv4_hash_u64(hash, static_cast<uint64_t>(ext.y));
+    }
+    hash = dsv4_hash_bytes(hash, plane.tensor_payload.data(), plane.tensor_payload.size());
+    return dsv4_hash_u64(hash, plane.checksum);
+}
+
+static uint64_t dsv4_hash_logical_tensor(
+        uint64_t hash,
+        const llama_dsv4_logical_tensor_state & tensor) {
+    hash = dsv4_hash_u64(hash, tensor.layer_id);
+    hash = dsv4_hash_u64(hash, static_cast<uint32_t>(tensor.type));
+    hash = dsv4_hash_u64(hash, tensor.ne0);
+    hash = dsv4_hash_u64(hash, tensor.row_size);
+    hash = dsv4_hash_u64(hash, tensor.chunks.size());
+    for (const auto & chunk : tensor.chunks) {
+        hash = dsv4_hash_u64(hash, chunk.row_begin);
+        hash = dsv4_hash_u64(hash, chunk.row_count);
+        hash = dsv4_hash_bytes(hash, chunk.bytes.data(), chunk.bytes.size());
+        hash = dsv4_hash_u64(hash, chunk.checksum);
+    }
+    return hash;
+}
+
+static uint64_t dsv4_hash_logical_component(
+        uint64_t hash,
+        const llama_dsv4_logical_component_state & component) {
+    hash = dsv4_hash_u64(hash, component.schema_version);
+    hash = dsv4_hash_u64(hash, component.row_begin);
+    hash = dsv4_hash_u64(hash, component.row_end);
+    hash = dsv4_hash_u64(hash, component.tensors.size());
+    for (const auto & tensor : component.tensors) {
+        hash = dsv4_hash_logical_tensor(hash, tensor);
+    }
+    return hash;
+}
+
+static uint64_t dsv4_hash_recurrent(
+        uint64_t hash,
+        const llama_dsv4_recurrent_sequence_state & state) {
+    hash = dsv4_hash_u64(hash, state.schema_version);
+    hash = dsv4_hash_u64(hash, state.ratio);
+    hash = dsv4_hash_u64(hash, state.state_size);
+    hash = dsv4_hash_u64(hash, state.n_embd_state);
+    hash = dsv4_hash_u64(hash, state.n_rs_seq);
+    hash = dsv4_hash_u64(hash, state.state_identity);
+    hash = dsv4_hash_u64(hash, state.kv.size());
+    for (const auto & tensor : state.kv) {
+        hash = dsv4_hash_logical_tensor(hash, tensor);
+    }
+    hash = dsv4_hash_u64(hash, state.score.size());
+    for (const auto & tensor : state.score) {
+        hash = dsv4_hash_logical_tensor(hash, tensor);
+    }
+    return hash;
+}
+
+uint64_t llama_dsv4_logical_sequence_fingerprint(const llama_dsv4_logical_sequence_state & state) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    hash = dsv4_hash_string(hash, "llama.cpp-dsv4-logical-sequence-v1");
+    hash = dsv4_hash_u64(hash, state.schema_version);
+    hash = dsv4_hash_u64(hash, state.identity);
+    hash = dsv4_hash_u64(hash, static_cast<uint64_t>(state.accepted_frontier));
+    hash = dsv4_hash_u64(hash, state.rollback_index);
+    hash = dsv4_hash_u64(hash, state.active_rollback_depth);
+    hash = dsv4_hash_u64(hash, state.n_rs_seq);
+    hash = dsv4_hash_u64(hash, state.raw_swa.schema_version);
+    hash = dsv4_hash_iswa_plane(hash, state.raw_swa.base);
+    hash = dsv4_hash_iswa_plane(hash, state.raw_swa.swa);
+    hash = dsv4_hash_logical_component(hash, state.csa);
+    hash = dsv4_hash_logical_component(hash, state.hca);
+    hash = dsv4_hash_logical_component(hash, state.lid);
+    hash = dsv4_hash_recurrent(hash, state.csa_recurrent);
+    hash = dsv4_hash_recurrent(hash, state.hca_recurrent);
+    return dsv4_hash_recurrent(hash, state.lid_recurrent);
 }
 
 static uint64_t dsv4_hash_tensor(uint64_t hash, const ggml_tensor * tensor) {
@@ -99,6 +204,20 @@ static uint64_t dsv4_hash_cache(uint64_t hash, const llama_kv_cache * cache) {
 
 void llama_kv_cache_dsv4_test_inject_physical_pressure(uint32_t count) {
     dsv4_test_pressure_count.store(count, std::memory_order_release);
+}
+
+void llama_kv_cache_dsv4_test_fail_logical_import_at(
+        llama_dsv4_logical_import_checkpoint checkpoint) {
+    dsv4_test_logical_import_checkpoint = (int) checkpoint;
+}
+
+static bool dsv4_test_fail_logical_import(
+        llama_dsv4_logical_import_checkpoint checkpoint) {
+    if (dsv4_test_logical_import_checkpoint != (int) checkpoint) {
+        return false;
+    }
+    dsv4_test_logical_import_checkpoint = -1;
+    return true;
 }
 
 void llama_kv_cache_dsv4_test_reset_cow_preflight_stats() {
@@ -177,6 +296,128 @@ bool llama_kv_cache_dsv4_supports_elastic_metal(
 
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
+}
+
+static llama_dsv4_logical_component_state dsv4_export_logical_component(
+        const llama_kv_cache * cache,
+        const std::vector<uint32_t> & segment_ids,
+        uint64_t row_count) {
+    const uint64_t logical_segments = llama_dsv4_comp_segments_for_rows(row_count);
+    if (cache == nullptr || cache->get_n_stream() != 1 ||
+            logical_segments > segment_ids.size()) {
+        throw std::runtime_error("DSV4 aggregate handle coverage does not match tensor storage");
+    }
+    llama_dsv4_logical_component_state result;
+    result.schema_version = LLAMA_DSV4_LOGICAL_STATE_SCHEMA;
+    result.row_begin      = 0;
+    result.row_end        = row_count;
+    const auto layers = cache->get_layer_ids();
+    result.tensors.reserve(layers.size());
+    for (uint32_t il : layers) {
+        ggml_tensor * tensor = cache->get_k_storage((int32_t) il);
+        llama_dsv4_logical_tensor_state logical;
+        logical.layer_id = il;
+        logical.type     = (int32_t) tensor->type;
+        logical.ne0      = tensor->ne[0];
+        logical.row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        if (logical.row_size != tensor->nb[1]) {
+            throw std::runtime_error("DSV4 aggregate tensor has unsupported row stride");
+        }
+        logical.chunks.reserve((size_t) logical_segments);
+        for (size_t logical_segment = 0; logical_segment < logical_segments; ++logical_segment) {
+            const uint64_t row_begin = logical_segment*LLAMA_DSV4_COMP_SEGMENT_ROWS;
+            const uint64_t rows = std::min<uint64_t>(
+                    LLAMA_DSV4_COMP_SEGMENT_ROWS, row_count - row_begin);
+            if (rows > std::numeric_limits<size_t>::max()/logical.row_size) {
+                throw std::runtime_error("DSV4 aggregate logical chunk size overflow");
+            }
+            llama_dsv4_logical_row_chunk chunk;
+            chunk.row_begin = row_begin;
+            chunk.row_count = rows;
+            chunk.bytes.resize((size_t) rows*logical.row_size);
+            const uint64_t physical_row =
+                    (uint64_t) segment_ids[logical_segment]*LLAMA_DSV4_COMP_SEGMENT_ROWS;
+            const uint64_t offset = physical_row*logical.row_size;
+            if (offset > std::numeric_limits<size_t>::max()) {
+                throw std::runtime_error("DSV4 aggregate logical chunk offset overflow");
+            }
+            if (!chunk.bytes.empty()) {
+                ggml_backend_tensor_get(tensor, chunk.bytes.data(), (size_t) offset, chunk.bytes.size());
+            }
+            chunk.checksum = dsv4_logical_chunk_checksum(chunk);
+            logical.chunks.push_back(std::move(chunk));
+        }
+        result.tensors.push_back(std::move(logical));
+    }
+    return result;
+}
+
+static void dsv4_validate_logical_component(
+        const llama_dsv4_logical_component_state & state,
+        const llama_kv_cache * cache,
+        uint64_t expected_rows,
+        uint64_t logical_capacity) {
+    if (cache == nullptr || cache->get_n_stream() != 1 ||
+            state.schema_version != LLAMA_DSV4_LOGICAL_STATE_SCHEMA || state.row_begin != 0 ||
+            state.row_end != expected_rows || state.row_end > logical_capacity) {
+        throw std::runtime_error("DSV4 aggregate logical component coverage mismatch");
+    }
+    const auto layers = cache->get_layer_ids();
+    if (state.tensors.size() != layers.size()) {
+        throw std::runtime_error("DSV4 aggregate logical component layer count mismatch");
+    }
+    const uint64_t expected_chunks = llama_dsv4_comp_segments_for_rows(expected_rows);
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto & logical = state.tensors[i];
+        const ggml_tensor * tensor = cache->get_k_storage((int32_t) layers[i]);
+        const uint64_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        if (logical.layer_id != layers[i] || logical.type != (int32_t) tensor->type ||
+                logical.ne0 != (uint64_t) tensor->ne[0] || logical.row_size != row_size ||
+                row_size != tensor->nb[1] || logical.chunks.size() != expected_chunks) {
+            throw std::runtime_error("DSV4 aggregate logical tensor geometry mismatch");
+        }
+        for (size_t chunk_index = 0; chunk_index < logical.chunks.size(); ++chunk_index) {
+            const auto & chunk = logical.chunks[chunk_index];
+            const uint64_t row_begin = chunk_index*LLAMA_DSV4_COMP_SEGMENT_ROWS;
+            const uint64_t row_count = std::min<uint64_t>(
+                    LLAMA_DSV4_COMP_SEGMENT_ROWS, expected_rows - row_begin);
+            if (row_size != 0 && row_count > std::numeric_limits<size_t>::max()/row_size) {
+                throw std::runtime_error("DSV4 aggregate logical tensor size overflow");
+            }
+            if (chunk.row_begin != row_begin || chunk.row_count != row_count ||
+                    chunk.bytes.size() != row_count*row_size ||
+                    chunk.checksum != dsv4_logical_chunk_checksum(chunk)) {
+                throw std::runtime_error("DSV4 aggregate logical chunk order, range, or checksum mismatch");
+            }
+        }
+    }
+}
+
+static void dsv4_materialize_logical_component(
+        const llama_dsv4_logical_component_state & state,
+        llama_kv_cache * cache,
+        const std::vector<uint32_t> & segment_ids) {
+    if (state.tensors.size() != cache->get_layer_ids().size()) {
+        throw std::runtime_error("DSV4 aggregate materialization layer count mismatch");
+    }
+    for (const auto & logical : state.tensors) {
+        ggml_tensor * tensor = cache->get_k_storage((int32_t) logical.layer_id);
+        for (size_t chunk_index = 0; chunk_index < logical.chunks.size(); ++chunk_index) {
+            if (chunk_index >= segment_ids.size()) {
+                throw std::runtime_error("DSV4 aggregate materialization segment coverage mismatch");
+            }
+            const auto & chunk = logical.chunks[chunk_index];
+            const uint64_t physical_row =
+                    (uint64_t) segment_ids[chunk_index]*LLAMA_DSV4_COMP_SEGMENT_ROWS;
+            const uint64_t offset = physical_row*logical.row_size;
+            if (offset > std::numeric_limits<size_t>::max()) {
+                throw std::runtime_error("DSV4 aggregate materialization offset overflow");
+            }
+            if (!chunk.bytes.empty()) {
+                ggml_backend_tensor_set(tensor, chunk.bytes.data(), (size_t) offset, chunk.bytes.size());
+            }
+        }
+    }
 }
 
 static uint64_t dsv4_affine_compressed_bytes(
@@ -2075,6 +2316,130 @@ void llama_dsv4_comp_state::state_read(llama_io_read_i & io, llama_seq_id seq_id
     }
 }
 
+llama_dsv4_recurrent_sequence_state llama_dsv4_comp_state::export_sequence_all_depths(
+        llama_seq_id seq_id) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_stream) {
+        throw std::runtime_error("DSV4 recurrent export sequence is out of range");
+    }
+
+    llama_dsv4_recurrent_sequence_state result;
+    result.schema_version = LLAMA_DSV4_LOGICAL_STATE_SCHEMA;
+    result.ratio          = ratio;
+    result.state_size     = state_size;
+    result.n_embd_state   = n_embd_state;
+    result.n_rs_seq       = n_rs_seq;
+    result.state_identity = state_identity();
+    result.kv.reserve(layers.size());
+    result.score.reserve(layers.size());
+
+    const auto export_tensor = [&](uint32_t il, ggml_tensor * tensor) {
+        llama_dsv4_logical_tensor_state logical;
+        logical.layer_id = il;
+        logical.type     = (int32_t) tensor->type;
+        logical.ne0      = tensor->ne[0];
+        logical.row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        if (logical.row_size != tensor->nb[1] ||
+                state_size > std::numeric_limits<size_t>::max()/logical.row_size) {
+            throw std::runtime_error("DSV4 recurrent tensor has unsupported row geometry");
+        }
+        const size_t plane_bytes = (size_t) state_size*logical.row_size;
+        logical.chunks.reserve((size_t) n_rs_seq + 1);
+        for (uint32_t depth = 0; depth <= n_rs_seq; ++depth) {
+            llama_dsv4_logical_row_chunk chunk;
+            chunk.row_begin = (uint64_t) depth*state_size;
+            chunk.row_count = state_size;
+            chunk.bytes.resize(plane_bytes);
+            const uint64_t stream = (uint64_t) depth*n_stream + (uint32_t) seq_id;
+            const uint64_t offset = stream*plane_bytes;
+            if (offset > std::numeric_limits<size_t>::max()) {
+                throw std::runtime_error("DSV4 recurrent tensor offset overflow");
+            }
+            if (plane_bytes != 0) {
+                ggml_backend_tensor_get(tensor, chunk.bytes.data(), (size_t) offset, plane_bytes);
+            }
+            chunk.checksum = dsv4_logical_chunk_checksum(chunk);
+            logical.chunks.push_back(std::move(chunk));
+        }
+        return logical;
+    };
+
+    for (const auto & layer : layers) {
+        result.kv.push_back(export_tensor(layer.il, layer.kv));
+        result.score.push_back(export_tensor(layer.il, layer.score));
+    }
+    return result;
+}
+
+void llama_dsv4_comp_state::validate_sequence_all_depths(
+        const llama_dsv4_recurrent_sequence_state & state) const {
+    if (state.schema_version != LLAMA_DSV4_LOGICAL_STATE_SCHEMA || state.ratio != ratio ||
+            state.state_size != state_size || state.n_embd_state != n_embd_state ||
+            state.n_rs_seq != n_rs_seq || state.state_identity != state_identity() ||
+            state.kv.size() != layers.size() || state.score.size() != layers.size()) {
+        throw std::runtime_error("DSV4 recurrent logical-state geometry mismatch");
+    }
+
+    const auto validate_tensor = [&](const llama_dsv4_logical_tensor_state & logical,
+                                     uint32_t il, const ggml_tensor * tensor) {
+        const uint64_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        if (logical.layer_id != il || logical.type != (int32_t) tensor->type ||
+                logical.ne0 != (uint64_t) tensor->ne[0] || logical.row_size != row_size ||
+                row_size != tensor->nb[1] || logical.chunks.size() != (size_t) n_rs_seq + 1) {
+            throw std::runtime_error("DSV4 recurrent logical tensor geometry mismatch");
+        }
+        if (row_size != 0 && state_size > std::numeric_limits<size_t>::max()/row_size) {
+            throw std::runtime_error("DSV4 recurrent logical tensor size overflow");
+        }
+        const size_t expected_bytes = (size_t) state_size*row_size;
+        for (uint32_t depth = 0; depth <= n_rs_seq; ++depth) {
+            const auto & chunk = logical.chunks[depth];
+            if (chunk.row_begin != (uint64_t) depth*state_size || chunk.row_count != state_size ||
+                    chunk.bytes.size() != expected_bytes ||
+                    chunk.checksum != dsv4_logical_chunk_checksum(chunk)) {
+                throw std::runtime_error("DSV4 recurrent logical plane coverage or checksum mismatch");
+            }
+        }
+    };
+
+    for (size_t i = 0; i < layers.size(); ++i) {
+        validate_tensor(state.kv[i],    layers[i].il, layers[i].kv);
+        validate_tensor(state.score[i], layers[i].il, layers[i].score);
+    }
+}
+
+void llama_dsv4_comp_state::import_sequence_all_depths(
+        llama_seq_id seq_id,
+        const llama_dsv4_recurrent_sequence_state & state) {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_stream) {
+        throw std::runtime_error("DSV4 recurrent import sequence is out of range");
+    }
+    validate_sequence_all_depths(state);
+    if (!has_generation_headroom(1)) {
+        throw std::overflow_error("DSV4 recurrent-state generation exhausted");
+    }
+
+    const auto import_tensor = [&](const llama_dsv4_logical_tensor_state & logical,
+                                   ggml_tensor * tensor) {
+        const size_t plane_bytes = (size_t) state_size*logical.row_size;
+        for (uint32_t depth = 0; depth <= n_rs_seq; ++depth) {
+            const uint64_t stream = (uint64_t) depth*n_stream + (uint32_t) seq_id;
+            const uint64_t offset = stream*plane_bytes;
+            if (offset > std::numeric_limits<size_t>::max()) {
+                throw std::runtime_error("DSV4 recurrent import offset overflow");
+            }
+            if (plane_bytes != 0) {
+                ggml_backend_tensor_set(tensor, logical.chunks[depth].bytes.data(),
+                                        (size_t) offset, plane_bytes);
+            }
+        }
+    };
+    for (size_t i = 0; i < layers.size(); ++i) {
+        import_tensor(state.kv[i],    layers[i].kv);
+        import_tensor(state.score[i], layers[i].score);
+    }
+    bump_generation();
+}
+
 ggml_tensor * llama_dsv4_comp_state::get_kv_all(ggml_context * ctx, int32_t il) const {
     const int32_t ids = map_layer_ids.at(il);
     ggml_tensor * state = layers[ids].kv;
@@ -2146,6 +2511,51 @@ const char * llama_dsv4_resident_status_name(llama_dsv4_resident_status status) 
     }
     return "unknown";
 }
+
+const char * llama_dsv4_logical_state_status_name(llama_dsv4_logical_state_status status) {
+    switch (status) {
+        case llama_dsv4_logical_state_status::ok:                    return "ok";
+        case llama_dsv4_logical_state_status::invalid_sequence:      return "invalid_sequence";
+        case llama_dsv4_logical_state_status::unsupported_layout:    return "unsupported_layout";
+        case llama_dsv4_logical_state_status::invalid_schema:        return "invalid_schema";
+        case llama_dsv4_logical_state_status::identity_mismatch:     return "identity_mismatch";
+        case llama_dsv4_logical_state_status::coverage_mismatch:     return "coverage_mismatch";
+        case llama_dsv4_logical_state_status::corrupt_payload:       return "corrupt_payload";
+        case llama_dsv4_logical_state_status::stale_quote:           return "stale_quote";
+        case llama_dsv4_logical_state_status::capacity_exhausted:    return "capacity_exhausted";
+        case llama_dsv4_logical_state_status::not_quiescent:         return "not_quiescent";
+        case llama_dsv4_logical_state_status::generation_exhausted:  return "generation_exhausted";
+        case llama_dsv4_logical_state_status::resource_exhausted:    return "resource_exhausted";
+        case llama_dsv4_logical_state_status::backend_error:         return "backend_error";
+    }
+    return "unknown";
+}
+
+enum class dsv4_logical_import_plan_state : uint8_t {
+    prepared,
+    committed,
+    rejected,
+};
+
+struct llama_dsv4_logical_import_plan {
+    explicit llama_dsv4_logical_import_plan(llama_kv_iswa_resident_transaction transaction) :
+        raw_transaction(std::move(transaction)),
+        owner_thread(std::this_thread::get_id()) {}
+
+    const llama_kv_cache_dsv4 * owner = nullptr;
+    llama_seq_id                destination = -1;
+    uint64_t                    fingerprint = 0;
+    uint64_t                    pool_epoch = 0;
+    llama_dsv4_comp_handle_id   destination_handle = 0;
+    uint64_t                    destination_handle_generation = 0;
+    std::array<uint64_t, 3>     recurrent_generation = {};
+    uint32_t                    rollback_index = 0;
+    uint32_t                    active_rollback_depth = 0;
+    std::shared_ptr<llama_kv_iswa_logical_import_plan> raw;
+    llama_kv_iswa_resident_transaction raw_transaction;
+    std::thread::id              owner_thread;
+    dsv4_logical_import_plan_state state = dsv4_logical_import_plan_state::prepared;
+};
 
 llama_dsv4_resident_detach_quote llama_dsv4_quote_resident_detach_layout(llama_dsv4_resident_detach_request request,
                                                                          uint32_t                           n_seq_max,
@@ -2967,7 +3377,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
             model, hparams_raw, type_k, type_v,
             v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_pad,
-            nullptr, filter_raw, reuse, nullptr, raw_resident_buft, raw_resident_slots);
+            nullptr, filter_raw, reuse, nullptr, raw_resident_buft, raw_resident_slots,
+            /* logical_transactions = */ aggregate_compressed);
 
     dsv4_make_k_only(hparams_csa);
     dsv4_make_k_only(hparams_hca);
@@ -3897,6 +4308,367 @@ llama_dsv4_memory_usage_snapshot llama_kv_cache_dsv4::memory_usage_snapshot() co
     return result;
 }
 
+static llama_dsv4_logical_state_status dsv4_logical_status_from_compressed(
+        llama_dsv4_comp_status status) {
+    switch (status) {
+        case llama_dsv4_comp_status::ok:                   return llama_dsv4_logical_state_status::ok;
+        case llama_dsv4_comp_status::capacity_exhausted:   return llama_dsv4_logical_state_status::capacity_exhausted;
+        case llama_dsv4_comp_status::generation_exhausted: return llama_dsv4_logical_state_status::generation_exhausted;
+        case llama_dsv4_comp_status::resource_exhausted:   return llama_dsv4_logical_state_status::resource_exhausted;
+        case llama_dsv4_comp_status::busy:                 return llama_dsv4_logical_state_status::not_quiescent;
+        case llama_dsv4_comp_status::stale_quote:
+        case llama_dsv4_comp_status::stale_ticket:
+        case llama_dsv4_comp_status::stale_handle:
+        case llama_dsv4_comp_status::handle_not_found:
+        case llama_dsv4_comp_status::binding_not_found:    return llama_dsv4_logical_state_status::stale_quote;
+        case llama_dsv4_comp_status::slot_occupied:
+        case llama_dsv4_comp_status::handle_bound:
+        case llama_dsv4_comp_status::handle_resident:
+        case llama_dsv4_comp_status::invalid_argument:     return llama_dsv4_logical_state_status::backend_error;
+    }
+    return llama_dsv4_logical_state_status::backend_error;
+}
+
+llama_dsv4_logical_sequence_state llama_kv_cache_dsv4::export_logical_sequence(
+        llama_seq_id seq_id) const {
+    if (!aggregate_compressed) {
+        throw std::runtime_error("DSV4 logical export requires aggregate compressed storage");
+    }
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+        throw std::runtime_error("DSV4 logical export sequence is out of range");
+    }
+    auto raw_transaction = kv_raw->acquire_resident_transaction();
+    if (!raw_transaction) {
+        throw std::runtime_error("DSV4 logical export requires a quiescent raw/SWA cache");
+    }
+
+    llama_dsv4_comp_handle_id handle = 0;
+    llama_dsv4_comp_handle_info info;
+    if (comp_pool->get_binding((uint32_t) seq_id, handle) != llama_dsv4_comp_status::ok ||
+            comp_pool->get_handle(handle, info) != llama_dsv4_comp_status::ok) {
+        throw std::runtime_error("DSV4 logical export compressed root is unavailable");
+    }
+
+    llama_dsv4_logical_sequence_state result;
+    result.schema_version         = LLAMA_DSV4_LOGICAL_STATE_SCHEMA;
+    result.identity               = state_identity_hash;
+    result.accepted_frontier      = kv_raw->seq_pos_max(seq_id);
+    result.rollback_index         = rs_idx[(uint32_t) seq_id];
+    result.active_rollback_depth  = n_rs_seq_active;
+    result.n_rs_seq               = n_rs_seq;
+    result.raw_swa                = kv_raw->export_logical_sequence(seq_id);
+    const uint64_t c4_rows = dsv4_state_n_used_k_rows(
+            result.accepted_frontier, DSV4_CSA_RATIO, c4_logical_rows);
+    const uint64_t hca_rows = dsv4_state_n_used_k_rows(
+            result.accepted_frontier, DSV4_HCA_RATIO, hca_logical_rows);
+    // A pending bounded rollback intentionally leaves the old physical tail
+    // attached until the next graph consumes the selected recurrent plane.
+    // Persist only the prefix accepted by raw/SWA; the extra physical rows are
+    // placement state, not part of the restored logical continuation.
+    if (info.visible_c4_rows < c4_rows || info.visible_hca_rows < hca_rows) {
+        throw std::runtime_error("DSV4 logical export compressed coverage trails the accepted frontier");
+    }
+    result.csa                    = dsv4_export_logical_component(
+            kv_csa.get(), info.c4_segment_ids, c4_rows);
+    result.hca                    = dsv4_export_logical_component(
+            kv_hca.get(), info.hca_segment_ids, hca_rows);
+    result.lid                    = dsv4_export_logical_component(
+            kv_lid.get(), info.c4_segment_ids, c4_rows);
+    result.csa_recurrent          = csa_state->export_sequence_all_depths(seq_id);
+    result.hca_recurrent          = hca_state->export_sequence_all_depths(seq_id);
+    result.lid_recurrent          = lid_state->export_sequence_all_depths(seq_id);
+    result.fingerprint            = llama_dsv4_logical_sequence_fingerprint(result);
+    return result;
+}
+
+llama_dsv4_logical_import_quote llama_kv_cache_dsv4::quote_logical_import(
+        llama_seq_id destination,
+        const llama_dsv4_logical_sequence_state & state) const {
+    llama_dsv4_logical_import_quote result;
+    result.destination = destination;
+    result.fingerprint = state.fingerprint;
+    if (!aggregate_compressed) {
+        result.status = llama_dsv4_logical_state_status::unsupported_layout;
+        return result;
+    }
+    if (destination < 0 || (uint32_t) destination >= n_seq_max) {
+        result.status = llama_dsv4_logical_state_status::invalid_sequence;
+        return result;
+    }
+    if (state.schema_version != LLAMA_DSV4_LOGICAL_STATE_SCHEMA ||
+            state.raw_swa.schema_version != LLAMA_KV_ISWA_LOGICAL_STATE_SCHEMA) {
+        result.status = llama_dsv4_logical_state_status::invalid_schema;
+        return result;
+    }
+    if (state.identity != state_identity_hash) {
+        result.status = llama_dsv4_logical_state_status::identity_mismatch;
+        return result;
+    }
+    if (state.fingerprint == 0 || state.fingerprint != llama_dsv4_logical_sequence_fingerprint(state)) {
+        result.status = llama_dsv4_logical_state_status::corrupt_payload;
+        return result;
+    }
+    if (state.accepted_frontier < -1 || state.n_rs_seq != n_rs_seq ||
+            state.active_rollback_depth != n_rs_seq_active ||
+            state.active_rollback_depth > n_rs_seq ||
+            state.rollback_index > state.active_rollback_depth) {
+        result.status = llama_dsv4_logical_state_status::coverage_mismatch;
+        return result;
+    }
+
+    try {
+        kv_raw->validate_logical_sequence(state.raw_swa, state.accepted_frontier);
+
+        const uint64_t c4_rows = dsv4_state_n_used_k_rows(
+                state.accepted_frontier, DSV4_CSA_RATIO, c4_logical_rows);
+        const uint64_t hca_rows = dsv4_state_n_used_k_rows(
+                state.accepted_frontier, DSV4_HCA_RATIO, hca_logical_rows);
+        dsv4_validate_logical_component(state.csa, kv_csa.get(), c4_rows, c4_logical_rows);
+        dsv4_validate_logical_component(state.lid, kv_lid.get(), c4_rows, c4_logical_rows);
+        dsv4_validate_logical_component(state.hca, kv_hca.get(), hca_rows, hca_logical_rows);
+        if (state.csa.row_begin != state.lid.row_begin || state.csa.row_end != state.lid.row_end) {
+            result.status = llama_dsv4_logical_state_status::coverage_mismatch;
+            return result;
+        }
+        csa_state->validate_sequence_all_depths(state.csa_recurrent);
+        hca_state->validate_sequence_all_depths(state.hca_recurrent);
+        lid_state->validate_sequence_all_depths(state.lid_recurrent);
+    } catch (const std::bad_alloc &) {
+        result.status = llama_dsv4_logical_state_status::resource_exhausted;
+        return result;
+    } catch (...) {
+        result.status = llama_dsv4_logical_state_status::coverage_mismatch;
+        return result;
+    }
+
+    auto raw_transaction = kv_raw->acquire_resident_transaction();
+    if (!raw_transaction) {
+        result.status = llama_dsv4_logical_state_status::not_quiescent;
+        return result;
+    }
+    try {
+        auto plan = std::make_shared<llama_dsv4_logical_import_plan>(std::move(raw_transaction));
+        plan->owner                     = this;
+        plan->destination               = destination;
+        plan->fingerprint               = state.fingerprint;
+        plan->pool_epoch                = comp_pool->memory_usage_snapshot().epoch;
+        plan->rollback_index            = rs_idx[(uint32_t) destination];
+        plan->active_rollback_depth     = n_rs_seq_active;
+        plan->recurrent_generation      = {
+            csa_state->state_generation(),
+            hca_state->state_generation(),
+            lid_state->state_generation(),
+        };
+        if (!csa_state->has_generation_headroom(1) || !hca_state->has_generation_headroom(1) ||
+                !lid_state->has_generation_headroom(1)) {
+            result.status = llama_dsv4_logical_state_status::generation_exhausted;
+            return result;
+        }
+        if (comp_pool->get_binding((uint32_t) destination, plan->destination_handle) !=
+                    llama_dsv4_comp_status::ok) {
+            result.status = llama_dsv4_logical_state_status::stale_quote;
+            return result;
+        }
+        llama_dsv4_comp_handle_info destination_info;
+        if (comp_pool->get_handle(plan->destination_handle, destination_info) !=
+                    llama_dsv4_comp_status::ok) {
+            result.status = llama_dsv4_logical_state_status::stale_quote;
+            return result;
+        }
+        plan->destination_handle_generation = destination_info.generation;
+        plan->raw = kv_raw->prepare_logical_sequence_import(
+                destination, state.raw_swa, state.accepted_frontier);
+        result.status = llama_dsv4_logical_state_status::ok;
+        result.plan   = std::move(plan);
+        return result;
+    } catch (const std::bad_alloc &) {
+        result.status = llama_dsv4_logical_state_status::resource_exhausted;
+        return result;
+    } catch (...) {
+        result.status = llama_dsv4_logical_state_status::unsupported_layout;
+        return result;
+    }
+}
+
+llama_dsv4_logical_state_status llama_kv_cache_dsv4::import_logical_sequence(
+        const llama_dsv4_logical_import_quote & quote,
+        const llama_dsv4_logical_sequence_state & state) {
+    if (!quote.plan || quote.plan->owner != this) {
+        return llama_dsv4_logical_state_status::stale_quote;
+    }
+    auto & plan = *quote.plan;
+    if (plan.state != dsv4_logical_import_plan_state::prepared) {
+        return llama_dsv4_logical_state_status::stale_quote;
+    }
+    const auto reject = [&](llama_dsv4_logical_state_status status) {
+        plan.state = dsv4_logical_import_plan_state::rejected;
+        plan.raw_transaction.release();
+        return status;
+    };
+    // Staging/publication is deliberately same-thread so the coordinator can
+    // recurse through the gate. A wrong-thread consume is still terminal: it
+    // burns the one-shot quote and releases the cross-thread-safe gate so a
+    // retained rejected quote cannot strand waiters.
+    if (plan.owner_thread != std::this_thread::get_id() ||
+            !plan.raw_transaction.owned_by_current_thread()) {
+        return reject(llama_dsv4_logical_state_status::not_quiescent);
+    }
+    if (plan.fingerprint != state.fingerprint ||
+            state.fingerprint != llama_dsv4_logical_sequence_fingerprint(state)) {
+        return reject(llama_dsv4_logical_state_status::stale_quote);
+    }
+    if (dsv4_test_fail_logical_import(llama_dsv4_logical_import_checkpoint::after_raw_staging) ||
+            dsv4_test_fail_logical_import(llama_dsv4_logical_import_checkpoint::after_recurrent_staging)) {
+        return reject(llama_dsv4_logical_state_status::resource_exhausted);
+    }
+    if (!kv_raw->validate_logical_sequence_import(plan.raw) ||
+            csa_state->state_generation() != plan.recurrent_generation[0] ||
+            hca_state->state_generation() != plan.recurrent_generation[1] ||
+            lid_state->state_generation() != plan.recurrent_generation[2] ||
+            n_rs_seq_active != plan.active_rollback_depth ||
+            rs_idx[(uint32_t) plan.destination] != plan.rollback_index ||
+            comp_pool->memory_usage_snapshot().epoch != plan.pool_epoch) {
+        return reject(llama_dsv4_logical_state_status::stale_quote);
+    }
+    llama_dsv4_comp_handle_id current_handle = 0;
+    llama_dsv4_comp_handle_info current_info;
+    if (comp_pool->get_binding((uint32_t) plan.destination, current_handle) != llama_dsv4_comp_status::ok ||
+            current_handle != plan.destination_handle ||
+            comp_pool->get_handle(current_handle, current_info) != llama_dsv4_comp_status::ok ||
+            current_info.generation != plan.destination_handle_generation) {
+        return reject(llama_dsv4_logical_state_status::stale_quote);
+    }
+
+    llama_dsv4_comp_handle_id staged_handle = 0;
+    llama_dsv4_comp_ticket staged_ticket = {};
+    const auto abort_staging = [&](llama_dsv4_logical_state_status status) {
+        llama_dsv4_comp_status cleanup = llama_dsv4_comp_status::ok;
+        if (staged_ticket.id != 0) {
+            cleanup = comp_pool->abort_detached_import(staged_handle, staged_ticket, plan.pool_epoch);
+        } else if (staged_handle != 0) {
+            cleanup = comp_pool->abort_empty_detached_handle(staged_handle, plan.pool_epoch);
+        }
+        if (cleanup != llama_dsv4_comp_status::ok) {
+            std::terminate();
+        }
+        return reject(status);
+    };
+
+    const auto created = comp_pool->create_handle();
+    if (created.status != llama_dsv4_comp_status::ok) {
+        return reject(dsv4_logical_status_from_compressed(created.status));
+    }
+    staged_handle = created.handle;
+
+    llama_dsv4_comp_batch_plan batch;
+    batch.changes = {
+        { staged_handle, llama_dsv4_comp_family::c4,  state.csa.row_end, {} },
+        { staged_handle, llama_dsv4_comp_family::hca, state.hca.row_end, {} },
+    };
+    const auto pool_quote = comp_pool->quote_batch(batch);
+    if (pool_quote.status != llama_dsv4_comp_status::ok) {
+        return abort_staging(dsv4_logical_status_from_compressed(pool_quote.status));
+    }
+    const auto reserved = comp_pool->try_reserve(pool_quote);
+    if (reserved.status != llama_dsv4_comp_status::ok) {
+        return abort_staging(dsv4_logical_status_from_compressed(reserved.status));
+    }
+    staged_ticket = reserved.ticket;
+
+    llama_dsv4_comp_handle_info candidate;
+    if (comp_pool->candidate_handle(staged_ticket, staged_handle, candidate) != llama_dsv4_comp_status::ok ||
+            candidate.visible_c4_rows != state.csa.row_end ||
+            candidate.visible_hca_rows != state.hca.row_end) {
+        return abort_staging(llama_dsv4_logical_state_status::backend_error);
+    }
+    if (dsv4_test_fail_logical_import(llama_dsv4_logical_import_checkpoint::after_segment_staging)) {
+        return abort_staging(llama_dsv4_logical_state_status::resource_exhausted);
+    }
+
+    std::vector<dsv4_sparse_range> ranges;
+    try {
+        const auto append_component = [&](const llama_kv_cache * cache,
+                                          const std::vector<uint32_t> & segments,
+                                          uint64_t rows,
+                                          llama_dsv4_memory_family family) {
+            for (size_t i = 0; i < segments.size(); ++i) {
+                const uint64_t logical_begin = i*LLAMA_DSV4_COMP_SEGMENT_ROWS;
+                const uint64_t count = std::min<uint64_t>(
+                        LLAMA_DSV4_COMP_SEGMENT_ROWS, rows - logical_begin);
+                const int64_t physical_begin =
+                        (int64_t) segments[i]*LLAMA_DSV4_COMP_SEGMENT_ROWS;
+                if (!dsv4_sparse_append_k_row_run(
+                            cache, physical_begin, physical_begin + (int64_t) count, family, ranges)) {
+                    throw std::runtime_error("DSV4 logical import sparse range is invalid");
+                }
+            }
+        };
+        append_component(kv_csa.get(), candidate.c4_segment_ids, candidate.visible_c4_rows,
+                         LLAMA_DSV4_MEMORY_CSA);
+        append_component(kv_lid.get(), candidate.c4_segment_ids, candidate.visible_c4_rows,
+                         LLAMA_DSV4_MEMORY_LID);
+        append_component(kv_hca.get(), candidate.hca_segment_ids, candidate.visible_hca_rows,
+                         LLAMA_DSV4_MEMORY_HCA);
+    } catch (const std::bad_alloc &) {
+        return abort_staging(llama_dsv4_logical_state_status::resource_exhausted);
+    } catch (...) {
+        return abort_staging(llama_dsv4_logical_state_status::backend_error);
+    }
+
+    dsv4_sparse_transaction sparse;
+    llama_dsv4_batch_quote sparse_quote = {};
+    const auto sparse_status = sparse.reserve_ranges(ranges, sparse_quote);
+    if (sparse_status == dsv4_sparse_transaction::PRESSURE) {
+        return abort_staging(llama_dsv4_logical_state_status::capacity_exhausted);
+    }
+    if (sparse_status != dsv4_sparse_transaction::SUCCESS) {
+        return abort_staging(llama_dsv4_logical_state_status::backend_error);
+    }
+    if (dsv4_test_fail_logical_import(llama_dsv4_logical_import_checkpoint::before_publication)) {
+        return abort_staging(llama_dsv4_logical_state_status::resource_exhausted);
+    }
+    if (sparse.commit_ranges() != GGML_METAL_SPARSE_RESERVATION_OK) {
+        return abort_staging(llama_dsv4_logical_state_status::backend_error);
+    }
+
+    // From this point onward every range, tensor envelope, generation, and map
+    // node has been validated or reserved. No recoverable failure boundary is
+    // permitted: exposing only part of an occupied destination would be worse
+    // than terminating on an impossible backend invariant violation.
+    try {
+        dsv4_materialize_logical_component(state.csa, kv_csa.get(), candidate.c4_segment_ids);
+        dsv4_materialize_logical_component(state.lid, kv_lid.get(), candidate.c4_segment_ids);
+        dsv4_materialize_logical_component(state.hca, kv_hca.get(), candidate.hca_segment_ids);
+    } catch (...) {
+        std::terminate();
+    }
+    if (comp_pool->commit(staged_ticket) != llama_dsv4_comp_status::ok ||
+            comp_pool->get_handle(staged_handle, candidate) != llama_dsv4_comp_status::ok) {
+        std::terminate();
+    }
+    staged_ticket = {};
+    if (comp_pool->replace_binding(
+                (uint32_t) plan.destination,
+                plan.destination_handle, plan.destination_handle_generation,
+                staged_handle, candidate.generation) != llama_dsv4_comp_status::ok) {
+        std::terminate();
+    }
+    if (!kv_raw->commit_logical_sequence_import(plan.raw, state.raw_swa)) {
+        std::terminate();
+    }
+    try {
+        csa_state->import_sequence_all_depths(plan.destination, state.csa_recurrent);
+        hca_state->import_sequence_all_depths(plan.destination, state.hca_recurrent);
+        lid_state->import_sequence_all_depths(plan.destination, state.lid_recurrent);
+    } catch (...) {
+        std::terminate();
+    }
+    rs_idx[(uint32_t) plan.destination] = state.rollback_index;
+    plan.state = dsv4_logical_import_plan_state::committed;
+    plan.raw_transaction.release();
+    return llama_dsv4_logical_state_status::ok;
+}
+
 void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // The lease closes the gap between the fail-closed handle check and the
     // DSV4 header write. A new detach cannot land until the complete state
@@ -3909,10 +4681,17 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     if (seq_id < 0 && kv_raw->has_resident_handles()) {
         throw std::runtime_error("DSV4 raw/SWA resident handles are not serializable");
     }
-    if (aggregate_compressed && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
-        throw std::runtime_error("full DSV4 state write is not yet supported by the aggregate compressed pool");
-    }
     const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+
+    if (aggregate_compressed && !partial_only) {
+        // The canonical logical API below is complete, but public state sizing
+        // invokes state_write with a counting sink. Materializing the entire
+        // aggregate device state merely to count it would double host staging
+        // and create an unacceptable long-context stall/peak. Keep the public
+        // container fail-closed until it has a streaming/counting-aware codec.
+        throw std::runtime_error(
+                "full aggregate DSV4 state requires the canonical logical streaming codec");
+    }
 
     const uint32_t magic   = DSV4_STATE_MAGIC;
     const uint32_t version = DSV4_STATE_VERSION;
@@ -3956,7 +4735,8 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         throw std::runtime_error("DSV4 raw/SWA resident handles cannot survive whole-cache restore");
     }
     if (aggregate_compressed && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
-        throw std::runtime_error("full DSV4 state restore is not yet supported by the aggregate compressed pool");
+        throw std::runtime_error(
+                "full aggregate DSV4 state requires the canonical logical streaming codec");
     }
     uint32_t magic;
     uint32_t version;
@@ -3972,7 +4752,6 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     if (version != DSV4_STATE_VERSION) {
         throw std::runtime_error("DSV4 state version mismatch");
     }
-
     io.read(&mode, sizeof(mode));
     if (mode != DSV4_STATE_MODE_FULL && mode != DSV4_STATE_MODE_PARTIAL) {
         throw std::runtime_error("DSV4 state mode mismatch");

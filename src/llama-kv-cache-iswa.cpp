@@ -2,12 +2,14 @@
 
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-io.h"
 #include "llama-model.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <map>
@@ -15,6 +17,105 @@
 #include <stdexcept>
 
 namespace {
+
+uint64_t logical_hash_u64(uint64_t hash, uint64_t value) {
+    for (uint32_t i = 0; i < 8; ++i) {
+        hash ^= (value >> (8*i)) & 0xffu;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+uint64_t logical_hash_bytes(uint64_t hash, const uint8_t * data, size_t size) {
+    hash = logical_hash_u64(hash, size);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+uint64_t logical_plane_checksum(const llama_kv_iswa_logical_plane_state & state) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    hash = logical_hash_u64(hash, state.schema_version);
+    hash = logical_hash_u64(hash, state.positions.size());
+    for (llama_pos pos : state.positions) {
+        hash = logical_hash_u64(hash, static_cast<uint64_t>(pos));
+    }
+    hash = logical_hash_u64(hash, state.extensions.size());
+    for (const llama_kv_cell_ext & ext : state.extensions) {
+        hash = logical_hash_u64(hash, static_cast<uint64_t>(ext.x));
+        hash = logical_hash_u64(hash, static_cast<uint64_t>(ext.y));
+    }
+    return logical_hash_bytes(hash, state.tensor_payload.data(), state.tensor_payload.size());
+}
+
+class logical_vector_writer final : public llama_io_write_i {
+public:
+    void write(const void * src, size_t size) override {
+        if (size > std::numeric_limits<size_t>::max() - data.size()) {
+            throw std::overflow_error("ISWA logical state size overflow");
+        }
+        const size_t old_size = data.size();
+        data.resize(old_size + size);
+        if (size != 0) {
+            std::memcpy(data.data() + old_size, src, size);
+        }
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > std::numeric_limits<size_t>::max() - data.size()) {
+            throw std::overflow_error("ISWA logical tensor state size overflow");
+        }
+        const size_t old_size = data.size();
+        data.resize(old_size + size);
+        if (size != 0) {
+            ggml_backend_tensor_get(tensor, data.data() + old_size, offset, size);
+        }
+    }
+
+    size_t n_bytes() override { return data.size(); }
+
+    std::vector<uint8_t> data;
+};
+
+class logical_vector_reader final : public llama_io_read_i {
+public:
+    explicit logical_vector_reader(const std::vector<uint8_t> & data) : data(data) {}
+
+    void read(void * dst, size_t size) override {
+        require(size);
+        if (size != 0) {
+            std::memcpy(dst, data.data() + offset, size);
+        }
+        offset += size;
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t tensor_offset, size_t size) override {
+        require(size);
+        if (size != 0) {
+            ggml_backend_tensor_set(tensor, data.data() + offset, tensor_offset, size);
+        }
+        offset += size;
+    }
+
+    void skip(size_t size) {
+        require(size);
+        offset += size;
+    }
+
+    size_t n_bytes() override { return offset; }
+
+private:
+    void require(size_t size) const {
+        if (offset > data.size() || size > data.size() - offset) {
+            throw std::runtime_error("truncated ISWA logical tensor payload");
+        }
+    }
+
+    const std::vector<uint8_t> & data;
+    size_t                       offset = 0;
+};
 
 uint64_t llama_kv_iswa_allocate_pool_id() {
     static std::atomic<uint64_t> next{ 1 };
@@ -235,6 +336,30 @@ void llama_kv_iswa_publish_move_audit(
 
 } // namespace
 
+enum class llama_kv_iswa_logical_import_state : uint8_t {
+    prepared,
+    committed,
+};
+
+struct llama_kv_iswa_logical_import_plan {
+    struct plane {
+        uint32_t                  stream = UINT32_MAX;
+        uint32_t                  head = 0;
+        llama_kv_cells            cells;
+        llama_kv_cache::slot_info slot;
+    };
+
+    const llama_kv_cache_iswa * owner = nullptr;
+    llama_seq_id                destination = -1;
+    uint64_t                    version[2] = { 0, 0 };
+    uint64_t                    transaction_generation = 0;
+    uint64_t                    base_checksum = 0;
+    uint64_t                    swa_checksum = 0;
+    plane                       base;
+    plane                       swa;
+    llama_kv_iswa_logical_import_state state = llama_kv_iswa_logical_import_state::prepared;
+};
+
 void llama_kv_iswa_set_resident_backend_override_for_test(
         llama_kv_iswa_resident_backend_override backend) {
     sparse_move_test_override = { backend.quote, backend.commit, backend.free, backend.audit };
@@ -249,10 +374,12 @@ void llama_kv_iswa_set_resident_lock_hook_for_test(llama_kv_iswa_resident_lock_h
 }
 
 struct llama_kv_cache_iswa::resident_impl {
-    explicit resident_impl(uint32_t capacity) : slots(capacity, false) {}
+    resident_impl(uint32_t capacity, std::shared_ptr<llama_kv_cache_resident_guard> guard) :
+        guard(std::move(guard)), slots(capacity, false) {
+        GGML_ASSERT(this->guard != nullptr);
+    }
 
-    std::shared_ptr<llama_kv_cache_resident_guard> guard =
-            std::make_shared<llama_kv_cache_resident_guard>();
+    std::shared_ptr<llama_kv_cache_resident_guard> guard;
     std::shared_ptr<const llama_kv_iswa_resident_identity> identity =
             std::make_shared<llama_kv_iswa_resident_identity>();
     uint64_t epoch = 1;
@@ -265,28 +392,55 @@ llama_kv_iswa_resident_transaction::llama_kv_iswa_resident_transaction(
     std::shared_ptr<llama_kv_cache_resident_guard> guard,
     std::unique_lock<std::recursive_mutex>         lock) :
     guard(std::move(guard)),
-    lock(std::move(lock)),
+    owner_thread(std::this_thread::get_id()),
     active(true) {
-    GGML_ASSERT(this->guard != nullptr && this->lock.owns_lock());
+    GGML_ASSERT(this->guard != nullptr && lock.owns_lock());
     GGML_ASSERT(!this->guard->resident_transaction_active);
+    if (this->guard->resident_transaction_generation == std::numeric_limits<uint64_t>::max()) {
+        std::terminate();
+    }
+    generation = ++this->guard->resident_transaction_generation;
     this->guard->resident_transaction_active = true;
+    this->guard->resident_transaction_owner  = owner_thread;
 }
 
 llama_kv_iswa_resident_transaction::llama_kv_iswa_resident_transaction(
     llama_kv_iswa_resident_transaction && other) noexcept :
     guard(std::move(other.guard)),
-    lock(std::move(other.lock)),
+    owner_thread(other.owner_thread),
+    generation(other.generation),
     active(other.active) {
     other.active = false;
 }
 
 llama_kv_iswa_resident_transaction::~llama_kv_iswa_resident_transaction() {
+    release();
+}
+
+bool llama_kv_iswa_resident_transaction::owned_by_current_thread() const {
+    return active && owner_thread == std::this_thread::get_id();
+}
+
+void llama_kv_iswa_resident_transaction::release() noexcept {
     if (!active) {
         return;
     }
-    GGML_ASSERT(guard != nullptr && lock.owns_lock());
-    GGML_ASSERT(guard->resident_transaction_active);
-    guard->resident_transaction_active = false;
+    auto retained_guard = guard;
+    if (!retained_guard) {
+        std::terminate();
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lock(retained_guard->mutex);
+        if (!retained_guard->resident_transaction_active ||
+                retained_guard->resident_transaction_generation != generation ||
+                retained_guard->resident_transaction_owner != owner_thread) {
+            std::terminate();
+        }
+        retained_guard->resident_transaction_active = false;
+        retained_guard->resident_transaction_owner  = {};
+        active = false;
+    }
+    retained_guard->transaction_released.notify_all();
 }
 
 struct llama_kv_iswa_resident_detach_plan {
@@ -361,9 +515,11 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
     ggml_backend_buffer_type_t buft_override,
-                uint32_t   n_resident) :
+                uint32_t   n_resident,
+                     bool   logical_transactions) :
     llama_kv_cache_iswa(model, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
-            kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share, buft_override, n_resident) {
+            kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share, buft_override, n_resident,
+            logical_transactions) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
@@ -384,7 +540,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
     ggml_backend_buffer_type_t buft_override,
-                uint32_t   n_resident) : unified(unified) {
+                uint32_t   n_resident,
+                     bool   logical_transactions) : unified(unified) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -441,10 +598,13 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share, buft_override, n_resident);
 
+    if (n_resident > 0 || logical_transactions) {
+        logical_guard = std::make_shared<llama_kv_cache_resident_guard>();
+        kv_base->resident_bind_guard(logical_guard, 0);
+        kv_swa ->resident_bind_guard(logical_guard, 1);
+    }
     if (n_resident > 0) {
-        resident = std::make_unique<resident_impl>(n_resident);
-        kv_base->resident_bind_guard(resident->guard, 0);
-        kv_swa ->resident_bind_guard(resident->guard, 1);
+        resident = std::make_unique<resident_impl>(n_resident, logical_guard);
     }
 }
 
@@ -455,18 +615,35 @@ llama_kv_cache_iswa::~llama_kv_cache_iswa() {
 }
 
 std::unique_lock<std::recursive_mutex> llama_kv_cache_iswa::lock_resident() const {
-    if (resident) {
+    if (logical_guard) {
         const auto hook    = resident_lock_hook;
         resident_lock_hook = {};
         if (hook.callback == nullptr) {
-            return std::unique_lock<std::recursive_mutex>(resident->guard->mutex);
+            std::unique_lock<std::recursive_mutex> result(logical_guard->mutex);
+            logical_guard->transaction_released.wait(result, [&] {
+                return !logical_guard->resident_transaction_active ||
+                        logical_guard->resident_transaction_owner == std::this_thread::get_id();
+            });
+            return result;
         }
 
         hook.callback(llama_kv_iswa_resident_lock_phase::before_lock, hook.context);
-        std::unique_lock<std::recursive_mutex> result(resident->guard->mutex, std::try_to_lock);
+        std::unique_lock<std::recursive_mutex> result(logical_guard->mutex, std::try_to_lock);
+        bool contended = !result.owns_lock();
         if (!result.owns_lock()) {
             hook.callback(llama_kv_iswa_resident_lock_phase::lock_contended, hook.context);
             result.lock();
+        }
+        if (logical_guard->resident_transaction_active &&
+                logical_guard->resident_transaction_owner != std::this_thread::get_id()) {
+            if (!contended) {
+                hook.callback(llama_kv_iswa_resident_lock_phase::lock_contended, hook.context);
+                contended = true;
+            }
+            logical_guard->transaction_released.wait(result, [&] {
+                return !logical_guard->resident_transaction_active ||
+                        logical_guard->resident_transaction_owner == std::this_thread::get_id();
+            });
         }
         hook.callback(llama_kv_iswa_resident_lock_phase::lock_acquired, hook.context);
         return result;
@@ -475,29 +652,29 @@ std::unique_lock<std::recursive_mutex> llama_kv_cache_iswa::lock_resident() cons
 }
 
 bool llama_kv_cache_iswa::resident_is_quiescent() const {
-    return resident && kv_base->sc_info.empty() && kv_swa->sc_info.empty() &&
-            resident->guard->pending_updates[0] == 0 && resident->guard->pending_updates[1] == 0 &&
-            !resident->guard->update_active[0] && !resident->guard->update_active[1] &&
-            resident->guard->active_batches == 0;
+    return logical_guard && kv_base->sc_info.empty() && kv_swa->sc_info.empty() &&
+            logical_guard->pending_updates[0] == 0 && logical_guard->pending_updates[1] == 0 &&
+            !logical_guard->update_active[0] && !logical_guard->update_active[1] &&
+            logical_guard->active_batches == 0;
 }
 
 std::shared_ptr<void> llama_kv_cache_iswa::acquire_resident_batch_lease() const {
     [[maybe_unused]] auto resident_scope = lock_resident();
-    if (!resident) {
+    if (!logical_guard) {
         return {};
     }
-    if (resident->guard->resident_transaction_active) {
+    if (logical_guard->resident_transaction_active) {
         throw std::runtime_error("cannot begin ISWA graph while a resident transaction is active");
     }
-    return std::make_shared<llama_kv_iswa_batch_lease>(resident->guard);
+    return std::make_shared<llama_kv_iswa_batch_lease>(logical_guard);
 }
 
 llama_kv_iswa_resident_transaction llama_kv_cache_iswa::acquire_resident_transaction() const {
     auto resident_scope = lock_resident();
-    if (!resident || resident->guard->resident_transaction_active || !resident_is_quiescent()) {
+    if (!logical_guard || logical_guard->resident_transaction_active || !resident_is_quiescent()) {
         return {};
     }
-    return llama_kv_iswa_resident_transaction(resident->guard, std::move(resident_scope));
+    return llama_kv_iswa_resident_transaction(logical_guard, std::move(resident_scope));
 }
 
 bool llama_kv_cache_iswa::has_resident_aperture() const {
@@ -704,6 +881,294 @@ llama_kv_cache * llama_kv_cache_iswa::get_base() const {
 
 llama_kv_cache * llama_kv_cache_iswa::get_swa() const {
     return kv_swa.get();
+}
+
+llama_kv_iswa_logical_sequence_state llama_kv_cache_iswa::export_logical_sequence(
+        llama_seq_id seq_id) const {
+    [[maybe_unused]] auto resident_scope = lock_resident();
+    if (seq_id < 0 || (uint32_t) seq_id >= kv_base->n_seq_max) {
+        throw std::runtime_error("ISWA logical export sequence is out of range");
+    }
+
+    const auto export_plane = [&](const llama_kv_cache & cache) {
+        llama_kv_iswa_logical_plane_state result;
+        result.schema_version = LLAMA_KV_ISWA_LOGICAL_STATE_SCHEMA;
+
+        const uint32_t stream = cache.seq_to_stream.at((size_t) seq_id);
+        const auto &   cells  = cache.v_cells.at(stream);
+        std::vector<std::pair<llama_pos, uint32_t>> logical_cells;
+        logical_cells.reserve(cells.get_used());
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i) || !cells.seq_has(i, seq_id)) {
+                continue;
+            }
+            if (llama_hparams::is_masked_swa(
+                        cache.n_swa, cache.swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id))) {
+                continue;
+            }
+            logical_cells.emplace_back(cells.pos_get(i), i);
+        }
+        std::sort(logical_cells.begin(), logical_cells.end(), [](const auto & lhs, const auto & rhs) {
+            return lhs.first != rhs.first ? lhs.first < rhs.first : lhs.second < rhs.second;
+        });
+        for (size_t i = 1; i < logical_cells.size(); ++i) {
+            if (logical_cells[i - 1].first == logical_cells[i].first) {
+                throw std::runtime_error("ISWA logical export contains duplicate absolute positions");
+            }
+        }
+
+        llama_kv_cache::cell_ranges_t ranges;
+        ranges.strm = stream;
+        for (const auto & [pos, cell] : logical_cells) {
+            result.positions.push_back(pos);
+            if (cache.hparams.n_pos_per_embd() > 1) {
+                result.extensions.push_back(cells.ext_get(cell));
+            }
+            if (!ranges.data.empty() && ranges.data.back().second == cell) {
+                ++ranges.data.back().second;
+            } else {
+                ranges.data.emplace_back(cell, cell + 1);
+            }
+        }
+
+        for (const auto & layer : cache.layers) {
+            if (layer.v != nullptr) {
+                throw std::runtime_error("ISWA canonical DSV4 state requires K-only storage");
+            }
+        }
+        logical_vector_writer writer;
+        cache.state_write_data(writer, ranges);
+        result.tensor_payload = std::move(writer.data);
+        result.checksum       = logical_plane_checksum(result);
+        return result;
+    };
+
+    llama_kv_iswa_logical_sequence_state result;
+    result.schema_version = LLAMA_KV_ISWA_LOGICAL_STATE_SCHEMA;
+    result.base           = export_plane(*kv_base);
+    result.swa            = export_plane(*kv_swa);
+    return result;
+}
+
+void llama_kv_cache_iswa::validate_logical_sequence(
+        const llama_kv_iswa_logical_sequence_state & state,
+        llama_pos                                    accepted_frontier) const {
+    [[maybe_unused]] auto resident_scope = lock_resident();
+    if (state.schema_version != LLAMA_KV_ISWA_LOGICAL_STATE_SCHEMA) {
+        throw std::runtime_error("ISWA logical sequence schema mismatch");
+    }
+    if (accepted_frontier < -1) {
+        throw std::runtime_error("ISWA logical sequence frontier is invalid");
+    }
+
+    const auto validate_plane = [&](const llama_kv_cache & cache,
+                                    const llama_kv_iswa_logical_plane_state & plane) {
+        if (plane.schema_version != LLAMA_KV_ISWA_LOGICAL_STATE_SCHEMA) {
+            throw std::runtime_error("ISWA logical plane schema mismatch");
+        }
+        if (plane.positions.size() > cache.get_size()) {
+            throw std::runtime_error("ISWA logical plane exceeds cache capacity");
+        }
+        for (size_t i = 0; i < plane.positions.size(); ++i) {
+            if (plane.positions[i] < 0 || plane.positions[i] > accepted_frontier ||
+                    (i != 0 && plane.positions[i - 1] >= plane.positions[i])) {
+                throw std::runtime_error("ISWA logical positions are not a strict absolute range");
+            }
+        }
+        if (accepted_frontier < 0) {
+            if (!plane.positions.empty()) {
+                throw std::runtime_error("ISWA empty frontier has logical rows");
+            }
+        } else {
+            // Every currently visible row is mandatory. Derive the exact
+            // contiguous suffix from the cache's own SWA mask; stop after one
+            // capacity plus one so a hostile frontier cannot force an
+            // unbounded scan.
+            llama_pos first = accepted_frontier;
+            uint64_t expected_count = 1;
+            while (first > 0 && !llama_hparams::is_masked_swa(
+                        cache.n_swa, cache.swa_type, first - 1, accepted_frontier)) {
+                if (expected_count == cache.get_size()) {
+                    throw std::runtime_error("ISWA logical frontier exceeds plane capacity");
+                }
+                --first;
+                ++expected_count;
+            }
+            if (plane.positions.size() != expected_count) {
+                throw std::runtime_error("ISWA logical plane does not cover the accepted frontier");
+            }
+            for (size_t i = 0; i < plane.positions.size(); ++i) {
+                if (plane.positions[i] != first + (llama_pos) i) {
+                    throw std::runtime_error("ISWA logical plane has a sparse accepted tail");
+                }
+            }
+        }
+        const bool has_extensions = cache.hparams.n_pos_per_embd() > 1;
+        if (plane.extensions.size() != (has_extensions ? plane.positions.size() : 0)) {
+            throw std::runtime_error("ISWA logical extension coverage mismatch");
+        }
+        if (logical_plane_checksum(plane) != plane.checksum) {
+            throw std::runtime_error("ISWA logical plane checksum mismatch");
+        }
+        for (const auto & layer : cache.layers) {
+            if (layer.v != nullptr) {
+                throw std::runtime_error("ISWA logical DSV4 validation requires K-only storage");
+            }
+        }
+
+        logical_vector_reader reader(plane.tensor_payload);
+        uint32_t v_trans_ref = 0;
+        uint32_t n_layer_ref = 0;
+        reader.read(&v_trans_ref, sizeof(v_trans_ref));
+        reader.read(&n_layer_ref, sizeof(n_layer_ref));
+        if (v_trans_ref != (cache.v_trans ? 1u : 0u) || n_layer_ref != cache.layers.size()) {
+            throw std::runtime_error("ISWA logical tensor envelope mismatch");
+        }
+        for (const auto & layer : cache.layers) {
+            int32_t  type_ref     = -1;
+            uint64_t row_size_ref = 0;
+            reader.read(&type_ref, sizeof(type_ref));
+            reader.read(&row_size_ref, sizeof(row_size_ref));
+            const ggml_tensor * tensor   = layer.k_stream.at(0);
+            const uint64_t      row_size = ggml_row_size(tensor->type, cache.hparams.n_embd_k_gqa(layer.il));
+            if (type_ref != (int32_t) tensor->type || row_size_ref != row_size) {
+                throw std::runtime_error("ISWA logical K tensor geometry mismatch");
+            }
+            if (row_size != 0 && plane.positions.size() > std::numeric_limits<size_t>::max()/row_size) {
+                throw std::runtime_error("ISWA logical K payload size overflow");
+            }
+            reader.skip(plane.positions.size()*row_size);
+        }
+        if (reader.n_bytes() != plane.tensor_payload.size()) {
+            throw std::runtime_error("ISWA logical tensor payload has trailing bytes");
+        }
+    };
+
+    validate_plane(*kv_base, state.base);
+    validate_plane(*kv_swa,  state.swa);
+}
+
+std::shared_ptr<llama_kv_iswa_logical_import_plan>
+llama_kv_cache_iswa::prepare_logical_sequence_import(
+        llama_seq_id                                 seq_id,
+        const llama_kv_iswa_logical_sequence_state & state,
+        llama_pos                                    accepted_frontier) const {
+    [[maybe_unused]] auto resident_scope = lock_resident();
+    if (!logical_guard || !logical_guard->resident_transaction_active ||
+            seq_id < 0 || (uint32_t) seq_id >= kv_base->n_seq_max) {
+        throw std::runtime_error("ISWA logical import requires a retained quiescent transaction");
+    }
+    validate_logical_sequence(state, accepted_frontier);
+
+    auto result = std::make_shared<llama_kv_iswa_logical_import_plan>();
+    result->owner         = this;
+    result->destination   = seq_id;
+    result->version[0]    = logical_guard->version[0];
+    result->version[1]    = logical_guard->version[1];
+    result->transaction_generation = logical_guard->resident_transaction_generation;
+    result->base_checksum = state.base.checksum;
+    result->swa_checksum  = state.swa.checksum;
+
+    const auto prepare_plane = [&](const llama_kv_cache & cache,
+                                   const llama_kv_iswa_logical_plane_state & logical,
+                                   llama_kv_iswa_logical_import_plan::plane & prepared) {
+        if (cache.other != nullptr || cache.n_stream <= 1 ||
+                cache.seq_to_stream.at((size_t) seq_id) != (uint32_t) seq_id) {
+            throw std::runtime_error("ISWA logical import requires exclusive per-sequence streams");
+        }
+        const auto & current = cache.v_cells.at((uint32_t) seq_id);
+        if (current.get_has_shift()) {
+            throw std::runtime_error("ISWA logical import cannot replace shifted metadata");
+        }
+        for (uint32_t i = 0; i < current.size(); ++i) {
+            if (!current.is_empty(i) &&
+                    (current.seq_count(i) != 1 || !current.seq_has(i, seq_id))) {
+                throw std::runtime_error("ISWA logical import stream contains foreign sequence ownership");
+            }
+        }
+
+        prepared.stream = (uint32_t) seq_id;
+        prepared.head   = (uint32_t) logical.positions.size();
+        prepared.cells.resize(cache.get_size());
+        prepared.slot.s0 = prepared.stream;
+        prepared.slot.s1 = prepared.stream;
+        prepared.slot.resize(1);
+        prepared.slot.strm[0] = prepared.stream;
+        prepared.slot.idxs[0].resize(logical.positions.size());
+        for (size_t i = 0; i < logical.positions.size(); ++i) {
+            prepared.slot.idxs[0][i] = (uint32_t) i;
+            prepared.cells.pos_set((uint32_t) i, logical.positions[i]);
+            if (!logical.extensions.empty()) {
+                prepared.cells.ext_set((uint32_t) i, logical.extensions[i]);
+            }
+            prepared.cells.seq_add((uint32_t) i, seq_id);
+        }
+    };
+
+    prepare_plane(*kv_base, state.base, result->base);
+    prepare_plane(*kv_swa,  state.swa,  result->swa);
+    return result;
+}
+
+bool llama_kv_cache_iswa::validate_logical_sequence_import(
+        const std::shared_ptr<llama_kv_iswa_logical_import_plan> & plan) const {
+    [[maybe_unused]] auto resident_scope = lock_resident();
+    return plan && plan->owner == this &&
+            plan->state == llama_kv_iswa_logical_import_state::prepared &&
+            logical_guard && logical_guard->resident_transaction_active &&
+            plan->transaction_generation == logical_guard->resident_transaction_generation &&
+            plan->destination >= 0 && (uint32_t) plan->destination < kv_base->n_seq_max &&
+            plan->version[0] == logical_guard->version[0] &&
+            plan->version[1] == logical_guard->version[1];
+}
+
+bool llama_kv_cache_iswa::commit_logical_sequence_import(
+        const std::shared_ptr<llama_kv_iswa_logical_import_plan> & plan,
+        const llama_kv_iswa_logical_sequence_state & state) noexcept {
+    try {
+        [[maybe_unused]] auto resident_scope = lock_resident();
+        if (!validate_logical_sequence_import(plan) ||
+                state.schema_version != LLAMA_KV_ISWA_LOGICAL_STATE_SCHEMA ||
+                state.base.checksum != plan->base_checksum || state.swa.checksum != plan->swa_checksum ||
+                logical_plane_checksum(state.base) != state.base.checksum ||
+                logical_plane_checksum(state.swa)  != state.swa.checksum ||
+                state.base.positions.size() != plan->base.slot.idxs[0].size() ||
+                state.swa.positions.size()  != plan->swa.slot.idxs[0].size()) {
+            return false;
+        }
+
+        const auto write_plane = [](llama_kv_cache & cache,
+                                    llama_kv_iswa_logical_import_plan::plane & prepared,
+                                    const llama_kv_iswa_logical_plane_state & logical) {
+            logical_vector_reader reader(logical.tensor_payload);
+            if (!cache.state_read_data(reader, prepared.stream,
+                                       (uint32_t) logical.positions.size(), prepared.slot) ||
+                    reader.n_bytes() != logical.tensor_payload.size()) {
+                // Every envelope field and byte count was checked during the
+                // prepare phase. Reaching this point would mean an internal
+                // invariant changed while the retained transaction was held;
+                // continuing could expose a half-written execution stream.
+                std::terminate();
+            }
+        };
+        write_plane(*kv_base, plan->base, state.base);
+        write_plane(*kv_swa,  plan->swa,  state.swa);
+
+        static_assert(std::is_nothrow_move_assignable_v<llama_kv_cells>);
+        kv_base->resident_note_mutation();
+        kv_swa ->resident_note_mutation();
+        kv_base->v_cells[plan->base.stream] = std::move(plan->base.cells);
+        kv_swa ->v_cells[plan->swa.stream]  = std::move(plan->swa.cells);
+        kv_base->v_heads[plan->base.stream] = plan->base.head;
+        kv_swa ->v_heads[plan->swa.stream]  = plan->swa.head;
+        plan->state = llama_kv_iswa_logical_import_state::committed;
+        return true;
+    } catch (...) {
+        // Publication is designed to be no-throw after the complete prepare
+        // and checksum checks above. A backend throwing through its C entry
+        // point is not a recoverable cache-state failure.
+        std::terminate();
+    }
 }
 
 llama_kv_iswa_resident_detach_quote llama_kv_cache_iswa::quote_resident_detach(llama_seq_id execution_id) const {

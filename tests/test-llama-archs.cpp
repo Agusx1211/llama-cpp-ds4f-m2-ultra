@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -23,10 +24,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -898,6 +901,54 @@ static bool dsv4_usage_footprint_equal(
         }
     }
     return true;
+}
+
+static bool dsv4_comp_family_semantic_equal(
+        const llama_dsv4_comp_family_usage & lhs,
+        const llama_dsv4_comp_family_usage & rhs) {
+    return lhs.capacity_segments == rhs.capacity_segments &&
+           lhs.permanent_segments == rhs.permanent_segments &&
+           lhs.free_segments == rhs.free_segments &&
+           lhs.reserved_segments == rhs.reserved_segments &&
+           lhs.mapped_segments == rhs.mapped_segments &&
+           lhs.shared_segments == rhs.shared_segments &&
+           lhs.cow_segments == rhs.cow_segments &&
+           lhs.scratch_rows_in_use == rhs.scratch_rows_in_use &&
+           lhs.capacity_pages == rhs.capacity_pages &&
+           lhs.free_pages == rhs.free_pages &&
+           lhs.reserved_pages == rhs.reserved_pages &&
+           lhs.mapped_pages == rhs.mapped_pages &&
+           lhs.shared_pages == rhs.shared_pages &&
+           lhs.cow_pages == rhs.cow_pages &&
+           lhs.segment_pages_capacity == rhs.segment_pages_capacity &&
+           lhs.segment_pages_free == rhs.segment_pages_free &&
+           lhs.segment_pages_reserved == rhs.segment_pages_reserved &&
+           lhs.segment_pages_mapped == rhs.segment_pages_mapped &&
+           lhs.lid_pages_capacity == rhs.lid_pages_capacity &&
+           lhs.lid_pages_free == rhs.lid_pages_free &&
+           lhs.lid_pages_reserved == rhs.lid_pages_reserved &&
+           lhs.lid_pages_mapped == rhs.lid_pages_mapped;
+}
+
+static bool dsv4_comp_semantic_equal(
+        const llama_dsv4_comp_memory_usage & lhs,
+        const llama_dsv4_comp_memory_usage & rhs) {
+    // Epoch and retained tombstones are intentionally monotonic audit state.
+    return dsv4_comp_family_semantic_equal(lhs.c4, rhs.c4) &&
+           dsv4_comp_family_semantic_equal(lhs.hca, rhs.hca) &&
+           lhs.handles == rhs.handles && lhs.bindings == rhs.bindings &&
+           lhs.resident_handles == rhs.resident_handles &&
+           lhs.active_tickets == rhs.active_tickets;
+}
+
+static bool dsv4_comp_handle_equal(
+        const llama_dsv4_comp_handle_info & lhs,
+        const llama_dsv4_comp_handle_info & rhs) {
+    return lhs.id == rhs.id && lhs.generation == rhs.generation &&
+           lhs.visible_c4_rows == rhs.visible_c4_rows &&
+           lhs.visible_hca_rows == rhs.visible_hca_rows &&
+           lhs.c4_segment_ids == rhs.c4_segment_ids &&
+           lhs.hca_segment_ids == rhs.hca_segment_ids;
 }
 
 class dsv4_page_delta_audit_scope {
@@ -2067,8 +2118,8 @@ static bool test_dsv4_elastic_borrow(size_t seed, ggml_backend_dev_t dev) {
 }
 
 static bool test_dsv4_restore_boundaries(size_t seed, ggml_backend_dev_t dev) {
-    static constexpr std::array<uint32_t, 8> boundaries = {
-        3, 4, 127, 128, 129, 255, 256, 260,
+    static constexpr std::array<uint32_t, 9> boundaries = {
+        3, 4, 5, 127, 128, 129, 255, 256, 260,
     };
     static constexpr uint32_t n_vocab = 128;
     static constexpr uint32_t n_ctx_seq = 512;
@@ -2581,6 +2632,310 @@ static bool test_dsv4_parallel_device(size_t seed, ggml_backend_dev_t dev) {
     return all_ok;
 }
 
+static void dsv4_assert_logical_component_coverage(
+        const llama_dsv4_logical_component_state & component,
+        uint64_t expected_rows) {
+    GGML_ASSERT(component.row_begin == 0 && component.row_end == expected_rows);
+    const uint64_t expected_chunks = llama_dsv4_comp_segments_for_rows(expected_rows);
+    for (const auto & tensor : component.tensors) {
+        GGML_ASSERT(tensor.chunks.size() == expected_chunks);
+        for (size_t i = 0; i < tensor.chunks.size(); ++i) {
+            const auto & chunk = tensor.chunks[i];
+            const uint64_t begin = i*LLAMA_DSV4_COMP_SEGMENT_ROWS;
+            GGML_ASSERT(chunk.row_begin == begin);
+            GGML_ASSERT(chunk.row_count == std::min<uint64_t>(
+                    LLAMA_DSV4_COMP_SEGMENT_ROWS, expected_rows - begin));
+            GGML_ASSERT(chunk.bytes.size() == chunk.row_count*tensor.row_size);
+        }
+    }
+}
+
+static void dsv4_logical_waiter_hook(llama_kv_iswa_resident_lock_phase phase, void * context) {
+    if (phase == llama_kv_iswa_resident_lock_phase::lock_contended) {
+        static_cast<std::promise<void> *>(context)->set_value();
+    }
+}
+
+static bool test_dsv4_aggregate_logical_boundaries(size_t seed, ggml_backend_dev_t dev) {
+    static constexpr std::array<uint32_t, 10> boundaries = {
+        0, 3, 4, 5, 127, 128, 129, 255, 256, 260,
+    };
+    static constexpr uint32_t n_vocab = 128;
+    const auto tokens = get_tokens(boundaries.back() + 1, n_vocab, seed + 70);
+    dsv4_test_context test(seed, dev, 2, true, boundaries.back() + 2, 1, 1024);
+    auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(test.lctx.get()));
+    GGML_ASSERT(memory != nullptr && memory->is_aggregate_compressed());
+
+    for (uint32_t n_tokens : boundaries) {
+        llama_memory_clear(memory, true);
+        if (n_tokens != 0) {
+            dsv4_decode_sequence(test,
+                    std::vector<llama_token>(tokens.begin(), tokens.begin() + n_tokens),
+                    0, "aggregate logical boundary source");
+        }
+        const llama_token divergent = (tokens[0] + 17) % n_vocab;
+        test.add(divergent, 0, { 1 });
+        test.decode("aggregate logical boundary occupied destination");
+        test.clear_batch();
+
+        const auto state = memory->export_logical_sequence(0);
+        GGML_ASSERT(state.accepted_frontier == (llama_pos) n_tokens - 1);
+        GGML_ASSERT(state.rollback_index == 0);
+        GGML_ASSERT(state.raw_swa.base.positions.size() == n_tokens);
+        if (n_tokens == 0) {
+            GGML_ASSERT(state.raw_swa.swa.positions.empty());
+        } else {
+            GGML_ASSERT(!state.raw_swa.swa.positions.empty() &&
+                        state.raw_swa.swa.positions.back() == (llama_pos) n_tokens - 1);
+        }
+        const uint64_t c4_rows  = n_tokens/LLAMA_DSV4_COMP_C4_TOKENS_PER_ROW;
+        const uint64_t hca_rows = n_tokens/LLAMA_DSV4_COMP_HCA_TOKENS_PER_ROW;
+        dsv4_assert_logical_component_coverage(state.csa, c4_rows);
+        dsv4_assert_logical_component_coverage(state.lid, c4_rows);
+        dsv4_assert_logical_component_coverage(state.hca, hca_rows);
+        GGML_ASSERT(state.csa.row_end == state.lid.row_end);
+        GGML_ASSERT(state.fingerprint == llama_dsv4_logical_sequence_fingerprint(state));
+
+        auto quote = memory->quote_logical_import(1, state);
+        GGML_ASSERT(quote.status == llama_dsv4_logical_state_status::ok);
+        GGML_ASSERT(memory->import_logical_sequence(quote, state) == llama_dsv4_logical_state_status::ok);
+        // Retaining a consumed quote must not retain the raw/SWA gate.
+        const auto restored = memory->export_logical_sequence(1);
+        GGML_ASSERT(restored.fingerprint == state.fingerprint);
+        GGML_ASSERT(memory->import_logical_sequence(quote, state) ==
+                    llama_dsv4_logical_state_status::stale_quote);
+
+        test.add(tokens[n_tokens], n_tokens, { 0 });
+        test.add(tokens[n_tokens], n_tokens, { 1 });
+        test.decode("aggregate logical boundary continuation");
+        GGML_ASSERT(dsv4_logits_ith(test, 0) == dsv4_logits_ith(test, 1));
+        test.clear_batch();
+    }
+    return true;
+}
+
+static bool test_dsv4_aggregate_logical_failures(size_t seed, ggml_backend_dev_t dev) {
+    static constexpr uint32_t n_vocab  = 128;
+    static constexpr uint32_t n_prompt = 260;
+    const auto tokens = get_tokens(n_prompt + 1, n_vocab, seed + 71);
+    dsv4_test_context test(seed, dev, 2, true, n_prompt + 2, 1, 768, 0, nullptr, nullptr, 2);
+    auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(test.lctx.get()));
+    GGML_ASSERT(memory != nullptr && memory->is_aggregate_compressed());
+    auto * pool = memory->get_comp_pool();
+    GGML_ASSERT(pool != nullptr);
+
+    dsv4_decode_sequence(test,
+            std::vector<llama_token>(tokens.begin(), tokens.begin() + n_prompt),
+            0, "aggregate logical failure source");
+    llama_memory_seq_cp(memory, 0, 1, -1, -1);
+    test.add((tokens[n_prompt] + 1) % n_vocab, n_prompt, { 1 });
+    test.decode("aggregate logical failure COW destination");
+    test.clear_batch();
+
+    const auto source = memory->export_logical_sequence(0);
+    GGML_ASSERT(source.csa.tensors.front().chunks.size() == 2);
+    const auto destination_before = memory->export_logical_sequence(1);
+    llama_dsv4_comp_handle_id destination_handle = 0;
+    llama_dsv4_comp_handle_info destination_info;
+    GGML_ASSERT(pool->get_binding(1, destination_handle) == llama_dsv4_comp_status::ok);
+    GGML_ASSERT(pool->get_handle(destination_handle, destination_info) == llama_dsv4_comp_status::ok);
+
+    const auto assert_rejected_without_mutation = [&](llama_dsv4_logical_sequence_state malformed,
+                                                       llama_dsv4_logical_state_status expected) {
+        malformed.fingerprint = llama_dsv4_logical_sequence_fingerprint(malformed);
+        const auto pool_before     = pool->memory_usage_snapshot();
+        const auto physical_before = memory->memory_usage_snapshot();
+        const auto quote = memory->quote_logical_import(1, malformed);
+        GGML_ASSERT(quote.status == expected);
+        GGML_ASSERT(memory->export_logical_sequence(1).fingerprint == destination_before.fingerprint);
+        GGML_ASSERT(dsv4_comp_semantic_equal(pool->memory_usage_snapshot(), pool_before));
+        GGML_ASSERT(dsv4_usage_footprint_equal(memory->memory_usage_snapshot(), physical_before));
+    };
+
+    auto malformed = source;
+    malformed.identity ^= UINT64_C(1);
+    assert_rejected_without_mutation(std::move(malformed),
+                                     llama_dsv4_logical_state_status::identity_mismatch);
+    malformed = source;
+    malformed.csa.tensors.front().chunks.front().bytes.pop_back();
+    assert_rejected_without_mutation(std::move(malformed),
+                                     llama_dsv4_logical_state_status::coverage_mismatch);
+    malformed = source;
+    std::swap(malformed.csa.tensors.front().chunks[0], malformed.csa.tensors.front().chunks[1]);
+    assert_rejected_without_mutation(std::move(malformed),
+                                     llama_dsv4_logical_state_status::coverage_mismatch);
+    malformed = source;
+    malformed.lid.tensors.front().chunks[1] = malformed.lid.tensors.front().chunks[0];
+    assert_rejected_without_mutation(std::move(malformed),
+                                     llama_dsv4_logical_state_status::coverage_mismatch);
+    malformed = source;
+    malformed.rollback_index = malformed.active_rollback_depth + 1;
+    assert_rejected_without_mutation(std::move(malformed),
+                                     llama_dsv4_logical_state_status::coverage_mismatch);
+
+    // Coordinator staging is same-thread, but a wrong-thread consume is a
+    // terminal rejection. It must release the generation gate immediately so
+    // a waiter progresses even while this rejected quote remains retained.
+    {
+        auto quote = memory->quote_logical_import(1, source);
+        GGML_ASSERT(quote.status == llama_dsv4_logical_state_status::ok);
+        std::promise<void> waiter_contended;
+        auto waiter_contended_future = waiter_contended.get_future();
+        std::promise<uint64_t> waiter_fingerprint;
+        auto waiter_fingerprint_future = waiter_fingerprint.get_future();
+        std::thread waiter([&] {
+            llama_kv_iswa_set_resident_lock_hook_for_test(
+                    dsv4_logical_waiter_hook, &waiter_contended);
+            try {
+                waiter_fingerprint.set_value(memory->export_logical_sequence(1).fingerprint);
+            } catch (...) {
+                waiter_fingerprint.set_exception(std::current_exception());
+            }
+        });
+        waiter_contended_future.wait();
+
+        llama_dsv4_logical_state_status wrong_thread_status = llama_dsv4_logical_state_status::ok;
+        std::thread wrong_thread([&] {
+            wrong_thread_status = memory->import_logical_sequence(quote, source);
+        });
+        wrong_thread.join();
+        GGML_ASSERT(wrong_thread_status == llama_dsv4_logical_state_status::not_quiescent);
+        GGML_ASSERT(waiter_fingerprint_future.wait_for(std::chrono::seconds(2)) ==
+                    std::future_status::ready);
+        waiter.join();
+        GGML_ASSERT(waiter_fingerprint_future.get() == destination_before.fingerprint);
+        GGML_ASSERT(memory->import_logical_sequence(quote, source) ==
+                    llama_dsv4_logical_state_status::stale_quote);
+    }
+
+    static constexpr std::array<llama_dsv4_logical_import_checkpoint, 4> checkpoints = {
+        llama_dsv4_logical_import_checkpoint::after_raw_staging,
+        llama_dsv4_logical_import_checkpoint::after_recurrent_staging,
+        llama_dsv4_logical_import_checkpoint::after_segment_staging,
+        llama_dsv4_logical_import_checkpoint::before_publication,
+    };
+    for (auto checkpoint : checkpoints) {
+        const auto pool_before     = pool->memory_usage_snapshot();
+        const auto physical_before = memory->memory_usage_snapshot();
+        llama_dsv4_comp_handle_id binding_before = 0;
+        llama_dsv4_comp_handle_info info_before;
+        GGML_ASSERT(pool->get_binding(1, binding_before) == llama_dsv4_comp_status::ok);
+        GGML_ASSERT(pool->get_handle(binding_before, info_before) == llama_dsv4_comp_status::ok);
+
+        auto quote = memory->quote_logical_import(1, source);
+        GGML_ASSERT(quote.status == llama_dsv4_logical_state_status::ok);
+        llama_kv_cache_dsv4_test_fail_logical_import_at(checkpoint);
+        GGML_ASSERT(memory->import_logical_sequence(quote, source) ==
+                    llama_dsv4_logical_state_status::resource_exhausted);
+        // The quote intentionally remains alive while a new export acquires a
+        // fresh quiescence token. Reuse is terminally stale.
+        GGML_ASSERT(memory->export_logical_sequence(1).fingerprint == destination_before.fingerprint);
+        GGML_ASSERT(memory->import_logical_sequence(quote, source) ==
+                    llama_dsv4_logical_state_status::stale_quote);
+
+        llama_dsv4_comp_handle_id binding_after = 0;
+        llama_dsv4_comp_handle_info info_after;
+        GGML_ASSERT(pool->get_binding(1, binding_after) == llama_dsv4_comp_status::ok);
+        GGML_ASSERT(pool->get_handle(binding_after, info_after) == llama_dsv4_comp_status::ok);
+        GGML_ASSERT(binding_after == binding_before && dsv4_comp_handle_equal(info_after, info_before));
+        const auto pool_after = pool->memory_usage_snapshot();
+        GGML_ASSERT(dsv4_comp_semantic_equal(pool_after, pool_before));
+        GGML_ASSERT(dsv4_usage_footprint_equal(memory->memory_usage_snapshot(), physical_before));
+        if (checkpoint == llama_dsv4_logical_import_checkpoint::after_segment_staging ||
+                checkpoint == llama_dsv4_logical_import_checkpoint::before_publication) {
+            GGML_ASSERT(pool_after.epoch > pool_before.epoch);
+            GGML_ASSERT(pool_after.retained_ticket_records > pool_before.retained_ticket_records);
+        }
+    }
+
+    // A same-thread raw mutation after quote acquisition invalidates the
+    // quote, releases its gate at the terminal failure, and changes no logical
+    // destination bytes because the selected range is empty.
+    {
+        auto quote = memory->quote_logical_import(1, source);
+        GGML_ASSERT(quote.status == llama_dsv4_logical_state_status::ok);
+        GGML_ASSERT(memory->get_raw()->seq_rm(1, 9999, 10000));
+        GGML_ASSERT(memory->import_logical_sequence(quote, source) ==
+                    llama_dsv4_logical_state_status::stale_quote);
+        GGML_ASSERT(memory->export_logical_sequence(1).fingerprint == destination_before.fingerprint);
+        GGML_ASSERT(memory->import_logical_sequence(quote, source) ==
+                    llama_dsv4_logical_state_status::stale_quote);
+    }
+
+    auto success = memory->quote_logical_import(1, source);
+    GGML_ASSERT(success.status == llama_dsv4_logical_state_status::ok);
+    GGML_ASSERT(memory->import_logical_sequence(success, source) == llama_dsv4_logical_state_status::ok);
+    GGML_ASSERT(memory->export_logical_sequence(0).fingerprint == source.fingerprint);
+    GGML_ASSERT(memory->export_logical_sequence(1).fingerprint == source.fingerprint);
+    GGML_ASSERT(pool->get_handle(destination_handle, destination_info) ==
+                llama_dsv4_comp_status::handle_not_found);
+
+    test.add(tokens[n_prompt], n_prompt, { 0 });
+    test.add(tokens[n_prompt], n_prompt, { 1 });
+    test.decode("aggregate logical failure success continuation");
+    GGML_ASSERT(dsv4_logits_ith(test, 0) == dsv4_logits_ith(test, 1));
+    test.clear_batch();
+    return true;
+}
+
+static bool test_dsv4_aggregate_logical_rollback(size_t seed, ggml_backend_dev_t dev) {
+    static constexpr uint32_t n_vocab  = 128;
+    static constexpr uint32_t n_prompt = 8;
+    static constexpr uint32_t n_depth  = 5;
+    const auto tokens = get_tokens(n_prompt + 1, n_vocab, seed + 72);
+    dsv4_test_context test(seed, dev, 2, true, n_prompt + 2, 1, 256, 0, nullptr, nullptr, n_depth);
+    auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(test.lctx.get()));
+    GGML_ASSERT(memory != nullptr && memory->is_aggregate_compressed());
+    auto * pool = memory->get_comp_pool();
+
+    for (uint32_t depth = 1; depth <= n_depth; ++depth) {
+        llama_memory_clear(memory, true);
+        dsv4_decode_sequence(test,
+                std::vector<llama_token>(tokens.begin(), tokens.begin() + n_prompt),
+                0, "aggregate rollback source");
+        test.add((tokens[0] + 29) % n_vocab, 0, { 1 });
+        test.decode("aggregate rollback occupied destination");
+        test.clear_batch();
+
+        const uint32_t accepted = n_prompt - depth;
+        llama_dsv4_comp_handle_id source_handle = 0;
+        llama_dsv4_comp_handle_info source_physical;
+        GGML_ASSERT(pool->get_binding(0, source_handle) == llama_dsv4_comp_status::ok);
+        GGML_ASSERT(pool->get_handle(source_handle, source_physical) == llama_dsv4_comp_status::ok);
+        GGML_ASSERT(source_physical.visible_c4_rows == n_prompt/LLAMA_DSV4_COMP_C4_TOKENS_PER_ROW);
+        GGML_ASSERT(llama_memory_seq_rm(memory, 0, accepted, -1));
+
+        const auto state = memory->export_logical_sequence(0);
+        GGML_ASSERT(state.accepted_frontier == (llama_pos) accepted - 1);
+        GGML_ASSERT(state.rollback_index == depth && state.active_rollback_depth == n_depth);
+        GGML_ASSERT(state.csa.row_end == accepted/LLAMA_DSV4_COMP_C4_TOKENS_PER_ROW);
+        GGML_ASSERT(state.lid.row_end == state.csa.row_end);
+        GGML_ASSERT(source_physical.visible_c4_rows > state.csa.row_end &&
+                    "rollback physical tail was not present for canonicalization test");
+
+        auto quote = memory->quote_logical_import(1, state);
+        GGML_ASSERT(quote.status == llama_dsv4_logical_state_status::ok);
+        GGML_ASSERT(memory->import_logical_sequence(quote, state) == llama_dsv4_logical_state_status::ok);
+        GGML_ASSERT(memory->get_rs_idx()[1] == depth);
+        llama_dsv4_comp_handle_id restored_handle = 0;
+        llama_dsv4_comp_handle_info restored_physical;
+        GGML_ASSERT(pool->get_binding(1, restored_handle) == llama_dsv4_comp_status::ok);
+        GGML_ASSERT(pool->get_handle(restored_handle, restored_physical) == llama_dsv4_comp_status::ok);
+        GGML_ASSERT(restored_physical.visible_c4_rows == state.csa.row_end);
+        GGML_ASSERT(restored_physical.visible_hca_rows == state.hca.row_end);
+        GGML_ASSERT(memory->export_logical_sequence(1).fingerprint == state.fingerprint);
+
+        const llama_token replacement = (tokens[accepted] + 1) % n_vocab;
+        test.add(replacement, accepted, { 0 });
+        test.add(replacement, accepted, { 1 });
+        test.decode("aggregate rollback first restored graph");
+        GGML_ASSERT(dsv4_logits_ith(test, 0) == dsv4_logits_ith(test, 1));
+        GGML_ASSERT(memory->get_rs_idx()[0] == 0 && memory->get_rs_idx()[1] == 0);
+        test.clear_batch();
+    }
+    return true;
+}
+
 static bool test_dsv4_aggregate_device(size_t seed, ggml_backend_dev_t dev) {
     if (!dsv4_test_has_elastic_pages(dev, 2)) {
         return true;
@@ -2635,6 +2990,9 @@ static bool test_dsv4_aggregate_device(size_t seed, ggml_backend_dev_t dev) {
     bool all_ok = true;
     all_ok = compare_dsv4_trace("aggregate-copied", "A", isolated_a, copied.seq_a) && all_ok;
     all_ok = compare_dsv4_trace("aggregate-copied", "B", isolated_b, copied.seq_b) && all_ok;
+    all_ok = test_dsv4_aggregate_logical_boundaries(seed, dev) && all_ok;
+    all_ok = test_dsv4_aggregate_logical_failures(seed, dev) && all_ok;
+    all_ok = test_dsv4_aggregate_logical_rollback(seed, dev) && all_ok;
 
     dsv4_test_context state_test(seed, dev, 2, true, n_prompt);
     const auto state_tokens = get_tokens(n_prompt, n_vocab, seed + 62);
@@ -2642,8 +3000,9 @@ static bool test_dsv4_aggregate_device(size_t seed, ggml_backend_dev_t dev) {
     GGML_ASSERT(llama_state_seq_get_size(state_test.lctx.get(), 0) == 0 &&
             "aggregate full-state limitation did not reject the size request");
 
-    printf("DSV4 aggregate selection/alias matrix (%s): %s; single-slot = affine, "
-           "small multi-slot = affine, forced multi-slot = aggregate, full state = explicitly unsupported\n",
+    printf("DSV4 aggregate selection/alias/logical-state matrix (%s): %s; single-slot = affine, "
+           "small multi-slot = affine, forced multi-slot = aggregate, canonical sequence transactions = exact, "
+           "public full state = explicitly unsupported pending streaming codec\n",
             ggml_backend_dev_description(dev), all_ok ? "OK" : "FAIL");
     return all_ok;
 }
@@ -2722,13 +3081,13 @@ static int test_dsv4_aggregate_selector() {
     selector.affine_compressed_bytes = bytes_256k_4;
     GGML_ASSERT(!dsv4_select_aggregate_compressed(selector));
     selector.affine_compressed_bytes = bytes_512k_4;
-    GGML_ASSERT(dsv4_select_aggregate_compressed(selector));
+    GGML_ASSERT(!dsv4_select_aggregate_compressed(selector));
     selector.n_seq_max = 64;
     selector.affine_compressed_bytes = bytes_1m_64;
     GGML_ASSERT(dsv4_select_aggregate_compressed(selector));
 
     printf("DSV4 aggregate selector: OK; 2K/4=%.2f MiB affine, 128K/4=%.3f GiB affine, "
-           "256K/4=%.3f GiB affine, 512K/4=%.3f GiB aggregate, 1M/64=%.3f GiB aggregate\n",
+           "256K/4=%.3f GiB affine, 512K/4=%.3f GiB affine, 1M/64=%.3f GiB aggregate\n",
             bytes_2k_4/(1024.0*1024.0), bytes_128k_4/(1024.0*1024.0*1024.0),
             bytes_256k_4/(1024.0*1024.0*1024.0), bytes_512k_4/(1024.0*1024.0*1024.0),
             bytes_1m_64/(1024.0*1024.0*1024.0));
