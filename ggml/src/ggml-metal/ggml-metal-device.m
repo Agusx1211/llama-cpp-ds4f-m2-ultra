@@ -759,6 +759,11 @@ static struct {
     /*.seq         =*/ 0,
     /*.pending     =*/ NULL,
     /*.mtx         =*/ PTHREAD_MUTEX_INITIALIZER,
+    /*.free_sb     =*/ { nil },
+    /*.n_free_sb   =*/ 0,
+    /*.n_created_sb=*/ 0,
+    /*.n_reused_sb =*/ 0,
+    /*.n_failed_sb =*/ 0,
 };
 
 // GGML_METAL_KPROF_DEBUG=1 adds a KPROFSB line per flush. Off by default so the
@@ -945,7 +950,18 @@ void ggml_metal_kprof_flush(void) {
                     const uint64_t t0 = ts[2*i + 0].timestamp;
                     const uint64_t t1 = ts[2*i + 1].timestamp;
 
-                    if (t0 == MTLCounterErrorValue || t1 == MTLCounterErrorValue || t1 < t0) {
+                    const char * error = NULL;
+                    if (t0 == MTLCounterErrorValue || t1 == MTLCounterErrorValue) {
+                        error = "counter timestamp unavailable";
+                    } else if (t1 < t0) {
+                        error = "counter timestamp regressed";
+                    }
+
+                    if (error != NULL) {
+                        fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"seg\":%d,\"node\":%d,"
+                                "\"error\":\"%s\",\"t0\":%llu,\"t1\":%llu}\n",
+                                seq, batch, seg0 + i, b->nodes[seg0 + i], error,
+                                (unsigned long long) t0, (unsigned long long) t1);
                         continue;
                     }
 
