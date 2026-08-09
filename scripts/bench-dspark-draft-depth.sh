@@ -34,11 +34,22 @@ depth_chars=${DWIN_DEPTH_CHARS:-530000}
 stage_tokens=${DWIN_STAGE_TOKENS:-96}
 profile_tokens=${DWIN_PROFILE_TOKENS:-16}
 cache_ram_mib=${DWIN_CACHE_RAM_MIB:-1536}
-max_fillers=${DWIN_MAX_FILLERS:-32}
+filler_hard_cap=96
+max_fillers=${DWIN_MAX_FILLERS:-$filler_hard_cap}
 allow_deeper=${DWIN_ALLOW_OVER_150K:-0}
 
 if [ "$depth_chars" -gt 800000 ] && [ "$allow_deeper" != "1" ]; then
     echo "refusing a >~150k-token prompt without DWIN_ALLOW_OVER_150K=1" >&2
+    exit 2
+fi
+case $max_fillers in
+    ''|*[!0-9]*)
+        echo "DWIN_MAX_FILLERS must be an integer from 1 through $filler_hard_cap" >&2
+        exit 2
+        ;;
+esac
+if [ "$max_fillers" -lt 1 ] || [ "$max_fillers" -gt "$filler_hard_cap" ]; then
+    echo "DWIN_MAX_FILLERS must be from 1 through $filler_hard_cap" >&2
     exit 2
 fi
 
@@ -50,6 +61,7 @@ if [ "${DWIN_DRY_RUN:-0}" = "1" ]; then
         "profile_tokens=$profile_tokens" \
         "cache_ram_mib=$cache_ram_mib" \
         "max_fillers=$max_fillers" \
+        "filler_hard_cap=$filler_hard_cap" \
         "profile_order=near1,deep1,deep2,near2" \
         "decision=<5.0% reject; >=5.0% stop for explicit 500k review"
     exit 0
@@ -83,11 +95,12 @@ log() {
 }
 
 python3 - "$result_root/manifest.json" "$depth_chars" "$stage_tokens" \
-        "$profile_tokens" "$cache_ram_mib" "$max_fillers" <<'PY'
+        "$profile_tokens" "$cache_ram_mib" "$max_fillers" "$filler_hard_cap" <<'PY'
 import json
 import sys
 
-path, depth_chars, stage_tokens, profile_tokens, cache_ram_mib, max_fillers = sys.argv[1:]
+(path, depth_chars, stage_tokens, profile_tokens, cache_ram_mib, max_fillers,
+ filler_hard_cap) = sys.argv[1:]
 value = {
     "schema": 1,
     "objective": "E1 DSpark context-proportional drafter cost gate",
@@ -100,6 +113,7 @@ value = {
     "profile_order": ["near-kprof-1", "deep-kprof-1", "deep-kprof-2", "near-kprof-2"],
     "cache_ram_mib": int(cache_ram_mib),
     "max_fillers": int(max_fillers),
+    "filler_hard_cap": int(filler_hard_cap),
     "spec_draft_n_max": 5,
     "kprof_stride": 1,
     "ctx_checkpoints": 0,
@@ -552,6 +566,7 @@ replay_n=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))
 cache_token_min=$((replay_n - 1))
 
 deep_disk_entry=
+# Check after every unique entry and stop as soon as the exact deep state spills.
 for i in $(seq 1 "$max_fillers"); do
     filler_prompt=$result_root/filler-$i-tokens.json
     tokenize_prompt "Unique DSpark cache spill filler $i; do not reuse another filler." \
