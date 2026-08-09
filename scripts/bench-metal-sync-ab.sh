@@ -1,9 +1,10 @@
 #!/bin/bash
 
-# Controlled Apple M2 Ultra A/B for GGML_METAL_FAST_SYNC. The default and
-# polling arms use the same binary. Two reversed ABBA cycles per workload
-# balance startup/order drift, while per-process CPU time and a four-request
-# stress batch expose the polling cost that single-lane throughput can hide.
+# Controlled Apple M2 Ultra A/B for GGML_METAL_FAST_SYNC. The blocking opt-out
+# and explicit polling arms use the same binary. Two reversed ABBA cycles per
+# workload balance startup/order drift, while per-process CPU time and a
+# four-request stress batch expose the polling cost that single-lane throughput
+# can hide.
 
 set -euo pipefail
 
@@ -53,6 +54,7 @@ write_metadata() {
         echo "profile_tokens=$profile_tokens"
         echo "wait_env=GGML_METAL_FAST_SYNC=0"
         echo "poll_env=GGML_METAL_FAST_SYNC=1"
+        echo "m2_ultra_default=poll"
         echo "shared_env=LLAMA_DSV4_ADMISSION_VERTICAL=1 GGML_E4M3_MM_NT2_MIN_N=512"
         echo "target_theoretical_ceiling_pct=0.5"
         echo "spec_theoretical_ceiling_pct=0.7"
