@@ -37,7 +37,7 @@ def arguments(**overrides: object) -> argparse.Namespace:
         "burst_interval_seconds": 2,
         "burst_n_predict": 16,
         "alignment_tokens": 128,
-        "active_fast_chunk_limit_tokens": 128,
+        "priority_chunk_limit_tokens": 2048,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -83,6 +83,7 @@ class AdaptivePrefillSmokeTests(unittest.TestCase):
         SMOKE.validate_args(args)
         config = SMOKE.config_from_args(args)
         self.assertNotIn("mode", config)
+        self.assertEqual(config["acceptance"]["priority_chunk_limit_tokens"], 2048)
         self.assertEqual(
             SMOKE.expected_trusted_requests(config),
             {

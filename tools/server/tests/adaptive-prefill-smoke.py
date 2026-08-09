@@ -518,9 +518,10 @@ class Smoke:
         generations: set[int] = set()
         cursors: dict[int, int] = {}
         low_active_fast = 0
+        low_large_active_fast = 0
         low_aligned_yields = 0
         alignment = self.config["acceptance"]["prefill_alignment_tokens"]
-        active_limit = self.config["acceptance"]["active_fast_chunk_limit_tokens"]
+        priority_limit = self.config["acceptance"]["priority_chunk_limit_tokens"]
         low_id = request_ids["low-8k"]
         for event in events:
             kind = event["event"]
@@ -553,11 +554,12 @@ class Smoke:
                 if (event["yield_boundary"] and not event["completes_prompt"]
                         and end % alignment):
                     raise RuntimeError(f"non-final yield ends off alignment: {event}")
-                if event["active_decode"] and event["active_decode_lane"] == "fast":
-                    if end - begin > active_limit:
-                        raise RuntimeError(f"active-fast chunk over limit: {event}")
-                    if request_id == low_id:
-                        low_active_fast += 1
+                if event["active_decode"] and end - begin > priority_limit:
+                    raise RuntimeError(f"mixed prefill chunk over priority limit: {event}")
+                if event["active_decode"] and event["active_decode_lane"] == "fast" and request_id == low_id:
+                    low_active_fast += 1
+                    if end - begin > alignment:
+                        low_large_active_fast += 1
             elif kind == "prefill_chunk_aborted":
                 raise RuntimeError(f"prefill abort: {event}")
             elif kind == "prefill_owner_released":
@@ -574,9 +576,10 @@ class Smoke:
                 owner = None
         if owner is not None or staged:
             raise RuntimeError("trace ends with live owner/stage")
-        if low_active_fast < 1 or low_aligned_yields < 1:
+        if low_active_fast < 1 or low_large_active_fast < 1 or low_aligned_yields < 1:
             raise RuntimeError(
-                f"missing vertical overlap proof: low_active_fast={low_active_fast}, low_yields={low_aligned_yields}")
+                f"missing vertical overlap proof: low_active_fast={low_active_fast}, "
+                f"low_large_active_fast={low_large_active_fast}, low_yields={low_aligned_yields}")
         prompt_by_id = {int(event["request_id"]): int(event["prompt_tokens"]) for event in registrations}
         if cursors != prompt_by_id:
             raise RuntimeError(f"committed prompt ranges differ from registrations: {cursors} != {prompt_by_id}")
@@ -585,6 +588,7 @@ class Smoke:
             "unique_generations": len(generations), "maximum_prefill_owners": 1,
             "low_active_fast_commits": low_active_fast,
             "low_aligned_yielded_releases": low_aligned_yields,
+            "low_large_active_fast_commits": low_large_active_fast,
         }
 
     def exact_pair(self, left: str, right: str) -> None:
@@ -687,7 +691,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--burst-interval-seconds", type=int, default=2)
     parser.add_argument("--burst-n-predict", type=int, default=16)
     parser.add_argument("--alignment-tokens", type=int, default=128)
-    parser.add_argument("--active-fast-chunk-limit-tokens", type=int, default=128)
+    parser.add_argument("--priority-chunk-limit-tokens", type=int, default=2048)
     return parser.parse_args()
 
 
@@ -735,7 +739,7 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         },
         "acceptance": {
             "prefill_alignment_tokens": args.alignment_tokens,
-            "active_fast_chunk_limit_tokens": args.active_fast_chunk_limit_tokens,
+            "priority_chunk_limit_tokens": args.priority_chunk_limit_tokens,
         },
     }
     if args.sequential_bursts:
@@ -752,8 +756,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("prompt lengths must be positive")
     if min(args.low_n_predict, args.fast_n_predict, args.reference_n_predict,
            args.burst_n_predict, args.alignment_tokens,
-           args.active_fast_chunk_limit_tokens) <= 0:
-        raise ValueError("prediction and alignment values must be positive")
+           args.priority_chunk_limit_tokens) <= 0:
+        raise ValueError("prediction, alignment, and priority chunk limits must be positive")
     if args.sequential_bursts:
         if args.burst_count != SEQUENTIAL_BURST_COUNT:
             raise ValueError(f"sequential burst mode requires --burst-count {SEQUENTIAL_BURST_COUNT}")

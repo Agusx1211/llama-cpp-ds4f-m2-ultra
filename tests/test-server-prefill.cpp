@@ -858,7 +858,7 @@ void test_late_fast_arrival_has_finite_committed_token_bound() {
 }
 
 // [TAG_PREFILL_PRIORITY]
-void test_prefill_priority_keeps_full_chunks_under_active_decode() {
+void test_prefill_priority_keeps_full_chunks_for_every_decode_lane() {
     coordinator_config config;
     config.alignment_tokens           = 4;
     config.idle_chunk_tokens          = 16;
@@ -866,7 +866,6 @@ void test_prefill_priority_keeps_full_chunks_under_active_decode() {
     config.active_fast_chunk_tokens   = 4;
     require(config.prefill_priority, "prefill priority is the shipped default");
     require(config.priority_chunk_tokens == 0, "the shipped default caps the priority chunk only at the idle budget");
-    require(config.priority_yields_to_fast, "the shipped default keeps yielding to a fast-lane generator");
 
     coordinator owner(config);
     require(static_cast<bool>(owner.select_owner({ request(1, server_scheduler::lane::low, 1) })),
@@ -874,20 +873,20 @@ void test_prefill_priority_keeps_full_chunks_under_active_decode() {
 
     require(owner.limit_chunk(1, 0, 32, 32, {}).end_token == 16, "an idle chunk is unchanged by prefill priority");
     require(owner.limit_chunk(1, 0, 32, 32, { true, server_scheduler::lane::low }).end_token == 16,
-            "a low-lane generator no longer shrinks the prefill chunk");
+            "a low-lane generator keeps the large-M priority chunk");
     require(owner.limit_chunk(1, 0, 32, 32, { true, server_scheduler::lane::normal }).end_token == 16,
-            "a normal-lane generator no longer shrinks the prefill chunk");
-    require(owner.limit_chunk(1, 0, 32, 32, { true, server_scheduler::lane::fast }).end_token == 4,
-            "prefill still yields to a fast-lane generator by default");
+            "a normal-lane generator keeps the large-M priority chunk");
+    require(owner.limit_chunk(1, 0, 32, 32, { true, server_scheduler::lane::fast }).end_token == 16,
+            "a fast-lane generator no longer forces the 128-token-equivalent chunk");
 
     // The batch-space clamp and anchor alignment are unaffected by the policy.
-    require(owner.limit_chunk(1, 0, 32, 10, { true, server_scheduler::lane::normal }).end_token == 8,
+    require(owner.limit_chunk(1, 0, 32, 10, { true, server_scheduler::lane::fast }).end_token == 8,
             "a priority chunk is still clamped to the available batch space and aligned down");
-    require(owner.limit_chunk(1, 0, 32, 3, { true, server_scheduler::lane::normal }).end_token == 3,
+    require(owner.limit_chunk(1, 0, 32, 3, { true, server_scheduler::lane::fast }).end_token == 3,
             "a batch too small for the next anchor still makes progress");
 }
 
-void test_prefill_priority_knobs_select_the_three_policies() {
+void test_prefill_priority_knobs_select_priority_and_rollback() {
     coordinator_config base;
     base.alignment_tokens           = 4;
     base.idle_chunk_tokens          = 16;
@@ -897,7 +896,8 @@ void test_prefill_priority_knobs_select_the_three_policies() {
     const decode_activity normal_decode = { true, server_scheduler::lane::normal };
     const decode_activity fast_decode   = { true, server_scheduler::lane::fast };
 
-    // Rollback lever: identical to the pre-priority behavior.
+    // Rollback lever: identical to the pre-priority behavior, including the
+    // lane-specific fast cap.
     {
         coordinator_config config = base;
         config.prefill_priority   = false;
@@ -908,24 +908,17 @@ void test_prefill_priority_knobs_select_the_three_policies() {
         require(owner.limit_chunk(1, 0, 32, 32, {}).end_token == 16, "rollback leaves the idle budget alone");
     }
 
-    // Sweep lever: an explicit cap on the priority chunk.
+    // Sweep lever: an explicit cap applies uniformly to active decode lanes.
     {
         coordinator_config config    = base;
         config.priority_chunk_tokens = 12;
         coordinator owner(config);
         require(static_cast<bool>(owner.select_owner({ request(1, server_scheduler::lane::low, 1) })), "select owner");
-        require(owner.limit_chunk(1, 0, 32, 32, normal_decode).end_token == 12, "the priority chunk cap is honored");
+        require(owner.limit_chunk(1, 0, 32, 32, normal_decode).end_token == 12,
+                "the normal priority chunk cap is honored");
+        require(owner.limit_chunk(1, 0, 32, 32, fast_decode).end_token == 12,
+                "the fast priority chunk uses the same cap");
         require(owner.limit_chunk(1, 0, 32, 32, {}).end_token == 16, "the priority cap does not touch idle chunks");
-    }
-
-    // Fast-lane opt-in: priority applies to every lane.
-    {
-        coordinator_config config      = base;
-        config.priority_yields_to_fast = false;
-        coordinator owner(config);
-        require(static_cast<bool>(owner.select_owner({ request(1, server_scheduler::lane::low, 1) })), "select owner");
-        require(owner.limit_chunk(1, 0, 32, 32, fast_decode).end_token == 16,
-                "opting in stops prefill from yielding to a fast-lane generator");
     }
 
     // A priority chunk larger than the idle budget is a configuration error
@@ -940,6 +933,85 @@ void test_prefill_priority_knobs_select_the_three_policies() {
             rejected = true;
         }
         require(rejected, "a priority chunk above the idle budget is rejected");
+    }
+}
+
+void test_decode_cadence_bounds_service_and_empty_escape() {
+    decode_cadence cadence(2);
+    require(cadence.begin_iteration(true), "a new prefill window services decode immediately");
+    cadence.note_decode_served();
+    cadence.note_chunk_committed();
+    require(!cadence.begin_iteration(true), "one of two committed chunks defers decode");
+    cadence.note_chunk_committed();
+    require(cadence.begin_iteration(true), "two committed chunks make decode due");
+    cadence.note_decode_served();
+    require(cadence.begin_iteration(false), "prompt completion restores unrestricted decode immediately");
+    require(cadence.begin_iteration(true), "a later prefill window again services its first mixed iteration");
+
+    decode_cadence disabled(0);
+    require(!disabled.begin_iteration(true), "zero cadence defers decode during productive prefill");
+    disabled.force_decode_next();
+    require(disabled.begin_iteration(true), "an empty gated iteration forces the liveness decode");
+    disabled.note_decode_served();
+    require(disabled.begin_iteration(false), "zero cadence cannot suppress decode after prompt completion");
+}
+
+void test_fast_generators_and_long_prefill_keep_large_chunks_with_bounded_service() {
+    coordinator_config config;
+    config.alignment_tokens           = 4;
+    config.idle_chunk_tokens          = 16;
+    config.active_decode_chunk_tokens = 8;
+    config.active_fast_chunk_tokens   = 4;
+
+    decode_activity generators;
+    generators.include(server_scheduler::lane::low);
+    generators.include(server_scheduler::lane::normal);
+    generators.include(server_scheduler::lane::fast);
+    require(generators.active && generators.highest_lane == server_scheduler::lane::fast,
+            "multiple generators aggregate to the highest active lane");
+
+    for (const server_scheduler::lane prefill_lane :
+         { server_scheduler::lane::low, server_scheduler::lane::normal }) {
+        coordinator owner(config);
+        const uint64_t request_id = prefill_lane == server_scheduler::lane::low ? 1 : 2;
+        require(owner.select_owner({ request(request_id, prefill_lane, request_id) }).request_id == request_id,
+                "select long prefill cohort");
+
+        decode_cadence cadence(1);
+        uint64_t       committed             = 0;
+        uint32_t       chunks                = 0;
+        uint32_t       commits_since_decode  = 0;
+        uint32_t       maximum_service_gap   = 0;
+        constexpr uint64_t prompt_tokens     = 68;
+
+        while (committed < prompt_tokens) {
+            require(cadence.begin_iteration(true), "default cadence services every mixed prefill iteration");
+            maximum_service_gap = std::max(maximum_service_gap, commits_since_decode);
+            commits_since_decode = 0;
+            cadence.note_decode_served();
+
+            const auto limit = owner.limit_chunk(request_id, committed, prompt_tokens, 64, generators);
+            require(static_cast<bool>(limit), "long mixed prefill chunk is available");
+            if (limit.end_token != prompt_tokens) {
+                require(limit.end_token - committed == config.idle_chunk_tokens,
+                        "non-final fast-overlap prefill retains the full priority chunk");
+                require(limit.end_token - committed > config.active_fast_chunk_tokens,
+                        "fast overlap does not regress to the legacy small chunk");
+            }
+
+            const auto lease = owner.stage_chunk(request_id, committed, limit.end_token, prompt_tokens);
+            require(static_cast<bool>(lease), "long mixed prefill chunk stages");
+            require(owner.commit_chunk(lease), "long mixed prefill chunk commits exactly once");
+            cadence.note_chunk_committed();
+            committed = lease.end_token;
+            ++commits_since_decode;
+            ++chunks;
+        }
+
+        maximum_service_gap = std::max(maximum_service_gap, commits_since_decode);
+        require(chunks == 5 && committed == prompt_tokens, "long prompt completes with four full chunks and one tail");
+        require(maximum_service_gap <= 1, "fast generation service is bounded by one committed prefill chunk");
+        require(cadence.begin_iteration(false), "decode is immediately unrestricted after long prompt completion");
     }
 }
 
@@ -962,8 +1034,11 @@ int main() {
         { "three cohort round robin",             test_three_cohort_round_robin_survives_arrival_and_removal      },
         { "weighted cross lane service",          test_weighted_cross_lane_service_is_bounded_and_work_conserving },
         { "late fast committed-token bound",      test_late_fast_arrival_has_finite_committed_token_bound         },
-        { "prefill priority full chunks",         test_prefill_priority_keeps_full_chunks_under_active_decode     },
-        { "prefill priority policy knobs",        test_prefill_priority_knobs_select_the_three_policies           },
+        { "prefill priority all decode lanes",    test_prefill_priority_keeps_full_chunks_for_every_decode_lane  },
+        { "prefill priority policy knobs",        test_prefill_priority_knobs_select_priority_and_rollback       },
+        { "prefill decode cadence bound",         test_decode_cadence_bounds_service_and_empty_escape            },
+        { "fast generators with long prefill",
+          test_fast_generators_and_long_prefill_keep_large_chunks_with_bounded_service },
     };
 
     try {
