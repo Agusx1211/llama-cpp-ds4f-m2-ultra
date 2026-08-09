@@ -8,6 +8,11 @@ set -euo pipefail
 
 export PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
+if [ -z "${M2_ULTRA_QUEUE_TOKEN:-}" ]; then
+    echo "bench-metal-sync-wake.sh must run inside m2-ultra-queue.sh" >&2
+    exit 2
+fi
+
 lane_root=/Users/agusx1211/worktrees/llama-cpp-m2-ultra/campaign-0809-fast-sync
 model=/Users/agusx1211/unsloth/gguf-m2/dsv4-flash-0731-full.m2.gguf
 draft=/Users/agusx1211/unsloth/gguf-m2/dspark-0731-expertsonly.m2.gguf
@@ -44,7 +49,10 @@ restore_prod() {
     set +e
     stop_bench
     log "restoring production elastic4 service (harness rc=$rc)"
-    /Users/agusx1211/start-llama-server.sh elastic4 >> "$result_root/restore.log" 2>&1
+    # Production must outlive this queue job. Do not let the restored tmux
+    # session inherit the queue ownership token from the benchmark harness.
+    env -u M2_ULTRA_QUEUE_TOKEN \
+        /Users/agusx1211/start-llama-server.sh elastic4 >> "$result_root/restore.log" 2>&1
 
     local healthy=0
     local i

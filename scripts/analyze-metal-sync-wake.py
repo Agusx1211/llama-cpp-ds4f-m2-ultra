@@ -59,7 +59,7 @@ def parse(path: Path) -> list[dict[str, object]]:
 def summarize(name: str, records: list[dict[str, object]]) -> None:
     wakes = [int(record["wake"]) for record in records]
     waits = [int(record["wait"]) for record in records]
-    print(
+    fields = [
         name,
         f"n={len(records)}",
         f"wake_mean_us={statistics.fmean(wakes):.3f}",
@@ -71,7 +71,17 @@ def summarize(name: str, records: list[dict[str, object]]) -> None:
         f"wake_p99_us={percentile(wakes, 0.99):.3f}",
         f"wake_max_us={max(wakes)}",
         f"wait_p50_us={percentile(waits, 0.50):.3f}",
-    )
+    ]
+    polls = [int(record.get("polls", 0)) for record in records]
+    if any(polls):
+        fields.extend(
+            [
+                f"polls_mean={statistics.fmean(polls):.3f}",
+                f"polls_p50={percentile(polls, 0.50):.3f}",
+                f"polls_p95={percentile(polls, 0.95):.3f}",
+            ]
+        )
+    print(*fields)
 
 
 def main() -> None:
@@ -104,10 +114,23 @@ def main() -> None:
 
     if retained:
         summarize("all", retained)
+    else:
+        raise SystemExit("no valid HOSTPROF cbw samples remained after filtering")
 
     if args.csv:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["line", "context", "t", "wait", "ge", "wake", "status", "sync_wait_us"]
+        fields = [
+            "line",
+            "context",
+            "t",
+            "wait",
+            "ge",
+            "wake",
+            "status",
+            "mode",
+            "polls",
+            "sync_wait_us",
+        ]
         with args.csv.open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
