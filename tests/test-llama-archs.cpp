@@ -14,7 +14,7 @@
 #include "../src/llama-kv-cache-dsv4-accounting.h"
 #include "../src/llama-model-saver.h"
 
-#include <stdlib.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
