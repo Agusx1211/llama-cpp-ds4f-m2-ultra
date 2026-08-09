@@ -69,11 +69,14 @@ private:
     const server_http_req * req = nullptr;
     // set once next_orig reports no more data, so on_complete() doesn't re-drain a finished stream
     bool next_finished = false;
+    std::function<void(const std::string &)> produced_chunk_observer;
 
 public:
     void set_req(const server_http_req * req);
     bool conn_alive();
     bool should_stop();
     void on_complete() override;
+    bool set_produced_chunk_observer(std::function<void(const std::string &)> observer) override;
+    bool stream_generation_complete() const override;
     void set_next(std::function<bool(std::string &)> next_fn);
 };

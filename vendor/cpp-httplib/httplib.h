@@ -1645,6 +1645,15 @@ struct Request {
   Headers trailers;
   std::string body;
 
+  // Optional server-side capture of the decoded HTTP application entity.
+  // When enabled by Server::set_request_body_capture_predicate, this is
+  // populated before multipart/form parsing. Transfer framing and supported
+  // Content-Encoding layers have already been removed; multipart boundary
+  // bytes are preserved exactly. It is empty when the entity is empty, so use
+  // has_captured_body() to distinguish that case from disabled capture.
+  const std::string &captured_body() const { return captured_body_; }
+  bool has_captured_body() const { return captured_body_active_; }
+
   std::string remote_addr;
   int remote_port = -1;
   std::string local_addr;
@@ -1687,6 +1696,8 @@ struct Request {
 
   // private members...
   bool body_consumed_ = false;
+  std::string captured_body_;
+  bool captured_body_active_ = false;
   size_t redirect_count_ = CPPHTTPLIB_REDIRECT_MAX_COUNT;
   size_t content_length_ = 0;
   ContentProvider content_provider_;
@@ -2063,6 +2074,11 @@ public:
 
   using StartHandler = std::function<void()>;
 
+  // Evaluated after routing/authentication and before reading request content.
+  // No capture allocation or copy occurs when this predicate is unset or
+  // returns false.
+  using RequestBodyCapturePredicate = std::function<bool(const Request &)>;
+
   using WebSocketHandler =
       std::function<void(const Request &, ws::WebSocket &)>;
   using SubProtocolSelector =
@@ -2116,6 +2132,9 @@ public:
   Server &set_expect_100_continue_handler(Expect100ContinueHandler handler);
 
   Server &set_start_handler(StartHandler handler);
+
+  Server &set_request_body_capture_predicate(
+      RequestBodyCapturePredicate predicate);
 
   Server &set_logger(Logger logger);
   Server &set_pre_compression_logger(Logger logger);
@@ -2307,6 +2326,7 @@ private:
   HandlerWithResponse pre_request_handler_;
   Expect100ContinueHandler expect_100_continue_handler_;
   StartHandler start_handler_;
+  RequestBodyCapturePredicate request_body_capture_predicate_;
 
   mutable std::mutex logger_mutex_;
   Logger logger_;

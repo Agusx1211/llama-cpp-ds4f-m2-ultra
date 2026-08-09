@@ -2,11 +2,13 @@
 #include "http.h"
 #include "server-http.h"
 #include "server-common.h"
+#include "server-request-history.h"
 #include "ui.h"
 
 #include <cpp-httplib/httplib.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <functional>
 #include <future>
@@ -21,6 +23,7 @@
 class server_http_context::Impl {
 public:
     std::unique_ptr<httplib::Server> srv;
+    std::shared_ptr<server_request_history::store> request_history;
 };
 
 server_http_context::server_http_context()
@@ -137,6 +140,33 @@ bool server_http_context::init(const common_params & params) {
         return v != nullptr && v[0] != '\0' && std::string(v) != "0";
     }();
 
+    // Router children receive the router's command line, including this
+    // option. The public router owns the exact decoded client request/response
+    // application entities; a child must not contend for the same owner lock
+    // or duplicate the router-to-child proxy exchange.
+    const bool is_router_child = std::getenv("LLAMA_SERVER_ROUTER_PORT") != nullptr;
+    if (!params.request_history_root.empty() && !is_router_child) {
+        server_request_history::config history_config;
+        history_config.root_path = params.request_history_root;
+        history_config.retention_age_ns = static_cast<uint64_t>(params.request_history_days) *
+                                          24ULL * 60ULL * 60ULL * 1000ULL * 1000ULL * 1000ULL;
+        history_config.max_retained_bytes = static_cast<uint64_t>(params.request_history_max_gib) *
+                                            1024ULL * 1024ULL * 1024ULL;
+        history_config.max_retained_files = static_cast<uint64_t>(params.request_history_max_files);
+        history_config.terminal_ack_timeout_ms = static_cast<uint64_t>(params.request_history_ack_ms);
+        try {
+            pimpl->request_history = std::make_shared<server_request_history::store>(std::move(history_config));
+            SRV_INF("request history enabled: root=%s retention_days=%d max_gib=%d max_files=%d\n",
+                    params.request_history_root.c_str(), params.request_history_days,
+                    params.request_history_max_gib, params.request_history_max_files);
+        } catch (const std::exception & error) {
+            SRV_ERR("request history initialization failed: %s\n", error.what());
+            return false;
+        }
+    } else if (!params.request_history_root.empty()) {
+        SRV_INF("%s", "request history is owned by the router; disabled in this child\n");
+    }
+
     if (gcp.enabled) {
         SRV_TRC("Google Cloud Platform compat: health route = %s, predict route = %s, port = %d\n", gcp.path_health.c_str(), gcp.path_predict.c_str(), gcp.port);
 
@@ -178,6 +208,17 @@ bool server_http_context::init(const common_params & params) {
                 SRV_WRN("trusted-LAN: failed to mount dashboard directory %s\n", dash_dir);
             }
         }
+    }
+    if (pimpl->request_history) {
+        // cpp-httplib already retains ordinary decoded entities in req.body.
+        // Multipart is the exceptional path: its parser consumes the entity
+        // into req.form, so opt in to the pre-form decoded-entity tap only for
+        // history-owned inference routes. This avoids a second prompt-sized
+        // copy for ordinary JSON requests and has zero cost when disabled.
+        srv->set_request_body_capture_predicate([prefix = path_prefix](const httplib::Request & req) {
+            return req.is_multipart_form_data() &&
+                   server_request_history::should_capture(req.method, req.path, prefix);
+        });
     }
     // srv->set_logger(log_server_request); // TODO @ngxson : this is too spamy, no very useful; improve it in the future
     srv->set_exception_handler([](const httplib::Request &, httplib::Response & res, const std::exception_ptr & ep) {
@@ -536,6 +577,11 @@ bool server_http_context::start() {
 }
 
 void server_http_context::stop() const {
+    // Stop acceptance first so HTTP workers blocked by history backpressure
+    // are released before cpp-httplib joins its pool.
+    if (pimpl->request_history) {
+        pimpl->request_history->stop_accepting();
+    }
     if (pimpl->srv) {
         pimpl->srv->stop();
     }
@@ -591,6 +637,189 @@ static std::map<std::string, std::string> get_headers(const httplib::Request & r
         headers[key] = value;
     }
     return headers;
+}
+
+struct request_history_fields {
+    std::string model;
+    std::string profile;
+};
+
+// Metadata is best effort. Exact entities are always persisted, but reparsing
+// an arbitrarily large prompt or response on an HTTP worker would duplicate
+// memory and add request latency. Offline inspection can derive fields from
+// bodies above this bound.
+static constexpr size_t REQUEST_HISTORY_METADATA_PARSE_MAX = 64 * 1024;
+
+static std::string request_history_json_field(const json & object, const char * name) {
+    if (!object.is_object()) {
+        return {};
+    }
+    const auto found = object.find(name);
+    if (found == object.end() || found->is_null()) {
+        return {};
+    }
+    if (found->is_string()) {
+        return found->get<std::string>();
+    }
+    if (found->is_boolean() || found->is_number()) {
+        return found->dump();
+    }
+    return {};
+}
+
+static request_history_fields request_history_extract_fields(const std::string & raw_body) {
+    request_history_fields fields;
+    if (raw_body.size() > REQUEST_HISTORY_METADATA_PARSE_MAX) return fields;
+    const json body = json::parse(raw_body, nullptr, false);
+    if (body.is_discarded() || !body.is_object()) {
+        return fields;
+    }
+    fields.model = request_history_json_field(body, "model");
+    for (const char * name : { "profile", "service_tier", "reasoning_effort" }) {
+        const std::string value = request_history_json_field(body, name);
+        if (!value.empty()) {
+            if (!fields.profile.empty()) fields.profile += ';';
+            fields.profile += std::string(name) + '=' + value;
+        }
+    }
+    return fields;
+}
+
+static std::string request_history_usage_from_json(const json & value) {
+    if (!value.is_object()) return {};
+    const auto usage = value.find("usage");
+    if (usage != value.end() && (usage->is_object() || usage->is_array())) {
+        return usage->dump(-1, ' ', false, json::error_handler_t::replace);
+    }
+    for (const char * container : { "message", "response" }) {
+        const auto nested = value.find(container);
+        if (nested != value.end() && nested->is_object()) {
+            const auto nested_usage = nested->find("usage");
+            if (nested_usage != nested->end() && (nested_usage->is_object() || nested_usage->is_array())) {
+                return nested_usage->dump(-1, ' ', false, json::error_handler_t::replace);
+            }
+        }
+    }
+    return {};
+}
+
+static std::string request_history_extract_usage(const std::string & entity) {
+    if (entity.size() > REQUEST_HISTORY_METADATA_PARSE_MAX) return {};
+    const json whole = json::parse(entity, nullptr, false);
+    if (!whole.is_discarded()) {
+        const std::string usage = request_history_usage_from_json(whole);
+        if (!usage.empty()) return usage;
+    }
+    size_t offset = 0;
+    std::string latest;
+    while (offset < entity.size()) {
+        const size_t end = entity.find('\n', offset);
+        const size_t length = (end == std::string::npos ? entity.size() : end) - offset;
+        std::string line = entity.substr(offset, length);
+        offset = end == std::string::npos ? entity.size() : end + 1;
+        if (line.rfind("data:", 0) != 0) continue;
+        size_t value_offset = 5;
+        while (value_offset < line.size() && std::isspace(static_cast<unsigned char>(line[value_offset]))) {
+            ++value_offset;
+        }
+        if (line.compare(value_offset, 6, "[DONE]") == 0) continue;
+        const json event = json::parse(line.begin() + static_cast<std::ptrdiff_t>(value_offset), line.end(), nullptr, false);
+        if (event.is_discarded()) continue;
+        const std::string usage = request_history_usage_from_json(event);
+        if (!usage.empty()) latest = usage;
+    }
+    return latest;
+}
+
+static bool request_history_entity_is_error(const std::string & entity) {
+    if (entity.size() > REQUEST_HISTORY_METADATA_PARSE_MAX) return false;
+    const json whole = json::parse(entity, nullptr, false);
+    if (!whole.is_discarded() && whole.is_object() && whole.contains("error")) return true;
+
+    // Parse complete SSE fields rather than substring matching generated text.
+    // A JSON data object carrying an error is also terminal even when the
+    // provider omits the optional `event: error` field.
+    std::string event_name;
+    std::string data;
+    size_t offset = 0;
+    while (offset <= entity.size()) {
+        const size_t newline = entity.find('\n', offset);
+        size_t end = newline == std::string::npos ? entity.size() : newline;
+        if (end != offset && entity[end - 1] == '\r') --end;
+        const std::string line = entity.substr(offset, end - offset);
+        if (line.empty()) {
+            if (event_name == "error") return true;
+            if (!data.empty()) {
+                const json payload = json::parse(data, nullptr, false);
+                if (!payload.is_discarded() && payload.is_object() && payload.contains("error")) return true;
+            }
+            event_name.clear();
+            data.clear();
+        } else if (line.rfind("event:", 0) == 0) {
+            size_t value = 6;
+            if (value < line.size() && line[value] == ' ') ++value;
+            event_name = line.substr(value);
+        } else if (line.rfind("data:", 0) == 0) {
+            size_t value = 5;
+            if (value < line.size() && line[value] == ' ') ++value;
+            if (!data.empty()) data.push_back('\n');
+            data.append(line, value, std::string::npos);
+        }
+        if (newline == std::string::npos) break;
+        offset = newline + 1;
+    }
+    if (event_name == "error") return true;
+    if (!data.empty()) {
+        const json payload = json::parse(data, nullptr, false);
+        return !payload.is_discarded() && payload.is_object() && payload.contains("error");
+    }
+    return false;
+}
+
+static void request_history_report_terminal(uint64_t record_id, const server_request_history::result & result) {
+    if (result.value == server_request_history::status::ok && result.durable) return;
+    if (result.durable) {
+        SRV_ERR("request history record %llu is durable but maintenance failed: status=%s errno=%d\n",
+                static_cast<unsigned long long>(record_id), server_request_history::status_name(result.value),
+                result.os_error);
+    } else {
+        SRV_ERR("request history record %llu not durably published: status=%s errno=%d durable=0\n",
+                static_cast<unsigned long long>(record_id), server_request_history::status_name(result.value),
+                result.os_error);
+    }
+}
+
+static void request_history_report_append(
+        const std::shared_ptr<server_request_history::session> & history,
+        const char * entity) {
+    const server_request_history::result failure = history->failure_status();
+    SRV_ERR("request history %s append failed for record %llu; record is not yet durable: status=%s errno=%d\n",
+            entity, static_cast<unsigned long long>(history->record_id()),
+            server_request_history::status_name(failure.value), failure.os_error);
+}
+
+static std::shared_ptr<server_request_history::session> request_history_begin(
+        const std::shared_ptr<server_request_history::store> & history,
+        const std::string & method,
+        const std::string & path,
+        const std::string & raw_body,
+        const std::string & path_prefix) {
+    if (!history || !server_request_history::should_capture(method, path, path_prefix)) return nullptr;
+    const request_history_fields fields = request_history_extract_fields(raw_body);
+    auto session = history->begin(method, path, raw_body, fields.model, fields.profile);
+    if (!session) {
+        const auto state = history->get_stats();
+        SRV_ERR("request history ingress rejected: status=%s errno=%d\n",
+                server_request_history::status_name(state.last_failure.value), state.last_failure.os_error);
+    }
+    return session;
+}
+
+static const std::string & request_history_application_entity(const httplib::Request & req) {
+    // Bodies are decoded application entities, not transfer-framed/compressed
+    // wire bytes. The optional tap exists only because multipart parsing would
+    // otherwise consume those exact boundary bytes out of req.body.
+    return req.has_captured_body() ? req.captured_body() : req.body;
 }
 
 static bool header_name_equals(const std::string & left, const char * right) {
@@ -673,7 +902,11 @@ static std::string build_query_string(const httplib::Request & req) {
 // using unique_ptr for request to allow safe capturing in lambdas
 using server_http_req_ptr = std::unique_ptr<server_http_req>;
 
-static void process_handler_response(server_http_req_ptr && request, server_http_res_ptr & response, httplib::Response & res) {
+static void process_handler_response(
+        server_http_req_ptr && request,
+        server_http_res_ptr & response,
+        httplib::Response & res,
+        std::shared_ptr<server_request_history::session> history) {
     if (response->is_stream()) {
         res.status = response->status;
         // Tell Nginx to not buffer any streamed response
@@ -683,29 +916,111 @@ static void process_handler_response(server_http_req_ptr && request, server_http
         // convert to shared_ptr as both chunked_content_provider() and on_complete() need to use it
         std::shared_ptr<server_http_req> q_ptr = std::move(request);
         std::shared_ptr<server_http_res> r_ptr = std::move(response);
+        auto exhausted = std::make_shared<std::atomic<bool>>(false);
+        auto stream_error = std::make_shared<std::atomic<bool>>(false);
+        auto request_stopped = std::make_shared<std::atomic<bool>>(false);
 
-        const auto chunked_content_provider = [response = r_ptr](size_t, httplib::DataSink & sink) -> bool {
+        const auto capture_produced_chunk = [history, stream_error](const std::string & chunk) {
+            if (!history || chunk.empty()) return;
+            try {
+                if (!history->append_response(chunk, true)) {
+                    request_history_report_append(history, "stream response");
+                }
+                const std::string usage = request_history_extract_usage(chunk);
+                if (!usage.empty() && !history->set_usage_json(usage)) {
+                    request_history_report_append(history, "usage metadata");
+                }
+                if (request_history_entity_is_error(chunk)) {
+                    stream_error->store(true, std::memory_order_release);
+                }
+            } catch (...) {
+                stream_error->store(true, std::memory_order_release);
+                SRV_ERR("%s", "request history stream observer failed\n");
+            }
+        };
+        const bool captures_full_producer = r_ptr->set_produced_chunk_observer(capture_produced_chunk);
+
+        const auto chunked_content_provider = [request = q_ptr, response = r_ptr, history, exhausted,
+                                               stream_error, request_stopped, capture_produced_chunk,
+                                               captures_full_producer](size_t, httplib::DataSink & sink) -> bool {
             std::string chunk;
-            const bool has_next = response->next(chunk);
+            bool has_next = false;
+            try {
+                has_next = response->next(chunk);
+            } catch (...) {
+                stream_error->store(true, std::memory_order_release);
+                throw;
+            }
             if (!chunk.empty()) {
                 if (!sink.write(chunk.data(), chunk.size())) {
                     return false;
                 }
+                if (!captures_full_producer) capture_produced_chunk(chunk);
                 SRV_DBG("http: streamed chunk: %s\n", chunk.c_str());
             }
             if (!has_next) {
+                request_stopped->store(request->should_stop(), std::memory_order_release);
+                exhausted->store(true, std::memory_order_release);
                 sink.done();
                 SRV_DBG("%s", "http: stream ended\n");
             }
-            return has_next;
+            // cpp-httplib interprets false as provider cancellation, including
+            // after sink.done(). Clean exhaustion must therefore return true;
+            // sink.write failure above is the only cancellation return.
+            return true;
         };
-        const auto on_complete = [request = q_ptr, response = r_ptr](bool) mutable {
-            response->on_complete();
+        const int response_status = r_ptr->status;
+        const auto on_complete = [request = q_ptr, response = r_ptr, history, exhausted, stream_error,
+                                  request_stopped, response_status, captures_full_producer](bool transport_success) mutable {
+            // A resumable stream may deliberately finish producer execution
+            // here after the peer has gone away. Its observer captures that
+            // tail before history is terminalized.
+            try {
+                response->on_complete();
+            } catch (...) {
+                stream_error->store(true, std::memory_order_release);
+                SRV_ERR("%s", "http: stream completion drain failed\n");
+            }
+            if (history) {
+                const bool generation_complete = exhausted->load(std::memory_order_acquire) ||
+                                                 response->stream_generation_complete();
+                const bool aborted = !generation_complete ||
+                    (!captures_full_producer && request_stopped->load(std::memory_order_acquire));
+                const server_request_history::outcome terminal_outcome = aborted ?
+                    server_request_history::outcome::aborted :
+                    (response_status >= 400 || stream_error->load(std::memory_order_acquire) ?
+                        server_request_history::outcome::error : server_request_history::outcome::complete);
+                try {
+                    request_history_report_terminal(
+                        history->record_id(), history->finish(
+                            response_status, terminal_outcome, true, transport_success, true));
+                } catch (...) {
+                    SRV_ERR("%s", "request history stream terminalization threw unexpectedly\n");
+                }
+            }
+            if (!transport_success) {
+                SRV_DBG("%s", "http: transport ended before/at stream completion; history outcome describes producer completion\n");
+            }
             response.reset();
             request.reset();
         };
         res.set_chunked_content_provider(content_type, chunked_content_provider, on_complete);
     } else {
+        if (history) {
+            if (!response->data.empty() && !history->append_response(response->data, false)) {
+                request_history_report_append(history, "response");
+            }
+            const std::string usage = request_history_extract_usage(response->data);
+            if (!usage.empty() && !history->set_usage_json(usage)) {
+                request_history_report_append(history, "usage metadata");
+            }
+            const server_request_history::outcome terminal_outcome = request->should_stop() ?
+                server_request_history::outcome::aborted :
+                (response->status >= 400 ? server_request_history::outcome::error :
+                                           server_request_history::outcome::complete);
+            request_history_report_terminal(
+                history->record_id(), history->finish(response->status, terminal_outcome, false));
+        }
         res.status = response->status;
         set_headers(res, response->headers);
         res.set_content(response->data, response->content_type);
@@ -715,7 +1030,11 @@ static void process_handler_response(server_http_req_ptr && request, server_http
 
 void server_http_context::get(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto serve = [handler](const httplib::Request & req, httplib::Response & res) {
+    auto serve = [handler, history = pimpl->request_history, prefix = path_prefix](
+            const httplib::Request & req,
+            httplib::Response & res) {
+        auto history_session = request_history_begin(
+            history, req.method, req.path, request_history_application_entity(req), prefix);
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -730,14 +1049,20 @@ void server_http_context::get(const std::string & path, const server_http_contex
             has_ambiguous_dashboard_security_headers(req)
         });
         server_http_res_ptr response = handler(*request);
-        process_handler_response(std::move(request), response, res);
+        process_handler_response(std::move(request), response, res, std::move(history_session));
     };
     pimpl->srv->Get(path_prefix + path, std::move(serve));
 }
 
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto serve = [handler](const httplib::Request & req, httplib::Response & res) {
+    auto serve = [handler, history = pimpl->request_history, prefix = path_prefix](
+            const httplib::Request & req,
+            httplib::Response & res) {
+        // Capture the exact decoded application entity before multipart
+        // fields/files or JSON transforms replace the handler-facing body.
+        auto history_session = request_history_begin(
+            history, req.method, req.path, request_history_application_entity(req), prefix);
         std::string body = req.body;
         std::map<std::string, uploaded_file> files;
 
@@ -782,14 +1107,18 @@ void server_http_context::post(const std::string & path, const server_http_conte
             has_ambiguous_dashboard_security_headers(req)
         });
         server_http_res_ptr response = handler(*request);
-        process_handler_response(std::move(request), response, res);
+        process_handler_response(std::move(request), response, res, std::move(history_session));
     };
     pimpl->srv->Post(path_prefix + path, std::move(serve));
 }
 
 void server_http_context::del(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto serve = [handler](const httplib::Request & req, httplib::Response & res) {
+    auto serve = [handler, history = pimpl->request_history, prefix = path_prefix](
+            const httplib::Request & req,
+            httplib::Response & res) {
+        auto history_session = request_history_begin(
+            history, req.method, req.path, request_history_application_entity(req), prefix);
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -804,7 +1133,7 @@ void server_http_context::del(const std::string & path, const server_http_contex
             has_ambiguous_dashboard_security_headers(req)
         });
         server_http_res_ptr response = handler(*request);
-        process_handler_response(std::move(request), response, res);
+        process_handler_response(std::move(request), response, res, std::move(history_session));
     };
     pimpl->srv->Delete(path_prefix + path, std::move(serve));
 }

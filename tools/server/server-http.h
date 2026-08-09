@@ -32,6 +32,12 @@ struct server_http_res {
     // fired before req and res are destroyed
     virtual void on_complete() {}
 
+    // Resumable response types can expose chunks they continue producing
+    // after transport disconnect. Returning true transfers history capture to
+    // this observer for the full producer lifetime.
+    virtual bool set_produced_chunk_observer(std::function<void(const std::string &)>) { return false; }
+    virtual bool stream_generation_complete() const { return false; }
+
     virtual ~server_http_res() = default;
 };
 

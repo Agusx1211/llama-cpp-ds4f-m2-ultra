@@ -7595,6 +7595,12 @@ Server &Server::set_start_handler(StartHandler handler) {
   return *this;
 }
 
+Server &Server::set_request_body_capture_predicate(
+    RequestBodyCapturePredicate predicate) {
+  request_body_capture_predicate_ = std::move(predicate);
+  return *this;
+}
+
 Server &Server::set_address_family(int family) {
   address_family_ = family;
   return *this;
@@ -8035,6 +8041,20 @@ bool Server::read_content_core(
   } else {
     out = [receiver](const char *buf, size_t n, size_t /*off*/,
                      size_t /*len*/) { return receiver(buf, n); };
+  }
+
+  req.captured_body_active_ =
+      request_body_capture_predicate_ && request_body_capture_predicate_(req);
+  if (req.captured_body_active_) {
+    auto downstream = std::move(out);
+    out = [&req, downstream = std::move(downstream)](
+              const char *buf, size_t n, size_t off, size_t len) {
+      if (n > req.captured_body_.max_size() - req.captured_body_.size()) {
+        return false;
+      }
+      req.captured_body_.append(buf, n);
+      return downstream(buf, n, off, len);
+    };
   }
 
   // RFC 9112 §6: no Transfer-Encoding and no Content-Length means no body.

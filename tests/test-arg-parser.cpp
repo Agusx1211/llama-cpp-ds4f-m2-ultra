@@ -142,6 +142,16 @@ static void test(void) {
     argv = {"binary_name", "-lm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    common_params history_params;
+    argv = {"binary_name", "--request-history-days", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), history_params, LLAMA_EXAMPLE_SERVER));
+    argv = {"binary_name", "--request-history-max-gib", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), history_params, LLAMA_EXAMPLE_SERVER));
+    argv = {"binary_name", "--request-history-max-files", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), history_params, LLAMA_EXAMPLE_SERVER));
+    argv = {"binary_name", "--request-history-ack-ms", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), history_params, LLAMA_EXAMPLE_SERVER));
+
     printf("test-arg-parser: test valid usage\n\n");
 
     argv = {"binary_name", "-m", "model_file.gguf"};
@@ -186,6 +196,16 @@ static void test(void) {
     argv = {"binary_name", "-lm", "dio"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
+    argv = {"binary_name", "--request-history", "/tmp/private-history",
+            "--request-history-days", "3", "--request-history-max-gib", "7",
+            "--request-history-max-files", "1234", "--request-history-ack-ms", "4321"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), history_params, LLAMA_EXAMPLE_SERVER));
+    assert(history_params.request_history_root == "/tmp/private-history");
+    assert(history_params.request_history_days == 3);
+    assert(history_params.request_history_max_gib == 7);
+    assert(history_params.request_history_max_files == 1234);
+    assert(history_params.request_history_ack_ms == 4321);
 
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};

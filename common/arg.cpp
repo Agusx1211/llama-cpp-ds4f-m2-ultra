@@ -1683,6 +1683,61 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DASHBOARD_CONTENT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--request-history"}, "PATH",
+        "persist complete decoded inference request and response application entities under a private local directory; "
+        "headers are never stored (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("request-history path must not be empty");
+            }
+            params.request_history_root = value;
+        }
+    ).set_env("LLAMA_ARG_REQUEST_HISTORY").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--request-history-days"}, "N",
+        string_format("wall-clock retention in days for request history (default: %d, 0 disables age retention)",
+            params.request_history_days),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 3650) {
+                throw std::invalid_argument("request-history-days must be between 0 and 3650");
+            }
+            params.request_history_days = value;
+        }
+    ).set_env("LLAMA_ARG_REQUEST_HISTORY_DAYS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--request-history-max-gib"}, "N",
+        string_format("maximum retained request-history bytes in GiB (default: %d)",
+            params.request_history_max_gib),
+        [](common_params & params, int value) {
+            if (value <= 0 || value > 4096) {
+                throw std::invalid_argument("request-history-max-gib must be between 1 and 4096");
+            }
+            params.request_history_max_gib = value;
+        }
+    ).set_env("LLAMA_ARG_REQUEST_HISTORY_MAX_GIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--request-history-max-files"}, "N",
+        string_format("maximum retained request-history files (default: %d)",
+            params.request_history_max_files),
+        [](common_params & params, int value) {
+            if (value <= 0 || value > 10000000) {
+                throw std::invalid_argument("request-history-max-files must be between 1 and 10000000");
+            }
+            params.request_history_max_files = value;
+        }
+    ).set_env("LLAMA_ARG_REQUEST_HISTORY_MAX_FILES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--request-history-ack-ms"}, "N",
+        string_format("maximum wait for durable request-history terminal publication in milliseconds (default: %d)",
+            params.request_history_ack_ms),
+        [](common_params & params, int value) {
+            if (value <= 0 || value > 600000) {
+                throw std::invalid_argument("request-history-ack-ms must be between 1 and 600000");
+            }
+            params.request_history_ack_ms = value;
+        }
+    ).set_env("LLAMA_ARG_REQUEST_HISTORY_ACK_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

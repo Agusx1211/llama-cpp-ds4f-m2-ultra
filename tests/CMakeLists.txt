@@ -370,6 +370,17 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-server-capture-resync-journal PRIVATE
         ${PROJECT_SOURCE_DIR}/tools/server)
     target_compile_features(test-server-capture-resync-journal PRIVATE cxx_std_17)
+    llama_build_and_test(test-server-request-history.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-capture-sha256.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-request-history.cpp)
+    target_include_directories(test-server-request-history PRIVATE
+        ${PROJECT_SOURCE_DIR}/tools/server)
+    target_compile_features(test-server-request-history PRIVATE cxx_std_17)
+    llama_build_and_test(test-server-request-history-http.cpp)
+    target_include_directories(test-server-request-history-http PRIVATE
+        ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-request-history-http PRIVATE llama-server-impl cpp-httplib)
+    target_compile_features(test-server-request-history-http PRIVATE cxx_std_17)
     llama_build_and_test(test-snapshot-metal-staging.cpp)
     target_include_directories(test-snapshot-metal-staging PRIVATE
         ${PROJECT_SOURCE_DIR}/src)

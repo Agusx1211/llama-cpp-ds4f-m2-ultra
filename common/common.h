@@ -627,6 +627,16 @@ struct common_params {
     // capture off entirely: the store stays empty and all three routes 501.
     bool dashboard_content = true;
 
+    // Durable decoded inference request/response application-entity history.
+    // An empty root disables the content store. Enabled files contain complete
+    // bodies and therefore use
+    // a separate private root from the metrics-only server-capture-store.
+    std::string request_history_root       = "";
+    int32_t     request_history_days       = 3;
+    int32_t     request_history_max_gib    = 64;
+    int32_t     request_history_max_files  = 100000;
+    int32_t     request_history_ack_ms     = 30000;
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
