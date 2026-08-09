@@ -12,7 +12,7 @@
 // routing decisions, one line each, so a routing change can be confirmed
 // without a full GGML_METAL_KPROF window. Diagnostic only, default off.
 // WARN because llama-server's log callback drops llama-internal INFO.
-static void dsv4_sparse_route_debug(const char * path, int64_t ne01, int64_t n_csa, int il) {
+static void dsv4_sparse_route_debug(const char * path, int64_t ne01, int64_t n_csa, int il, bool draft) {
     static const int64_t budget = []() {
         const char * v = std::getenv("LLAMA_DSV4_SPARSE_ROUTE_DEBUG");
         return v != nullptr ? atoll(v) : (int64_t) 0;
@@ -25,8 +25,8 @@ static void dsv4_sparse_route_debug(const char * path, int64_t ne01, int64_t n_c
         return;
     }
     ++emitted;
-    LLAMA_LOG_WARN("SPARSEROUTE path=%s ne01=%lld n_csa=%lld il=%d\n",
-            path, (long long) ne01, (long long) n_csa, il);
+    LLAMA_LOG_WARN("SPARSEROUTE path=%s ne01=%lld n_csa=%lld il=%d draft=%d\n",
+            path, (long long) ne01, (long long) n_csa, il, (int) draft);
 }
 
 static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
@@ -981,7 +981,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             top_k->ne[1] == 1 && top_k->ne[3] == comp_n_stream &&
             n_csa >= 2*(int64_t) hparams.indexer_top_k;
     if (gather_decode) {
-        dsv4_sparse_route_debug("gather", q->ne[2], n_csa, il);
+        dsv4_sparse_route_debug("gather", q->ne[2], n_csa, il, hparams.n_dspark_block_size > 0);
         const int64_t n_stream = comp_n_stream;
         const int64_t n_raw = raw_k->type == GGML_TYPE_Q8_0 ?
                 std::min<int64_t>(hparams.n_swa, raw_k->ne[2]) : 0;
@@ -1070,11 +1070,27 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     // ne01 = 4). ne01 = 1 already takes the gather path above; prefill
     // (ne01 = n_ubatch) already packs. So 2..7 was the one shape paying the
     // scatter penalty. See notes/2026-08-08-sparse-pack-routing.md.
-    static const int64_t sparse_pack_min_tokens = []() {
+    //
+    // The DSpark drafter is a DeepSeek V4 model too and runs this same builder,
+    // so a process-wide threshold changes the drafter's numerics as well as the
+    // target's - and a drafter that produces different tokens changes draft
+    // acceptance, which moves end-to-end t/s far more than the attention cost
+    // this knob is meant to control. GGML_DSV4_SPARSE_PACK_MIN_TOKENS_DRAFT is
+    // therefore a separate threshold for `n_dspark_block_size > 0` models so the
+    // two effects can be separated. Default 8 for both.
+    static const int64_t sparse_pack_min_tokens_tgt = []() {
         const char * v = std::getenv("GGML_DSV4_SPARSE_PACK_MIN_TOKENS");
         const int64_t n = v != nullptr ? atoll(v) : 8;
         return n < 2 ? (int64_t) 2 : n;
     }();
+    static const int64_t sparse_pack_min_tokens_drf = []() {
+        const char * v = std::getenv("GGML_DSV4_SPARSE_PACK_MIN_TOKENS_DRAFT");
+        const int64_t n = v != nullptr ? atoll(v) : 8;
+        return n < 2 ? (int64_t) 2 : n;
+    }();
+    const bool is_dspark_draft = hparams.n_dspark_block_size > 0;
+    const int64_t sparse_pack_min_tokens =
+            is_dspark_draft ? sparse_pack_min_tokens_drf : sparse_pack_min_tokens_tgt;
 
     // The pack kernel stages the whole per-token working set in threadgroup
     // memory (kernel_dsv4_sparse_pack / kernel_dsv4_indexed_sparse_pack in
@@ -1093,7 +1109,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     if (cparams.fused_dsv4_sparse && cparams.flash_attn &&
             sparse_k_type && sparse_pack_fits &&
             (sparse_probe || sparse_prefill)) {
-        dsv4_sparse_route_debug("pack", q->ne[2], n_csa, il);
+        dsv4_sparse_route_debug("pack", q->ne[2], n_csa, il, is_dspark_draft);
         GGML_ASSERT(top_k);
         const int64_t n_stream = comp_n_stream;
         const int64_t nq       = q->ne[2]/n_stream;
@@ -1140,7 +1156,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         return out;
     }
 
-    dsv4_sparse_route_debug("mask", q->ne[2], n_csa, il);
+    dsv4_sparse_route_debug("mask", q->ne[2], n_csa, il, is_dspark_draft);
 
     ggml_tensor * k_all = indexed ? ggml_dsv4_indexed_concat(
             ctx0, raw_k, csa_k, inp_csa.segment_ids, n_csa) :
