@@ -23,27 +23,20 @@ struct coordinator_config {
 
     // [TAG_PREFILL_PRIORITY]
     // On the M2 Ultra DSV4 vertical a decode ubatch inserted into a prefill
-    // iteration costs a fixed ~0.47 s of deep-context weight sweep no matter
-    // how large the prefill chunk it rides with is. Shrinking the chunk under
-    // active decode therefore multiplies that fixed cost instead of amortizing
-    // it: measured 196-211 t/s of prefill against 300-310 t/s solo while the
-    // generators still only reached 0.9-1.8 t/s each - both sides lose. With
-    // priority_chunk_tokens = idle_chunk_tokens the same interleaved shape
-    // measures 299.8 t/s (97% of solo). The generators' remaining trickle is
-    // metered against prefill progress by the server loop, not here.
+    // iteration costs a fixed deep-context weight sweep no matter how large
+    // the prefill chunk it rides with is. Shrinking the chunk under active
+    // decode therefore multiplies that fixed cost instead of amortizing it.
+    // priority_chunk_tokens = idle_chunk_tokens retains large-M efficiency;
+    // decode cadence, rather than lane-specific chunk shrinkage, bounds
+    // generator service.
     //
-    // prefill_priority = false restores the pre-priority behavior exactly.
+    // prefill_priority = false restores the pre-priority behavior exactly,
+    // including active_decode_chunk_tokens and active_fast_chunk_tokens.
     // priority_chunk_tokens = 0 means "no extra cap", i.e. the full
     // idle_chunk_tokens budget; a non-zero value caps the priority chunk and
     // exists so the chunk size can be swept without rebuilding.
     bool     prefill_priority      = true;
     uint32_t priority_chunk_tokens = 0;
-
-    // The fast lane is an explicit interactive-latency contract, so a
-    // generating fast-lane slot keeps the small-chunk behavior by default and
-    // prefill yields to it. Only the lane of a *generating* slot matters here;
-    // the lane of the prefilling request never shrinks its own chunk.
-    bool priority_yields_to_fast = true;
 
     // A cohort normally keeps a multi-chunk lease. At an aligned committed
     // boundary this limit gives another waiting cohort a deterministic turn.
@@ -75,6 +68,37 @@ struct candidate {
 struct decode_activity {
     bool                   active       = false;
     server_scheduler::lane highest_lane = server_scheduler::lane::low;
+
+    void include(server_scheduler::lane priority) {
+        if (!active || static_cast<uint8_t>(priority) > static_cast<uint8_t>(highest_lane)) {
+            highest_lane = priority;
+        }
+        active = true;
+    }
+};
+
+// Prefill-progress clock for generation service. Wall time is circular here:
+// chunk duration is an output of the policy, while committed chunks are an
+// input the scheduler controls. Entering a window services decode immediately;
+// after that, at most chunks_per_decode successful prefill commits may occur
+// before decode is due again. Leaving the window restores unrestricted decode.
+class decode_cadence {
+  public:
+    explicit decode_cadence(uint32_t chunks_per_decode = 1);
+
+    bool begin_iteration(bool prefill_pending);
+    void note_chunk_committed();
+    void note_decode_served();
+    void force_decode_next();
+
+    uint32_t chunks_per_decode() const { return chunks_per_decode_; }
+    uint32_t chunks_since_decode() const { return chunks_since_decode_; }
+
+  private:
+    uint32_t chunks_per_decode_   = 1;
+    uint32_t chunks_since_decode_ = 0;
+    bool     window_open_         = false;
+    bool     force_next_          = false;
 };
 
 struct owner_selection {

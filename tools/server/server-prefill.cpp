@@ -47,6 +47,41 @@ const candidate * best_candidate(const std::vector<candidate> & candidates, uint
 
 }  // namespace
 
+decode_cadence::decode_cadence(uint32_t chunks_per_decode) : chunks_per_decode_(chunks_per_decode) {
+}
+
+bool decode_cadence::begin_iteration(bool prefill_pending) {
+    if (!prefill_pending) {
+        window_open_         = false;
+        force_next_          = false;
+        chunks_since_decode_ = chunks_per_decode_;
+        return true;
+    }
+    if (!window_open_) {
+        window_open_         = true;
+        chunks_since_decode_ = chunks_per_decode_;
+    }
+
+    const bool due =
+        force_next_ || (chunks_per_decode_ > 0 && chunks_since_decode_ >= chunks_per_decode_);
+    force_next_ = false;
+    return due;
+}
+
+void decode_cadence::note_chunk_committed() {
+    if (chunks_since_decode_ != std::numeric_limits<uint32_t>::max()) {
+        ++chunks_since_decode_;
+    }
+}
+
+void decode_cadence::note_decode_served() {
+    chunks_since_decode_ = 0;
+}
+
+void decode_cadence::force_decode_next() {
+    force_next_ = true;
+}
+
 bool chunk_lease::operator==(const chunk_lease & other) const {
     return request_id == other.request_id && cohort_id == other.cohort_id && generation == other.generation &&
            begin_token == other.begin_token && end_token == other.end_token && yield_boundary == other.yield_boundary &&
@@ -282,14 +317,12 @@ chunk_limit coordinator::limit_chunk(uint64_t                request_id,
 
     uint64_t budget = std::min<uint64_t>(available_batch_tokens, cfg.idle_chunk_tokens);
     if (activity.active) {
-        // [TAG_PREFILL_PRIORITY] Active decode shrinks the chunk only when
-        // prefill priority is off, or when the highest generating lane is the
-        // fast lane and the configuration yields to it.
-        const bool fast   = activity.highest_lane == server_scheduler::lane::fast;
-        const bool yields = !cfg.prefill_priority || (fast && cfg.priority_yields_to_fast);
-        if (yields) {
+        // [TAG_PREFILL_PRIORITY] Priority keeps large-M prompt work on the
+        // idle chunk budget for every generating lane. The server's
+        // prefill-progress cadence bounds decode service independently.
+        if (!cfg.prefill_priority) {
             budget = std::min<uint64_t>(budget, cfg.active_decode_chunk_tokens);
-            if (fast) {
+            if (activity.highest_lane == server_scheduler::lane::fast) {
                 budget = std::min<uint64_t>(budget, cfg.active_fast_chunk_tokens);
             }
         } else if (cfg.priority_chunk_tokens != 0) {

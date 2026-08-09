@@ -119,30 +119,19 @@ static uint32_t server_env_u32(const char * name, uint32_t fallback) {
 // [TAG_PREFILL_PRIORITY]
 // Prefill priority on the M2 Ultra DSV4 vertical.
 //
-// The problem: while any slot generates, the prefill coordinator used to cap
-// chunks at active_decode_chunk_tokens (256; 128 under a fast-lane generator)
-// instead of idle_chunk_tokens (2048), and every iteration additionally
-// carried the generators' decode tokens, which DSV4 executes as separate
-// deep-context ubatches. Measured cost model on this box: a decode ubatch
-// inserted into a prefill iteration costs a FIXED ~0.47 s and yields ~2.3
-// accepted tokens, while 256 tokens of prefill cost ~0.82 s. The small chunk
-// therefore does not buy decode anything extra - it only multiplies how many
-// times the fixed decode tax is paid per prefilled token. The result is
-// lose-lose: 196-211 t/s of prefill against 300-310 t/s solo, with generators
-// still stuck at 0.9-1.8 t/s.
+// A decode ubatch inserted into a prefill iteration pays a fixed deep-context
+// weight sweep. Small active-decode chunks multiply that fixed cost instead of
+// amortizing it. Production task 10628 made the fast-lane exception visible:
+// it advanced in fixed 128-token chunks at about 124 tok/s while fast task
+// 10623 generated, then immediately returned to 2048-token chunks when that
+// generator released.
 //
-// The fix has two parts:
-//  1. the chunk stays full-size under active decode (server_prefill::
-//     coordinator_config::prefill_priority), so the fixed decode tax is
-//     amortized over 1920-2048 tokens instead of 256 - measured 299.8 t/s,
-//     97% of solo;
-//  2. the generators' remaining trickle is metered against PREFILL PROGRESS
-//     (one decode step every N committed prefill chunks), not wall clock. A
-//     wall-clock throttle was tried first (LLAMA_SERVER_DECODE_KEEPALIVE_TPS,
-//     lane admission-reuse-fix) and measured a no-op: the interval it must
-//     exceed to have any effect is the iteration period, which is itself set
-//     by the chunk size the throttle is trying to control. Prefill progress
-//     has no such circularity.
+// Keep every generating lane on the same large-M priority chunk policy. The
+// fast lane gets an explicit source-level service bound from the established
+// prefill-progress cadence: generators are serviced on the first mixed
+// iteration and after at most LLAMA_SERVER_PREFILL_DECODE_EVERY committed
+// prompt chunks. This avoids the circular wall-clock throttle previously shown
+// to be ineffective. The target gate measures the resulting time bound.
 //
 // LLAMA_SERVER_PREFILL_PRIORITY=0 restores the previous behavior exactly
 // (small chunks + a decode step every iteration) and is the rollback lever.
@@ -152,22 +141,15 @@ static const bool SERVER_PREFILL_PRIORITY = server_env_flag("LLAMA_SERVER_PREFIL
 // rebuild. 0 = no extra cap (full idle_chunk_tokens).
 static const uint32_t SERVER_PREFILL_PRIORITY_CHUNK = server_env_u32("LLAMA_SERVER_PREFILL_PRIORITY_CHUNK", 0);
 
-// 1 = prefill priority applies even while a fast-lane slot generates. Default
-// 0: the fast lane is an explicit interactive-latency contract, so prefill
-// keeps yielding to it with the existing 128-token chunks.
-static const bool SERVER_PREFILL_PRIORITY_FAST = server_env_flag("LLAMA_SERVER_PREFILL_PRIORITY_FAST", false);
-
 // Generators join a decode batch once every N committed prefill chunks while a
-// prompt still needs prefill. 1 = one decode step per prefill chunk (the
-// measured operating point: 97% of solo prefill, ~one generated token per
-// chunk per slot). 0 = no decode at all until prefill finishes.
+// prompt still needs prefill. 1 = a clear one-chunk maximum service gap. 0 =
+// no decode until prefill finishes, except for the empty-batch liveness escape.
 static const uint32_t SERVER_PREFILL_DECODE_EVERY = server_env_u32("LLAMA_SERVER_PREFILL_DECODE_EVERY", 1);
 
 static server_prefill::coordinator_config server_prefill_config_from_environment() {
     server_prefill::coordinator_config config;
-    config.prefill_priority        = SERVER_PREFILL_PRIORITY;
-    config.priority_chunk_tokens   = std::min(SERVER_PREFILL_PRIORITY_CHUNK, config.idle_chunk_tokens);
-    config.priority_yields_to_fast = !SERVER_PREFILL_PRIORITY_FAST;
+    config.prefill_priority      = SERVER_PREFILL_PRIORITY;
+    config.priority_chunk_tokens = std::min(SERVER_PREFILL_PRIORITY_CHUNK, config.idle_chunk_tokens);
     return config;
 }
 
@@ -1311,16 +1293,10 @@ private:
         server_trusted_scheduling::config_from_environment()
     };
 
-    // [TAG_PREFILL_PRIORITY] Prefill-progress meter for the generator trickle.
-    // Counts prefill chunks committed since the last iteration that carried
-    // generator decode tokens; the gate opens at
-    // SERVER_PREFILL_DECODE_EVERY. Progress, not wall clock: the iteration
-    // period is a function of the chunk size, so a wall-clock interval short
-    // enough to matter is always due and a long enough one is unpredictable.
-    uint32_t prefill_chunks_since_decode = 0;
-    // One-shot escape so an iteration that staged literally nothing cannot
-    // spin: set when the gate was closed AND the batch came out empty.
-    bool prefill_decode_force_next = false;
+    // [TAG_PREFILL_PRIORITY] Shared prefill-progress clock for generator
+    // service. It advances only after an exact chunk commit; an aborted chunk
+    // did not happen and must not buy a decode step.
+    server_prefill::decode_cadence prefill_decode_cadence{ SERVER_PREFILL_DECODE_EVERY };
     // Did this iteration skip at least one generating slot?
     bool prefill_decode_gate_closed = false;
     // One log line per prefill window rather than per iteration.
@@ -4190,9 +4166,7 @@ private:
     // generator trickle, so only a committed chunk advances the counter. An
     // aborted chunk did not happen and must not buy a decode step.
     void note_prefill_chunk_committed() {
-        if (prefill_chunks_since_decode != std::numeric_limits<uint32_t>::max()) {
-            ++prefill_chunks_since_decode;
-        }
+        prefill_decode_cadence.note_chunk_committed();
     }
 
     bool commit_prefill_chunk(const server_prefill::chunk_lease & lease) {
@@ -4910,38 +4884,27 @@ private:
 
         // [TAG_PREFILL_PRIORITY] Meter the generator trickle against prefill
         // progress. A prefill window is open while any non-child slot still
-        // has a prompt to process; inside it a generating slot joins a decode
-        // batch only once every SERVER_PREFILL_DECODE_EVERY committed prefill
-        // chunks. Outside a prefill window nothing is gated and decode runs at
-        // full speed from the first iteration after prefill completes.
+        // has a prompt to process. Generators join the first mixed iteration
+        // and then at the configured committed-chunk cadence. Outside a
+        // prefill window decode runs at full speed immediately.
         const bool prefill_pending = SERVER_PREFILL_PRIORITY &&
                 std::any_of(slots.begin(), slots.end(), [](const server_slot & s) {
                     return (s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT) &&
                            s.task && !s.task->is_child();
                 });
 
-        bool decode_due = true;
-        if (prefill_pending) {
-            decode_due = prefill_decode_force_next ||
-                         (SERVER_PREFILL_DECODE_EVERY > 0 &&
-                          prefill_chunks_since_decode >= SERVER_PREFILL_DECODE_EVERY);
-        } else {
-            // Entering the next prefill window should not open with an extra
-            // stall on top of the one the window itself imposes.
-            prefill_chunks_since_decode = SERVER_PREFILL_DECODE_EVERY;
-        }
-        prefill_decode_force_next  = false;
+        const bool decode_due = prefill_decode_cadence.begin_iteration(prefill_pending);
         prefill_decode_gate_closed = false;
 
         if (prefill_pending != prefill_priority_window_open) {
             prefill_priority_window_open = prefill_pending;
             if (prefill_pending) {
-                SRV_INF("prefill priority: window open (chunk cap under active decode = %u tokens%s, "
-                        "decode every %u prefill chunks; LLAMA_SERVER_PREFILL_PRIORITY=0 to revert)\n",
+                SRV_INF("prefill priority: window open (chunk cap under active decode = %u tokens, "
+                        "decode after at most %u committed prefill chunks; "
+                        "LLAMA_SERVER_PREFILL_PRIORITY=0 to revert)\n",
                         prefill.config().priority_chunk_tokens != 0 ? prefill.config().priority_chunk_tokens :
                                                                       prefill.config().idle_chunk_tokens,
-                        prefill.config().priority_yields_to_fast ? ", except under a fast-lane generator" : "",
-                        SERVER_PREFILL_DECODE_EVERY);
+                        prefill_decode_cadence.chunks_per_decode());
             }
         }
 
@@ -4962,18 +4925,15 @@ private:
                     common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
                 }
                 prefill_decode_gate_closed = true;
-                SLT_DBG(slot, "prefill priority: deferring decode (%u/%u prefill chunks since last decode step)\n",
-                        prefill_chunks_since_decode, SERVER_PREFILL_DECODE_EVERY);
+                SLT_DBG(slot, "prefill priority: deferring decode (%u/%u committed chunks since last decode step)\n",
+                        prefill_decode_cadence.chunks_since_decode(),
+                        prefill_decode_cadence.chunks_per_decode());
                 return;
             }
 
             const auto priority = server_prefill_lane(slot.task->scheduling.lane);
             GGML_ASSERT(priority != server_scheduler::lane::count);
-            if (!prefill_decode.active ||
-                static_cast<uint8_t>(priority) > static_cast<uint8_t>(prefill_decode.highest_lane)) {
-                prefill_decode.highest_lane = priority;
-            }
-            prefill_decode.active = true;
+            prefill_decode.include(priority);
 
             // check if we can batch this slot with the previous one
             if (!slot_batched) {
@@ -5029,10 +4989,10 @@ private:
             }
         });
 
-        // [TAG_PREFILL_PRIORITY] A generator actually joined this iteration,
-        // so the meter restarts from this chunk.
+        // [TAG_PREFILL_PRIORITY] Every eligible generator joins the same
+        // iteration; serving that decode cohort restarts the shared cadence.
         if (prefill_pending && prefill_decode.active) {
-            prefill_chunks_since_decode = 0;
+            prefill_decode_cadence.note_decode_served();
         }
 
         // generate the actual drafts (if any)
@@ -5912,7 +5872,7 @@ private:
         // while prefill is making progress and therefore cannot silently
         // disable the mechanism.
         if (prefill_decode_gate_closed && batch.size() == 0) {
-            prefill_decode_force_next = true;
+            prefill_decode_cadence.force_decode_next();
         }
     }
 
