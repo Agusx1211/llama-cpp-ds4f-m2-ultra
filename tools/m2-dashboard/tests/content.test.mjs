@@ -14,6 +14,7 @@ import test from "node:test";
 import {
     CONTENT_SCHEMA_V,
     WATCH_REASON_LABEL,
+    WATCH_RENDER_CHARS,
     WATCH_TEXT_MAX,
     WATCH_TEXT_TRIM_TO,
     WatchStream,
@@ -23,6 +24,7 @@ import {
     extentLabel,
     parseCachePreview,
     parseContent,
+    watchRenderView,
 } from "../lib/content.mjs";
 
 const CAPS = {
@@ -84,6 +86,23 @@ test("parseContent keeps output null while the request is still generating", () 
     const view = parseContent(contentBody({ state: "live", output: null }));
     assert.equal(view.state, "live");
     assert.equal(view.output, null);
+});
+
+test("a target-sized full payload is rendered as complete", () => {
+    const view = parseContent(contentBody({
+        caps: {
+            in_head_tokens: 524288, in_tail_tokens: 0,
+            out_head_bytes: 8 * 1024 * 1024, out_tail_bytes: 0,
+            max_requests: 64, max_bytes: 256 * 1024 * 1024,
+        },
+        input: {
+            n_tokens: 118432, head: "complete prompt", tail: "",
+            head_tokens: 118432, tail_tokens: 0, elided_tokens: 0, truncated: false,
+        },
+    }));
+    assert.equal(view.input.truncated, false);
+    assert.match(extentLabel(view.input), /118,432 tokens · complete/);
+    assert.equal(view.caps.maxBytes, 256 * 1024 * 1024);
 });
 
 test("a side with no text is flagged empty rather than rendered as blank content", () => {
@@ -220,14 +239,26 @@ test("unknown kinds and wrong schema versions are ignored, not rendered", () => 
 test("accumulated live text is bounded and reports what the page dropped", () => {
     let s = emptyWatchState(5);
     s = applyWatchFrame(s, hello());
-    const chunk = "x".repeat(64 * 1024);
-    for (let i = 0; i < 8; i++) {
-        s = applyWatchFrame(s, delta(chunk, { cursor: (i + 1) * chunk.length }));
-    }
+    const chunk = "x".repeat(WATCH_TEXT_MAX + 64 * 1024);
+    s = applyWatchFrame(s, delta(chunk, { cursor: chunk.length }));
     assert.ok(s.text.length <= WATCH_TEXT_MAX, "text must stay under the client ceiling");
-    assert.ok(s.text.length >= WATCH_TEXT_TRIM_TO - chunk.length);
+    assert.equal(s.text.length, WATCH_TEXT_TRIM_TO);
     assert.ok(s.clientDropped > 0, "the page must account for what it dropped");
-    assert.equal(s.text.length + s.clientDropped, 8 * chunk.length);
+    assert.equal(s.text.length + s.clientDropped, chunk.length);
+});
+
+test("live rendering can reveal the complete accumulated target output", () => {
+    const text = "x".repeat(WATCH_RENDER_CHARS + 4096);
+    const state = { ...emptyWatchState(5), text };
+    const tail = watchRenderView(state, false);
+    assert.equal(tail.text.length, WATCH_RENDER_CHARS);
+    assert.equal(tail.clipped, true);
+    assert.equal(tail.hidden, 4096);
+    const full = watchRenderView(state, true);
+    assert.equal(full.text, text);
+    assert.equal(full.clipped, true);
+    assert.equal(full.hidden, 0);
+    assert.equal(full.dropped, 0);
 });
 
 // ---------------------------------------------------------------------------

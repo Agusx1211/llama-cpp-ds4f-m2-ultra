@@ -490,27 +490,62 @@ static void test_content_capture_and_caps() {
     content_store store;
     store.set_enabled(true);
 
-    // a prompt longer than the head+tail budget keeps only the ends
-    capture_prompt_into(store, 1, 3, ids(content_in_head_tokens + content_in_tail_tokens + 500));
+    // The complete production-sized context is retained. The old head/tail
+    // response shape remains, but the tail is empty because the head now holds
+    // the whole target prompt.
+    const auto full_prompt = ids(content_in_head_tokens);
+    const int64_t capture_start = ggml_time_us();
+    capture_prompt_into(store, 1, 3, full_prompt);
+    const int64_t capture_us = ggml_time_us() - capture_start;
 
     request_content got;
     CHECK(store.lookup(1, got));
     CHECK(got.has_input);
-    CHECK(got.in_tokens == content_in_head_tokens + content_in_tail_tokens + 500);
+    CHECK(got.in_tokens == content_in_head_tokens);
     CHECK(got.in_head.size() == content_in_head_tokens);
-    CHECK(got.in_tail.size() == content_in_tail_tokens);
+    CHECK(got.in_tail.empty());
     CHECK(got.in_head.front() == 100);
+    CHECK(got.in_head.back() == 100 + (int32_t) content_in_head_tokens - 1);
     CHECK(got.complete == false); // no output yet: the request is still live
+    std::printf("  full dashboard prompt capture: %.3f ms (%u tokens)\n",
+                capture_us / 1000.0, content_in_head_tokens);
 
-    // the generation is capped in bytes at both ends, on code-point boundaries
-    const std::string long_out(content_out_head_bytes + content_out_tail_bytes + 4096, 'x');
-    store.capture_output(1, 3, long_out, 4321);
+    // A generously target-sized generation is also retained whole.
+    const std::string target_out(1u << 20, 'x');
+    store.capture_output(1, 3, target_out, 32768);
     CHECK(store.lookup(1, got));
     CHECK(got.complete);
-    CHECK(got.out_tokens == 4321);
-    CHECK(got.out_bytes == long_out.size());
+    CHECK(got.out_tokens == 32768);
+    CHECK(got.out_bytes == target_out.size());
+    CHECK(got.out_head == target_out);
+    CHECK(got.out_tail.empty());
+    const json target_body = content_to_json(1, &got, nullptr, store.usage(), fake_detok);
+    CHECK(target_body["input"]["head_tokens"] == content_in_head_tokens);
+    CHECK(target_body["input"]["tail_tokens"] == 0);
+    CHECK(target_body["input"]["elided_tokens"] == 0);
+    CHECK(target_body["input"]["truncated"] == false);
+    CHECK(target_body["output"]["elided_bytes"] == 0);
+    CHECK(target_body["output"]["truncated"] == false);
+
+    // Inputs outside the target envelope still fail honestly: they are
+    // bounded, not silently described as complete.
+    capture_prompt_into(store, 3, 1, ids(content_in_head_tokens + 500));
+    CHECK(store.lookup(3, got));
+    CHECK(got.in_head.size() == content_in_head_tokens);
+    CHECK(got.in_tail.empty());
+    CHECK(got.in_tokens == content_in_head_tokens + 500);
+    const json oversized_body = content_to_json(3, &got, nullptr, store.usage(), fake_detok);
+    CHECK(oversized_body["input"]["elided_tokens"] == 500);
+    CHECK(oversized_body["input"]["truncated"] == true);
+
+    const std::string oversized_out(content_out_head_bytes + 4096, 'q');
+    store.capture_output(4, 1, oversized_out, 1000000);
+    CHECK(store.lookup(4, got));
     CHECK(got.out_head.size() == content_out_head_bytes);
-    CHECK(got.out_tail.size() == content_out_tail_bytes);
+    CHECK(got.out_tail.empty());
+    const json oversized_output_body = content_to_json(4, &got, nullptr, store.usage(), fake_detok);
+    CHECK(oversized_output_body["output"]["elided_bytes"] == 4096);
+    CHECK(oversized_output_body["output"]["truncated"] == true);
 
     // a short generation is kept whole with no tail
     store.capture_output(2, 0, "short answer", 3);
@@ -590,7 +625,7 @@ static void test_content_disable_clears_everything() {
 static void test_content_json() {
     content_store store;
     store.set_enabled(true);
-    capture_prompt_into(store, 11, 2, ids(content_in_head_tokens + content_in_tail_tokens + 10));
+    capture_prompt_into(store, 11, 2, ids(4096));
     store.capture_output(11, 2, "generated", 4);
 
     request_content got;
@@ -606,10 +641,11 @@ static void test_content_json() {
     CHECK(body["caps"]["max_requests"] == content_max_requests);
     CHECK(body["caps"]["max_bytes"] == content_max_bytes);
     CHECK(body["store"]["requests"] == 1);
-    CHECK(body["input"]["n_tokens"] == content_in_head_tokens + content_in_tail_tokens + 10);
-    CHECK(body["input"]["head_tokens"] == content_in_head_tokens);
-    CHECK(body["input"]["elided_tokens"] == 10);
-    CHECK(body["input"]["truncated"] == true);
+    CHECK(body["input"]["n_tokens"] == 4096);
+    CHECK(body["input"]["head_tokens"] == 4096);
+    CHECK(body["input"]["tail_tokens"] == 0);
+    CHECK(body["input"]["elided_tokens"] == 0);
+    CHECK(body["input"]["truncated"] == false);
     CHECK(body["input"]["head"].get<std::string>().rfind("100 101", 0) == 0);
     CHECK(body["output"]["head"] == "generated");
     CHECK(body["output"]["truncated"] == false);

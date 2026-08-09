@@ -275,21 +275,26 @@ bus & instance();
 // its own routes, and its own kill switch:
 //
 //   - retention is bounded in entries AND bytes and evicts oldest-first;
-//   - the prompt is retained as a head/tail slice of TOKEN IDS and is
-//     detokenized only on the HTTP thread, on demand, for one request at a
-//     time (the same thing POST /detokenize already does; the vocab is
-//     immutable, so this is safe off the main loop);
-//   - the generation is retained as capped head/tail UTF-8 (it is already text
+//   - the complete target prompt is retained as TOKEN IDS and detokenized only
+//     on the HTTP thread, on demand, for one request at a time (the same thing
+//     POST /detokenize already does; the vocab is immutable, so this is safe
+//     off the main loop);
+//   - the complete target generation is retained as UTF-8 (it is already text
 //     on the producer side, so no detokenize happens on the main loop);
 //   - nothing here is ever logged, and none of it appears in /m2-dashboard/
 //     events, /m2-dashboard/cache-state or the registry snapshot.
 
 constexpr size_t   content_max_requests   = 64;          // retained requests
-constexpr size_t   content_max_bytes      = 1u << 20;    // 1 MiB of retained material
-constexpr uint32_t content_in_head_tokens = 512;
-constexpr uint32_t content_in_tail_tokens = 256;
-constexpr size_t   content_out_head_bytes = 4096;
-constexpr size_t   content_out_tail_bytes = 2048;
+constexpr size_t   content_max_bytes      = 256u << 20;  // 256 MiB across the FIFO
+
+// Production runs a shared 512K context and requests at most 32K output
+// tokens. Keep those target-sized values whole. The legacy head/tail wire
+// shape remains for compatibility and still reports honest truncation for a
+// request outside this fork's target envelope.
+constexpr uint32_t content_in_head_tokens = 512u << 10;
+constexpr uint32_t content_in_tail_tokens = 0;
+constexpr size_t   content_out_head_bytes = 8u << 20;
+constexpr size_t   content_out_tail_bytes = 0;
 
 constexpr size_t cache_preview_head_tokens = 64;
 constexpr size_t cache_preview_tail_tokens = 32;
