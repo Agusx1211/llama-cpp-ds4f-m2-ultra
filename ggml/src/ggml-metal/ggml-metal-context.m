@@ -12,6 +12,7 @@
 #import <Metal/Metal.h>
 
 #include <inttypes.h>
+#include <mach/mach_time.h>
 
 #undef MIN
 #undef MAX
@@ -34,6 +35,22 @@ static bool ggml_metal_hp_enabled(void) {
         enabled = (v != NULL && atoi(v) != 0) ? 1 : 0;
     }
     return enabled != 0;
+}
+
+// MTLCommandBuffer.GPUEndTime uses Darwin's Mach host-time domain. Do not use
+// ggml_time_us() here: CLOCK_MONOTONIC has a boot-specific offset from Mach
+// host time on macOS (11.946 s on the validation boot), which is harmless for
+// durations but invalid for subtracting an absolute Metal timestamp.
+static int64_t ggml_metal_host_time_us(void) {
+    static mach_timebase_info_data_t timebase;
+    static dispatch_once_t once;
+
+    dispatch_once(&once, ^{
+        mach_timebase_info(&timebase);
+    });
+
+    const uint64_t ticks = mach_absolute_time();
+    return (int64_t) (((long double) ticks*timebase.numer/timebase.denom)/1000.0L);
 }
 
 // Private ABI shared with ggml-metal-device.m. Keeping it out of the public
@@ -745,7 +762,7 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
         const bool hp = ggml_metal_hp_enabled();
-        const int64_t wait_start_us = hp ? ggml_time_us() : 0;
+        const int64_t wait_start_us = hp ? ggml_metal_host_time_us() : 0;
 
         [ctx->cmd_buf_last waitUntilCompleted];
 
@@ -753,7 +770,7 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
         // immediately after waitUntilCompleted returns, before status scans or
         // profiler I/O, so `wake` isolates the GPU-complete -> host-return tail.
         if (hp) {
-            const int64_t wait_return_us = ggml_time_us();
+            const int64_t wait_return_us = ggml_metal_host_time_us();
             const double gpu_end_s = [ctx->cmd_buf_last GPUEndTime];
             const int64_t gpu_end_us = gpu_end_s > 0.0 ? (int64_t) (gpu_end_s*1e6) : -1;
 
