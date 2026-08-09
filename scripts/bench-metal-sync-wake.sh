@@ -155,10 +155,15 @@ run_server() {
     local speculative=$3
     local repetitions=$4
     local server_log="$result_root/$name-server.log"
-    local -a extra_args=()
+    local -a server_args=(
+        -m "$model"
+        -c 1048576 -np 4 --kv-unified --no-context-shift --cache-ram 0
+        -ctk f16 -ctv f16 -ngl 999 -fa on -fit on -ub 2048 -b 2048
+        --host 127.0.0.1 --port "$bench_port" --no-webui
+    )
 
     if [ "$speculative" = "1" ]; then
-        extra_args=(
+        server_args+=(
             -md "$draft"
             --spec-type draft-dspark
             --spec-draft-n-max 5
@@ -177,11 +182,7 @@ run_server() {
             GGML_E4M3_MM_NT2_MIN_N=512 \
             DYLD_LIBRARY_PATH="$lane_root/build-m2/bin" \
             "$lane_root/build-m2/bin/llama-server" \
-                -m "$model" \
-                -c 1048576 -np 4 --kv-unified --no-context-shift --cache-ram 0 \
-                -ctk f16 -ctv f16 -ngl 999 -fa on -fit on -ub 2048 -b 2048 \
-                --host 127.0.0.1 --port "$bench_port" --no-webui \
-                "${extra_args[@]}" \
+                "${server_args[@]}" \
                 > "$server_log" 2>&1
     ) &
     bench_pid=$!
@@ -214,4 +215,3 @@ run_server spec-default 0 1 3
 run_server spec-profile 1 1 1
 
 log "baseline complete"
-
