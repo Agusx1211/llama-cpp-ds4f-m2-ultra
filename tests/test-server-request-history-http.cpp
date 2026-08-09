@@ -313,13 +313,19 @@ void test_http_capture() {
         expect(by_path.at("/v1/audio/transcriptions").request_body == multipart_request &&
                by_path.at("/v1/audio/transcriptions").response_body == audio_response,
                "multipart decoded application entity preserves exact boundaries and binary bytes");
+        // The client stopped consuming, but a small response may already fit
+        // in the kernel socket buffer. cpp-httplib can therefore honestly
+        // report either provider transport result across operating systems;
+        // the deterministic contract is that the result is known while the
+        // complete server-produced tail and generation outcome are preserved.
         expect(by_path.at("/chat/completions").response_stream_chunks == resumable_chunks &&
                by_path.at("/chat/completions").metadata.terminal_outcome == outcome::complete &&
-               by_path.at("/chat/completions").metadata.transport_complete_known &&
-               !by_path.at("/chat/completions").metadata.transport_complete,
+               by_path.at("/chat/completions").metadata.transport_complete_known,
                "resumable disconnect captures full producer tail and completes generation: chunks=" +
                std::to_string(by_path.at("/chat/completions").response_stream_chunks.size()) +
-               " outcome=" + outcome_name(by_path.at("/chat/completions").metadata.terminal_outcome));
+               " outcome=" + outcome_name(by_path.at("/chat/completions").metadata.terminal_outcome) +
+               " provider_transport=" +
+               std::to_string(by_path.at("/chat/completions").metadata.transport_complete));
         expect(by_path.at("/responses").metadata.terminal_outcome == outcome::error,
                "SSE data JSON error is structurally classified");
         expect(by_path.at("/chat/completions").metadata.terminal_outcome != outcome::error,

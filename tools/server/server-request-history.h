@@ -147,6 +147,10 @@ struct record_metadata {
     outcome     terminal_outcome      = outcome::recovered_incomplete;
     bool        streaming             = false;
     bool        recovered             = false;
+    // For streaming responses this is cpp-httplib's server-provider result:
+    // whether the local write path completed, not proof that the peer
+    // application consumed every buffered byte. Non-stream transport status
+    // is unavailable and therefore leaves transport_complete_known false.
     bool        transport_complete_known = false;
     bool        transport_complete    = false;
     bool        terminal_present      = false;

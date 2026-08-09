@@ -164,7 +164,7 @@ void test_exact_nonstream_and_stream_bytes() {
         auto session = history.begin("POST", "/v1/responses", "{\"stream\":true}");
         expect(session && session->append_response(chunk1, true) && session->append_response(chunk2, true),
                "stream chunks append");
-        result finished = session->finish(200, outcome::complete, true);
+        result finished = session->finish(200, outcome::complete, true, true, true);
         expect_status(finished, status::ok, "stream finish");
         expect(finished.durable, "stream durable ack");
     }
@@ -174,6 +174,8 @@ void test_exact_nonstream_and_stream_bytes() {
            "preserve stream chunks and boundaries exactly");
     expect(stored.metadata.streaming && stored.metadata.response_bytes == chunk1.size() + chunk2.size(),
            "stream byte metadata");
+    expect(stored.metadata.transport_complete_known && stored.metadata.transport_complete,
+           "successful provider transport flag round trip");
 }
 
 void test_outcomes_and_route_policy() {
@@ -182,14 +184,16 @@ void test_outcomes_and_route_policy() {
         store history(make_config(temp.path()));
         auto aborted = history.begin("POST", "/v1/messages", "bad body");
         expect(aborted && aborted->append_response("event: error\n\n", true), "aborted append");
-        expect_status(aborted->finish(200, outcome::aborted, true), status::ok, "aborted finish");
+        expect_status(aborted->finish(200, outcome::aborted, true, false, true), status::ok, "aborted finish");
         auto error = history.begin("POST", "/v1/completions", "{bad json");
         expect(error && error->append_response("{\"error\":\"invalid\"}", false), "error append");
         expect_status(error->finish(400, outcome::error, false), status::ok, "error finish");
     }
     const auto records = inspect_records(temp.path());
     expect(records.size() == 2, "two outcome records");
-    expect(records[0].terminal_outcome == outcome::aborted && records[0].streaming, "aborted outcome persisted");
+    expect(records[0].terminal_outcome == outcome::aborted && records[0].streaming &&
+           records[0].transport_complete_known && !records[0].transport_complete,
+           "aborted outcome and failed provider transport persisted");
     expect(records[1].terminal_outcome == outcome::error && records[1].http_status == 400, "error outcome persisted");
 
     const std::vector<std::string> required = {
