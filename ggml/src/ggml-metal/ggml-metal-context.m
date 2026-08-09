@@ -12,6 +12,7 @@
 #import <Metal/Metal.h>
 
 #include <inttypes.h>
+#include <mach/mach_time.h>
 
 #undef MIN
 #undef MAX
@@ -25,8 +26,8 @@
 // ggml_metal_graph_compute - reported by llama_context as the "gcomp" phase -
 // into command-buffer setup, the main-thread node prefix encode, and the
 // dispatch_apply that encodes the remainder, and reports the GPU timeline of
-// each command buffer from ggml_metal_synchronize. See src/llama-context.cpp
-// for the record format.
+// each command buffer plus the last-buffer GPU-end -> host-return wake latency
+// from ggml_metal_synchronize. See src/llama-context.cpp for the record format.
 static bool ggml_metal_hp_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -34,6 +35,22 @@ static bool ggml_metal_hp_enabled(void) {
         enabled = (v != NULL && atoi(v) != 0) ? 1 : 0;
     }
     return enabled != 0;
+}
+
+// MTLCommandBuffer.GPUEndTime uses Darwin's Mach host-time domain. Do not use
+// ggml_time_us() here: CLOCK_MONOTONIC has a boot-specific offset from Mach
+// host time on macOS (11.946 s on the validation boot), which is harmless for
+// durations but invalid for subtracting an absolute Metal timestamp.
+static int64_t ggml_metal_host_time_us(void) {
+    static mach_timebase_info_data_t timebase;
+    static dispatch_once_t once;
+
+    dispatch_once(&once, ^{
+        mach_timebase_info(&timebase);
+    });
+
+    const uint64_t ticks = mach_absolute_time();
+    return (int64_t) (((long double) ticks*timebase.numer/timebase.denom)/1000.0L);
 }
 
 // Private ABI shared with ggml-metal-device.m. Keeping it out of the public
@@ -154,6 +171,7 @@ struct ggml_metal {
     bool use_dsv4_split_tuning;
     bool use_dsv4_encode_profile;
     bool use_dsv4_encode_profile_scalar_delta;
+    bool use_fast_sync;
 
     int dsv4_encode_profile_interval;
 
@@ -211,6 +229,30 @@ struct ggml_metal {
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
 };
+
+// Apple M2 Ultra uses a status poll for the final relevant command buffer by
+// default. Set GGML_METAL_FAST_SYNC=0 to use the blocking wait instead. Other
+// devices always block. Polling keeps the caller runnable for the full GPU wait
+// and can therefore occupy one CPU core per active inference lane.
+static MTLCommandBufferStatus ggml_metal_cmd_buf_wait(
+        id<MTLCommandBuffer> cmd_buf,
+        bool fast_sync,
+        uint64_t * n_polls) {
+    *n_polls = 0;
+
+    if (!fast_sync) {
+        [cmd_buf waitUntilCompleted];
+        return [cmd_buf status];
+    }
+
+    MTLCommandBufferStatus status;
+    do {
+        status = [cmd_buf status];
+        (*n_polls)++;
+    } while (status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError);
+
+    return status;
+}
 
 static bool ggml_metal_encode_profile_commands_equal(
         const struct ggml_metal_encoder_profile_result * lhs,
@@ -560,6 +602,33 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     snprintf(res->name, sizeof(res->name), "%s", props_dev->name);
 
+    {
+        const char * value = getenv("GGML_METAL_FAST_SYNC");
+        const char * device_name = [[device name] UTF8String];
+        const bool is_m2_ultra = strcmp(device_name, "Apple M2 Ultra") == 0;
+        const bool explicitly_disabled = value != NULL && strcmp(value, "0") == 0;
+        const bool explicitly_enabled  = value != NULL && strcmp(value, "1") == 0;
+        const bool valid_value = value == NULL || explicitly_disabled || explicitly_enabled;
+
+        res->use_fast_sync = is_m2_ultra && !explicitly_disabled;
+
+        if (!valid_value) {
+            GGML_LOG_WARN("%s: invalid GGML_METAL_FAST_SYNC value '%s'; using the device default\n",
+                    __func__, value);
+        }
+        if (explicitly_enabled && !is_m2_ultra) {
+            GGML_LOG_WARN("%s: GGML_METAL_FAST_SYNC ignored on non-M2-Ultra device '%s'\n",
+                    __func__, device_name);
+        } else if (res->use_fast_sync) {
+            GGML_LOG_WARN("%s: fast command-buffer status polling enabled%s; one CPU core may be occupied per "
+                          "active lane (set GGML_METAL_FAST_SYNC=0 to disable)\n",
+                    __func__, value == NULL || !valid_value ? " by default on Apple M2 Ultra" : "");
+        } else if (explicitly_disabled && is_m2_ultra) {
+            GGML_LOG_INFO("%s: fast command-buffer status polling disabled by GGML_METAL_FAST_SYNC=0\n",
+                    __func__);
+        }
+    }
+
     res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
 
     res->use_fusion            = getenv("GGML_METAL_FUSION_DISABLE") == nil;
@@ -744,7 +813,30 @@ static id<MTLCommandBuffer> ggml_metal_graph_cmd_buf_new(id<MTLCommandQueue> que
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
-        [ctx->cmd_buf_last waitUntilCompleted];
+        const bool hp = ggml_metal_hp_enabled();
+        const int64_t wait_start_us = hp ? ggml_metal_host_time_us() : 0;
+        uint64_t n_polls = 0;
+
+        const MTLCommandBufferStatus wait_status =
+                ggml_metal_cmd_buf_wait(ctx->cmd_buf_last, ctx->use_fast_sync, &n_polls);
+
+        // GPUEndTime is expressed in host-time seconds. Capture the host clock
+        // immediately after the selected completion primitive returns, before
+        // status scans or profiler I/O, so `wake` isolates the GPU-complete ->
+        // host-return tail.
+        if (hp) {
+            const int64_t wait_return_us = ggml_metal_host_time_us();
+            const double gpu_end_s = [ctx->cmd_buf_last GPUEndTime];
+            const int64_t gpu_end_us = gpu_end_s > 0.0 ? (int64_t) (gpu_end_s*1e6) : -1;
+
+            fprintf(stderr, "HOSTPROF {\"op\":\"cbw\",\"t\":%" PRId64
+                    ",\"wait\":%" PRId64 ",\"ge\":%.6f,\"wake\":%" PRId64
+                    ",\"status\":%lu,\"mode\":\"%s\",\"polls\":%" PRIu64 "}\n",
+                    wait_return_us, wait_return_us - wait_start_us, gpu_end_s,
+                    gpu_end_us >= 0 ? wait_return_us - gpu_end_us : -1,
+                    (unsigned long) wait_status, ctx->use_fast_sync ? "poll" : "wait", n_polls);
+        }
+
         ctx->cmd_buf_last = nil;
     }
 

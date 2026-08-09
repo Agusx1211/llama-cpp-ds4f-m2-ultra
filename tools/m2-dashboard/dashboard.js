@@ -33,6 +33,16 @@ import {
     tokenSpans,
     wastedRestore,
 } from "./lib/events.mjs";
+import {
+    CACHE_PREVIEW_PATH,
+    CONTENT_PATH,
+    WATCH_REASON_LABEL,
+    WatchStream,
+    cachePreviewLabel,
+    extentLabel,
+    parseCachePreview,
+    parseContent,
+} from "./lib/content.mjs";
 
 const POLL_MS = 2000;
 const SSE_POLL_MS = 5000;     // slots poll relaxes once the event stream is live
@@ -68,6 +78,9 @@ function liveTransport(apiKey) {
         registry: () => get("/internal/admin/dashboard/snapshot"),
         metrics: () => get("/metrics", "text"),
         cacheState: () => get(CACHE_STATE_PATH),
+        // v3 content routes: only ever called from an explicit reveal action
+        content: (id) => get(CONTENT_PATH + "?req=" + encodeURIComponent(String(id))),
+        cachePreview: (id) => get(CACHE_PREVIEW_PATH + "?id=" + encodeURIComponent(String(id))),
         requestDetail: async (id) => {
             const res = await fetch("/internal/admin/dashboard/request-detail", {
                 method: "POST",
@@ -105,6 +118,16 @@ function fixtureTransport(replay, startIndex = 0) {
         cacheState: async () => {
             if (!state.fixtureEvents?.cache_state) { const e = new Error("fixture"); e.status = 404; throw e; }
             return state.fixtureEvents.cache_state;
+        },
+        content: async (id) => {
+            const body = state.fixtureContent?.requests?.[String(id)];
+            if (!body) { const e = new Error("unknown"); e.status = 404; throw e; }
+            return body;
+        },
+        cachePreview: async (id) => {
+            const body = state.fixtureContent?.cache?.[String(id)];
+            if (!body) return { v: 1, id, found: false };
+            return body;
         },
         requestDetail: async (id) => {
             const slot = tick().bindings?.[id];
@@ -147,7 +170,22 @@ const state = {
     tlDirty: false,
     cacheState: null,
     cacheTimer: null,
+    // v3 content. Everything here is memory-only and explicitly bounded: a
+    // reveal is a deliberate act, it is never persisted, and the page keeps at
+    // most MAX_REVEALS of them alive at once.
+    contentEnabled: null,       // from /props; null = unknown yet
+    reveal: new Map(),          // req id -> {status, view?, error?}
+    contentNodes: new Map(),    // req id -> the live DOM node for that block
+    watch: null,                // {req, stream, state} while a mirror is open
+    cacheExpanded: null,        // expanded cache entry id
+    cachePreview: new Map(),    // entry id -> {status, view?, error?}
+    fixtureContent: null,
 };
+
+// A page left open for a day must not accumulate prompts. Reveals are capped
+// and evicted oldest-first, mirroring the server store's own bound.
+const MAX_REVEALS = 8;
+const MAX_CACHE_PREVIEWS = 8;
 
 function currentApiKey() {
     const hash = new URLSearchParams(location.hash.replace(/^#/, ""));
@@ -164,6 +202,14 @@ async function poll() {
     try {
         if (state.props === null) {
             state.props = await t.props();
+            // v3: the server tells us up front whether the content routes will
+            // answer, so the page shows "disclosure disabled" instead of
+            // offering a button that always fails
+            if (typeof state.props.dashboard_content === "boolean") {
+                state.contentEnabled = state.props.dashboard_content;
+            } else if (state.transport.mode === "live") {
+                state.contentEnabled = null; // older server: find out on first use
+            }
             renderHeader();
         }
         const [slots, registry] = await Promise.all([
@@ -293,7 +339,43 @@ function renderHeader() {
     document.title = "M2 llama-server · " + model;
 }
 
+// A standing, always-visible marker of whether any prompt or generated text is
+// currently on screen. Content is the one thing on this page that is not
+// metadata, so its presence is never implicit.
+function renderContentFlag() {
+    const flag = $("content-flag");
+    if (!flag) return;
+    const revealed = [...state.reveal.values()].filter((e) => e.status === "ok" && e.view?.found).length;
+    const watching = state.watch ? 1 : 0;
+    const previews = [...state.cachePreview.values()].filter((e) => e.status === "ok" && e.view?.found).length;
+    const total = revealed + watching + previews;
+    flag.hidden = total === 0;
+    if (total === 0) return;
+    flag.replaceChildren(
+        el("span", "reveal-flag", "content shown"),
+        document.createTextNode(" " + total + " "),
+    );
+    const hideAll = el("button", "", "hide all");
+    hideAll.type = "button";
+    hideAll.addEventListener("click", () => {
+        stopWatch();
+        const reqs = [...state.reveal.keys()];
+        state.reveal.clear();
+        state.cachePreview.clear();
+        for (const id of reqs) {
+            const node = state.contentNodes.get(id);
+            if (node) { node.dataset.rev = ""; node.replaceChildren(); }
+        }
+        state.contentNodes.clear();
+        renderContentFlag();
+        if (state.view === "timeline") renderTimeline({ force: true });
+        if (state.view === "cache") renderCache();
+    });
+    flag.append(hideAll);
+}
+
 function renderStatus() {
+    renderContentFlag();
     const status = $("status");
     if (state.failures > 0) {
         const wait = Math.min(MAX_BACKOFF_MS, POLL_MS * 2 ** state.failures) / 1000;
@@ -647,6 +729,11 @@ function renderFooter() {
     } else if (state.metricsEnabled === false && state.transport.mode === "live") {
         bits.push("/metrics disabled on this server (start with --metrics for KV-pressure counters)");
     }
+    if (state.contentEnabled === false) {
+        bits.push("content disclosure disabled (--no-dashboard-content)");
+    } else if (state.contentEnabled === true) {
+        bits.push("prompt/output text is fetched only when you ask for it, per request");
+    }
     $("foot").textContent = bits.join("  ·  ");
 }
 
@@ -724,7 +811,20 @@ function timelineWindow(rows, now) {
     return { w0: now - span * 1.02, w1: now };
 }
 
-function renderTimeline() {
+// While a row's content is open, the 500 ms rebuild would move the content DOM
+// on every tick — which drops text selection and resets the live mirror's
+// scroll. Reading content wins; the row still updates, just not the whole board.
+function timelinePaused() {
+    if (state.tlExpanded === null) return false;
+    return state.reveal.has(state.tlExpanded) || (state.watch !== null && state.watch.req === state.tlExpanded);
+}
+
+function renderTimeline({ force = false } = {}) {
+    if (!force && timelinePaused()) {
+        $("tl-note").textContent = "timeline paused while request #" + state.tlExpanded +
+            "'s content is open · close it to resume";
+        return;
+    }
     renderTimelineLegend();
     const container = $("timeline");
     const rows = state.events.rows().slice(0, TIMELINE_ROWS);
@@ -831,8 +931,12 @@ function timelineMeta(req, durMs) {
 // rows are expandable controls: keyboard-reachable, not mouse-only
 function expandOnClick(row, req) {
     const toggle = () => {
-        state.tlExpanded = state.tlExpanded === req.id ? null : req.id;
-        renderTimeline();
+        const collapsing = state.tlExpanded === req.id;
+        state.tlExpanded = collapsing ? null : req.id;
+        // collapsing a row drops any content it was showing: a reveal is an
+        // action taken for one look, not a setting that stays on
+        if (collapsing) hideReveal(req);
+        renderTimeline({ force: true });
         const next = $("timeline").querySelector('[data-req="' + req.id + '"]');
         if (next) next.focus();
     };
@@ -1085,6 +1189,11 @@ function timelineDetail(req, seg) {
             (p) => formatTokens(p.v) + " tok @ " + formatDuration(p.t)));
     }
 
+    // what the request actually said and what came back. Hidden until asked
+    // for; see contentSection().
+    box.append(el("h3", "", "content · prompt in / generation out"));
+    box.append(contentSection(req));
+
     // decode rate curve
     const decodePoints = req.decode.filter((d) => d.tps !== null);
     if (decodePoints.length > 1) {
@@ -1103,6 +1212,348 @@ function timelineDetail(req, seg) {
 function spanText(s) {
     if (s.kind === "restored") return "restored from " + (SRC_LABEL[s.src] ?? s.src);
     return "recomputed — " + (WHY_LABEL[s.why] ?? s.why);
+}
+
+// ---------------------------------------------------------------------------
+// Content (v3): prompt in / generation out, revealed only on request
+//
+// The three rules this section implements:
+//   1. nothing renders content until a human presses a button for THAT request;
+//   2. whatever is on screen says how much of the real thing it is, so a capped
+//      preview can never read as the complete prompt;
+//   3. reveals are memory-only, capped, and dropped when the row collapses.
+// ---------------------------------------------------------------------------
+
+function contentDisabled() {
+    return state.contentEnabled === false;
+}
+
+function pruneReveals() {
+    while (state.reveal.size > MAX_REVEALS) {
+        const oldest = state.reveal.keys().next().value;
+        state.reveal.delete(oldest);
+        state.contentNodes.delete(oldest);
+    }
+}
+
+function requestReveal(req) {
+    if (state.reveal.has(req.id)) return;
+    state.reveal.set(req.id, { status: "loading" });
+    pruneReveals();
+    repaintContent(req);
+    state.transport.content(req.id).then((raw) => {
+        const view = parseContent(raw);
+        state.reveal.set(req.id, view
+            ? { status: "ok", view }
+            : { status: "error", error: "unrecognized content response" });
+    }).catch((error) => {
+        const message = error.status === 501
+            ? "content disclosure is disabled on this server"
+            : error.status === 401 || error.status === 403
+                ? "not authorized to read content"
+                : "content unavailable (" + (error.status ?? error.message) + ")";
+        if (error.status === 501) state.contentEnabled = false;
+        state.reveal.set(req.id, { status: "error", error: message });
+    }).finally(() => repaintContent(req));
+}
+
+function hideReveal(req) {
+    if (state.watch && state.watch.req === req.id) stopWatch();
+    state.reveal.delete(req.id);
+    repaintContent(req);
+}
+
+// A signature of the block's STRUCTURE — deliberately not of the live text.
+// Rebuilding an 8 KB <pre> on every arriving token would fight the operator for
+// text selection and scroll position, so a token arrival updates the live pane
+// in place (updateWatchPane) and only a structural change rebuilds.
+function contentRevision(req) {
+    const entry = state.reveal.get(req.id);
+    const watching = state.watch && state.watch.req === req.id ? state.watch : null;
+    return [
+        entry?.status ?? "-",
+        entry?.view?.found ?? "-",
+        watching ? "w" : "-",
+        watching?.state?.ended ?? "-",
+        state.contentEnabled,
+    ].join("|");
+}
+
+function repaintContent(req) {
+    const node = state.contentNodes.get(req.id);
+    if (node) {
+        const rev = contentRevision(req);
+        if (node.dataset.rev === rev && node.dataset.built === "1") {
+            const watching = state.watch && state.watch.req === req.id ? state.watch : null;
+            if (watching) updateWatchPane(watching);
+        } else {
+            node.dataset.rev = rev;
+            renderContentBlock(req, node);
+        }
+    }
+    renderStatus();
+}
+
+// ---- live token mirror ----
+
+function startWatch(req) {
+    stopWatch();
+    const entry = { req: req.id, stream: null, state: null, pinned: true };
+    entry.stream = new WatchStream({
+        req: req.id,
+        apiKey: currentApiKey(),
+        onUpdate: (s) => {
+            entry.state = s;
+            repaintContent(req);
+        },
+        onClose: () => {
+            // leave the last frame on screen; only the arming is released
+            repaintContent(req);
+        },
+    });
+    state.watch = entry;
+    entry.stream.start();
+    repaintContent(req);
+}
+
+function stopWatch() {
+    if (!state.watch) return;
+    const open = state.watch;
+    state.watch = null;
+    open.stream.stop();
+}
+
+function watchable(req) {
+    return state.transport.mode === "live" && req.terminal === null && !contentDisabled();
+}
+
+// ---- rendering ----
+
+// How many lines of a pane are shown before it is clamped. The clamp is
+// decided from the TEXT, not from measured layout, so it is deterministic:
+// there is always either the whole pane or a visible "show all" control, and
+// never a silently-scrolled pane that looks complete.
+const PANE_CLAMP_LINES = 14;
+const PANE_CLAMP_CHARS = 1100;
+
+function textPane(value, { clamp = true } = {}) {
+    const pre = el("pre", "content-pre");
+    pre.textContent = value;
+    const lines = value.split("\n").length;
+    if (!clamp || (lines <= PANE_CLAMP_LINES && value.length <= PANE_CLAMP_CHARS)) {
+        return pre;
+    }
+    const wrap = el("div", "pane-wrap");
+    pre.classList.add("clamped");
+    const more = el("button", "pane-more", "show all " + lines.toLocaleString("en-US") + " lines");
+    more.type = "button";
+    more.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const open = pre.classList.toggle("clamped");
+        more.textContent = open
+            ? "show all " + lines.toLocaleString("en-US") + " lines"
+            : "collapse";
+    });
+    wrap.append(pre, more);
+    return wrap;
+}
+
+function elisionRule(text) {
+    const rule = el("div", "elision");
+    rule.append(el("span", "", "⋯ " + text + " ⋯"));
+    return rule;
+}
+
+function sideBlock(side, { title, cls, extent = null, liveTag = null, actions = null, autoscroll = false }) {
+    const box = el("div", "content-side " + cls);
+    const head = el("div", "cs-head");
+    head.append(el("b", "", title));
+    head.append(el("span", "cs-extent", extent ?? extentLabel(side)));
+    if (liveTag) head.append(liveTag);
+    if (actions) head.append(actions);
+    box.append(head);
+
+    if (!side || side.empty) {
+        box.append(el("p", "cs-empty", side && side.nTokens === 0
+            ? "empty" : "nothing captured for this side"));
+        return box;
+    }
+    const body = el("div", "cs-body" + (autoscroll ? " scroll" : ""));
+    body.append(textPane(side.head, { clamp: !autoscroll }));
+    if (side.truncated) {
+        body.append(elisionRule(side.kind === "input"
+            ? side.elidedTokens.toLocaleString("en-US") + " tokens elided"
+            : side.elidedBytes.toLocaleString("en-US") + " bytes elided"));
+        if (side.tail) body.append(textPane(side.tail));
+    }
+    box.append(body);
+    return box;
+}
+
+function renderContentBlock(req, node) {
+    const entry = state.reveal.get(req.id);
+    const watching = state.watch && state.watch.req === req.id ? state.watch : null;
+
+    if (!entry && !watching) {
+        node.replaceChildren(closedContentPrompt(req));
+        return;
+    }
+
+    const nodes = [];
+    const bar = el("div", "content-bar");
+    // the flag marks an actual disclosure, so it stays off when the answer was
+    // "nothing retained" — otherwise it cries wolf and stops meaning anything
+    const showing = (entry?.status === "ok" && entry.view?.found) ||
+        (watching !== null && (watching.state?.text?.length ?? 0) > 0);
+    bar.append(showing
+        ? el("span", "reveal-flag", "content shown")
+        : el("span", "dim", "no content shown"));
+    const hide = el("button", "", "hide");
+    hide.type = "button";
+    hide.addEventListener("click", (ev) => { ev.stopPropagation(); hideReveal(req); });
+    bar.append(hide);
+    if (watchable(req)) {
+        const w = el("button", "", watching && !watching.state?.ended ? "stop watching" : "watch live");
+        w.type = "button";
+        w.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            if (watching && !watching.state?.ended) stopWatch(); else startWatch(req);
+            repaintContent(req);
+        });
+        bar.append(w);
+    }
+    bar.append(el("span", "content-policy dim",
+        "fetched now for this request only · not logged, not in the event stream"));
+    nodes.push(bar);
+
+    if (entry?.status === "loading") {
+        nodes.push(el("p", "cs-empty", "loading…"));
+    } else if (entry?.status === "error") {
+        nodes.push(el("p", "warn-line", entry.error));
+    } else if (entry?.status === "ok") {
+        const view = entry.view;
+        if (!view.found) {
+            nodes.push(el("p", "cs-empty", view.reason === "evicted"
+                ? "no longer retained — the content store evicted this request (cap " +
+                  (view.caps.maxRequests ?? "?") + " requests / " + formatBytes(view.caps.maxBytes) + ")"
+                : "nothing captured for this request — it never reached prefill, or the server restarted"));
+        } else {
+            nodes.push(sideBlock(view.input, { title: "INPUT · prompt as sent", cls: "in" }));
+            if (view.output) {
+                nodes.push(sideBlock(view.output, { title: "OUTPUT · generated", cls: "out" }));
+            } else if (!watching) {
+                const live = el("p", "cs-empty",
+                    "still generating — the final text is captured when the request completes.");
+                if (watchable(req)) live.append(document.createTextNode(" Use “watch live” to follow it token by token."));
+                nodes.push(live);
+            }
+        }
+        nodes.push(el("p", "content-policy dim",
+            "server retains at most " + (view.caps.maxRequests ?? "?") + " requests / " +
+            formatBytes(view.caps.maxBytes) + " — currently " + view.store.requests + " (" +
+            formatBytes(view.store.bytes) + "), " + view.store.evicted + " evicted"));
+    }
+
+    if (watching) nodes.push(watchPane(watching));
+    node.replaceChildren(...nodes);
+    node.dataset.built = "1";
+    if (watching) updateWatchPane(watching); // now that the pane is in the document
+}
+
+// How much of a live generation is laid out at once. The accumulated text is
+// already capped in content.mjs; this is a second, tighter bound so a 45-minute
+// turn does not re-layout 256 KiB of <pre> on every frame.
+const WATCH_RENDER_BYTES = 24 * 1024;
+
+// Built once per watch, then mutated in place as tokens arrive.
+function watchPane(watching) {
+    const box = el("div", "content-side out watching");
+    const head = el("div", "cs-head");
+    head.append(el("b", "", "OUTPUT · live"));
+    const extent = el("span", "cs-extent");
+    const tag = el("span", "live-tag on", "connecting");
+    head.append(extent, tag);
+    box.append(head);
+
+    const body = el("div", "cs-body scroll");
+    const pre = el("pre", "content-pre");
+    const caret = el("i", "caret");
+    body.append(pre);
+    box.append(body);
+    body.addEventListener("scroll", () => {
+        watching.pinned = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
+    });
+
+    watching.pane = { box, extent, tag, body, pre, caret };
+    updateWatchPane(watching);
+    return box;
+}
+
+function updateWatchPane(watching) {
+    const pane = watching?.pane;
+    if (!pane) return;
+    const s = watching.state;
+    const full = s?.text ?? "";
+    const shown = full.length > WATCH_RENDER_BYTES ? full.slice(-WATCH_RENDER_BYTES) : full;
+
+    // A live pane must never claim to be complete: it says what it has and,
+    // when the stream outran the mirror, that earlier output is simply gone.
+    const trimmed = (s?.dropped ?? 0) + (s?.clientDropped ?? 0) + (full.length - shown.length);
+    pane.extent.textContent = (s?.nDec ?? 0).toLocaleString("en-US") + " tokens · " +
+        formatBytes(s?.cursor ?? 0) + " generated" +
+        (trimmed > 0 ? " · newest " + formatBytes(shown.length) + " shown, " +
+            formatBytes(trimmed) + " earlier output dropped" : "");
+    pane.tag.className = "live-tag " + (s?.ended ? "done" : "on");
+    pane.tag.textContent = s?.ended
+        ? (WATCH_REASON_LABEL[s.reason] ?? s.reason ?? "closed")
+        : (s?.frames ?? 0) > 0 ? "streaming" : "connecting";
+
+    pane.pre.textContent = shown;
+    if (!s?.ended) pane.pre.append(pane.caret);
+
+    // stay on the newest token unless the operator scrolled away from it
+    if (watching.pinned !== false) pane.body.scrollTop = pane.body.scrollHeight;
+}
+
+function closedContentPrompt(req) {
+    const p = el("p", "content-closed");
+    if (contentDisabled()) {
+        p.append(el("span", "dim",
+            "content disclosure is disabled on this server (--no-dashboard-content) — metadata only"));
+        return p;
+    }
+    if (state.transport.mode !== "live" && !state.fixtureContent) {
+        p.append(el("span", "dim", "no content source in this fixture"));
+        return p;
+    }
+    const btn = el("button", "reveal-btn", "show prompt & output");
+    btn.type = "button";
+    btn.addEventListener("click", (ev) => { ev.stopPropagation(); requestReveal(req); });
+    p.append(btn);
+    if (watchable(req)) {
+        const w = el("button", "reveal-btn", "watch live");
+        w.type = "button";
+        w.addEventListener("click", (ev) => { ev.stopPropagation(); startWatch(req); });
+        p.append(w);
+    }
+    p.append(el("span", "dim",
+        "prompt and generated text are hidden by default — fetched only when you ask, for this request"));
+    return p;
+}
+
+function contentSection(req) {
+    let node = state.contentNodes.get(req.id);
+    if (!node) {
+        node = el("div", "content-block");
+        node.dataset.rev = "";
+        state.contentNodes.set(req.id, node);
+    }
+    const rev = contentRevision(req);
+    if (node.dataset.rev !== rev || node.dataset.built !== "1") {
+        node.dataset.rev = rev;
+        renderContentBlock(req, node);
+    }
+    return node;
 }
 
 // tiny line chart over {t, v} points with hover; x spans [0, max t].
@@ -1238,33 +1689,139 @@ function renderCache() {
     $("cache-note").textContent = "· " + view.entries.length + " entries, snapshot " +
         (view.ageMs < 2000 ? "fresh" : formatDuration(view.ageMs) + " old");
     const body = $("cache-body");
-    const rows = [...view.entries]
-        .sort((a, b) => (a.tier === b.tier ? a.ageS - b.ageS : a.tier === "ram" ? -1 : 1))
-        .map((e) => {
-            const tr = el("tr", "");
-            tr.append(el("td", "num", String(e.id)));
-            const tierTd = el("td", "");
-            tierTd.append(el("span", "tier-tag " + e.tier, e.tier));
-            tr.append(tierTd);
-            tr.append(el("td", "num", formatTokens(e.tokens)));
-            tr.append(el("td", "num", formatBytes(e.bytes)));
-            tr.append(el("td", "num", formatDuration(e.ageS * 1000)));
-            tr.append(el("td", "num", e.lastHitS !== null ? formatDuration(e.lastHitS * 1000) + " ago" : "never"));
-            tr.append(el("td", "num" + (e.hits > 0 ? " strong" : ""), String(e.hits)));
-            const fileTd = el("td", "");
-            if (e.file) fileTd.append(el("code", "", e.file));
-            else fileTd.textContent = "—";
-            tr.append(fileTd);
-            return tr;
-        });
+    const rows = [];
+    for (const e of [...view.entries].sort(
+            (a, b) => (a.tier === b.tier ? a.ageS - b.ageS : a.tier === "ram" ? -1 : 1))) {
+        const tr = el("tr", state.cacheExpanded === e.id ? "expanded" : "");
+        tr.append(el("td", "num", String(e.id)));
+        const tierTd = el("td", "");
+        tierTd.append(el("span", "tier-tag " + e.tier, e.tier));
+        tr.append(tierTd);
+        tr.append(el("td", "num", formatTokens(e.tokens)));
+        tr.append(el("td", "num", formatBytes(e.bytes)));
+        tr.append(el("td", "num", formatDuration(e.ageS * 1000)));
+        tr.append(el("td", "num", e.lastHitS !== null ? formatDuration(e.lastHitS * 1000) + " ago" : "never"));
+        tr.append(el("td", "num" + (e.hits > 0 ? " strong" : ""), String(e.hits)));
+        tr.append(el("td", "num", e.req !== null ? "#" + e.req : "—"));
+        const fileTd = el("td", "");
+        if (e.file) fileTd.append(el("code", "", e.file));
+        else fileTd.textContent = "—";
+        tr.append(fileTd);
+        if (e.preview) {
+            // rows that hold previewable text are real controls, not decoration
+            tr.classList.add("clickable");
+            tr.tabIndex = 0;
+            tr.setAttribute("role", "button");
+            tr.setAttribute("aria-expanded", state.cacheExpanded === e.id ? "true" : "false");
+            tr.setAttribute("aria-label", "cache entry " + e.id + " contents");
+            const toggle = () => {
+                state.cacheExpanded = state.cacheExpanded === e.id ? null : e.id;
+                renderCache();
+            };
+            tr.addEventListener("click", toggle);
+            tr.addEventListener("keydown", (ev) => {
+                if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(); }
+            });
+        }
+        rows.push(tr);
+        if (state.cacheExpanded === e.id) rows.push(cacheDetailRow(e));
+    }
     body.replaceChildren(...rows);
     if (rows.length === 0) {
         const tr = el("tr");
         const td = el("td", "empty", view.enabled ? "cache is empty" : "prompt cache is disabled on this server");
-        td.colSpan = 8;
+        td.colSpan = 9;
         tr.append(td);
         body.append(tr);
     }
+    renderContentFlag();
+}
+
+// ---- cache entry preview ----
+
+function requestCachePreview(id) {
+    if (state.cachePreview.has(id)) return;
+    state.cachePreview.set(id, { status: "loading" });
+    while (state.cachePreview.size > MAX_CACHE_PREVIEWS) {
+        state.cachePreview.delete(state.cachePreview.keys().next().value);
+    }
+    renderCache();
+    state.transport.cachePreview(id).then((raw) => {
+        const view = parseCachePreview(raw);
+        state.cachePreview.set(id, view
+            ? { status: "ok", view }
+            : { status: "error", error: "unrecognized preview response" });
+    }).catch((error) => {
+        if (error.status === 501) state.contentEnabled = false;
+        state.cachePreview.set(id, { status: "error", error: error.status === 501
+            ? "content disclosure is disabled on this server"
+            : "preview unavailable (" + (error.status ?? error.message) + ")" });
+    }).finally(() => renderCache());
+}
+
+function cacheDetailRow(entry) {
+    const tr = el("tr", "cache-detail-row");
+    const td = el("td", "");
+    td.colSpan = 9;
+    const box = el("div", "cache-detail");
+
+    const head = el("div", "cs-head");
+    head.append(el("b", "", "entry " + entry.id));
+    head.append(el("span", "cs-extent",
+        formatTokens(entry.tokens) + " tokens · " + entry.tier + " tier · " + formatBytes(entry.bytes) +
+        (entry.req !== null ? " · saved by request #" + entry.req : " · origin unknown (rebuilt from disk)")));
+    box.append(head);
+
+    const state_ = state.cachePreview.get(entry.id);
+    if (!state_) {
+        const p = el("p", "content-closed");
+        if (contentDisabled()) {
+            p.append(el("span", "dim",
+                "content disclosure is disabled on this server (--no-dashboard-content)"));
+        } else {
+            const btn = el("button", "reveal-btn", "show cached text");
+            btn.type = "button";
+            btn.addEventListener("click", (ev) => { ev.stopPropagation(); requestCachePreview(entry.id); });
+            p.append(btn);
+            p.append(el("span", "dim",
+                "the entry's own tokens, decoded on demand — first " +
+                "and last few hundred characters only"));
+        }
+        box.append(p);
+    } else if (state_.status === "loading") {
+        box.append(el("p", "cs-empty", "loading…"));
+    } else if (state_.status === "error") {
+        box.append(el("p", "warn-line", state_.error));
+    } else if (!state_.view.found) {
+        box.append(el("p", "cs-empty", "entry is gone — evicted or spilled since the snapshot"));
+    } else {
+        const p = state_.view;
+        const bar = el("div", "content-bar");
+        bar.append(el("span", "reveal-flag", "content shown"));
+        const hide = el("button", "", "hide");
+        hide.type = "button";
+        hide.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            state.cachePreview.delete(entry.id);
+            renderCache();
+        });
+        bar.append(hide);
+        bar.append(el("span", "content-policy dim", cachePreviewLabel(p)));
+        box.append(bar);
+
+        const body = el("div", "cs-body");
+        body.append(textPane(p.head));
+        if (p.truncated) {
+            body.append(elisionRule(p.elidedTokens.toLocaleString("en-US") + " tokens elided"));
+            if (p.tail) body.append(textPane(p.tail));
+        }
+        box.append(body);
+    }
+
+    box.addEventListener("click", (ev) => ev.stopPropagation());
+    td.append(box);
+    tr.append(td);
+    return tr;
 }
 
 // ---------------------------------------------------------------------------
@@ -1339,6 +1896,10 @@ async function boot() {
                     state.events.feed(evt);
                 }
             } catch { /* fixture without events: timeline stays empty */ }
+            try {
+                state.fixtureContent = await (await fetch("fixtures/content-v3.json", { cache: "no-store" })).json();
+                state.contentEnabled = true;
+            } catch { state.contentEnabled = false; }
         }
     } else {
         state.transport = liveTransport(currentApiKey());
@@ -1368,7 +1929,7 @@ async function boot() {
         for (const b of $("tl-windows").querySelectorAll("button")) {
             b.classList.toggle("active", b === btn);
         }
-        renderTimeline();
+        renderTimeline({ force: true });
     });
 
     $("tl-scales").addEventListener("click", (ev) => {
@@ -1378,7 +1939,7 @@ async function boot() {
         for (const b of $("tl-scales").querySelectorAll("button")) {
             b.classList.toggle("active", b === btn);
         }
-        renderTimeline();
+        renderTimeline({ force: true });
     });
 
     document.addEventListener("visibilitychange", () => {

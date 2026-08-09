@@ -405,6 +405,12 @@ export function cacheView(stateJson) {
             lastHitS: e.last_hit_s ?? null,
             hits: e.hits ?? 0,
             file: e.file ?? null,
+            // v3, additive: which request's save created the entry, and whether
+            // a text preview can be fetched for it. The preview TEXT is never
+            // in this payload — it comes from /m2-dashboard/cache-preview, one
+            // entry at a time, on request.
+            req: e.req ?? null,
+            preview: e.preview === true,
         })),
     };
 }

@@ -473,6 +473,11 @@ struct server_slot {
             return false;
         }
 
+        // m2-dashboard v3: remember which request's state this entry holds so
+        // the cache view can say which conversation an entry belongs to
+        // (introspection only; never consulted by lookup or eviction)
+        cur->dash_req = dash_req;
+
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (include_dft && ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -539,6 +544,12 @@ struct server_slot {
     // bus event per >=32 tokens or >=1 s instead of per token
     int32_t dash_n_decoded_last = 0;
     int64_t dash_t_last_us      = 0;
+
+    // m2-dashboard v3: the request whose residue this slot currently holds.
+    // Survives release() on purpose: prompt_save() runs from get_available_slot
+    // AFTER the slot went idle, so `task` is already gone by then and only this
+    // still knows which conversation the saved state belongs to.
+    uint64_t dash_req = 0;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -1119,6 +1130,11 @@ struct server_metrics {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    uint64_t n_draft_tokens_total      = 0;
+    uint64_t n_draft_accepted_total    = 0;
+    uint64_t n_draft_verif_steps_total = 0;
+    std::vector<uint64_t> n_accepted_per_pos_total;
+
     void init() {
         t_start = ggml_time_us();
     }
@@ -1137,6 +1153,17 @@ struct server_metrics {
         n_tokens_predicted         += slot.n_decoded;
         t_tokens_generation        += slot.t_token_generation;
         t_tokens_generation_total  += slot.t_token_generation;
+
+        n_draft_tokens_total      += slot.n_draft_total;
+        n_draft_accepted_total    += slot.n_draft_accepted;
+        n_draft_verif_steps_total += slot.n_draft_verif_steps;
+
+        if (n_accepted_per_pos_total.size() < slot.n_accepted_per_pos.size()) {
+            n_accepted_per_pos_total.resize(slot.n_accepted_per_pos.size(), 0);
+        }
+        for (size_t i = 0; i < slot.n_accepted_per_pos.size(); i++) {
+            n_accepted_per_pos_total[i] += slot.n_accepted_per_pos[i];
+        }
     }
 
     void on_decoded(const std::vector<server_slot> & slots) {
@@ -2864,8 +2891,7 @@ private:
         // initialize samplers
         if (task.need_sampling()) {
             try {
-                slot.smpl.reset(common_sampler_init(
-                        model_tgt, task.params.sampling, (int32_t) llama_n_ctx(ctx_tgt)));
+                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
@@ -2898,6 +2924,9 @@ private:
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        // m2-dashboard v3: attribute whatever residue this slot ends up holding
+        slot.dash_req = static_cast<uint64_t>(slot.task->id) + 1;
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -3046,6 +3075,23 @@ private:
         }
 
         SLT_DBG(slot, "n_decoded = %d, n_remaining = %d, next token: %5d '%s'\n", slot.n_decoded, slot.n_remaining, result.tok, token_str.c_str());
+
+        // m2-dashboard v3: live token mirror for GET /m2-dashboard/watch.
+        //
+        // This is the ONLY per-token dashboard hook in the server, and it is
+        // deliberately not an event: the bus ring must stay metadata-only and
+        // its <10 events/s budget must not move. When nobody is watching, the
+        // whole cost is the single relaxed atomic load inside watching().
+        // When a watcher IS attached, sync() copies only the bytes generated
+        // since its previous call into that watcher's bounded buffer — which
+        // also makes it correct across the stop-word trim above, because it
+        // compares against the slot's own current text rather than assuming
+        // generated_text only ever grows.
+        if (server_dashboard::watching()) {
+            server_dashboard::watches().sync(
+                    static_cast<uint64_t>(slot.task->id) + 1, slot.id,
+                    slot.generated_text, slot.n_decoded);
+        }
 
         return slot.has_next_token; // continue
     }
@@ -3236,6 +3282,23 @@ private:
         res->id_slot = slot.id;
 
         res->index = slot.task->index;
+
+        // m2-dashboard v3: capture the generation into the bounded content
+        // store BEFORE the non-stream branch below moves generated_text out of
+        // the slot. Capped head/tail only; nothing is logged, and the store
+        // evicts by both entry count and bytes (server-dashboard-bus.h).
+        {
+            const uint64_t dash_req = static_cast<uint64_t>(slot.task->id) + 1;
+            if (server_dashboard::content().enabled()) {
+                server_dashboard::content().capture_output(
+                        dash_req, slot.id, slot.generated_text, (uint64_t) slot.n_decoded);
+            }
+            if (server_dashboard::watching()) {
+                // deliver the final tail to a live watcher, then close it out
+                server_dashboard::watches().sync(dash_req, slot.id, slot.generated_text, slot.n_decoded);
+                server_dashboard::watches().finish(dash_req, slot.n_decoded);
+            }
+        }
 
         // keep copy of last generated text for debugging purposes
         if (slots_debug) {
@@ -3758,6 +3821,11 @@ private:
                     res->kv_physical_pressure_total   = pressure.total;
                     res->kv_physical_pressure_retries = pressure.retries;
                     res->kv_physical_pressure_victims = pressure.victims;
+
+                    res->n_draft_tokens_total      = metrics.n_draft_tokens_total;
+                    res->n_draft_accepted_total    = metrics.n_draft_accepted_total;
+                    res->n_draft_verif_steps_total = metrics.n_draft_verif_steps_total;
+                    res->n_accepted_per_pos_total  = metrics.n_accepted_per_pos_total;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -5325,6 +5393,15 @@ private:
                             server_dashboard::instance().emit(ev);
                         }
 
+                        // m2-dashboard v3: capture the prompt for the content
+                        // route. Only a bounded head/tail of TOKEN IDS is kept
+                        // (512 + 256 by default) — detokenization happens on
+                        // the HTTP thread, on demand, for one request at a
+                        // time, so the main loop pays a couple of small vector
+                        // copies once per request and never touches the vocab.
+                        server_dashboard::capture_prompt(
+                                static_cast<uint64_t>(slot.task->id) + 1, slot.id, input_tokens);
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -6434,7 +6511,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params = server_schema::eval_llama_cmpl_schema(
                     ctx_server.vocab,
                     params,
-                    meta->slot_n_ctx,
                     meta->logit_bias_eog,
                     data);
 
@@ -6967,6 +7043,243 @@ void server_routes::init_routes() {
         return res;
     };
 
+    // m2-dashboard v3 content routes. Same key-authenticated middleware as the
+    // v2 routes above, but every one of them is a separate, explicitly-called
+    // path: nothing here is reachable by the metadata views, so the dashboard
+    // shows content only when a human asks for that one request or entry.
+    //
+    // Detokenization runs here, on the HTTP thread, exactly like POST
+    // /detokenize does — the vocab is immutable, so this never touches the
+    // main loop and costs nothing when nobody calls.
+    const auto dashboard_detokenizer = [this]() {
+        return [this](const std::vector<int32_t> & ids) {
+            std::string out;
+            llama_tokens run;
+            run.reserve(ids.size());
+            for (const int32_t id : ids) {
+                if (id < 0) {
+                    // media placeholder (LLAMA_TOKEN_NULL): never hand it to
+                    // the vocab, name it instead
+                    if (!run.empty()) {
+                        out += tokens_to_str(ctx_server.vocab, run);
+                        run.clear();
+                    }
+                    out += "\xef\xbf\xbd[media]";
+                    continue;
+                }
+                run.push_back((llama_token) id);
+            }
+            if (!run.empty()) {
+                out += tokens_to_str(ctx_server.vocab, run);
+            }
+            return out;
+        };
+    };
+
+    const auto dashboard_content_disabled = [](server_res_generator & res) {
+        res.error(format_error_response(
+                "dashboard content capture is disabled on this server (--no-dashboard-content)",
+                ERROR_TYPE_NOT_SUPPORTED));
+    };
+
+    // shared ?req=<uint> parser; 0 is never a valid runtime request id
+    const auto parse_dashboard_id = [](const std::string & raw, uint64_t & out) {
+        if (raw.empty()) {
+            return false;
+        }
+        const char * begin  = raw.data();
+        const char * end    = begin + raw.size();
+        const auto   parsed = std::from_chars(begin, end, out, 10);
+        return parsed.ec == std::errc() && parsed.ptr == end && out != 0;
+    };
+
+    this->get_dashboard_content =
+            [this, dashboard_detokenizer, dashboard_content_disabled, parse_dashboard_id]
+            (const server_http_req & req) {
+        auto res = create_response(true);
+        res->headers["Cache-Control"] = "no-store";
+        if (!server_dashboard::content().enabled()) {
+            dashboard_content_disabled(*res);
+            return res;
+        }
+        uint64_t request_id = 0;
+        if (!parse_dashboard_id(req.get_param("req"), request_id)) {
+            res->error(format_error_response("invalid or missing req parameter", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        server_dashboard::request_content found;
+        const bool have  = server_dashboard::content().lookup(request_id, found);
+        const auto stats = server_dashboard::content().usage();
+        res->ok(server_dashboard::content_to_json(
+                request_id, have ? &found : nullptr,
+                have ? nullptr : (server_dashboard::content().was_evicted(request_id) ? "evicted" : "absent"),
+                stats, dashboard_detokenizer()));
+        return res;
+    };
+
+    this->get_dashboard_cache_preview =
+            [this, dashboard_detokenizer, dashboard_content_disabled, parse_dashboard_id]
+            (const server_http_req & req) {
+        auto res = create_response(true);
+        res->headers["Cache-Control"] = "no-store";
+        if (!server_dashboard::content().enabled()) {
+            dashboard_content_disabled(*res);
+            return res;
+        }
+        uint64_t entry_id = 0;
+        if (!parse_dashboard_id(req.get_param("id"), entry_id)) {
+            res->error(format_error_response("invalid or missing id parameter", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // served from the same published snapshot /m2-dashboard/cache-state
+        // reads, so the HTTP thread still never touches live cache structures
+        const auto state = server_dashboard::instance().cache();
+        const server_dashboard::cache_entry_state * entry = nullptr;
+        for (const auto & candidate : state.entries) {
+            if (candidate.id == entry_id) {
+                entry = &candidate;
+                break;
+            }
+        }
+        res->ok(server_dashboard::cache_preview_to_json(
+                entry_id, entry, (uint64_t) ggml_time_us(), state.at_us, dashboard_detokenizer()));
+        return res;
+    };
+
+    this->get_dashboard_watch =
+            [this, dashboard_detokenizer, dashboard_content_disabled, parse_dashboard_id]
+            (const server_http_req & req) {
+        auto res = create_response(true);
+        res->headers["Cache-Control"] = "no-store";
+        if (!server_dashboard::content().enabled()) {
+            dashboard_content_disabled(*res);
+            return res;
+        }
+        uint64_t request_id = 0;
+        if (!parse_dashboard_id(req.get_param("req"), request_id)) {
+            res->error(format_error_response("invalid or missing req parameter", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // A watch lease is what arms the per-token mirror. Two at a time: this
+        // is the only thing in the dashboard that touches the decode loop per
+        // token, so its fan-out is kept deliberately tighter than the 8-stream
+        // event feed.
+        const int lease = server_dashboard::watches().attach(request_id);
+        if (lease < 0) {
+            res->error(format_error_response(
+                    "too many dashboard watch streams", ERROR_TYPE_OVERLOADED));
+            return res;
+        }
+        // released on every exit path below, including a client disconnect
+        auto lease_guard = std::shared_ptr<void>((void *) &server_dashboard::watches(),
+                [lease](void *) { server_dashboard::watches().detach(lease); });
+
+        // hello: whatever the store already knows (the input, and the final
+        // output when the request is already over), so a watch on a finished
+        // request degrades to "here is what it produced" instead of hanging
+        server_dashboard::request_content known;
+        const bool have = server_dashboard::content().lookup(request_id, known);
+        json input = nullptr;
+        const char * state = "absent";
+        if (have) {
+            state = known.complete ? "final" : "live";
+            const auto detok = dashboard_detokenizer();
+            if (known.has_input) {
+                const uint64_t shown = (uint64_t) (known.in_head.size() + known.in_tail.size());
+                input = {
+                    { "n_tokens", known.in_tokens },
+                    { "head", detok(known.in_head) },
+                    { "tail", detok(known.in_tail) },
+                    { "head_tokens", known.in_head.size() },
+                    { "tail_tokens", known.in_tail.size() },
+                    { "elided_tokens", known.in_tokens > shown ? known.in_tokens - shown : 0 },
+                    { "truncated", known.in_tokens > shown },
+                };
+            }
+        }
+
+        server_dashboard::watch_view opening;
+        server_dashboard::watches().drain(lease, opening);
+        opening.req = request_id;
+        if (have && known.complete && known.has_output) {
+            // already finished: hand over the retained head, and let the end
+            // frame follow immediately
+            opening.text  = known.out_head;
+            opening.n_dec = (int32_t) known.out_tokens;
+        }
+        std::string hello = server_dashboard::make_watch_hello_frame(request_id, opening, state, input);
+        const bool already_done = have && known.complete;
+
+        res->status = 200;
+        res->content_type = "text/event-stream; charset=utf-8";
+
+        const auto * should_stop = &req.should_stop;
+        auto last_write = std::chrono::steady_clock::now();
+        auto last_data  = std::chrono::steady_clock::now();
+        res->next = [should_stop, lease, lease_guard, request_id, already_done,
+                     last_write, last_data, hello = std::move(hello),
+                     sent_hello = false, done = false](std::string & output) mutable {
+            (void) lease_guard;
+            if (!sent_hello) {
+                output     = std::move(hello);
+                sent_hello = true;
+                last_write = std::chrono::steady_clock::now();
+                return true;
+            }
+            if (done) {
+                output.clear();
+                return false;
+            }
+            if (already_done) {
+                output = server_dashboard::make_watch_end_frame(request_id, "gone", 0);
+                done   = true;
+                return true;
+            }
+            while (!(*should_stop)()) {
+                server_dashboard::watch_view view;
+                if (!server_dashboard::watches().drain(lease, view)) {
+                    output = server_dashboard::make_watch_end_frame(request_id, "gone", 0);
+                    done   = true;
+                    return true;
+                }
+                if (!view.text.empty()) {
+                    output     = server_dashboard::make_watch_frame(view);
+                    last_write = std::chrono::steady_clock::now();
+                    last_data  = last_write;
+                    if (view.ended) {
+                        output += server_dashboard::make_watch_end_frame(request_id, "finished", view.n_dec);
+                        done = true;
+                    }
+                    return true;
+                }
+                if (view.ended) {
+                    output = server_dashboard::make_watch_end_frame(request_id, "finished", view.n_dec);
+                    done   = true;
+                    return true;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last_data >= std::chrono::milliseconds(server_dashboard::watch_idle_timeout_ms)) {
+                    output = server_dashboard::make_watch_end_frame(request_id, "idle", view.n_dec);
+                    done   = true;
+                    return true;
+                }
+                if (now - last_write >= std::chrono::milliseconds(server_dashboard::heartbeat_ms)) {
+                    output     = ": keepalive\n\n";
+                    last_write = now;
+                    return true;
+                }
+                std::this_thread::sleep_for(
+                        std::chrono::milliseconds(server_dashboard::watch_poll_interval_ms));
+            }
+            output.clear();
+            return false;
+        };
+        return res;
+    };
+
     this->post_admin_dashboard_detail =
             [this, authorize_dashboard_post, secure_dashboard_response](const server_http_req & req) {
         auto res = create_response(true);
@@ -7127,6 +7440,18 @@ void server_routes::init_routes() {
                     {"name",  "kv_physical_pressure_victims_total"},
                     {"help",  "Requests selected after exhausting physical KV pressure retries."},
                     {"value",  res_task->kv_physical_pressure_victims}
+            }, {
+                    {"name",  "spec_decode_num_draft_tokens_total"},
+                    {"help",  "Total draft tokens generated"},
+                    {"value",  res_task->n_draft_tokens_total}
+            }, {
+                    {"name",  "spec_decode_num_accepted_tokens_total"},
+                    {"help",  "Total draft tokens accepted by the target model"},
+                    {"value",  res_task->n_draft_accepted_total}
+            }, {
+                    {"name",  "spec_decode_num_drafts_total"},
+                    {"help",  "Total speculative decoding verification steps"},
+                    {"value",  res_task->n_draft_verif_steps_total}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},
@@ -7165,6 +7490,17 @@ void server_routes::init_routes() {
                 prometheus << "# HELP llamacpp:" << name << " " << help  << "\n"
                             << "# TYPE llamacpp:" << name << " " << type  << "\n"
                             << "llamacpp:"        << name << " " << value << "\n";
+            }
+        }
+
+        // labeled counter: one time series per draft position
+        if (!res_task->n_accepted_per_pos_total.empty()) {
+            prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
+                          " Accepted tokens per draft position\n"
+                       << "# TYPE llamacpp:spec_decode_num_accepted_tokens_per_pos_total counter\n";
+            for (size_t i = 0; i < res_task->n_accepted_per_pos_total.size(); i++) {
+                prometheus << "llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position=\""
+                           << i << "\"} " << res_task->n_accepted_per_pos_total[i] << "\n";
             }
         }
 
@@ -7284,6 +7620,10 @@ void server_routes::init_routes() {
             { "endpoint_slots",              params.endpoint_slots },
             { "endpoint_props",              params.endpoint_props },
             { "endpoint_metrics",            params.endpoint_metrics },
+            // m2-dashboard v3: whether the content/watch/cache-preview routes
+            // will answer at all, so the page can say "disclosure disabled on
+            // this server" instead of offering a button that always 501s
+            { "dashboard_content",           server_dashboard::content().enabled() },
             { "ui",                          params.ui },
             { "ui_settings",                 meta->json_ui_settings },
             { "chat_template",               tmpl_default },

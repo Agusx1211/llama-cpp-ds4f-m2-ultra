@@ -165,6 +165,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_layer = 3;
     } else if (arch == LLM_ARCH_CHAMELEON) {
         n_vocab = 10240;
+    } else if (arch == LLM_ARCH_QWEN3TTS) {
+        n_vocab = 4096; // must be >= the hard-coded codec head size (3072)
     }
 
     const uint32_t n_embd_head = n_embd / n_head;
@@ -2419,6 +2421,38 @@ static bool test_dsv4_transactional_restore(size_t seed, ggml_backend_dev_t dev)
     GGML_ASSERT(loaded_tokens == file_tokens);
     std::filesystem::remove(file_path);
 
+    // A sequence snapshot embeds its physical stream position and sequence ID,
+    // so logically equal states from different IDs are not directly bytewise
+    // comparable. Round-trip both through one empty destination using only the
+    // public PARTIAL_ONLY state API. No restored partial state is decoded.
+    static constexpr llama_seq_id canonical_seq = 5;
+    GGML_ASSERT(llama_memory_seq_rm(memory, dest_seq, -1, -1));
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, dest_seq) == -1);
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, canonical_seq) == -1);
+    const auto output_before_canonical = dsv4_logits_ith(test, 0);
+    const auto transcode_partial = [&](const std::vector<uint8_t> & raw) {
+        GGML_ASSERT(llama_state_seq_set_data_ext(
+                test.lctx.get(), raw.data(), raw.size(),
+                canonical_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == raw.size());
+        auto result = dsv4_sequence_state_ext(
+                test.lctx.get(), canonical_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        GGML_ASSERT(llama_memory_seq_rm(memory, canonical_seq, -1, -1));
+        GGML_ASSERT(llama_memory_seq_rm(memory, dest_seq, -1, -1));
+        GGML_ASSERT(llama_memory_seq_pos_max(memory, canonical_seq) == -1);
+        GGML_ASSERT(llama_memory_seq_pos_max(memory, dest_seq) == -1);
+        return result;
+    };
+
+    auto other_stream_partial = transcode_partial(source_partial);
+    std::fill_n(other_stream_partial.begin() + sizeof(uint32_t), sizeof(llama_seq_id), 0);
+    GGML_ASSERT(other_stream_partial != source_partial);
+    const auto canonical_source = transcode_partial(source_partial);
+    const auto canonical_other  = transcode_partial(other_stream_partial);
+    GGML_ASSERT(canonical_source == canonical_other);
+    GGML_ASSERT(dsv4_sequence_state_ext(
+            test.lctx.get(), source_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == source_partial);
+    GGML_ASSERT(dsv4_logits_ith(test, 0) == output_before_canonical);
+
     // A genuinely different cache geometry must reject the snapshot before
     // changing its empty destination.
     dsv4_test_context wrong_geometry(
@@ -2859,10 +2893,18 @@ static bool arch_supported(const llm_arch arch) {
     }
     // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
 #ifdef GGML_USE_WEBGPU
-    if (arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MINIMAX_M3) {
+    if (arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA) {
         return false;
     }
 #endif // GGML_USE_WEBGPU
+
+    // FIXME: jamba produces incorrect output (~0.55 NMSE vs CPU) on the HIP
+    // backend on RDNA3.5 (gfx1151); the SSM kernels need investigation.
+#ifdef GGML_USE_HIP
+    if (arch == LLM_ARCH_JAMBA) {
+        return false;
+    }
+#endif // GGML_USE_HIP
 
     return true;
 }

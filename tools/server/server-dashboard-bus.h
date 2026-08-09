@@ -26,10 +26,15 @@
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace server_dashboard {
@@ -40,8 +45,12 @@ using json = nlohmann::ordered_json;
 // frame and snapshot carries this as "v"
 constexpr uint32_t schema_version = 1;
 
-constexpr const char * events_path      = "/m2-dashboard/events";
-constexpr const char * cache_state_path = "/m2-dashboard/cache-state";
+constexpr const char * events_path        = "/m2-dashboard/events";
+constexpr const char * cache_state_path   = "/m2-dashboard/cache-state";
+// dashboard v3 content routes (see notes/2026-08-09-dashboard-v3.md)
+constexpr const char * content_path       = "/m2-dashboard/content";
+constexpr const char * watch_path         = "/m2-dashboard/watch";
+constexpr const char * cache_preview_path = "/m2-dashboard/cache-preview";
 
 constexpr size_t ring_capacity_default   = 8192;
 constexpr size_t maximum_live_streams    = 8;
@@ -187,6 +196,15 @@ struct cache_entry_state {
     uint64_t    last_hit_us  = 0;  // 0 = never hit
     uint32_t    hits         = 0;
     std::string file;              // basename of the SSD-tier file, empty in RAM
+
+    // dashboard v3 preview material. Both tiers keep prompt.tokens resident
+    // (the SSD tier only spills the state blobs), so a bounded head/tail slice
+    // of TOKEN IDS rides along in the snapshot and is detokenized on the HTTP
+    // thread only when GET /m2-dashboard/cache-preview asks for that entry.
+    // No decoded text is ever retained here.
+    std::vector<int32_t> head_ids;
+    std::vector<int32_t> tail_ids;
+    uint64_t             request_id = 0; // request whose save created it (0 = unknown)
 };
 
 struct cache_counters {
@@ -248,12 +266,231 @@ class bus {
 // process-wide instance used by all emit sites
 bus & instance();
 
+// content capture (dashboard v3) ---------------------------------------------
+//
+// Request content (the prompt as sent, the text generated) is deliberately NOT
+// on the bus: the bus event is a fixed 96-byte POD and the replay ring is
+// bounded history that any late consumer receives, so a ring of prompts would
+// be a standing liability. Content lives in its own store with its own caps,
+// its own routes, and its own kill switch:
+//
+//   - retention is bounded in entries AND bytes and evicts oldest-first;
+//   - the prompt is retained as a head/tail slice of TOKEN IDS and is
+//     detokenized only on the HTTP thread, on demand, for one request at a
+//     time (the same thing POST /detokenize already does; the vocab is
+//     immutable, so this is safe off the main loop);
+//   - the generation is retained as capped head/tail UTF-8 (it is already text
+//     on the producer side, so no detokenize happens on the main loop);
+//   - nothing here is ever logged, and none of it appears in /m2-dashboard/
+//     events, /m2-dashboard/cache-state or the registry snapshot.
+
+constexpr size_t   content_max_requests   = 64;          // retained requests
+constexpr size_t   content_max_bytes      = 1u << 20;    // 1 MiB of retained material
+constexpr uint32_t content_in_head_tokens = 512;
+constexpr uint32_t content_in_tail_tokens = 256;
+constexpr size_t   content_out_head_bytes = 4096;
+constexpr size_t   content_out_tail_bytes = 2048;
+
+constexpr size_t cache_preview_head_tokens = 64;
+constexpr size_t cache_preview_tail_tokens = 32;
+
+constexpr size_t maximum_watch_streams   = 2;
+constexpr size_t watch_mirror_bytes      = 64u << 10;    // per watcher
+constexpr int    watch_poll_interval_ms  = 60;
+constexpr int    watch_idle_timeout_ms   = 180000;       // silent watched request
+
+struct request_content {
+    uint64_t request_id = 0;
+    int32_t  slot       = -1;
+    uint64_t at_us      = 0;
+    bool     complete   = false; // the generation finished (output is final)
+
+    bool                 has_input = false;
+    uint64_t             in_tokens = 0;  // full prompt length, not the slice length
+    std::vector<int32_t> in_head;
+    std::vector<int32_t> in_tail;
+
+    bool        has_output  = false;
+    uint64_t    out_tokens  = 0;
+    uint64_t    out_bytes   = 0;  // full generation length in bytes
+    std::string out_head;
+    std::string out_tail;
+
+    size_t bytes() const {
+        return (in_head.size() + in_tail.size()) * sizeof(int32_t) +
+               out_head.size() + out_tail.size();
+    }
+};
+
+struct content_stats {
+    size_t   requests = 0;
+    size_t   bytes    = 0;
+    uint64_t evicted  = 0;
+};
+
+class content_store {
+  public:
+    void set_enabled(bool on);
+    bool enabled() const;
+
+    void capture_input(uint64_t req, int32_t slot, uint64_t n_tokens,
+                       std::vector<int32_t> && head, std::vector<int32_t> && tail);
+    void capture_output(uint64_t req, int32_t slot, const std::string & text, uint64_t n_tokens);
+    // terminal transition without an output capture (cancel, stall, timeout):
+    // drops the record's eviction exemption
+    void mark_final(uint64_t req);
+
+    // true when the request is retained; fills `out` with a copy
+    bool          lookup(uint64_t req, request_content & out) const;
+    content_stats usage() const;
+    bool          was_evicted(uint64_t req) const;
+    void          clear();
+
+  private:
+    void evict_locked();
+
+    mutable std::mutex                             mtx;
+    std::unordered_map<uint64_t, request_content>  entries;
+    std::deque<uint64_t>                           order;      // FIFO eviction order
+    std::deque<uint64_t>                           tombstones; // recently evicted ids
+    size_t                                         bytes_used = 0;
+    uint64_t                                       evicted    = 0;
+    bool                                           on         = true;
+};
+
+content_store & content();
+
+// Slice a bounded head/tail out of any indexable token container and hand it to
+// the store. Returns immediately (no slicing, no allocation) when capture is
+// disabled. Negative ids (media placeholders) are kept as-is; the detokenizer
+// renders them as a placeholder rather than passing them to the vocab.
+template <class Tokens>
+void capture_prompt_into(content_store & store, uint64_t req, int32_t slot, const Tokens & toks) {
+    if (!store.enabled() || req == 0) {
+        return;
+    }
+    const size_t n  = toks.size();
+    const size_t nh = std::min<size_t>(n, content_in_head_tokens);
+    std::vector<int32_t> head;
+    std::vector<int32_t> tail;
+    head.reserve(nh);
+    for (size_t i = 0; i < nh; ++i) {
+        head.push_back((int32_t) toks[i]);
+    }
+    if (n > nh) {
+        const size_t nt = std::min<size_t>(n - nh, content_in_tail_tokens);
+        tail.reserve(nt);
+        for (size_t i = n - nt; i < n; ++i) {
+            tail.push_back((int32_t) toks[i]);
+        }
+    }
+    store.capture_input(req, slot, (uint64_t) n, std::move(head), std::move(tail));
+}
+
+template <class Tokens>
+void capture_prompt(uint64_t req, int32_t slot, const Tokens & toks) {
+    capture_prompt_into(content(), req, slot, toks);
+}
+
+// live token mirror (dashboard v3) -------------------------------------------
+//
+// GET /m2-dashboard/watch mirrors ONE in-flight request's generated text to one
+// HTTP consumer. The decode loop's cost when nobody is watching is a single
+// relaxed atomic load (see watching() below): no event, no lock, no copy. When
+// a watcher IS attached, the producer appends only the bytes generated since
+// its last call into a bounded per-watcher buffer.
+
+namespace detail {
+extern std::atomic<uint32_t> watch_active;
+}
+
+// hot-path guard. Call this before touching the mirror at all.
+inline bool watching() noexcept {
+    return detail::watch_active.load(std::memory_order_relaxed) != 0;
+}
+
+// One drained frame. `cursor` is what the wire carries, and its meaning is
+// deliberately kind-dependent so a bounded mirror can still be described
+// exactly (see notes/2026-08-09-dashboard-v3.md, "watch frames"):
+//   delta   -> total bytes produced so far, i.e. the END offset of `text`
+//   rewind  -> the absolute offset at which `text` BEGINS (0 = replace all)
+// A rewind therefore says "throw away what you have; here is the generation
+// from byte `cursor` onward", which is representable even when the trim point
+// is older than the mirror.
+struct watch_view {
+    uint64_t    req      = 0;
+    int32_t     slot     = -1;
+    int32_t     n_dec    = 0;
+    uint64_t    cursor   = 0; // total bytes ever produced for this watcher
+    uint64_t    offset   = 0; // absolute offset at which `text` begins
+    uint64_t    dropped  = 0; // bytes discarded because the reader lagged
+    bool        replace  = false; // `text` supersedes everything the reader has
+    bool        ended    = false;
+    std::string text;
+};
+
+class watch_registry {
+  public:
+    // -1 when every watch slot is taken
+    int  attach(uint64_t req);
+    void detach(int lease);
+
+    // producer side (main loop). `generated` is the slot's whole generated text
+    // so far; only the new suffix is copied. A shrink (stop-word trim) is
+    // reported to the consumer as a replace.
+    void sync(uint64_t req, int32_t slot, const std::string & generated, int32_t n_dec);
+    void finish(uint64_t req, int32_t n_dec);
+
+    // consumer side (HTTP thread). Returns false when the lease is not attached.
+    // `out.text` is empty when nothing new arrived.
+    bool drain(int lease, watch_view & out);
+
+    size_t active() const;
+    void   reset(); // tests
+
+  private:
+    struct slot_state {
+        bool        in_use   = false;
+        uint64_t    req      = 0;
+        int32_t     slot     = -1;
+        int32_t     n_dec    = 0;
+        uint64_t    produced = 0; // total bytes appended for this watcher
+        uint64_t    start    = 0; // absolute offset of pending[0]
+        uint64_t    dropped  = 0;
+        size_t      mirrored = 0; // bytes of generated_text already mirrored
+        bool        replace  = true;
+        bool        ended    = false;
+        std::string pending;
+    };
+
+    mutable std::mutex mtx;
+    slot_state         slots[maximum_watch_streams];
+};
+
+watch_registry & watches();
+
 // serialization (shared by the SSE handler, the snapshot handler, and tests)
 const char * kind_name(event_kind kind);
 json         event_to_json(const event & e, uint64_t wall_offset_ms = 0);
 std::string  make_sse_frame(const event & e, uint64_t wall_offset_ms = 0);
 std::string  make_hello_frame(const ring_snapshot & window, uint64_t now_us, uint64_t wall_ms);
 json         cache_state_to_json(const cache_state & state, uint64_t now_us);
+
+// The content routes never link against llama: the caller supplies a
+// detokenizer so the bus stays a leaf and the tests can inject a fake one.
+using detokenizer = std::function<std::string(const std::vector<int32_t> &)>;
+
+// `found == nullptr` renders the not-retained body; `reason` is "absent" or
+// "evicted" in that case.
+json content_to_json(uint64_t req, const request_content * found, const char * reason,
+                     const content_stats & stats, const detokenizer & detok);
+json cache_preview_to_json(uint64_t id, const cache_entry_state * entry, uint64_t now_us,
+                           uint64_t snapshot_at_us, const detokenizer & detok);
+
+std::string make_watch_hello_frame(uint64_t req, const watch_view & view, const char * state,
+                                   const json & input);
+std::string make_watch_frame(const watch_view & view);
+std::string make_watch_end_frame(uint64_t req, const char * reason, int32_t n_dec);
 
 // milliseconds to add to (at_us / 1000) to obtain wall-clock ms for this
 // process (computed once from the current wall clock and ggml_time_us)
@@ -262,5 +499,10 @@ uint64_t wall_offset_ms();
 // bounded number of concurrent SSE consumers
 std::shared_ptr<void> try_acquire_stream_lease();
 size_t                active_streams();
+
+// UTF-8 safe truncation helpers used by the content store and its tests: never
+// cut a multi-byte sequence in half, or the JSON encoder produces mojibake.
+size_t utf8_prefix_len(const std::string & s, size_t max_bytes);
+size_t utf8_suffix_start(const std::string & s, size_t max_bytes);
 
 }  // namespace server_dashboard

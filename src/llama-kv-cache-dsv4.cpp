@@ -1538,9 +1538,21 @@ static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans
     std::vector<llama_kv_cache_dsv4_context::comp_plan> plans;
     plans.reserve(ubatches.size());
 
+    // A pending rollback restores the current plane exactly once, in the
+    // first ubatch that touches its sequence. Plans are built up front, so use
+    // a planning-local copy rather than replaying the original rs_idx in every
+    // later ubatch.
+    std::vector<uint32_t> pending(rs_idx);
     for (const llama_ubatch & ubatch : ubatches) {
         plans.push_back(dsv4_build_comp_plan(
-                ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, n_rs_seq_alloc, rs_idx));
+                ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, n_rs_seq_alloc, pending));
+
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+            if (seq_id >= 0 && (size_t) seq_id < pending.size()) {
+                pending[seq_id] = 0;
+            }
+        }
     }
 
     return plans;
@@ -3595,6 +3607,13 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 
         const llama_pos rollback = pos_max - (p0 - 1);
         if (rollback < 1 || rollback > (llama_pos) n_rs_seq_active) {
+            return false;
+        }
+
+        // Snapshot planes are relative to one accepted state. Stacking a
+        // second removal before the first restore executes would reinterpret
+        // them relative to already-truncated raw KV and cannot compose.
+        if (rs_idx[seq_id] != 0) {
             return false;
         }
 

@@ -18,6 +18,8 @@
       <button type="button" data-view="timeline">Timeline</button>
       <button type="button" data-view="cache">Cache</button>
     </nav>
+    <!-- standing marker: prompt or generated text is on screen right now -->
+    <span id="content-flag" class="content-flag" role="status" hidden></span>
     <span id="status" class="status" role="status">connecting</span>
   </header>
 
@@ -78,9 +80,10 @@
     <div id="view-cache" class="view" hidden>
       <section id="cache-tiles" class="tiles" aria-label="prompt cache tiers"></section>
       <h2>Entries <span id="cache-note" class="dim"></span></h2>
+      <p class="dim cache-hint">rows with cached text are expandable — open one to read what is actually in it</p>
       <table id="cache-table">
         <thead>
-          <tr><th>id</th><th>tier</th><th class="num">tokens</th><th class="num">size</th><th class="num">age</th><th class="num">last hit</th><th class="num">hits</th><th>file</th></tr>
+          <tr><th>id</th><th>tier</th><th class="num">tokens</th><th class="num">size</th><th class="num">age</th><th class="num">last hit</th><th class="num">hits</th><th class="num">request</th><th>file</th></tr>
         </thead>
         <tbody id="cache-body"></tbody>
       </table>

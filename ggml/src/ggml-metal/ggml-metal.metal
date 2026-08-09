@@ -6483,10 +6483,6 @@ kernel void kernel_upscale_nearest_f32(
     }
 }
 
-static inline float bilinear_tri(float x) {
-    return MAX(0.0f, 1.0f - fabs(x));
-}
-
 kernel void kernel_upscale_bilinear_f32(
     constant ggml_metal_kargs_upscale & args,
     device  const char * src0,

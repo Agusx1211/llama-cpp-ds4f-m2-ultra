@@ -589,6 +589,11 @@ struct server_task_result_metrics : server_task_result {
     uint64_t kv_physical_pressure_retries = 0;
     uint64_t kv_physical_pressure_victims = 0;
 
+    uint64_t n_draft_tokens_total      = 0;
+    uint64_t n_draft_accepted_total    = 0;
+    uint64_t n_draft_verif_steps_total = 0;
+    std::vector<uint64_t> n_accepted_per_pos_total;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();
@@ -690,6 +695,7 @@ struct server_prompt_cache_state {
     int64_t  dash_created_us  = 0;
     int64_t  dash_last_hit_us = 0; // 0 = never hit
     uint32_t dash_hits        = 0;
+    uint64_t dash_req         = 0; // request whose save created it (0 = rebuilt from disk)
 
     bool on_disk() const { return !file.empty(); }
 
