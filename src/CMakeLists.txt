@@ -19,6 +19,7 @@ add_library(llama
             llama-cparams.cpp
             llama-dsv4-amx.cpp
             llama-dsv4-comp-pool.cpp
+            llama-dsv4-segment-store.cpp
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp

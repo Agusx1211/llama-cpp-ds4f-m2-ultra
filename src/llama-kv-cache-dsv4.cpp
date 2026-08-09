@@ -2370,6 +2370,22 @@ llama_dsv4_recurrent_sequence_state llama_dsv4_comp_state::export_sequence_all_d
     return result;
 }
 
+std::vector<llama_dsv4_logical_tensor_state> llama_dsv4_comp_state::logical_tensor_geometry(
+        bool score) const {
+    std::vector<llama_dsv4_logical_tensor_state> result;
+    result.reserve(layers.size());
+    for (const auto & layer : layers) {
+        const ggml_tensor * tensor = score ? layer.score : layer.kv;
+        llama_dsv4_logical_tensor_state logical;
+        logical.layer_id = layer.il;
+        logical.type     = static_cast<int32_t>(tensor->type);
+        logical.ne0      = tensor->ne[0];
+        logical.row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        result.push_back(std::move(logical));
+    }
+    return result;
+}
+
 void llama_dsv4_comp_state::validate_sequence_all_depths(
         const llama_dsv4_recurrent_sequence_state & state) const {
     if (state.schema_version != LLAMA_DSV4_LOGICAL_STATE_SCHEMA || state.ratio != ratio ||
@@ -4829,12 +4845,20 @@ bool llama_kv_cache_dsv4::is_aggregate_compressed() const {
     return aggregate_compressed;
 }
 
+uint64_t llama_kv_cache_dsv4::get_logical_state_identity() const {
+    return state_identity_hash;
+}
+
 uint32_t llama_kv_cache_dsv4::get_c4_logical_rows() const {
     return c4_logical_rows;
 }
 
 uint32_t llama_kv_cache_dsv4::get_hca_logical_rows() const {
     return hca_logical_rows;
+}
+
+uint32_t llama_kv_cache_dsv4::get_active_rs_depth() const {
+    return n_rs_seq_active;
 }
 
 llama_dsv4_comp_pool * llama_kv_cache_dsv4::get_comp_pool() const {

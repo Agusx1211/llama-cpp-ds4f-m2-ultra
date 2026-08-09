@@ -403,6 +403,10 @@ public:
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
     llama_dsv4_recurrent_sequence_state export_sequence_all_depths(llama_seq_id seq_id) const;
+    // Payload-free geometry for bounded persistence decoders. This lets a
+    // manifest be checked against the execution allocation before allocating
+    // any declared tensor payload.
+    std::vector<llama_dsv4_logical_tensor_state> logical_tensor_geometry(bool score) const;
     void validate_sequence_all_depths(const llama_dsv4_recurrent_sequence_state & state) const;
     void import_sequence_all_depths(llama_seq_id seq_id, const llama_dsv4_recurrent_sequence_state & state);
 
@@ -573,8 +577,10 @@ public:
     llama_dsv4_comp_state * get_lid_state() const;
 
     bool is_aggregate_compressed() const;
+    uint64_t get_logical_state_identity() const;
     uint32_t get_c4_logical_rows() const;
     uint32_t get_hca_logical_rows() const;
+    uint32_t get_active_rs_depth() const;
     llama_dsv4_comp_pool * get_comp_pool() const;
 
     llama_dsv4_resident_detach_quote quote_resident_detach(llama_dsv4_resident_detach_request request) const;

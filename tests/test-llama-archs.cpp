@@ -9,6 +9,7 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-dsv4-segment-store.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-kv-cache-dsv4-accounting.h"
 #include "../src/llama-model-saver.h"
@@ -2913,9 +2914,56 @@ static bool test_dsv4_aggregate_logical_rollback(size_t seed, ggml_backend_dev_t
         GGML_ASSERT(source_physical.visible_c4_rows > state.csa.row_end &&
                     "rollback physical tail was not present for canonicalization test");
 
-        auto quote = memory->quote_logical_import(1, state);
-        GGML_ASSERT(quote.status == llama_dsv4_logical_state_status::ok);
-        GGML_ASSERT(memory->import_logical_sequence(quote, state) == llama_dsv4_logical_state_status::ok);
+        if (depth == 3) {
+            char pattern[] = "/tmp/llama-dsv4-segment-restore-XXXXXX";
+            const char * root = ::mkdtemp(pattern);
+            GGML_ASSERT(root != nullptr);
+            {
+                llama_dsv4_segment_store_config config;
+                config.root_path = root;
+                llama_dsv4_segment_store store(config);
+                llama_dsv4_segment_identity identity;
+                identity.geometry_identity = state.identity;
+                const std::string artifact = "generated-deepseek4-segment-test-" + std::to_string(seed);
+                identity.model_artifact_digest = llama_snapshot_sha256(artifact.data(), artifact.size());
+                llama_dsv4_segment_prefix_metadata prefix;
+                prefix.token_count  = accepted;
+                prefix.radix_depth  = accepted;
+                prefix.token_digest = llama_snapshot_sha256(tokens.data(), accepted*sizeof(tokens[0]));
+                const auto published = store.publish("rollback", state, identity, prefix);
+                GGML_ASSERT(published.status == llama_dsv4_segment_status::ok && published.committed);
+
+                // A fully occupied destination must remain byte-for-byte and
+                // page/refcount identical when authentication fails before
+                // phase one's quote/publication boundary.
+                const auto destination_before = memory->export_logical_sequence(1);
+                const auto pool_before = pool->memory_usage_snapshot();
+                const auto usage_before = memory->memory_usage_snapshot();
+                const auto missing_digest = published.manifest.segments.front().content_digest;
+                const std::filesystem::path missing_path =
+                        std::filesystem::path(root)/"chunks"/(llama_snapshot_digest_hex(missing_digest) + ".chunk");
+                const std::filesystem::path held_path = std::filesystem::path(root)/"held.chunk";
+                std::filesystem::rename(missing_path, held_path);
+                const auto rejected = store.restore(published.manifest, identity, *memory, 1);
+                GGML_ASSERT(rejected.status == llama_dsv4_segment_status::missing_chunk);
+                GGML_ASSERT(memory->export_logical_sequence(1).fingerprint == destination_before.fingerprint);
+                GGML_ASSERT(dsv4_comp_semantic_equal(pool->memory_usage_snapshot(), pool_before));
+                GGML_ASSERT(dsv4_usage_footprint_equal(memory->memory_usage_snapshot(), usage_before));
+                std::filesystem::rename(held_path, missing_path);
+
+                const auto restored = store.restore(published.manifest, identity, *memory, 1);
+                GGML_ASSERT(restored.status == llama_dsv4_segment_status::ok &&
+                        restored.import_status == llama_dsv4_logical_state_status::ok &&
+                        restored.segments_read == published.manifest.segments.size());
+            }
+            std::error_code remove_error;
+            std::filesystem::remove_all(root, remove_error);
+            GGML_ASSERT(!remove_error);
+        } else {
+            auto quote = memory->quote_logical_import(1, state);
+            GGML_ASSERT(quote.status == llama_dsv4_logical_state_status::ok);
+            GGML_ASSERT(memory->import_logical_sequence(quote, state) == llama_dsv4_logical_state_status::ok);
+        }
         GGML_ASSERT(memory->get_rs_idx()[1] == depth);
         llama_dsv4_comp_handle_id restored_handle = 0;
         llama_dsv4_comp_handle_info restored_physical;
