@@ -624,7 +624,10 @@ import sys
 
 entry_path, output_path, cache_root, expected_tokens = sys.argv[1:]
 entry = json.load(open(entry_path))
-path = os.path.realpath(entry["file"])
+reported_path = entry["file"]
+if not os.path.isabs(reported_path):
+    reported_path = os.path.join(cache_root, reported_path)
+path = os.path.realpath(reported_path)
 root = os.path.realpath(cache_root) + os.sep
 if not path.startswith(root):
     raise SystemExit("cache entry escaped the scratch cache directory")
