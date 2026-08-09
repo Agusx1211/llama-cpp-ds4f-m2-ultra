@@ -313,22 +313,22 @@ start_server() {
     server_profile=$2
     local cache_dir=$3
     server_log=$result_root/server-$server_label.log
-    local -a profile_env=()
+    local -a server_env=(
+        "DYLD_LIBRARY_PATH=$lane_root/build-m2/bin"
+        LLAMA_HOST_PROFILE=1
+        LLAMA_SPEC_TRACE=1
+        LLAMA_DSV4_ADMISSION_VERTICAL=1
+        GGML_E4M3_MM_NT2_MIN_N=512
+        GGML_METAL_FAST_SYNC=0
+    )
     if [ "$server_profile" = "1" ]; then
-        profile_env+=(GGML_METAL_KPROF=1 GGML_METAL_KPROF_DEBUG=1)
+        server_env+=(GGML_METAL_KPROF=1 GGML_METAL_KPROF_DEBUG=1)
     fi
 
     log "starting $server_label (kprof=$server_profile cache=$cache_dir)"
     (
         cd "$lane_root"
-        exec env \
-            DYLD_LIBRARY_PATH="$lane_root/build-m2/bin" \
-            LLAMA_HOST_PROFILE=1 \
-            LLAMA_SPEC_TRACE=1 \
-            LLAMA_DSV4_ADMISSION_VERTICAL=1 \
-            GGML_E4M3_MM_NT2_MIN_N=512 \
-            GGML_METAL_FAST_SYNC=0 \
-            "${profile_env[@]}" \
+        exec env "${server_env[@]}" \
             "$binary" \
                 -m "$model" -md "$draft" --spec-type draft-dspark \
                 --spec-draft-n-max 5 --spec-draft-n-min 1 --spec-draft-p-min 0.5 \
