@@ -896,6 +896,12 @@ void test_restore_planner_boundaries_and_rollback() {
     require(plan.kind == server_prompt_restore_kind::unusable,
             "checkpoint at the strict full-match threshold was admitted");
 
+    const auto zero_width_equality = server_prompt_build_restore_coverage(
+        boundary_bad, server_prompt_restore_scope::target_only, restore_domain(63, 94, 0, 0, false));
+    plan = server_prompt_make_restore_plan(zero_width_equality, boundary_bad.tokens, 64, 64);
+    require(plan.kind == server_prompt_restore_kind::unusable,
+            "zero-width direct state at the landing threshold was admitted");
+
     server_prompt boundary_good = make_prompt(96, 12);
     add_checkpoint(boundary_good, 63, 62, 62);
     auto good_coverage = coverage_for(boundary_good, 94, 94, 5);
@@ -990,6 +996,16 @@ void test_paired_unequal_swa_thresholds() {
     plan = server_prompt_make_restore_plan(coverage, prompt.tokens, 80, 90);
     require(plan.kind == server_prompt_restore_kind::direct && plan.effective_tokens == 80,
             "target SWA threshold falsely rejected the draft domain");
+
+    // Exact serialized SWA coverage starts at the threshold. The key at that
+    // position is already masked for the next token, so equality is sufficient
+    // for direct generated-residue restore.
+    coverage =
+        server_prompt_build_restore_coverage(prompt, server_prompt_restore_scope::target_and_draft,
+                                             restore_domain(98, 98, 32, 0), restore_domain(69, 98, 32, 30, false));
+    plan = server_prompt_make_restore_plan(coverage, prompt.tokens, 100, 104);
+    require(plan.kind == server_prompt_restore_kind::direct && plan.effective_tokens == 99,
+            "exact serialized draft SWA boundary rejected generated residue");
 
     printf("  ok: paired target/draft restores use independent SWA thresholds\n");
 }

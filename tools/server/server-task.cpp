@@ -2659,13 +2659,20 @@ server_prompt_restore_plan server_prompt_make_restore_plan(
 
     const size_t target_tail_tokens = target_represented - direct_tokens;
     const size_t draft_tail_tokens  = draft_represented  - direct_tokens;
-    const bool target_direct = coverage.target.pos_min < plan.target_pos_threshold &&
-            (!coverage.target.rollback_bounded ||
-             target_tail_tokens <= coverage.target.rollback_tokens);
-    const bool draft_direct = coverage.scope != server_prompt_restore_scope::target_and_draft ||
-            (coverage.draft.pos_min < plan.draft_pos_threshold &&
-             (!coverage.draft.rollback_bounded ||
-              draft_tail_tokens <= coverage.draft.rollback_tokens));
+    // Equality is sufficient only for an SWA domain: the row at
+    // pos_next - n_swa is already masked when evaluating pos_next, and this is
+    // the exact minimum retained by sequence serialization. A zero-width
+    // domain still needs state strictly before the landing.
+    const auto   covers_direct_threshold = [](const server_prompt_restore_domain & domain, llama_pos threshold) {
+        return domain.pos_min < threshold || (domain.swa_tokens > 0 && domain.pos_min == threshold);
+    };
+    const bool target_direct =
+        covers_direct_threshold(coverage.target, plan.target_pos_threshold) &&
+        (!coverage.target.rollback_bounded || target_tail_tokens <= coverage.target.rollback_tokens);
+    const bool draft_direct =
+        coverage.scope != server_prompt_restore_scope::target_and_draft ||
+        (covers_direct_threshold(coverage.draft, plan.draft_pos_threshold) &&
+         (!coverage.draft.rollback_bounded || draft_tail_tokens <= coverage.draft.rollback_tokens));
 
     if (target_direct && draft_direct) {
         plan.kind             = server_prompt_restore_kind::direct;
