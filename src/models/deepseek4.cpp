@@ -1071,26 +1071,19 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     // (ne01 = n_ubatch) already packs. So 2..7 was the one shape paying the
     // scatter penalty. See notes/2026-08-08-sparse-pack-routing.md.
     //
-    // The DSpark drafter is a DeepSeek V4 model too and runs this same builder,
-    // so a process-wide threshold changes the drafter's numerics as well as the
-    // target's - and a drafter that produces different tokens changes draft
-    // acceptance, which moves end-to-end t/s far more than the attention cost
-    // this knob is meant to control. GGML_DSV4_SPARSE_PACK_MIN_TOKENS_DRAFT is
-    // therefore a separate threshold for `n_dspark_block_size > 0` models so the
-    // two effects can be separated. Default 8 for both.
-    static const int64_t sparse_pack_min_tokens_tgt = []() {
+    // The threshold is process-wide on purpose. The DSpark drafter is a DeepSeek
+    // V4 model and derives from this same graph class, so a per-model threshold
+    // looked necessary - but it measured inert: over a complete 12k request with
+    // speculative decoding active, all 567 SPARSEROUTE decisions carried
+    // draft=0, and a (target=2, draft=2) arm reproduced (target=2, draft=8) to
+    // the token (24.2026 vs 24.2005 t/s, identical transcript sha, identical
+    // 142/182 draft counts). dspark-0731-expertsonly never reaches this builder.
+    static const int64_t sparse_pack_min_tokens = []() {
         const char * v = std::getenv("GGML_DSV4_SPARSE_PACK_MIN_TOKENS");
         const int64_t n = v != nullptr ? atoll(v) : 8;
         return n < 2 ? (int64_t) 2 : n;
     }();
-    static const int64_t sparse_pack_min_tokens_drf = []() {
-        const char * v = std::getenv("GGML_DSV4_SPARSE_PACK_MIN_TOKENS_DRAFT");
-        const int64_t n = v != nullptr ? atoll(v) : 8;
-        return n < 2 ? (int64_t) 2 : n;
-    }();
     const bool is_dspark_draft = hparams.n_dspark_block_size > 0;
-    const int64_t sparse_pack_min_tokens =
-            is_dspark_draft ? sparse_pack_min_tokens_drf : sparse_pack_min_tokens_tgt;
 
     // The pack kernel stages the whole per-token working set in threadgroup
     // memory (kernel_dsv4_sparse_pack / kernel_dsv4_indexed_sparse_pack in
