@@ -1701,7 +1701,11 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
     }
 
 
-    if (n_rs_seq > 0) {
+    // A persisted rollback selection belongs to sequence state, whereas the
+    // active depth is a runtime policy that can change between save and
+    // restore. Consume a pending allocated plane even when new snapshots are
+    // currently disabled.
+    if (n_rs_seq_alloc > 0) {
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
             const llama_seq_id seq_id = ubatch.seq_id_unq[s];
             if (seq_id < 0 || (uint32_t) seq_id >= n_stream) {
@@ -1711,7 +1715,8 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
             const int64_t stream_off = dsv4_stream_offset(n_stream, seq_id, state_size);
             const uint32_t rollback = (uint32_t) seq_id < rs_idx.size() ? rs_idx[seq_id] : 0;
             // Keep the restore graph fixed-width when no rollback is pending.
-            const int64_t src_plane = rollback > 0 && rollback <= n_rs_seq ? (int64_t) rollback*state_rows : 0;
+            const int64_t src_plane =
+                    rollback > 0 && rollback <= n_rs_seq_alloc ? (int64_t) rollback*state_rows : 0;
             for (uint32_t r = 0; r < state_size; ++r) {
                 plan.state_restore_src_idxs.push_back((int32_t) (src_plane + stream_off + r));
                 plan.state_restore_dst_idxs.push_back((int32_t) (stream_off + r));
@@ -4868,7 +4873,7 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     io.read(&allocated_rollback_depth, sizeof(allocated_rollback_depth));
     const uint32_t expected_domains = seq_id >= 0 ? 1 : n_seq_max;
     if (domain_count != expected_domains ||
-            active_rollback_depth != n_rs_seq_active ||
+            active_rollback_depth > allocated_rollback_depth ||
             allocated_rollback_depth != n_rs_seq) {
         throw std::runtime_error("DSV4 state sequence/rollback domain mismatch");
     }
@@ -4877,7 +4882,7 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     for (uint32_t i = 0; i < domain_count; ++i) {
         io.read(&frontiers[i],       sizeof(frontiers[i]));
         io.read(&rollback_indices[i], sizeof(rollback_indices[i]));
-        if (frontiers[i] < -1 || rollback_indices[i] > n_rs_seq_active ||
+        if (frontiers[i] < -1 || rollback_indices[i] > allocated_rollback_depth ||
                 (partial_only && rollback_indices[i] != 0)) {
             throw std::runtime_error("DSV4 state frontier/rollback metadata is invalid");
         }
@@ -5056,9 +5061,6 @@ bool llama_kv_cache_dsv4::set_rs_depth(uint32_t depth) {
 }
 
 void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches) {
-    if (n_rs_seq_active == 0) {
-        return;
-    }
 
     for (const llama_ubatch & ubatch : ubatches) {
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {

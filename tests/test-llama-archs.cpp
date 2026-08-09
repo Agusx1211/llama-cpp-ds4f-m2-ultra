@@ -2304,6 +2304,12 @@ static bool test_dsv4_restore_long_compressed_history(size_t seed, ggml_backend_
     GGML_ASSERT(llama_memory_seq_pos_max(memory, source_seq) == next_pos - 1);
     const auto generated_state = dsv4_sequence_state(test.lctx.get(), source_seq);
 
+    // The server switches rollback depth per batch. Restoring under a
+    // different current policy must retain and consume the saved pending
+    // plane; the allocated rollback domain remains stable for the context.
+    GGML_ASSERT(memory->set_rs_depth(0));
+    GGML_ASSERT(memory->get_active_rs_depth() == 0);
+
     // Restore over a different occupied stream. Sequence 3 is empty and is
     // therefore also the transactional publication staging lane.
     GGML_ASSERT(llama_state_seq_set_data(
@@ -2311,6 +2317,10 @@ static bool test_dsv4_restore_long_compressed_history(size_t seed, ggml_backend_
             generated_state.size());
     GGML_ASSERT(llama_memory_seq_pos_max(memory, dest_seq) == next_pos - 1);
     GGML_ASSERT(memory->get_rs_idx()[dest_seq] == pending_rollback);
+    GGML_ASSERT(llama_state_seq_set_data(
+            test.lctx.get(), generated_state.data(), generated_state.size(), source_seq) ==
+            generated_state.size());
+    GGML_ASSERT(memory->get_rs_idx()[source_seq] == pending_rollback);
 
     // Physical stream IDs make raw blobs differ. Transcoding source and
     // destination through one empty stream proves exact logical domain

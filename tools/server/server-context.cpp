@@ -462,6 +462,12 @@ struct server_slot {
         const size_t cur_size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = paired_frontier ?
                 llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        if (cur_size_tgt == 0 || (paired_frontier && cur_size_dft == 0)) {
+            SLT_WRN(*this,
+                    "refusing empty prompt-cache state (target=%zu draft=%zu scope=%u)\n",
+                    cur_size_tgt, cur_size_dft, (unsigned) coverage.scope);
+            return false;
+        }
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
@@ -478,9 +484,27 @@ struct server_slot {
         // (introspection only; never consulted by lookup or eviction)
         cur->dash_req = dash_req;
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t written_tgt = llama_state_seq_get_data_ext(
+                ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (written_tgt != cur_size_tgt) {
+            SLT_WRN(*this,
+                    "incomplete target prompt-cache capture (expected=%zu actual=%zu); discarding entry\n",
+                    cur_size_tgt, written_tgt);
+            const bool discarded = prompt_cache.discard(cur);
+            GGML_ASSERT(discarded);
+            return false;
+        }
         if (paired_frontier) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            const size_t written_dft = llama_state_seq_get_data_ext(
+                    ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (written_dft != cur_size_dft) {
+                SLT_WRN(*this,
+                        "incomplete draft prompt-cache capture (expected=%zu actual=%zu); discarding entry\n",
+                        cur_size_dft, written_dft);
+                const bool discarded = prompt_cache.discard(cur);
+                GGML_ASSERT(discarded);
+                return false;
+            }
         }
 
         return true;
