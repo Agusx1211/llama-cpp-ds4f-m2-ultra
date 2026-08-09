@@ -1069,7 +1069,21 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     // indexer-zero-rows census, ~80% of decode selections (252 of 315 had
     // ne01 = 4). ne01 = 1 already takes the gather path above; prefill
     // (ne01 = n_ubatch) already packs. So 2..7 was the one shape paying the
-    // scatter penalty. See notes/2026-08-08-sparse-pack-routing.md.
+    // scatter penalty. See notes/2026-08-09-sparse-pack-routing.md.
+    //
+    // MEASURED, and the reason the default stays at 8: closing the gap makes
+    // things WORSE. At 4k and 24k, where both arms produce byte-identical
+    // transcripts and the A/B is fully controlled, threshold 2 costs -9.90% and
+    // -1.93% t/s; at 37k it is -2.14%. GGML_METAL_KPROF says why: at a 4-row
+    // verify, DSV4_SPARSE_PACK costs 8.743 ms of a 20.642 ms compressed-attention
+    // chain, because ggml_metal_op_dsv4_sparse_pack dispatches ONE THREADGROUP
+    // PER TOKEN for the n_raw > 0 form - 4 threadgroups on a 152-core GPU, with
+    // a serial 640-iteration row loop inside. Per token per layer that is 104 us
+    // against 1.10 us at prefill, 95x worse. The packed flash attention itself is
+    // NOT cheaper than the masked one (5.885 vs 5.745 ms) despite a 4.8x smaller
+    // K, because the vec kernel is floor-limited per dispatch geometry. Give the
+    // pack kernel parallelism at small nt and this is worth re-measuring; until
+    // then the knob is a measurement seam, not a tuning parameter.
     //
     // The threshold is process-wide on purpose. The DSpark drafter is a DeepSeek
     // V4 model and derives from this same graph class, so a per-model threshold
