@@ -1,5 +1,7 @@
 #pragma once
 
+#include "server-prompt-cache-io.h"
+
 #include "common.h"
 #include "llama.h"
 
@@ -783,9 +785,25 @@ struct server_prompt_cache_state {
     server_prompt_data data;
     server_prompt_restore_coverage coverage;
 
-    // SSD tier: when set, the state blobs and the checkpoints live in this
-    // file and the in-RAM copies above are empty; only prompt.tokens stays
-    // resident so the best-match scan keeps working across both tiers
+    // Persistence identity is process-local but stable for this logical entry.
+    // A retry reuses entry_id and increments generation; completions are
+    // reconciled only when both still match. `file` is deliberately reserved
+    // for a validated durable/adopted backing. Queued, failed and uncertain
+    // generations keep the complete immutable LCPC image in io_payload and
+    // never advertise a file that has not crossed the durability boundary.
+    uint64_t                         io_entry_id  = 0;
+    uint64_t                         io_generation = 0;
+    uint64_t                         io_job_id    = 0;
+    server_prompt_cache_io_lifecycle io_lifecycle = server_prompt_cache_io_lifecycle::ram_ready;
+    server_prompt_cache_io_status    io_status    = server_prompt_cache_io_status::ok;
+    std::string                      io_path;
+    server_prompt_cache_io_payload   io_payload;
+    uint64_t                         io_checksum = 0;
+    bool                             io_reconcile_pending = false;
+    bool                             io_retire_retry       = false;
+
+    // SSD tier: when set, the state blobs, immutable fallback and checkpoints
+    // are absent; only prompt.tokens stays resident so matching remains cheap.
     std::string file;
     size_t size_disk = 0;
 
@@ -799,10 +817,27 @@ struct server_prompt_cache_state {
     uint32_t dash_hits        = 0;
     uint64_t dash_req         = 0; // request whose save created it (0 = rebuilt from disk)
 
-    bool on_disk() const { return !file.empty(); }
+    bool on_disk() const {
+        return !file.empty() && io_lifecycle == server_prompt_cache_io_lifecycle::durable;
+    }
 
-    // RAM footprint of the entry (disk entries hold no blobs in RAM)
+    bool has_ram_fallback() const {
+        return !data.main.empty() || static_cast<bool>(io_payload);
+    }
+
+    bool io_in_flight() const {
+        return io_lifecycle == server_prompt_cache_io_lifecycle::queued ||
+               io_lifecycle == server_prompt_cache_io_lifecycle::writing;
+    }
+
+    // Authoritative RAM footprint. Once serialized, the immutable LCPC image
+    // replaces the component vectors so queued persistence does not double the
+    // large target/draft blobs.
     size_t size() const {
+        if (io_payload) {
+            return io_payload->size();
+        }
+
         size_t res = data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
@@ -967,24 +1002,12 @@ uint64_t server_prompt_cache_file_probe(const std::string & path);
 
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens,
-                        const std::string & disk_dir, int32_t disk_limit_gib, uint64_t disk_fingerprint) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
+                        const std::string & disk_dir, int32_t disk_limit_gib, uint64_t disk_fingerprint,
+                        server_prompt_cache_io_config io_config = {});
+    ~server_prompt_cache();
 
-        this->disk_dir         = disk_dir;
-        this->limit_disk       = disk_limit_gib < 0 ? 0 : 1024ull*1024ull*1024ull*(uint64_t) disk_limit_gib;
-        this->disk_fingerprint = disk_fingerprint;
-
-        // a stored prompt can never be longer than the context it was captured
-        // from; keep the admission bound separate from the (mutable, softened)
-        // eviction limit so file parsing has a fixed ceiling
-        this->disk_max_tokens = limit_tokens > 0 ? std::min<uint64_t>(limit_tokens, PCACHE_MAX_TOKENS)
-                                                 : PCACHE_MAX_TOKENS;
-
-        if (!this->disk_dir.empty()) {
-            rescan_disk();
-        }
-    }
+    server_prompt_cache(const server_prompt_cache &)             = delete;
+    server_prompt_cache & operator=(const server_prompt_cache &) = delete;
 
     std::list<server_prompt_cache_state> states;
 
@@ -1000,6 +1023,22 @@ struct server_prompt_cache {
     uint64_t    disk_fingerprint = 0;
     uint64_t    disk_seq         = 0;
     uint64_t    disk_max_tokens  = PCACHE_MAX_TOKENS; // upper bound on a file's declared n_tokens
+    // Immutable startup snapshot, including corrupt/unadopted LCPC names. New
+    // names come from disk_seq and therefore never need to accumulate here.
+    std::unordered_set<std::string> disk_paths_reserved;
+
+    // The worker owns only immutable host bytes, value metadata and paths.
+    // All state-list transitions and completion reconciliation stay on the
+    // serialized server owner thread.
+    std::unique_ptr<server_prompt_cache_io> disk_io;
+    server_prompt_cache_io_stats            disk_io_stats;
+    bool                                    disk_io_shutdown    = false;
+    bool                                    disk_startup_reconciled = true;
+
+    // Logical deletion splices the existing list node here without allocation
+    // before asking the worker to retire its exact generation. This makes the
+    // tombstone transaction strongly exception-safe under memory pressure.
+    std::list<server_prompt_cache_state> retired_states;
 
     size_t size() const;
 
@@ -1017,9 +1056,17 @@ struct server_prompt_cache {
 
     void update();
 
+    // A worker completion only requests an owner-loop turn. The callback must
+    // obey server_prompt_cache_io's narrow callback contract.
+    void set_io_wake_callback(std::function<void()> callback);
+    void poll_io_completions();
+    server_prompt_cache_io_stats io_stats() const;
+    server_prompt_cache_io_status shutdown_io(server_prompt_cache_io_shutdown_mode mode);
+
     // SSD tier internals
     bool spill_to_disk(server_prompt_cache_state & state);
     bool load_from_disk(server_prompt_cache_state & state);
+    bool load_from_payload(server_prompt_cache_state & state);
     void rescan_disk();
 
     // evict the oldest RAM-resident entry: spill it to the SSD tier when
@@ -1028,6 +1075,13 @@ struct server_prompt_cache {
 
     // erase an entry and unlink its backing file (if any)
     std::list<server_prompt_cache_state>::iterator drop_entry(std::list<server_prompt_cache_state>::iterator it);
+
+    // Deterministic integration-test seams. Faults affect one subsequent write
+    // admission only; the production default is inert.
+    void set_next_io_faults_for_test(const server_prompt_cache_io_faults & faults);
+    bool test_wait_for_io_pause(uint64_t job_id, server_prompt_cache_io_test_pause point, uint64_t timeout_ms);
+    void test_release_io_pause(uint64_t job_id);
+    void test_reconcile_uncertain_for_test(server_prompt_cache_state & state);
 
     // m2-dashboard introspection (main thread only; see server-dashboard-bus.h).
     // What the most recent load() consult did, read by get_available_slot to
@@ -1056,10 +1110,26 @@ struct server_prompt_cache {
     uint64_t dash_bytes_saved     = 0;
     uint64_t dash_bytes_spilled   = 0;
     uint64_t dash_bytes_disk_load = 0;
+    uint64_t dash_io_rejections    = 0;
+    uint64_t dash_io_uncertain     = 0;
+    uint64_t dash_io_stale         = 0;
 
     // rebuild and publish the occupancy snapshot served by
     // GET /m2-dashboard/cache-state (called from update() and rescan_disk())
     void publish_dashboard_state();
+
+  private:
+    bool serialize_payload(server_prompt_cache_state & state);
+    bool submit_payload(server_prompt_cache_state & state);
+    void retry_retired_generations();
+    void begin_uncertain_reconciliation(server_prompt_cache_state & state);
+    void clear_component_payload(server_prompt_cache_state & state);
+    std::string next_disk_path();
+    std::list<server_prompt_cache_state>::iterator erase_entry(
+            std::list<server_prompt_cache_state>::iterator it, bool count_drop);
+
+    server_prompt_cache_io_faults next_io_faults_for_test;
+    bool                          have_next_io_faults_for_test = false;
 };
 
 // used exclusively by router mode

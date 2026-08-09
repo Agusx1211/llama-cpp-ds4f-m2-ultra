@@ -196,6 +196,8 @@ struct cache_entry_state {
     uint64_t    last_hit_us  = 0;  // 0 = never hit
     uint32_t    hits         = 0;
     std::string file;              // basename of the SSD-tier file, empty in RAM
+    std::string persistence;       // ram_ready/queued/writing/durable/failed/uncertain
+    uint64_t    generation = 0;
 
     // dashboard v3 preview material. Both tiers keep prompt.tokens resident
     // (the SSD tier only spills the state blobs), so a bounded head/tail slice
@@ -219,6 +221,9 @@ struct cache_counters {
     uint64_t bytes_saved      = 0;
     uint64_t bytes_spilled    = 0;
     uint64_t bytes_disk_load  = 0;
+    uint64_t io_rejections    = 0;
+    uint64_t io_uncertain     = 0;
+    uint64_t io_stale         = 0;
 };
 
 struct cache_state {
@@ -230,6 +235,18 @@ struct cache_state {
     uint64_t used_ram_bytes   = 0;
     uint64_t used_disk_bytes  = 0;
     uint64_t tokens_total     = 0;
+    bool     io_accepting             = false;
+    uint32_t io_active_jobs           = 0;
+    uint32_t io_queued_jobs           = 0;
+    uint32_t io_writing_jobs          = 0;
+    uint32_t io_completion_backlog    = 0;
+    uint64_t io_pending_ram_bytes     = 0;
+    uint64_t io_disk_reserved_bytes   = 0;
+    uint64_t io_disk_committed_bytes  = 0;
+    uint64_t io_disk_uncertain_bytes  = 0;
+    uint64_t io_cooldown_until_ns     = 0;
+    int      io_last_error            = 0;
+    uint64_t io_retirement_tombstones = 0;
     std::vector<cache_entry_state> entries;
     cache_counters counters;
 };

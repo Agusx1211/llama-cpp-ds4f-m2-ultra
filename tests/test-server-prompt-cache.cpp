@@ -24,6 +24,9 @@
 #include "mtmd.h"
 
 #include <cstdint>
+#include <chrono>
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -31,6 +34,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -88,6 +92,32 @@ size_t count_files(const std::string & dir) {
         n += entry.is_regular_file() ? 1 : 0;
     }
     return n;
+}
+
+template <typename Predicate>
+void wait_for_cache_io(server_prompt_cache & cache, Predicate predicate, const std::string & message) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        cache.poll_io_completions();
+        if (predicate()) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    cache.poll_io_completions();
+    require(predicate(), message);
+}
+
+template <typename Predicate>
+void wait_without_polling(Predicate predicate, const std::string & message) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    require(predicate(), message);
 }
 
 //
@@ -162,6 +192,15 @@ server_prompt_cache_state make_state(const entry_spec & spec) {
     return state;
 }
 
+server_prompt_cache_io_config integration_io_config(uint32_t max_jobs = 4) {
+    server_prompt_cache_io_config config;
+    config.max_jobs          = max_jobs;
+    config.max_completions   = std::max<uint32_t>(8, max_jobs);
+    config.max_pending_bytes = 64ull*1024*1024;
+    config.error_cooldown_ms = 0;
+    return config;
+}
+
 // spill one entry into `dir` and return the resulting file path
 std::string spill_one(const std::string & dir, const entry_spec & spec, uint64_t fingerprint = TEST_FINGERPRINT) {
     server_prompt_cache cache(/*limit_size_mib =*/ 64, TEST_LIMIT_TOKENS, dir, /*disk_limit_gib =*/ 8, fingerprint);
@@ -169,6 +208,8 @@ std::string spill_one(const std::string & dir, const entry_spec & spec, uint64_t
     cache.states.push_back(make_state(spec));
 
     require(cache.spill_to_disk(cache.states.back()), "spill_to_disk failed");
+    wait_for_cache_io(cache, [&] { return cache.states.back().on_disk(); },
+            "async spill did not become durable");
     require(cache.states.back().on_disk(), "entry is not on disk after spill");
 
     return cache.states.back().file;
@@ -308,6 +349,8 @@ void test_tiering_preserved() {
     require(cache.size() > 0, "RAM accounting is empty before eviction");
 
     require(cache.evict_oldest_ram(), "evict_oldest_ram found nothing to evict");
+    wait_for_cache_io(cache, [&] { return cache.states.front().on_disk(); },
+            "evicted entry did not become durable");
     require(cache.states.front().on_disk(), "eviction did not spill the oldest entry to the SSD tier");
     require(!cache.states.back().on_disk(), "eviction spilled more than the oldest entry");
     require(cache.size_disk_total() > 0, "disk accounting did not grow after the spill");
@@ -316,9 +359,481 @@ void test_tiering_preserved() {
     const std::string file = cache.states.front().file;
     require(std::filesystem::exists(file), "spilled file missing");
     cache.drop_entry(cache.states.begin());
+    wait_for_cache_io(cache, [&] { return !std::filesystem::exists(file); },
+            "async drop did not remove the durable file");
     require(!std::filesystem::exists(file), "drop_entry left the file behind");
 
     printf("  ok: RAM->SSD spill, disk accounting and drop-unlink still behave\n");
+}
+
+void discard_decoded_components(server_prompt_cache_state & state) {
+    state.data = {};
+    state.prompt.checkpoints.clear();
+}
+
+void test_async_pending_visibility_and_idle_wake() {
+    scratch_dir dir("async-visible");
+    server_prompt_cache cache(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT,
+            integration_io_config());
+
+    entry_spec spec;
+    spec.n_tokens = 192;
+    spec.n_main   = 128*1024;
+    spec.n_drft   = 16*1024;
+    spec.n_ckpt   = 3;
+    const auto expected = make_state(spec);
+    const auto expected_plan = server_prompt_make_restore_plan(
+            expected.coverage, expected.prompt.tokens, 25, 25);
+
+    cache.states.push_back(make_state(spec));
+    auto & state = cache.states.back();
+    server_prompt_cache_io_faults faults;
+    faults.pause = server_prompt_cache_io_test_pause::before_write;
+    cache.set_next_io_faults_for_test(faults);
+
+    std::atomic<uint32_t> wakes{ 0 };
+    cache.set_io_wake_callback([&] { wakes.fetch_add(1, std::memory_order_relaxed); });
+    require(cache.spill_to_disk(state), "pending visibility spill admission failed");
+    require(cache.test_wait_for_io_pause(state.io_job_id, faults.pause, 5000),
+            "pending visibility writer did not reach barrier");
+
+    require(!state.on_disk() && state.file.empty(), "queued entry advertised a non-durable file");
+    require(state.io_payload && state.data.size() == 0 && state.prompt.checkpoints.empty(),
+            "queued entry did not replace duplicate components with one immutable payload");
+    require(cache.load_from_payload(state), "queued immutable payload was not readable");
+    require(state.data.main == expected.data.main && state.data.drft == expected.data.drft,
+            "queued immutable payload decoded different state bytes");
+    const auto pending_plan = server_prompt_make_restore_plan(
+            state.coverage, state.prompt.tokens, 25, 25);
+    require(pending_plan.kind == expected_plan.kind &&
+            pending_plan.effective_tokens == expected_plan.effective_tokens &&
+            pending_plan.checkpoint_index == expected_plan.checkpoint_index,
+            "queued payload changed authoritative restore coverage");
+    discard_decoded_components(state);
+
+    cache.test_release_io_pause(state.io_job_id);
+    wait_without_polling([&] { return wakes.load(std::memory_order_relaxed) != 0; },
+            "worker completion did not issue the idle wake signal");
+    require(!state.on_disk() && state.io_payload,
+            "wake callback reconciled owner state from the worker thread");
+    cache.poll_io_completions();
+    require(state.on_disk() && !state.io_payload,
+            "owner poll did not publish the durable transition and release fallback RAM");
+
+    const std::string durable_path = state.file;
+    require(cache.shutdown_io(server_prompt_cache_io_shutdown_mode::graceful) ==
+                    server_prompt_cache_io_status::ok,
+            "source cache did not release directory ownership before restart");
+    server_prompt_cache restarted(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT,
+            integration_io_config());
+    require(restarted.states.size() == 1 && restarted.states.front().file == durable_path,
+            "restart did not adopt the durable async publication");
+    const auto stats = restarted.io_stats();
+    require(stats.initial_disk_bytes == 0 && stats.disk_committed_bytes == restarted.states.front().size_disk,
+            "startup adoption did not transfer aggregate bytes into exact ownership");
+    const auto restarted_plan = server_prompt_make_restore_plan(
+            restarted.states.front().coverage, restarted.states.front().prompt.tokens, 25, 25);
+    require(restarted.states.front().coverage.scope == expected.coverage.scope &&
+            restarted_plan.kind == expected_plan.kind &&
+            restarted_plan.effective_tokens == expected_plan.effective_tokens &&
+            restarted_plan.checkpoint_index == expected_plan.checkpoint_index,
+            "startup adoption changed authoritative restore coverage");
+
+    printf("  ok: queued memory stays readable, idle wake is narrow, and owner poll publishes durability\n");
+}
+
+void test_async_saturation_keeps_fallback() {
+    scratch_dir dir("async-saturation");
+    server_prompt_cache cache(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT,
+            integration_io_config(/*max_jobs=*/1));
+
+    entry_spec first_spec;
+    first_spec.seed   = 31;
+    first_spec.n_main = 256*1024;
+    entry_spec second_spec = first_spec;
+    second_spec.seed = 32;
+    const auto second_expected = make_state(second_spec);
+
+    cache.states.push_back(make_state(first_spec));
+    cache.states.push_back(make_state(second_spec));
+    auto first  = cache.states.begin();
+    auto second = std::next(first);
+
+    server_prompt_cache_io_faults faults;
+    faults.pause = server_prompt_cache_io_test_pause::before_write;
+    cache.set_next_io_faults_for_test(faults);
+    require(cache.spill_to_disk(*first), "saturation fixture first admission failed");
+    require(cache.test_wait_for_io_pause(first->io_job_id, faults.pause, 5000),
+            "saturation fixture did not hold the writer");
+
+    require(!cache.spill_to_disk(*second), "job-saturated second write was unexpectedly admitted");
+    require(second->io_status == server_prompt_cache_io_status::job_limit &&
+            second->io_payload && second->file.empty(),
+            "job saturation discarded or falsely published the second fallback");
+    require(cache.load_from_payload(*second), "saturated fallback was not restorable from memory");
+    require(second->data.main == second_expected.data.main && second->data.drft == second_expected.data.drft,
+            "saturated fallback decoded different state bytes");
+    discard_decoded_components(*second);
+
+    cache.test_release_io_pause(first->io_job_id);
+    wait_for_cache_io(cache, [&] { return first->on_disk(); }, "first saturated write did not become durable");
+    require(cache.spill_to_disk(*second), "second fallback did not retry after capacity release");
+    wait_for_cache_io(cache, [&] { return second->on_disk(); }, "retried second write did not become durable");
+
+    printf("  ok: job saturation retains one immutable, restorable RAM fallback and retries it\n");
+}
+
+void test_async_stale_generation_cannot_publish() {
+    scratch_dir dir("async-stale-generation");
+    server_prompt_cache cache(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT,
+            integration_io_config());
+
+    entry_spec spec;
+    spec.seed   = 41;
+    spec.n_main = 192*1024;
+    cache.states.push_back(make_state(spec));
+    auto & state = cache.states.back();
+
+    server_prompt_cache_io_faults faults;
+    faults.pause = server_prompt_cache_io_test_pause::after_publication_fence;
+    cache.set_next_io_faults_for_test(faults);
+    require(cache.spill_to_disk(state), "stale generation first admission failed");
+    const uint64_t first_generation = state.io_generation;
+    const uint64_t first_job        = state.io_job_id;
+    require(cache.test_wait_for_io_pause(first_job, faults.pause, 5000),
+            "stale generation did not reach post-fence barrier");
+
+    // The cache normally retries only after a terminal completion. This
+    // deterministic seam models an owner-side supersession while generation N
+    // is fenced, so the engine must retire N and let only N+1 own the path.
+    state.io_lifecycle = server_prompt_cache_io_lifecycle::write_failed;
+    require(cache.spill_to_disk(state), "superseding generation admission failed");
+    require(state.io_generation == first_generation + 1,
+            "superseding generation was not strictly monotone");
+    const auto expected_payload = state.io_payload;
+    cache.test_release_io_pause(first_job);
+    wait_for_cache_io(cache, [&] { return state.on_disk(); },
+            "superseding generation did not become durable");
+    require(state.io_generation == first_generation + 1 && state.file == state.io_path,
+            "stale completion published over the current generation");
+    require(expected_payload && read_file(state.file) == *expected_payload,
+            "durable current generation bytes are unreadable");
+    require(cache.dash_io_stale != 0, "stale generation completion was not observed by owner polling");
+
+    printf("  ok: fenced generation N cannot publish state or unlink generation N+1\n");
+}
+
+void test_async_uncertainty_reconciles_from_memory() {
+    scratch_dir dir("async-uncertain");
+    server_prompt_cache cache(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT,
+            integration_io_config(/*max_jobs=*/1));
+
+    entry_spec spec;
+    spec.seed   = 51;
+    spec.n_main = 160*1024;
+    const auto expected = make_state(spec);
+    cache.states.push_back(make_state(spec));
+    auto & state = cache.states.back();
+
+    server_prompt_cache_io_faults faults;
+    faults.fail_directory_fsync_errno = EIO;
+    cache.set_next_io_faults_for_test(faults);
+    require(cache.spill_to_disk(state), "uncertain write admission failed");
+
+    wait_without_polling([&] { return cache.io_stats().completion_backlog != 0; },
+            "uncertain write did not produce a completion");
+    require(!state.on_disk() && state.io_payload,
+            "worker exposed an uncertain file before owner reconciliation");
+    require(cache.load_from_payload(state) && state.data.main == expected.data.main,
+            "uncertain generation lost its memory-authoritative fallback");
+    discard_decoded_components(state);
+
+    // Occupy the sole job slot before the owner consumes the uncertainty.
+    // Cleanup admission must retain io_reconcile_pending and retry later; it
+    // must never treat capacity rejection as proof that the path is gone.
+    entry_spec blocker_spec = spec;
+    blocker_spec.seed = 53;
+    cache.states.push_back(make_state(blocker_spec));
+    auto & blocker = cache.states.back();
+    faults = {};
+    faults.pause = server_prompt_cache_io_test_pause::before_write;
+    cache.set_next_io_faults_for_test(faults);
+    require(cache.spill_to_disk(blocker), "uncertainty cleanup blocker admission failed");
+    require(cache.test_wait_for_io_pause(blocker.io_job_id, faults.pause, 5000),
+            "uncertainty cleanup blocker did not pause");
+
+    cache.poll_io_completions();
+    require(!state.on_disk() && state.io_payload && state.io_reconcile_pending && state.io_generation == 1,
+            "cleanup saturation discarded fallback, path tombstone, or generation fence");
+    cache.test_release_io_pause(blocker.io_job_id);
+    wait_for_cache_io(cache, [&] { return state.on_disk(); },
+            "uncertain generation did not clean and republish durably");
+    require(state.io_generation >= 2 && cache.dash_io_uncertain == 1,
+            "uncertain reconciliation did not use a newer fenced generation");
+
+    // A missing generation has no future cleanup completion. Exercise the
+    // synchronous resolved path directly so io_reconcile_pending cannot stick.
+    entry_spec missing_spec = spec;
+    missing_spec.seed = 52;
+    cache.states.push_back(make_state(missing_spec));
+    auto & missing = cache.states.back();
+    faults = {};
+    faults.fail_after_bytes = 0;
+    faults.fail_write_errno = EIO;
+    cache.set_next_io_faults_for_test(faults);
+    require(cache.spill_to_disk(missing), "missing-generation fixture admission failed");
+    wait_for_cache_io(cache,
+            [&] { return missing.io_lifecycle == server_prompt_cache_io_lifecycle::write_failed; },
+            "missing-generation fixture did not reach a retryable failure");
+    missing.io_generation += 7; // deliberately names no engine record
+    const uint64_t missing_generation = missing.io_generation;
+    missing.io_lifecycle = server_prompt_cache_io_lifecycle::commit_uncertain;
+    cache.test_reconcile_uncertain_for_test(missing);
+    require(!missing.io_reconcile_pending && missing.io_generation == missing_generation + 1,
+            "not_found reconciliation remained stuck without a future completion");
+    wait_for_cache_io(cache, [&] { return missing.on_disk(); },
+            "not_found reconciliation did not republish a newer generation");
+
+    printf("  ok: directory-fsync uncertainty stays memory-authoritative, cleans, and republishes\n");
+}
+
+void test_active_uncertainty_cooldown_wakes_idle_retry() {
+    scratch_dir dir("async-uncertain-cooldown");
+    auto io_config = integration_io_config(/*max_jobs=*/1);
+    io_config.error_cooldown_ms = 1000;
+    server_prompt_cache cache(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT, io_config);
+
+    entry_spec spec;
+    spec.seed   = 54;
+    spec.n_main = 160*1024;
+    cache.states.push_back(make_state(spec));
+    auto & state = cache.states.back();
+
+    std::atomic<uint32_t> wakes{ 0 };
+    cache.set_io_wake_callback([&] { wakes.fetch_add(1, std::memory_order_relaxed); });
+    server_prompt_cache_io_faults faults;
+    faults.fail_directory_fsync_errno = EIO;
+    cache.set_next_io_faults_for_test(faults);
+    require(cache.spill_to_disk(state), "cooldown uncertainty write admission failed");
+
+    wait_without_polling([&] { return cache.io_stats().completion_backlog != 0; },
+            "cooldown uncertainty write produced no completion");
+    cache.poll_io_completions();
+    require(state.io_reconcile_pending && state.io_payload && !state.on_disk(),
+            "cooldown uncertainty lost its cleanup tombstone or RAM fallback");
+
+    wait_without_polling([&] { return cache.io_stats().completion_backlog != 0; },
+            "cooldown uncertainty cleanup produced no completion");
+    wait_without_polling([&] { return wakes.load(std::memory_order_relaxed) >= 2; },
+            "cooldown uncertainty cleanup callback did not finish");
+    cache.poll_io_completions();
+    require(!state.io_reconcile_pending && state.io_lifecycle == server_prompt_cache_io_lifecycle::write_failed &&
+                    state.io_status == server_prompt_cache_io_status::cooldown && state.io_payload &&
+                    state.io_generation == 1,
+            "resolved uncertainty bypassed cooldown or discarded its retryable fallback");
+
+    const uint64_t rejections_before_polling = cache.dash_io_rejections;
+    for (int repetition = 0; repetition < 32; ++repetition) {
+        cache.poll_io_completions();
+    }
+    require(cache.dash_io_rejections == rejections_before_polling &&
+                    state.io_status == server_prompt_cache_io_status::cooldown && state.io_generation == 1,
+            "active owner polling retried admission or inflated rejection telemetry before cooldown expiry");
+
+    const uint32_t wakes_before_deadline = wakes.load(std::memory_order_relaxed);
+    wait_without_polling(
+            [&] { return wakes.load(std::memory_order_relaxed) > wakes_before_deadline; },
+            "cooldown deadline did not wake the idle owner");
+    require(cache.io_stats().completion_backlog == 0,
+            "cooldown retry wake was accidentally supplied by an unrelated completion");
+
+    cache.poll_io_completions();
+    require(state.io_in_flight() && state.io_generation == 2 && state.io_payload,
+            "deadline owner turn did not submit the same payload as a newer generation");
+    wait_for_cache_io(cache, [&] { return state.on_disk(); },
+            "cooldown retry did not become durable without unrelated traffic");
+    require(state.io_generation == 2 && !state.io_payload,
+            "durable cooldown retry retained fallback RAM or changed generations unexpectedly");
+
+    printf("  ok: active uncertainty schedules one idle owner wake and republishes after write cooldown\n");
+}
+
+void test_async_eviction_during_write_and_tombstone_retry() {
+    scratch_dir dir("async-retire");
+    server_prompt_cache cache(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT,
+            integration_io_config(/*max_jobs=*/1));
+
+    entry_spec durable_spec;
+    durable_spec.seed = 61;
+    cache.states.push_back(make_state(durable_spec));
+    require(cache.spill_to_disk(cache.states.back()), "durable retirement fixture spill failed");
+    wait_for_cache_io(cache, [&] { return cache.states.front().on_disk(); },
+            "durable retirement fixture did not publish");
+    const std::string durable_path = cache.states.front().file;
+    const uint64_t durable_bytes = cache.states.front().size_disk;
+
+    entry_spec writing_spec = durable_spec;
+    writing_spec.seed   = 62;
+    writing_spec.n_main = 256*1024;
+    cache.states.push_back(make_state(writing_spec));
+    auto writing = std::prev(cache.states.end());
+    server_prompt_cache_io_faults faults;
+    faults.pause = server_prompt_cache_io_test_pause::before_write;
+    cache.set_next_io_faults_for_test(faults);
+    require(cache.spill_to_disk(*writing), "retirement saturation write failed");
+    require(cache.test_wait_for_io_pause(writing->io_job_id, faults.pause, 5000),
+            "retirement saturation write did not pause");
+
+    cache.drop_entry(cache.states.begin());
+    require(!cache.retired_states.empty() && cache.retired_states.front().io_retire_retry,
+            "cleanup saturation did not retain a retryable retirement tombstone");
+    require(std::filesystem::exists(durable_path), "quota was reclaimed before cleanup admission");
+    require(cache.io_stats().disk_committed_bytes >= durable_bytes,
+            "engine accounting released committed bytes before cleanup completion");
+
+    const uint64_t writing_job = writing->io_job_id;
+    cache.test_release_io_pause(writing_job);
+    wait_for_cache_io(cache,
+            [&] { return !std::filesystem::exists(durable_path) && cache.retired_states.empty(); },
+            "retirement tombstone did not retry exact-path cleanup after capacity release");
+
+    // A separate pre-fence eviction proves that logical removal can erase the
+    // list entry immediately while the worker safely cancels its private temp.
+    entry_spec evicted_spec = durable_spec;
+    evicted_spec.seed = 63;
+    cache.states.push_back(make_state(evicted_spec));
+    auto evicted = std::prev(cache.states.end());
+    faults.pause = server_prompt_cache_io_test_pause::before_publication_fence;
+    cache.set_next_io_faults_for_test(faults);
+    require(cache.spill_to_disk(*evicted), "pre-fence eviction fixture admission failed");
+    require(cache.test_wait_for_io_pause(evicted->io_job_id, faults.pause, 5000),
+            "pre-fence eviction fixture did not pause");
+    const std::string evicted_path = evicted->io_path;
+    cache.drop_entry(evicted);
+    wait_for_cache_io(cache, [&] {
+        return std::none_of(cache.retired_states.begin(), cache.retired_states.end(),
+                [&](const auto & retired) { return retired.io_path == evicted_path; });
+    }, "pre-fence eviction tombstone did not complete");
+    require(!std::filesystem::exists(evicted_path), "pre-fence eviction published a retired path");
+
+    printf("  ok: eviction cancels pre-fence work and saturated cleanup retries without early quota release\n");
+}
+
+void test_post_fence_retirement_cleanup_failures_keep_tombstones() {
+    const auto exercise = [](const std::string & tag, int unlink_error, int directory_sync_error) {
+        scratch_dir dir("post-fence-" + tag);
+        auto io_config = integration_io_config();
+        io_config.error_cooldown_ms = 60*1000;
+        server_prompt_cache cache(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT,
+                io_config);
+
+        entry_spec spec;
+        spec.seed   = unlink_error != 0 ? 64 : 65;
+        spec.n_main = 192*1024;
+        cache.states.push_back(make_state(spec));
+        auto entry = cache.states.begin();
+
+        server_prompt_cache_io_faults faults;
+        faults.pause                      = server_prompt_cache_io_test_pause::after_publication_fence;
+        faults.fail_unlink_errno          = unlink_error;
+        faults.fail_directory_fsync_errno = directory_sync_error;
+        cache.set_next_io_faults_for_test(faults);
+        require(cache.spill_to_disk(*entry), tag + ": write admission failed");
+        const uint64_t job_id = entry->io_job_id;
+        const std::string path = entry->io_path;
+        require(cache.test_wait_for_io_pause(job_id, faults.pause, 5000),
+                tag + ": write did not cross the publication fence");
+
+        cache.drop_entry(entry);
+        require(cache.states.empty() && cache.retired_states.size() == 1,
+                tag + ": post-fence logical deletion lost its tombstone");
+        cache.test_release_io_pause(job_id);
+
+        wait_without_polling([&] { return cache.io_stats().completion_backlog != 0; },
+                tag + ": failed inline retirement produced no owner completion");
+        require(cache.io_stats().disk_uncertain_bytes != 0,
+                tag + ": failed inline retirement released disk accounting early");
+        if (unlink_error != 0) {
+            require(std::filesystem::exists(path), tag + ": injected unlink failure unexpectedly removed path");
+        } else {
+            require(!std::filesystem::exists(path),
+                    tag + ": directory-fsync uncertainty did not physically unlink path");
+        }
+
+        cache.poll_io_completions();
+        require(cache.retired_states.size() == 1,
+                tag + ": failed post-fence cleanup completion cleared the tombstone");
+
+        wait_for_cache_io(cache, [&] { return cache.retired_states.empty(); },
+                tag + ": exact-path cleanup retry did not resolve the tombstone");
+        require(!std::filesystem::exists(path) && cache.io_stats().disk_uncertain_bytes == 0,
+                tag + ": resolved cleanup retained a file or uncertain charge");
+    };
+
+    exercise("unlink", EIO, 0);
+    exercise("directory-fsync", 0, EIO);
+    printf("  ok: post-fence unlink/fsync failures retry cleanup during write cooldown and retain tombstones until proven\n");
+}
+
+void test_async_shutdown_modes_and_corrupt_memory() {
+    {
+        scratch_dir dir("async-graceful");
+        server_prompt_cache cache(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT,
+                integration_io_config());
+        entry_spec spec;
+        spec.seed = 71;
+        cache.states.push_back(make_state(spec));
+        require(cache.spill_to_disk(cache.states.back()), "graceful shutdown write admission failed");
+        require(cache.shutdown_io(server_prompt_cache_io_shutdown_mode::graceful) ==
+                        server_prompt_cache_io_status::ok,
+                "graceful shutdown failed");
+        require(cache.states.back().on_disk(), "graceful shutdown did not drain accepted publication");
+    }
+
+    {
+        scratch_dir dir("async-fast");
+        server_prompt_cache cache(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT,
+                integration_io_config());
+        entry_spec spec;
+        spec.seed = 72;
+        cache.states.push_back(make_state(spec));
+        auto & state = cache.states.back();
+        server_prompt_cache_io_faults faults;
+        faults.pause = server_prompt_cache_io_test_pause::before_write;
+        cache.set_next_io_faults_for_test(faults);
+        require(cache.spill_to_disk(state), "fast shutdown write admission failed");
+        require(cache.test_wait_for_io_pause(state.io_job_id, faults.pause, 5000),
+                "fast shutdown write did not pause");
+        require(cache.shutdown_io(server_prompt_cache_io_shutdown_mode::fast) ==
+                        server_prompt_cache_io_status::ok,
+                "fast shutdown failed");
+        require(!state.on_disk() && state.io_payload && state.has_ram_fallback(),
+                "fast shutdown discarded fallback or exposed a cancelled file");
+    }
+
+    {
+        scratch_dir dir("async-corrupt-memory");
+        server_prompt_cache cache(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT,
+                integration_io_config());
+        entry_spec spec;
+        spec.seed = 73;
+        cache.states.push_back(make_state(spec));
+        auto & state = cache.states.back();
+        server_prompt_cache_io_faults faults;
+        faults.pause = server_prompt_cache_io_test_pause::before_write;
+        cache.set_next_io_faults_for_test(faults);
+        require(cache.spill_to_disk(state), "corrupt-memory fixture admission failed");
+        require(cache.test_wait_for_io_pause(state.io_job_id, faults.pause, 5000),
+                "corrupt-memory fixture did not pause");
+        const uint64_t job_id = state.io_job_id;
+        auto mutable_payload = std::const_pointer_cast<std::vector<uint8_t>>(state.io_payload);
+        (*mutable_payload)[sizeof(pcache_disk_header) + 7] ^= 0x80;
+        require(!cache.load_from_payload(state), "corrupt pending memory passed LCPC verification");
+        cache.drop_entry(cache.states.begin());
+        cache.test_release_io_pause(job_id);
+    }
+
+    printf("  ok: graceful drains, fast cancels safely, and corrupt pending memory fails closed\n");
 }
 
 server_prompt make_prompt(size_t n_tokens, int seed) {
@@ -1070,6 +1585,68 @@ void test_startup_survives_a_poisoned_directory() {
            sizeof(corruptions)/sizeof(corruptions[0]));
 }
 
+void test_startup_cleanup_failure_disables_live_writes() {
+    scratch_dir dir("startup-cleanup-failure");
+    const std::string corrupt = dir.path + "/pc-unremovable.lcpc";
+    write_file(corrupt, std::vector<uint8_t>(8, 0x5a));
+
+    std::error_code ec;
+    std::filesystem::permissions(
+            dir.path,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec,
+            std::filesystem::perm_options::replace,
+            ec);
+    require(!ec, "could not make startup cache directory read-only");
+
+    server_prompt_cache cache(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT,
+            integration_io_config());
+
+    // Restore cleanup access before any assertion can throw and before the
+    // scratch fixture recursively removes the directory.
+    std::filesystem::permissions(
+            dir.path, std::filesystem::perms::owner_all,
+            std::filesystem::perm_options::replace, ec);
+    require(!ec, "could not restore startup cache directory permissions");
+
+    require(std::filesystem::exists(corrupt),
+            "startup cleanup-failure fixture unexpectedly removed the corrupt file");
+    require(!cache.disk_startup_reconciled && !cache.disk_io,
+            "unowned startup LCPC bytes did not disable live persistence");
+
+    entry_spec spec;
+    spec.seed = 91;
+    cache.states.push_back(make_state(spec));
+    require(!cache.spill_to_disk(cache.states.back()) && cache.states.back().has_ram_fallback(),
+            "fail-closed startup state discarded the RAM fallback or admitted a write");
+
+    printf("  ok: undeletable invalid startup LCPC disables writes instead of escaping quota ownership\n");
+}
+
+void test_startup_nonregular_cache_path_disables_live_writes() {
+    scratch_dir dir("startup-nonregular-cache-path");
+    const std::string nonregular = dir.path + "/pc-nonregular.lcpc";
+
+    std::error_code ec;
+    std::filesystem::create_directory(nonregular, ec);
+    require(!ec, "could not create non-regular startup cache fixture");
+
+    server_prompt_cache cache(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT,
+            integration_io_config());
+
+    require(std::filesystem::is_directory(nonregular),
+            "startup scan unexpectedly removed the non-regular cache path");
+    require(!cache.disk_startup_reconciled && !cache.disk_io,
+            "non-regular startup LCPC path did not disable live persistence");
+
+    entry_spec spec;
+    spec.seed = 92;
+    cache.states.push_back(make_state(spec));
+    require(!cache.spill_to_disk(cache.states.back()) && cache.states.back().has_ram_fallback(),
+            "fail-closed non-regular startup state discarded the RAM fallback or admitted a write");
+
+    printf("  ok: non-regular startup LCPC disables writes instead of escaping quota ownership\n");
+}
+
 // The hash sits on the spill and restore hot paths; keep an eye on its cost.
 void test_hash_throughput() {
     std::vector<uint8_t> buf(64ull*1024*1024);
@@ -1104,6 +1681,14 @@ int main() {
     const test_case tests[] = {
         { "round trip",                 test_round_trip                          },
         { "tiering preserved",          test_tiering_preserved                   },
+        { "async pending visibility",   test_async_pending_visibility_and_idle_wake },
+        { "async saturation fallback",  test_async_saturation_keeps_fallback     },
+        { "async stale generation",     test_async_stale_generation_cannot_publish },
+        { "async uncertainty",          test_async_uncertainty_reconciles_from_memory },
+        { "async uncertainty cooldown", test_active_uncertainty_cooldown_wakes_idle_retry },
+        { "async retirement",           test_async_eviction_during_write_and_tombstone_retry },
+        { "async post-fence cleanup",    test_post_fence_retirement_cleanup_failures_keep_tombstones },
+        { "async shutdown and corruption", test_async_shutdown_modes_and_corrupt_memory },
         { "restore plan boundaries",    test_restore_planner_boundaries_and_rollback },
         { "paired unequal SWA",         test_paired_unequal_swa_thresholds       },
         { "position-aware frontier",    test_position_aware_frontier_mapping     },
@@ -1114,6 +1699,8 @@ int main() {
         { "stale fingerprint",          test_stale_fingerprint_is_rejected       },
         { "corrupt file matrix",        test_corrupt_files_are_skipped           },
         { "poisoned startup directory", test_startup_survives_a_poisoned_directory },
+        { "startup cleanup failure",     test_startup_cleanup_failure_disables_live_writes },
+        { "startup non-regular path",    test_startup_nonregular_cache_path_disables_live_writes },
         { "hash throughput",            test_hash_throughput                     },
     };
 

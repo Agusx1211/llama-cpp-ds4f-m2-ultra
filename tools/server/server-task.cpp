@@ -12,12 +12,14 @@
 #include "server-dashboard-bus.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -1678,6 +1680,27 @@ static constexpr uint64_t PCACHE_HP3 = 0x165667B19E3779F9ull;
 static constexpr uint64_t PCACHE_HP4 = 0x85EBCA77C2B2AE63ull;
 static constexpr uint64_t PCACHE_HP5 = 0x27D4EB2F165667C5ull;
 
+static bool pcache_retire_completion_armed(server_prompt_cache_io_status status) {
+    return status == server_prompt_cache_io_status::ok ||
+           status == server_prompt_cache_io_status::cancel_requested ||
+           status == server_prompt_cache_io_status::too_late;
+}
+
+static bool pcache_retire_already_resolved(server_prompt_cache_io_status status) {
+    return status == server_prompt_cache_io_status::not_found ||
+           status == server_prompt_cache_io_status::stale_generation;
+}
+
+static bool pcache_cleanup_completion_resolved(server_prompt_cache_io_status status) {
+    return status == server_prompt_cache_io_status::ok || pcache_retire_already_resolved(status);
+}
+
+static uint64_t pcache_steady_now_ns() {
+    return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 static inline uint64_t pcache_rotl(uint64_t x, int r) {
     return (x << r) | (x >> (64 - r));
 }
@@ -1760,27 +1783,17 @@ static inline bool pcache_add_checked(uint64_t & a, uint64_t b) {
     return true;
 }
 
-#ifndef _WIN32
-static void pcache_fsync(const std::string & path, bool is_dir) {
-    const int fd = ::open(path.c_str(), is_dir ? (O_RDONLY | O_DIRECTORY) : O_RDONLY);
-    if (fd < 0) {
-        return;
-    }
-    // note: on macOS this does not force the drive's own write cache (that needs
-    // F_FULLFSYNC, which is far too slow for the spill path). It is enough to
-    // order the data before the rename against a process crash; a power cut can
-    // still leave a truncated tail, which the payload hash rejects on load.
-    (void) ::fsync(fd);
-    (void) ::close(fd);
-}
-#else
-static void pcache_fsync(const std::string &, bool) {}
-#endif
-
-// Sequential writer: streams the payload while chaining a hash over exactly the
-// chunks the reader will read back, in the same order and with the same sizes.
+// Owner-thread serializer: builds one complete immutable LCPC image while
+// chaining the payload hash over exactly the chunks the reader consumes. The
+// vector reserves its final size before the first append, so accepted writes
+// never reserialize state or expose cache/server objects to the worker.
 struct pcache_writer {
-    std::ofstream out;
+    explicit pcache_writer(size_t total_size) {
+        data.reserve(total_size);
+        data.resize(sizeof(pcache_disk_header));
+    }
+
+    std::vector<uint8_t> data;
 
     uint64_t payload_size = 0;
     uint64_t payload_hash = 0;
@@ -1792,10 +1805,13 @@ struct pcache_writer {
             return false;
         }
         if (size > 0) {
-            if (!out.write(static_cast<const char *>(data), (std::streamsize) size)) {
+            if (this->data.size() > SIZE_MAX - size) {
                 ok = false;
                 return false;
             }
+            const size_t begin = this->data.size();
+            this->data.resize(begin + size);
+            memcpy(this->data.data() + begin, data, size);
             payload_hash = server_pcache_hash(data, size, payload_hash);
         }
         payload_size += size;
@@ -1813,16 +1829,42 @@ struct pcache_writer {
     }
 };
 
-// Sequential reader bounded by the payload length declared in a header that has
-// already been validated against the real file size. `left` is the ground truth:
-// nothing is allocated or read past it.
+// Sequential reader over either a durable file or the owner-held immutable
+// payload. `left` is the validated payload bound; memory_offset separately
+// protects the full image, including its un-hashed header.
 struct pcache_reader {
     std::ifstream in;
+    const uint8_t * memory        = nullptr;
+    uint64_t        memory_size   = 0;
+    uint64_t        memory_offset = 0;
 
     uint64_t left = 0;
     uint64_t hash = 0;
 
     bool ok = true;
+
+    bool read_source(void * data, uint64_t size) {
+        if (!ok) {
+            return false;
+        }
+        if (memory != nullptr) {
+            if (size > memory_size - std::min(memory_offset, memory_size)) {
+                ok = false;
+                return false;
+            }
+            if (size > 0) {
+                memcpy(data, memory + memory_offset, (size_t) size);
+            }
+            memory_offset += size;
+            return true;
+        }
+        if (size > (uint64_t) std::numeric_limits<std::streamsize>::max() ||
+                !in.read(static_cast<char *>(data), (std::streamsize) size)) {
+            ok = false;
+            return false;
+        }
+        return true;
+    }
 
     bool read_raw(void * data, uint64_t size) {
         if (!ok) {
@@ -1833,8 +1875,7 @@ struct pcache_reader {
             return false;
         }
         if (size > 0) {
-            if (!in.read(static_cast<char *>(data), (std::streamsize) size)) {
-                ok = false;
+            if (!read_source(data, size)) {
                 return false;
             }
             hash = server_pcache_hash(data, (size_t) size, hash);
@@ -1908,18 +1949,21 @@ static bool pcache_coverage_equal(
     return true;
 }
 
-static bool pcache_state_coverage_matches_payload(const server_prompt_cache_state & state) {
-    if (state.data.main.empty() ||
-            !server_prompt_restore_coverage_is_valid(state.coverage, state.prompt.tokens)) {
+static bool pcache_coverage_matches_payload(
+        const server_prompt &                  prompt,
+        const server_prompt_data &             data,
+        const server_prompt_restore_coverage & coverage) {
+    if (data.main.empty() ||
+            !server_prompt_restore_coverage_is_valid(coverage, prompt.tokens)) {
         return false;
     }
 
-    if (state.coverage.scope == server_prompt_restore_scope::target_only) {
-        if (!state.data.drft.empty()) {
+    if (coverage.scope == server_prompt_restore_scope::target_only) {
+        if (!data.drft.empty()) {
             return false;
         }
-    } else if (state.coverage.scope == server_prompt_restore_scope::target_and_draft) {
-        if (state.data.drft.empty()) {
+    } else if (coverage.scope == server_prompt_restore_scope::target_and_draft) {
+        if (data.drft.empty()) {
             return false;
         }
     } else {
@@ -1927,18 +1971,18 @@ static bool pcache_state_coverage_matches_payload(const server_prompt_cache_stat
     }
 
     const auto actual = server_prompt_build_restore_coverage(
-            state.prompt,
-            state.coverage.scope,
-            state.coverage.target,
-            state.coverage.draft);
+            prompt,
+            coverage.scope,
+            coverage.target,
+            coverage.draft);
 
-    if (!pcache_coverage_equal(actual, state.coverage) ||
-            actual.checkpoints.size() != state.prompt.checkpoints.size()) {
+    if (!pcache_coverage_equal(actual, coverage) ||
+            actual.checkpoints.size() != prompt.checkpoints.size()) {
         return false;
     }
 
-    if (state.coverage.scope == server_prompt_restore_scope::target_only) {
-        for (const auto & checkpoint : state.prompt.checkpoints) {
+    if (coverage.scope == server_prompt_restore_scope::target_only) {
+        for (const auto & checkpoint : prompt.checkpoints) {
             if (!checkpoint.data_dft.empty() || !checkpoint.data_spec.empty()) {
                 return false;
             }
@@ -1946,6 +1990,10 @@ static bool pcache_state_coverage_matches_payload(const server_prompt_cache_stat
     }
 
     return true;
+}
+
+static bool pcache_state_coverage_matches_payload(const server_prompt_cache_state & state) {
+    return pcache_coverage_matches_payload(state.prompt, state.data, state.coverage);
 }
 
 static bool pcache_write_coverage(
@@ -2054,7 +2102,7 @@ static bool pcache_read_coverage(
 
 // Read and fully validate a header. On failure `reason` explains why, and the
 // caller must treat the file as unusable - never fatal, never trusted.
-static bool pcache_read_header(std::ifstream & in,
+static bool pcache_read_header(pcache_reader & reader,
                                uint64_t        file_size,
                                uint64_t        fingerprint,
                                uint64_t        max_tokens,
@@ -2072,7 +2120,7 @@ static bool pcache_read_header(std::ifstream & in,
         return false;
     }
 
-    if (!in.read(reinterpret_cast<char *>(&hdr), sizeof(hdr))) {
+    if (!reader.read_source(&hdr, sizeof(hdr))) {
         reason = "truncated header";
         return false;
     }
@@ -2146,6 +2194,129 @@ static bool pcache_read_header(std::ifstream & in,
     return true;
 }
 
+static bool pcache_serialized_size(const server_prompt_cache_state & state, uint64_t & result) {
+    const auto & tokens = state.prompt.tokens.get_tokens();
+    uint64_t size = sizeof(pcache_disk_header);
+    if (!pcache_add_checked(size, sizeof(pcache_disk_coverage)) ||
+            !pcache_add_checked(size,
+                    state.prompt.checkpoints.size()*(uint64_t) sizeof(pcache_disk_checkpoint_coverage)) ||
+            !pcache_add_checked(size, tokens.size()*(uint64_t) sizeof(llama_token)) ||
+            !pcache_add_checked(size, state.data.main.size()) ||
+            !pcache_add_checked(size, state.data.drft.size())) {
+        return false;
+    }
+    for (const auto & checkpoint : state.prompt.checkpoints) {
+        const uint64_t fixed = sizeof(checkpoint.n_tokens) + sizeof(checkpoint.id_task) +
+                sizeof(checkpoint.pos_min) + sizeof(checkpoint.pos_max) + 3*sizeof(uint64_t);
+        if (!pcache_add_checked(size, fixed) ||
+                !pcache_add_checked(size, checkpoint.data_tgt.size()) ||
+                !pcache_add_checked(size, checkpoint.data_dft.size()) ||
+                !pcache_add_checked(size, checkpoint.data_spec.size())) {
+            return false;
+        }
+    }
+    if (size > PCACHE_MAX_FILE_BYTES || size > SIZE_MAX) {
+        return false;
+    }
+    result = size;
+    return true;
+}
+
+struct pcache_decoded_state {
+    server_prompt_data                   data;
+    std::list<common_prompt_checkpoint>  checkpoints;
+    pcache_disk_header                   header = {};
+};
+
+static bool pcache_decode_state(
+        pcache_reader &                    reader,
+        uint64_t                           source_size,
+        uint64_t                           fingerprint,
+        uint64_t                           max_tokens,
+        const server_prompt_cache_state &  indexed,
+        pcache_decoded_state &             decoded,
+        const char * &                     reason) {
+    pcache_disk_header header = {};
+    if (!pcache_read_header(reader, source_size, fingerprint, max_tokens, header, reason)) {
+        return false;
+    }
+    if (header.n_tokens != (uint64_t) indexed.prompt.tokens.size()) {
+        reason = "token count does not match the index entry";
+        return false;
+    }
+
+    reader.left = header.size_payload;
+    server_prompt_restore_coverage disk_coverage;
+    if (!pcache_read_coverage(reader, header, disk_coverage, reason)) {
+        return false;
+    }
+    if (!pcache_coverage_equal(disk_coverage, indexed.coverage)) {
+        reason = "restore coverage does not match the index entry";
+        return false;
+    }
+
+    llama_tokens tokens((size_t) header.n_tokens);
+    if (!reader.read_raw(tokens.data(), header.n_tokens*(uint64_t) sizeof(llama_token))) {
+        reason = "truncated token array";
+        return false;
+    }
+    if (tokens != indexed.prompt.tokens.get_tokens()) {
+        reason = "tokens do not match the index entry";
+        return false;
+    }
+    if (!server_prompt_restore_coverage_is_valid(disk_coverage, indexed.prompt.tokens)) {
+        reason = "invalid restore coverage semantics";
+        return false;
+    }
+
+    pcache_decoded_state candidate;
+    bool ok = reader.read_sized(candidate.data.main, header.size_main, PCACHE_MAX_BLOB_BYTES) &&
+              reader.read_sized(candidate.data.drft, header.size_drft, PCACHE_MAX_BLOB_BYTES);
+    for (uint64_t i = 0; ok && i < header.n_checkpoints; ++i) {
+        common_prompt_checkpoint checkpoint = {};
+        ok = reader.read_pod(checkpoint.n_tokens) &&
+             reader.read_pod(checkpoint.id_task)  &&
+             reader.read_pod(checkpoint.pos_min)  &&
+             reader.read_pod(checkpoint.pos_max)  &&
+             reader.read_blob(checkpoint.data_tgt,  PCACHE_MAX_BLOB_BYTES) &&
+             reader.read_blob(checkpoint.data_dft,  PCACHE_MAX_BLOB_BYTES) &&
+             reader.read_blob(checkpoint.data_spec, PCACHE_MAX_BLOB_BYTES);
+        if (ok) {
+            candidate.checkpoints.push_back(std::move(checkpoint));
+        }
+    }
+    if (!ok) {
+        reason = "truncated or inconsistent payload";
+        return false;
+    }
+    if (reader.left != 0) {
+        reason = "trailing bytes after the payload";
+        return false;
+    }
+    if (reader.hash != header.hash_payload) {
+        reason = "payload checksum mismatch";
+        return false;
+    }
+
+    server_prompt prompt_check;
+    try {
+        prompt_check.tokens = indexed.prompt.tokens.clone();
+    } catch (const std::bad_alloc &) {
+        reason = "coverage verification allocation failed";
+        return false;
+    }
+    prompt_check.checkpoints = std::move(candidate.checkpoints);
+    if (!pcache_coverage_matches_payload(prompt_check, candidate.data, indexed.coverage)) {
+        reason = "restore coverage does not match the state payload";
+        return false;
+    }
+    candidate.checkpoints = std::move(prompt_check.checkpoints);
+
+    candidate.header = header;
+    decoded = std::move(candidate);
+    return true;
+}
+
 //
 // persistent cache identity
 //
@@ -2185,7 +2356,7 @@ struct pcache_fnv1a {
 
 } // namespace
 
-uint64_t server_pcache_file_probe_impl(const std::string & path) {
+static uint64_t server_pcache_file_probe_impl(const std::string & path) {
     std::error_code ec;
     const uint64_t size = (uint64_t) std::filesystem::file_size(path, ec);
     if (ec) {
@@ -2573,159 +2744,260 @@ size_t server_prompt_cache::size_disk_total() const {
     return res;
 }
 
-bool server_prompt_cache::spill_to_disk(server_prompt_cache_state & state) {
-    GGML_ASSERT(!disk_dir.empty());
+server_prompt_cache::server_prompt_cache(
+        int32_t                       limit_size_mib,
+        size_t                        limit_tokens_arg,
+        const std::string &           disk_dir_arg,
+        int32_t                       disk_limit_gib,
+        uint64_t                      disk_fingerprint_arg,
+        server_prompt_cache_io_config io_config) {
+    limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : (uint64_t) limit_size_mib);
+    limit_tokens = limit_tokens_arg;
 
-    if (state.on_disk()) {
+    disk_dir         = disk_dir_arg;
+    limit_disk       = disk_limit_gib < 0 ? 0 : 1024ull*1024ull*1024ull*(uint64_t) disk_limit_gib;
+    disk_fingerprint = disk_fingerprint_arg;
+    disk_max_tokens  = limit_tokens > 0 ? std::min<uint64_t>(limit_tokens, PCACHE_MAX_TOKENS)
+                                        : PCACHE_MAX_TOKENS;
+
+    if (disk_dir.empty()) {
+        return;
+    }
+
+    // Startup scanning is complete before the worker accepts a live write.
+    // Every admitted file is then transferred from the aggregate startup
+    // charge into exact (entry,generation,path) ownership.
+    rescan_disk();
+    if (!disk_startup_reconciled) {
+        SRV_ERR("%s", "prompt cache SSD startup reconciliation was incomplete; disabling live persistence\n");
+        publish_dashboard_state();
+        return;
+    }
+
+    if (io_config.max_pending_bytes == (1ull << 30)) {
+        // A legal cache entry is bounded by limit_size. Match that bound unless
+        // the caller explicitly supplied a different test/operational cap. An
+        // unlimited RAM cache still needs to admit target-sized LCPC images.
+        if (limit_size == 0) {
+            io_config.max_pending_bytes = PCACHE_MAX_FILE_BYTES;
+        } else {
+            io_config.max_pending_bytes = std::max<uint64_t>(io_config.max_pending_bytes, limit_size);
+        }
+    }
+    io_config.max_disk_bytes     = limit_disk;
+    io_config.initial_disk_bytes = size_disk_total();
+    if (std::find(io_config.startup_cleanup_directories.begin(),
+                  io_config.startup_cleanup_directories.end(), disk_dir) ==
+            io_config.startup_cleanup_directories.end()) {
+        io_config.startup_cleanup_directories.push_back(disk_dir);
+    }
+
+    disk_io = std::make_unique<server_prompt_cache_io>(std::move(io_config));
+    bool adoption_ok = disk_io->stats().accepting;
+    for (auto & state : states) {
+        state.io_entry_id   = state.dash_id;
+        state.io_generation = 1;
+        state.io_lifecycle  = server_prompt_cache_io_lifecycle::durable;
+        state.io_status     = server_prompt_cache_io_status::ok;
+        state.io_path       = state.file;
+        const auto adopted = disk_io->adopt_existing(
+                state.io_entry_id, state.io_generation, state.file, state.size_disk);
+        if (adopted != server_prompt_cache_io_status::ok) {
+            SRV_ERR("prompt cache SSD tier adoption failed for '%s': %s; disabling live persistence\n",
+                    state.file.c_str(), server_prompt_cache_io_status_name(adopted));
+            adoption_ok = false;
+            break;
+        }
+    }
+
+    if (!adoption_ok) {
+        disk_io->clear_error_cooldown();
+        (void) disk_io->shutdown(server_prompt_cache_io_shutdown_mode::graceful);
+        disk_io.reset();
+    } else {
+        disk_io_stats = disk_io->stats();
+    }
+    publish_dashboard_state();
+}
+
+server_prompt_cache::~server_prompt_cache() {
+    if (disk_io) {
+        disk_io->set_wake_callback({});
+        (void) shutdown_io(server_prompt_cache_io_shutdown_mode::graceful);
+    }
+}
+
+void server_prompt_cache::clear_component_payload(server_prompt_cache_state & state) {
+    std::vector<uint8_t>().swap(state.data.main);
+    std::vector<uint8_t>().swap(state.data.drft);
+    std::list<common_prompt_checkpoint>().swap(state.prompt.checkpoints);
+}
+
+std::string server_prompt_cache::next_disk_path() {
+    std::string path;
+    do {
+        path = disk_dir + "/pc-" + std::to_string(disk_fingerprint % 0xffffffull) + "-" +
+                std::to_string(disk_seq++) + ".lcpc";
+    } while (disk_paths_reserved.find(path) != disk_paths_reserved.end());
+    return path;
+}
+
+bool server_prompt_cache::serialize_payload(server_prompt_cache_state & state) {
+    if (state.io_payload) {
         return true;
     }
 
-    // media chunks cannot be serialized to the SSD tier
-    if (state.prompt.tokens.has_media()) {
+    const auto & tokens = state.prompt.tokens.get_tokens();
+    if ((uint64_t) tokens.size() > disk_max_tokens ||
+            (uint64_t) state.prompt.checkpoints.size() > PCACHE_MAX_CHECKPOINTS ||
+            (uint64_t) state.data.main.size() > PCACHE_MAX_BLOB_BYTES ||
+            (uint64_t) state.data.drft.size() > PCACHE_MAX_BLOB_BYTES ||
+            !pcache_state_coverage_matches_payload(state)) {
+        SRV_WRN(" - prompt cache entry (%zu tokens, %zu checkpoints, %zu B) is not a valid LCPC payload\n",
+                tokens.size(), state.prompt.checkpoints.size(), state.data.size());
+        state.io_status = server_prompt_cache_io_status::invalid_argument;
+        return false;
+    }
+
+    uint64_t total_size = 0;
+    if (!pcache_serialized_size(state, total_size)) {
+        state.io_status = server_prompt_cache_io_status::invalid_argument;
+        return false;
+    }
+
+    try {
+        pcache_writer writer((size_t) total_size);
+        uint64_t size_coverage = 0;
+        uint64_t hash_coverage = 0;
+        bool ok = pcache_write_coverage(writer, state, size_coverage, hash_coverage) &&
+                  writer.write_raw(tokens.data(), tokens.size()*sizeof(llama_token)) &&
+                  writer.write_raw(state.data.main.data(), state.data.main.size()) &&
+                  writer.write_raw(state.data.drft.data(), state.data.drft.size());
+        for (const auto & checkpoint : state.prompt.checkpoints) {
+            ok = ok &&
+                 writer.write_pod(checkpoint.n_tokens) &&
+                 writer.write_pod(checkpoint.id_task)  &&
+                 writer.write_pod(checkpoint.pos_min)  &&
+                 writer.write_pod(checkpoint.pos_max)  &&
+                 writer.write_blob(checkpoint.data_tgt) &&
+                 writer.write_blob(checkpoint.data_dft) &&
+                 writer.write_blob(checkpoint.data_spec);
+        }
+        if (!ok || writer.data.size() != total_size ||
+                writer.payload_size != total_size - sizeof(pcache_disk_header)) {
+            state.io_status = server_prompt_cache_io_status::invalid_argument;
+            return false;
+        }
+
+        pcache_disk_header header = {};
+        header.magic         = PCACHE_DISK_MAGIC;
+        header.version       = PCACHE_DISK_VERSION;
+        header.fingerprint   = disk_fingerprint;
+        header.size_main     = state.data.main.size();
+        header.size_drft     = state.data.drft.size();
+        header.n_tokens      = tokens.size();
+        header.n_checkpoints = state.prompt.checkpoints.size();
+        header.size_coverage = size_coverage;
+        header.size_payload  = writer.payload_size;
+        header.hash_coverage = hash_coverage;
+        header.hash_payload  = writer.payload_hash;
+        header.hash_header   = server_pcache_header_hash(header);
+        memcpy(writer.data.data(), &header, sizeof(header));
+
+        state.io_payload = std::make_shared<const std::vector<uint8_t>>(std::move(writer.data));
+        state.io_checksum = server_prompt_cache_io_checksum(
+                state.io_payload->data(), state.io_payload->size());
+        clear_component_payload(state);
+        state.io_lifecycle = server_prompt_cache_io_lifecycle::ram_ready;
+        state.io_status    = server_prompt_cache_io_status::ok;
+        return true;
+    } catch (const std::bad_alloc &) {
+        state.io_status = server_prompt_cache_io_status::allocation_failed;
+        return false;
+    } catch (...) {
+        state.io_status = server_prompt_cache_io_status::invalid_argument;
+        return false;
+    }
+}
+
+bool server_prompt_cache::submit_payload(server_prompt_cache_state & state) {
+    if (!disk_io || disk_io_shutdown || !state.io_payload || state.io_path.empty()) {
+        state.io_status = server_prompt_cache_io_status::sealed;
+        return false;
+    }
+    if (state.io_lifecycle == server_prompt_cache_io_lifecycle::commit_uncertain || state.io_reconcile_pending) {
+        state.io_status = server_prompt_cache_io_status::too_late;
+        return false;
+    }
+
+    if (state.io_generation == UINT64_MAX) {
+        state.io_status = server_prompt_cache_io_status::generation_not_newer;
+        return false;
+    }
+    const uint64_t generation = state.io_generation + 1;
+    server_prompt_cache_io_write write;
+    write.entry_id          = state.io_entry_id;
+    write.generation        = generation;
+    write.final_path        = state.io_path;
+    write.payload           = state.io_payload;
+    write.verify_checksum   = true;
+    write.expected_checksum = state.io_checksum;
+    if (have_next_io_faults_for_test) {
+        write.faults = next_io_faults_for_test;
+        have_next_io_faults_for_test = false;
+        next_io_faults_for_test      = {};
+    }
+
+    const auto result = disk_io->submit(std::move(write));
+    state.io_status = result.status;
+    if (result.status != server_prompt_cache_io_status::ok) {
+        ++dash_io_rejections;
+        return false;
+    }
+
+    state.io_generation = generation;
+    state.io_job_id      = result.job_id;
+    state.io_lifecycle   = result.lifecycle;
+    state.file.clear();
+    state.size_disk = 0;
+    return true;
+}
+
+bool server_prompt_cache::spill_to_disk(server_prompt_cache_state & state) {
+    if (state.on_disk()) {
+        return true;
+    }
+    if (disk_dir.empty() || !disk_io || disk_io_shutdown || state.prompt.tokens.has_media() ||
+            state.io_in_flight() || state.io_lifecycle == server_prompt_cache_io_lifecycle::commit_uncertain ||
+            state.io_reconcile_pending) {
         return false;
     }
 
     const int64_t t_start = ggml_time_us();
-
-    const llama_tokens & tokens = state.prompt.tokens.get_tokens();
-
-    // refuse to write anything the reader would have to refuse
-    if ((uint64_t) tokens.size() > disk_max_tokens ||
-        (uint64_t) state.prompt.checkpoints.size() > PCACHE_MAX_CHECKPOINTS ||
-        (uint64_t) state.data.main.size() > PCACHE_MAX_BLOB_BYTES ||
-        (uint64_t) state.data.drft.size() > PCACHE_MAX_BLOB_BYTES) {
-        SRV_WRN(" - prompt cache entry (%zu tokens, %zu checkpoints, %zu B) exceeds the SSD tier limits, not spilling\n",
-                tokens.size(), state.prompt.checkpoints.size(), state.data.size());
+    if (state.io_entry_id == 0) {
+        if (state.dash_id == 0) {
+            state.dash_id = dash_id_next++;
+        }
+        state.io_entry_id = state.dash_id;
+    }
+    if (state.io_path.empty()) {
+        try {
+            state.io_path = next_disk_path();
+        } catch (const std::bad_alloc &) {
+            state.io_status = server_prompt_cache_io_status::allocation_failed;
+            return false;
+        } catch (...) {
+            state.io_status = server_prompt_cache_io_status::invalid_argument;
+            return false;
+        }
+    }
+    if (!serialize_payload(state) || !submit_payload(state)) {
         return false;
     }
-    if (!pcache_state_coverage_matches_payload(state)) {
-        SRV_WRN(" - prompt cache entry (%zu tokens) has invalid restore coverage, not spilling\n",
-                tokens.size());
-        return false;
-    }
-
-    std::string path;
-    do {
-        path = disk_dir + "/pc-" + std::to_string(disk_fingerprint % 0xffffffull) + "-" + std::to_string(disk_seq++) + ".lcpc";
-    } while (std::filesystem::exists(path));
-
-    // write to a temporary name and publish with an atomic rename: a crash or a
-    // full disk must never leave a partial file in the discoverable namespace
-    const std::string path_tmp = path + ".tmp";
-
-    pcache_disk_header hdr = {};
-
-    bool ok = false;
-    {
-        pcache_writer w;
-        w.out.open(path_tmp, std::ios::binary | std::ios::trunc);
-
-        ok = w.out.is_open();
-
-        if (ok) {
-            // reserve the header; it is rewritten below once the payload hash
-            // is known (not part of the payload, so written outside the writer)
-            ok = bool(w.out.write(reinterpret_cast<const char *>(&hdr), sizeof(hdr)));
-        }
-
-        uint64_t size_coverage = 0;
-        uint64_t hash_coverage = 0;
-        ok = ok &&
-             pcache_write_coverage(w, state, size_coverage, hash_coverage) &&
-             w.write_raw(tokens.data(), tokens.size()*sizeof(llama_token)) &&
-             w.write_raw(state.data.main.data(), state.data.main.size()) &&
-             w.write_raw(state.data.drft.data(), state.data.drft.size());
-
-        for (const auto & ckpt : state.prompt.checkpoints) {
-            ok = ok &&
-                 w.write_pod(ckpt.n_tokens) &&
-                 w.write_pod(ckpt.id_task)  &&
-                 w.write_pod(ckpt.pos_min)  &&
-                 w.write_pod(ckpt.pos_max)  &&
-                 w.write_blob(ckpt.data_tgt) &&
-                 w.write_blob(ckpt.data_dft) &&
-                 w.write_blob(ckpt.data_spec);
-        }
-
-        if (ok) {
-            hdr.magic         = PCACHE_DISK_MAGIC;
-            hdr.version       = PCACHE_DISK_VERSION;
-            hdr.fingerprint   = disk_fingerprint;
-            hdr.size_main     = state.data.main.size();
-            hdr.size_drft     = state.data.drft.size();
-            hdr.n_tokens      = tokens.size();
-            hdr.n_checkpoints = state.prompt.checkpoints.size();
-            hdr.size_coverage = size_coverage;
-            hdr.size_payload  = w.payload_size;
-            hdr.hash_coverage = hash_coverage;
-            hdr.hash_payload  = w.payload_hash;
-            hdr.hash_header   = server_pcache_header_hash(hdr);
-
-            w.out.seekp(0, std::ios::beg);
-
-            ok = bool(w.out.write(reinterpret_cast<const char *>(&hdr), sizeof(hdr)));
-        }
-
-        if (ok) {
-            w.out.flush();
-            ok = bool(w.out);
-        }
-
-        w.out.close();
-        ok = ok && !w.out.fail();
-    }
-
-    if (ok) {
-        // order the data before the rename, then make the rename itself durable
-        pcache_fsync(path_tmp, false);
-
-        std::error_code ec;
-        std::filesystem::rename(path_tmp, path, ec);
-        if (ec) {
-            SRV_WRN(" - failed to publish prompt cache file '%s': %s\n", path.c_str(), ec.message().c_str());
-            ok = false;
-        } else {
-            pcache_fsync(disk_dir, true);
-        }
-    }
-
-    if (!ok) {
-        SRV_WRN(" - failed to spill prompt cache entry to '%s', dropping the file\n", path.c_str());
-        std::error_code ec;
-        std::filesystem::remove(path_tmp, ec);
-        std::filesystem::remove(path, ec);
-        return false;
-    }
-
-    std::error_code ec;
-    const size_t size_file = std::filesystem::file_size(path, ec);
-    const size_t size_ram = state.size();
-
-    state.file      = path;
-    state.size_disk = ec ? size_ram : size_file;
-
-    state.data.main.clear();
-    state.data.main.shrink_to_fit();
-    state.data.drft.clear();
-    state.data.drft.shrink_to_fit();
-    state.prompt.checkpoints.clear();
 
     const double dt_ms = (ggml_time_us() - t_start) / 1000.0;
-    SRV_INF(" - spilled prompt (%d tokens, %.3f MiB) to '%s' in %.1f ms (%.1f MB/s)\n",
-            state.prompt.n_tokens(), size_ram / (1024.0*1024.0), path.c_str(), dt_ms,
-            dt_ms > 0.0 ? (size_ram / (1024.0*1024.0)) / (dt_ms / 1000.0) : 0.0);
-
-    ++dash_spills;
-    dash_bytes_spilled += size_ram;
-    {
-        server_dashboard::event ev;
-        ev.kind = server_dashboard::event_kind::cache_op;
-        ev.code = (uint16_t) server_dashboard::cache_op_code::spill;
-        ev.a    = state.prompt.n_tokens();
-        ev.b    = (int64_t) size_ram;
-        ev.f    = dt_ms;
-        server_dashboard::instance().emit(ev);
-    }
+    SRV_INF(" - queued prompt (%d tokens, %.3f MiB) for durable SSD publication to '%s' after %.1f ms serialization\n",
+            state.prompt.n_tokens(), state.size() / (1024.0*1024.0), state.io_path.c_str(), dt_ms);
 
     return true;
 }
@@ -2737,11 +3009,6 @@ bool server_prompt_cache::load_from_disk(server_prompt_cache_state & state) {
 
     const auto reject = [&](const char * why) {
         SRV_WRN(" - prompt cache file '%s' rejected: %s\n", state.file.c_str(), why);
-        state.data.main.clear();
-        state.data.main.shrink_to_fit();
-        state.data.drft.clear();
-        state.data.drft.shrink_to_fit();
-        state.prompt.checkpoints.clear();
         return false;
     };
 
@@ -2757,89 +3024,34 @@ bool server_prompt_cache::load_from_disk(server_prompt_cache_state & state) {
         return reject("cannot open the file");
     }
 
-    pcache_disk_header hdr    = {};
-    const char *       reason = "";
-    if (!pcache_read_header(r.in, file_size, disk_fingerprint, disk_max_tokens, hdr, reason)) {
-        return reject(reason);
-    }
-
-    if (hdr.n_tokens != (uint64_t) state.prompt.tokens.size()) {
-        return reject("token count does not match the index entry");
-    }
-
-    r.left = hdr.size_payload;
-
-    server_prompt_restore_coverage disk_coverage;
-    if (!pcache_read_coverage(r, hdr, disk_coverage, reason)) {
-        return reject(reason);
-    }
-    if (!pcache_coverage_equal(disk_coverage, state.coverage)) {
-        return reject("restore coverage does not match the index entry");
-    }
-
-    // tokens: bounded by the header check above, so this resize is safe
-    llama_tokens tokens((size_t) hdr.n_tokens);
-    if (!r.read_raw(tokens.data(), hdr.n_tokens*(uint64_t) sizeof(llama_token))) {
-        return reject("truncated token array");
-    }
-
-    if (tokens != state.prompt.tokens.get_tokens()) {
-        return reject("tokens do not match the index entry");
-    }
-    if (!server_prompt_restore_coverage_is_valid(disk_coverage, state.prompt.tokens)) {
-        return reject("invalid restore coverage semantics");
-    }
-
-    bool ok = r.read_sized(state.data.main, hdr.size_main, PCACHE_MAX_BLOB_BYTES) &&
-              r.read_sized(state.data.drft, hdr.size_drft, PCACHE_MAX_BLOB_BYTES);
-
-    state.prompt.checkpoints.clear();
-    for (uint64_t i = 0; ok && i < hdr.n_checkpoints; ++i) {
-        common_prompt_checkpoint ckpt = {};
-        ok = r.read_pod(ckpt.n_tokens) &&
-             r.read_pod(ckpt.id_task)  &&
-             r.read_pod(ckpt.pos_min)  &&
-             r.read_pod(ckpt.pos_max)  &&
-             r.read_blob(ckpt.data_tgt,  PCACHE_MAX_BLOB_BYTES) &&
-             r.read_blob(ckpt.data_dft,  PCACHE_MAX_BLOB_BYTES) &&
-             r.read_blob(ckpt.data_spec, PCACHE_MAX_BLOB_BYTES);
-        if (ok) {
-            state.prompt.checkpoints.push_back(std::move(ckpt));
+    pcache_decoded_state decoded;
+    const char * reason = "";
+    try {
+        if (!pcache_decode_state(r, file_size, disk_fingerprint, disk_max_tokens, state, decoded, reason)) {
+            return reject(reason);
         }
+    } catch (const std::bad_alloc &) {
+        return reject("payload allocation failed");
+    } catch (...) {
+        return reject("unexpected payload decode failure");
     }
-
-    if (!ok) {
-        return reject("truncated or inconsistent payload");
-    }
-
-    if (r.left != 0) {
-        return reject("trailing bytes after the payload");
-    }
-
-    // every byte of the payload has now been hashed exactly once, in the same
-    // chunking the writer used
-    if (r.hash != hdr.hash_payload) {
-        return reject("payload checksum mismatch");
-    }
-
-    if (!pcache_state_coverage_matches_payload(state)) {
-        return reject("restore coverage does not match the state payload");
-    }
+    state.data               = std::move(decoded.data);
+    state.prompt.checkpoints = std::move(decoded.checkpoints);
 
     const double dt_ms = (ggml_time_us() - t_start) / 1000.0;
-    const double mib = (hdr.size_main + hdr.size_drft) / (1024.0*1024.0);
+    const double mib = (decoded.header.size_main + decoded.header.size_drft) / (1024.0*1024.0);
     SRV_INF(" - loaded prompt (%d tokens, %.3f MiB) from '%s' in %.1f ms (%.1f MB/s)\n",
             state.prompt.n_tokens(), mib, state.file.c_str(), dt_ms,
             dt_ms > 0.0 ? mib / (dt_ms / 1000.0) : 0.0);
 
     ++dash_disk_loads;
-    dash_bytes_disk_load += hdr.size_main + hdr.size_drft;
+    dash_bytes_disk_load += decoded.header.size_main + decoded.header.size_drft;
     {
         server_dashboard::event ev;
         ev.kind = server_dashboard::event_kind::cache_op;
         ev.code = (uint16_t) server_dashboard::cache_op_code::disk_load;
         ev.a    = state.prompt.n_tokens();
-        ev.b    = (int64_t) (hdr.size_main + hdr.size_drft);
+        ev.b    = (int64_t) (decoded.header.size_main + decoded.header.size_drft);
         ev.f    = dt_ms;
         server_dashboard::instance().emit(ev);
     }
@@ -2847,10 +3059,47 @@ bool server_prompt_cache::load_from_disk(server_prompt_cache_state & state) {
     return true;
 }
 
+bool server_prompt_cache::load_from_payload(server_prompt_cache_state & state) {
+    if (!state.io_payload || state.io_payload->size() < sizeof(pcache_disk_header)) {
+        return false;
+    }
+
+    pcache_reader reader;
+    reader.memory      = state.io_payload->data();
+    reader.memory_size = state.io_payload->size();
+
+    pcache_decoded_state decoded;
+    const char * reason = "";
+    bool decoded_ok = false;
+    try {
+        decoded_ok = pcache_decode_state(reader, state.io_payload->size(), disk_fingerprint, disk_max_tokens,
+                                         state, decoded, reason);
+    } catch (const std::bad_alloc &) {
+        reason = "payload allocation failed";
+    } catch (...) {
+        reason = "unexpected payload decode failure";
+    }
+    if (!decoded_ok) {
+        SRV_WRN(" - in-memory prompt cache generation %llu/%llu rejected: %s\n",
+                (unsigned long long) state.io_entry_id,
+                (unsigned long long) state.io_generation, reason);
+        return false;
+    }
+    state.data               = std::move(decoded.data);
+    state.prompt.checkpoints = std::move(decoded.checkpoints);
+    return true;
+}
+
 void server_prompt_cache::rescan_disk() {
     std::error_code ec;
 
     std::filesystem::create_directories(disk_dir, ec);
+    if (ec) {
+        disk_startup_reconciled = false;
+        SRV_WRN("failed to create prompt cache directory '%s': %s\n",
+                disk_dir.c_str(), ec.message().c_str());
+        return;
+    }
 
     struct found_file {
         std::string path;
@@ -2864,17 +3113,38 @@ void server_prompt_cache::rescan_disk() {
         std::error_code it_ec;
         auto it = std::filesystem::directory_iterator(disk_dir, it_ec);
         if (it_ec) {
+            disk_startup_reconciled = false;
             SRV_WRN("failed to scan prompt cache directory '%s': %s\n", disk_dir.c_str(), it_ec.message().c_str());
             return;
         }
 
-        for (const auto & entry : it) {
-            std::error_code e_ec;
-            if (!entry.is_regular_file(e_ec) || e_ec) {
+        const std::filesystem::directory_iterator end;
+        for (; it != end && !it_ec; it.increment(it_ec)) {
+            const auto & entry = *it;
+            const auto ext = entry.path().extension();
+
+            // Reserve names before asking the filesystem for metadata. A
+            // recognized path that cannot be classified or byte-accounted is
+            // still discoverable at startup, so live persistence must remain
+            // disabled rather than silently excluding it from quota ownership.
+            if (ext == ".lcpc") {
+                disk_paths_reserved.insert(entry.path().string());
+            }
+
+            if (ext != ".tmp" && ext != ".lcpc") {
                 continue;
             }
 
-            const auto ext = entry.path().extension();
+            std::error_code e_ec;
+            const auto file_status = entry.symlink_status(e_ec);
+            if (e_ec || !std::filesystem::is_regular_file(file_status)) {
+                if (ext == ".lcpc") {
+                    disk_startup_reconciled = false;
+                    SRV_WRN("prompt cache path '%s' is not an inspectable regular file; "
+                            "disabling live persistence\n", entry.path().string().c_str());
+                }
+                continue;
+            }
 
             // leftovers from a spill that was interrupted before its rename;
             // they were never discoverable, so they are simply garbage now
@@ -2883,20 +3153,24 @@ void server_prompt_cache::rescan_disk() {
                 continue;
             }
 
-            if (ext != ".lcpc") {
-                continue;
-            }
-
             std::error_code m_ec;
             std::error_code s_ec;
             const auto mtime = entry.last_write_time(m_ec);
             const auto size  = entry.file_size(s_ec);
             if (m_ec || s_ec) {
-                SRV_WRN("skipping unreadable prompt cache file '%s'\n", entry.path().string().c_str());
+                disk_startup_reconciled = false;
+                SRV_WRN("cannot account prompt cache file '%s'; disabling live persistence\n",
+                        entry.path().string().c_str());
                 continue;
             }
 
             files.push_back({ entry.path().string(), mtime, (size_t) size });
+        }
+
+        if (it_ec) {
+            disk_startup_reconciled = false;
+            SRV_WRN("failed while scanning prompt cache directory '%s': %s\n",
+                    disk_dir.c_str(), it_ec.message().c_str());
         }
     }
 
@@ -2904,6 +3178,11 @@ void server_prompt_cache::rescan_disk() {
         SRV_WRN("removing incomplete prompt cache file '%s'\n", path.c_str());
         std::error_code rmec;
         std::filesystem::remove(path, rmec);
+        if (rmec) {
+            disk_startup_reconciled = false;
+            SRV_WRN("failed to remove incomplete prompt cache file '%s': %s\n",
+                    path.c_str(), rmec.message().c_str());
+        }
     }
 
     // oldest first, so the eviction order survives the restart
@@ -2932,7 +3211,7 @@ void server_prompt_cache::rescan_disk() {
 
             if (!r.in.is_open()) {
                 reason = "cannot open the file";
-            } else if (pcache_read_header(r.in, (uint64_t) f.size, disk_fingerprint, disk_max_tokens, hdr, reason)) {
+            } else if (pcache_read_header(r, (uint64_t) f.size, disk_fingerprint, disk_max_tokens, hdr, reason)) {
                 r.left = hdr.size_payload;
 
                 // Coverage is small, independently hashed, and precedes the
@@ -2971,7 +3250,13 @@ void server_prompt_cache::rescan_disk() {
             SRV_WRN("dropping unusable prompt cache file '%s': %s\n", f.path.c_str(), reason);
             std::error_code rmec;
             std::filesystem::remove(f.path, rmec);
-            ++n_dropped;
+            if (rmec) {
+                disk_startup_reconciled = false;
+                SRV_WRN("failed to remove unusable prompt cache file '%s': %s\n",
+                        f.path.c_str(), rmec.message().c_str());
+            } else {
+                ++n_dropped;
+            }
             continue;
         }
 
@@ -2980,12 +3265,35 @@ void server_prompt_cache::rescan_disk() {
         state.coverage      = std::move(coverage);
         state.file          = f.path;
         state.size_disk     = f.size;
+        state.io_lifecycle  = server_prompt_cache_io_lifecycle::durable;
+        state.io_status     = server_prompt_cache_io_status::ok;
+        state.io_path       = f.path;
 
         state.dash_id         = dash_id_next++;
         state.dash_created_us = ggml_time_us();
+        state.io_entry_id     = state.dash_id;
+        state.io_generation   = 1;
 
         states.push_back(std::move(state));
         ++n_restored;
+    }
+
+    // Reconcile an over-limit directory before constructing the authoritative
+    // engine quota. Startup is not serving requests yet, so this one-time
+    // oldest-first cleanup may remain synchronous.
+    while (limit_disk > 0 && size_disk_total() > limit_disk && !states.empty()) {
+        const std::string path = states.front().file;
+        std::error_code rmec;
+        std::filesystem::remove(path, rmec);
+        if (rmec) {
+            disk_startup_reconciled = false;
+            SRV_WRN("failed to trim over-limit startup prompt cache file '%s': %s\n",
+                    path.c_str(), rmec.message().c_str());
+            break;
+        }
+        states.pop_front();
+        ++n_dropped;
+        --n_restored;
     }
 
     SRV_INF("prompt cache SSD tier: restored %zu entries (%.3f GiB), dropped %zu unusable, from '%s'\n",
@@ -2994,51 +3302,292 @@ void server_prompt_cache::rescan_disk() {
     publish_dashboard_state();
 }
 
-std::list<server_prompt_cache_state>::iterator server_prompt_cache::drop_entry(std::list<server_prompt_cache_state>::iterator it) {
-    if (it->on_disk()) {
-        std::error_code ec;
-        std::filesystem::remove(it->file, ec);
-        if (ec) {
-            SRV_WRN("failed to remove prompt cache file '%s': %s\n", it->file.c_str(), ec.message().c_str());
+void server_prompt_cache::begin_uncertain_reconciliation(server_prompt_cache_state & state) {
+    if (!disk_io || state.io_generation == 0) {
+        return;
+    }
+    state.io_reconcile_pending = true;
+    const auto status = disk_io->retire(state.io_entry_id, state.io_generation);
+    if (pcache_retire_already_resolved(status)) {
+        // No worker event can clear this flag. Treat the old publication as
+        // already reconciled and let a strictly newer generation reuse the
+        // same owner-held immutable payload.
+        state.io_reconcile_pending = false;
+        state.io_lifecycle = server_prompt_cache_io_lifecycle::write_failed;
+        state.io_status = status;
+        state.io_job_id = 0;
+        (void) submit_payload(state);
+    } else if (!pcache_retire_completion_armed(status)) {
+        // Capacity/allocation failures did not retire the uncertain path.
+        // Keep the tombstone armed for the next owner poll.
+        state.io_status = status;
+    }
+}
+
+void server_prompt_cache::retry_retired_generations() {
+    if (!disk_io || disk_io_shutdown) {
+        return;
+    }
+    // Write error cooldown gates new payload publication, not exact-path
+    // cleanup. Retry retirements on the completion wake itself so an idle
+    // server cannot strand a discoverable file until unrelated traffic.
+    for (auto & state : states) {
+        if (state.io_reconcile_pending) {
+            begin_uncertain_reconciliation(state);
+        }
+    }
+    for (auto & retired : retired_states) {
+        if (!retired.io_retire_retry) {
+            continue;
+        }
+        const auto status = disk_io->retire(retired.io_entry_id, retired.io_generation);
+        if (pcache_retire_completion_armed(status)) {
+            retired.io_retire_retry = false;
+        } else if (pcache_retire_already_resolved(status)) {
+            retired.io_entry_id = 0;
+        }
+    }
+    retired_states.remove_if(
+            [](const server_prompt_cache_state & retired) { return retired.io_entry_id == 0; });
+}
+
+void server_prompt_cache::poll_io_completions() {
+    if (!disk_io) {
+        return;
+    }
+
+    // Cooldown admission has no completion. The IO engine emits one delayed
+    // narrow wake at the deadline; on that owner turn, retry the same immutable
+    // RAM image before looking for ordinary completions.
+    if (disk_io_stats.cooldown_until_ns == 0 || pcache_steady_now_ns() >= disk_io_stats.cooldown_until_ns) {
+        for (auto & state : states) {
+            if (state.io_lifecycle == server_prompt_cache_io_lifecycle::write_failed &&
+                    state.io_status == server_prompt_cache_io_status::cooldown && state.io_payload &&
+                    !state.io_reconcile_pending) {
+                (void) submit_payload(state);
+            }
         }
     }
 
-    ++dash_drops;
-    {
+    for (auto & state : states) {
+        if (!state.io_in_flight()) {
+            continue;
+        }
+        const auto snapshot = disk_io->inspect(state.io_entry_id, state.io_generation);
+        if (snapshot.lifecycle == server_prompt_cache_io_lifecycle::queued ||
+                snapshot.lifecycle == server_prompt_cache_io_lifecycle::writing) {
+            state.io_lifecycle = snapshot.lifecycle;
+            state.io_status    = snapshot.status;
+        }
+    }
+
+    std::vector<server_prompt_cache_io_completion> completions;
+    try {
+        completions = disk_io->poll_completions();
+    } catch (const std::bad_alloc &) {
+        SRV_WRN("%s", "prompt cache completion polling deferred by allocation pressure\n");
+        disk_io_stats = disk_io->stats();
+        return;
+    } catch (...) {
+        SRV_WRN("%s", "prompt cache completion polling failed unexpectedly; retaining owner fallbacks\n");
+        disk_io_stats = disk_io->stats();
+        return;
+    }
+    for (auto & completion : completions) {
+        auto state_it = std::find_if(states.begin(), states.end(), [&](const server_prompt_cache_state & state) {
+            return state.io_entry_id == completion.entry_id && state.io_generation == completion.generation;
+        });
+
+        if (completion.event == server_prompt_cache_io_event_kind::cleanup) {
+            if (state_it != states.end() && state_it->io_reconcile_pending) {
+                if (pcache_cleanup_completion_resolved(completion.status)) {
+                    state_it->io_reconcile_pending = false;
+                    state_it->io_lifecycle = server_prompt_cache_io_lifecycle::write_failed;
+                    state_it->io_status    = completion.status;
+                    state_it->io_job_id    = 0;
+                    (void) submit_payload(*state_it);
+                } else {
+                    state_it->io_status = completion.status;
+                    // Leave the tombstone armed. retry_retired_generations()
+                    // observes the engine cooldown before another unlink.
+                }
+            }
+
+            for (auto & retired : retired_states) {
+                if (retired.io_entry_id != completion.entry_id ||
+                        retired.io_generation != completion.generation) {
+                    continue;
+                }
+                if (pcache_cleanup_completion_resolved(completion.status)) {
+                    retired.io_entry_id = 0;
+                } else {
+                    retired.io_retire_retry = true;
+                }
+            }
+            continue;
+        }
+
+        if (state_it == states.end()) {
+            for (auto & retired : retired_states) {
+                if (retired.io_entry_id == completion.entry_id &&
+                        retired.io_generation == completion.generation) {
+                    if (completion.status == server_prompt_cache_io_status::cancelled ||
+                            completion.status == server_prompt_cache_io_status::stale_generation) {
+                        retired.io_entry_id = 0;
+                    } else {
+                        retired.io_retire_retry = true;
+                    }
+                    // The worker is finished reading the immutable payload;
+                    // exact-path cleanup retries need only identity and path.
+                    retired.io_payload.reset();
+                    clear_component_payload(retired);
+                }
+            }
+            ++dash_io_stale;
+            continue;
+        }
+
+        auto & state = *state_it;
+        state.io_status    = completion.status;
+        state.io_lifecycle = completion.lifecycle;
+        state.io_job_id    = 0;
+
+        if (completion.status == server_prompt_cache_io_status::ok &&
+                completion.lifecycle == server_prompt_cache_io_lifecycle::durable &&
+                completion.final_path == state.io_path && state.io_payload &&
+                completion.bytes == state.io_payload->size()) {
+            state.file      = std::move(completion.final_path);
+            state.size_disk = (size_t) completion.bytes;
+            state.io_payload.reset();
+            clear_component_payload(state);
+            state.io_reconcile_pending = false;
+
+            ++dash_spills;
+            dash_bytes_spilled += completion.bytes;
+            server_dashboard::event ev;
+            ev.kind = server_dashboard::event_kind::cache_op;
+            ev.code = (uint16_t) server_dashboard::cache_op_code::spill;
+            ev.a    = state.prompt.n_tokens();
+            ev.b    = (int64_t) completion.bytes;
+            ev.f    = completion.started_ns != 0 && completion.completed_ns >= completion.started_ns ?
+                    (completion.completed_ns - completion.started_ns)/1e6 : 0.0;
+            server_dashboard::instance().emit(ev);
+        } else if (completion.lifecycle == server_prompt_cache_io_lifecycle::commit_uncertain ||
+                   completion.status == server_prompt_cache_io_status::commit_uncertain) {
+            state.file.clear();
+            state.size_disk = 0;
+            ++dash_io_uncertain;
+            begin_uncertain_reconciliation(state);
+        } else {
+            // Pre-publication failure or cancellation leaves the immutable
+            // memory image authoritative and retryable. A malformed durable
+            // completion also retires its exact generation before any retry.
+            state.file.clear();
+            state.size_disk = 0;
+            if (completion.lifecycle == server_prompt_cache_io_lifecycle::durable) {
+                state.io_lifecycle = server_prompt_cache_io_lifecycle::commit_uncertain;
+                begin_uncertain_reconciliation(state);
+            }
+        }
+    }
+
+    retired_states.remove_if(
+            [](const server_prompt_cache_state & retired) { return retired.io_entry_id == 0; });
+    retry_retired_generations();
+
+    if (!completions.empty() && limit_size > 0 && size() > limit_size) {
+        // A durable write or exact cleanup may have changed admission. Advance
+        // one spill/retirement step on this owner wake so an idle cache makes
+        // progress without running the full per-request update path.
+        (void) evict_oldest_ram();
+    }
+    disk_io_stats = disk_io->stats();
+    if (!completions.empty()) {
+        // Completion callbacks only request an owner turn. Publish the result
+        // here so an otherwise-idle server exposes durable/error transitions
+        // without running the full cache-limit update on every decode turn.
+        publish_dashboard_state();
+    }
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::erase_entry(
+        std::list<server_prompt_cache_state>::iterator it, bool count_drop) {
+    const size_t bytes = it->on_disk() ? it->size_disk : it->size();
+    if (count_drop) {
+        ++dash_drops;
         server_dashboard::event ev;
         ev.kind = server_dashboard::event_kind::cache_op;
         ev.code = (uint16_t) server_dashboard::cache_op_code::drop;
         ev.a    = it->prompt.n_tokens();
-        ev.b    = (int64_t) (it->on_disk() ? it->size_disk : it->size());
+        ev.b    = (int64_t) bytes;
         server_dashboard::instance().emit(ev);
     }
 
-    return states.erase(it);
+    const auto next = std::next(it);
+    if (!disk_io || it->io_generation == 0) {
+        states.erase(it);
+        return next;
+    }
+
+    // Move the already-allocated list node before mutating engine state. The
+    // tombstone therefore cannot be lost to an allocation failure after a
+    // cancellation/cleanup has been accepted.
+    retired_states.splice(retired_states.end(), states, it);
+    auto retired = std::prev(retired_states.end());
+    const auto status = disk_io->retire(retired->io_entry_id, retired->io_generation);
+    retired->io_retire_retry = !pcache_retire_completion_armed(status) &&
+            !pcache_retire_already_resolved(status);
+    if (pcache_retire_already_resolved(status)) {
+        retired_states.erase(retired);
+    }
+    return next;
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::drop_entry(
+        std::list<server_prompt_cache_state>::iterator it) {
+    return erase_entry(it, true);
 }
 
 bool server_prompt_cache::evict_oldest_ram() {
     for (auto it = states.begin(); it != states.end(); ++it) {
-        if (it->on_disk()) {
+        if (it->on_disk() || !it->has_ram_fallback() || it->io_in_flight() ||
+                it->io_lifecycle == server_prompt_cache_io_lifecycle::commit_uncertain ||
+                it->io_reconcile_pending) {
             continue;
         }
 
-        if (!disk_dir.empty() && spill_to_disk(*it)) {
+        if (!disk_dir.empty() && disk_io && !disk_io_shutdown && spill_to_disk(*it)) {
             return true;
+        }
+
+        if (!disk_dir.empty() && disk_io && !disk_io_shutdown) {
+            if (it->io_status == server_prompt_cache_io_status::disk_limit) {
+                if (!retired_states.empty()) {
+                    // Accounting is released only by the cleanup completion.
+                    // Retiring more durable entries in the same owner turn
+                    // would over-evict while quota truth is unchanged.
+                    return false;
+                }
+                const auto disk_it = std::find_if(states.begin(), states.end(),
+                        [](const server_prompt_cache_state & state) { return state.on_disk(); });
+                if (disk_it != states.end()) {
+                    SRV_WRN(" - cache disk admission is full, retiring oldest durable entry (%.3f MiB)\n",
+                            disk_it->size_disk / (1024.0*1024.0));
+                    erase_entry(disk_it, true);
+                    return true;
+                }
+            }
+            if (it->io_status != server_prompt_cache_io_status::invalid_argument) {
+                // Saturation, cooldown, allocation pressure and I/O failures
+                // retain the immutable fallback. The RAM limit may overshoot
+                // until an accepted generation becomes durable.
+                return false;
+            }
         }
 
         SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", it->size() / (1024.0 * 1024.0));
 
-        ++dash_drops;
-        {
-            server_dashboard::event ev;
-            ev.kind = server_dashboard::event_kind::cache_op;
-            ev.code = (uint16_t) server_dashboard::cache_op_code::drop;
-            ev.a    = it->prompt.n_tokens();
-            ev.b    = (int64_t) it->size();
-            server_dashboard::instance().emit(ev);
-        }
-
-        states.erase(it);
+        erase_entry(it, true);
 
         return true;
     }
@@ -3051,6 +3600,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(
         const server_prompt_restore_coverage & coverage,
         size_t state_size_tgt,
         size_t state_size_dft) {
+    poll_io_completions();
+
     server_prompt prompt_new;
     prompt_new.tokens = prompt.tokens.clone();
 
@@ -3180,6 +3731,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(
     state_new.data.drft          = std::move(state_data_dft);
     state_new.dash_id            = dash_id_next++;
     state_new.dash_created_us    = ggml_time_us();
+    state_new.io_entry_id        = state_new.dash_id;
+    state_new.io_lifecycle       = server_prompt_cache_io_lifecycle::ram_ready;
+    state_new.io_status          = server_prompt_cache_io_status::ok;
 
     states.push_back(std::move(state_new));
 
@@ -3198,6 +3752,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    poll_io_completions();
+
     ++dash_lookups;
     dash_last_load = {};
 
@@ -3252,13 +3808,22 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better coverage-qualified prompt with %zu effective tokens\n", reusable_best);
 
-        const bool from_disk = it_best->on_disk();
+        const bool from_disk    = it_best->on_disk();
+        const bool from_payload = !from_disk && static_cast<bool>(it_best->io_payload);
         const size_t tokens_restored = plan_best.effective_tokens;
 
         if (from_disk && !load_from_disk(*it_best)) {
             // unreadable or stale file - drop the entry so it is not retried
             drop_entry(it_best);
 
+            ++dash_misses;
+            return false;
+        }
+        if (from_payload && !load_from_payload(*it_best)) {
+            // The immutable fallback is the only representation for an
+            // in-flight/failed/uncertain generation. Corruption therefore
+            // retires that exact generation and fails closed.
+            drop_entry(it_best);
             ++dash_misses;
             return false;
         }
@@ -3366,6 +3931,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             slim.coverage      = it_best->coverage;
             slim.file          = std::move(it_best->file);
             slim.size_disk     = it_best->size_disk;
+            slim.io_entry_id   = it_best->io_entry_id;
+            slim.io_generation = it_best->io_generation;
+            slim.io_lifecycle  = server_prompt_cache_io_lifecycle::durable;
+            slim.io_status     = server_prompt_cache_io_status::ok;
+            slim.io_path       = it_best->io_path;
 
             slim.dash_id          = it_best->dash_id;
             slim.dash_created_us  = it_best->dash_created_us;
@@ -3377,9 +3947,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
             *it_best = std::move(slim);
         } else {
-            prompt = std::move(it_best->prompt);
-
-            states.erase(it_best);
+            server_prompt restored = std::move(it_best->prompt);
+            erase_entry(it_best, false);
+            prompt = std::move(restored);
         }
     }
 
@@ -3387,27 +3957,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update() {
+    poll_io_completions();
+
     if (limit_size > 0) {
         while (size() > limit_size) {
             if (!evict_oldest_ram()) {
                 break;
             }
-        }
-    }
-
-    // enforce the SSD tier limit, oldest spilled entries first
-    if (limit_disk > 0) {
-        while (size_disk_total() > limit_disk) {
-            auto it = std::find_if(states.begin(), states.end(),
-                    [](const server_prompt_cache_state & s) { return s.on_disk(); });
-            if (it == states.end()) {
-                break;
-            }
-
-            SRV_WRN(" - cache disk limit reached, removing oldest spilled entry (size = %.3f MiB)\n",
-                    it->size_disk / (1024.0 * 1024.0));
-
-            drop_entry(it);
         }
     }
 
@@ -3426,21 +3982,108 @@ void server_prompt_cache::update() {
         }
     }
 
-    SRV_TRC(" - cache state: %zu prompts, %.3f MiB RAM, %.3f GiB disk (limits: %.3f MiB RAM, %.3f GiB disk, %zu tokens, %zu est)\n",
-            states.size(), size() / (1024.0 * 1024.0), size_disk_total() / (1024.0*1024.0*1024.0),
-            limit_size / (1024.0 * 1024.0), limit_disk / (1024.0*1024.0*1024.0), limit_tokens, limit_tokens_cur);
+    const uint64_t disk_accounted = disk_io ?
+            disk_io_stats.initial_disk_bytes + disk_io_stats.disk_reserved_bytes +
+                    disk_io_stats.disk_committed_bytes + disk_io_stats.disk_uncertain_bytes :
+            size_disk_total();
+    SRV_TRC(" - cache state: %zu prompts, %.3f MiB RAM, %.3f GiB disk (limits: %.3f MiB RAM, %.3f GiB disk, %zu tokens, %zu est; io jobs=%u queued=%u writing=%u completions=%u cooldown=%llu)\n",
+            states.size(), size() / (1024.0 * 1024.0), disk_accounted / (1024.0*1024.0*1024.0),
+            limit_size / (1024.0 * 1024.0), limit_disk / (1024.0*1024.0*1024.0), limit_tokens, limit_tokens_cur,
+            disk_io_stats.active_jobs, disk_io_stats.queued_jobs, disk_io_stats.writing_jobs,
+            disk_io_stats.completion_backlog,
+            (unsigned long long) disk_io_stats.cooldown_until_ns);
 
     for (const auto & state : states) {
-        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB %s\n",
+        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB %s io=%s gen=%llu\n",
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(),
                 (state.on_disk() ? state.size_disk : state.size()) / (1024.0 * 1024.0),
-                state.on_disk() ? "(disk)" : "(ram)");
+                state.on_disk() ? "(disk)" : "(ram)",
+                server_prompt_cache_io_lifecycle_name(state.io_lifecycle),
+                (unsigned long long) state.io_generation);
     }
 
     publish_dashboard_state();
 }
 
+void server_prompt_cache::set_io_wake_callback(std::function<void()> callback) {
+    if (disk_io && !disk_io_shutdown) {
+        disk_io->set_wake_callback(std::move(callback));
+    }
+}
+
+server_prompt_cache_io_stats server_prompt_cache::io_stats() const {
+    return disk_io ? disk_io->stats() : disk_io_stats;
+}
+
+server_prompt_cache_io_status server_prompt_cache::shutdown_io(server_prompt_cache_io_shutdown_mode mode) {
+    if (!disk_io) {
+        disk_io_shutdown = true;
+        return server_prompt_cache_io_status::ok;
+    }
+    if (disk_io_shutdown) {
+        return server_prompt_cache_io_status::ok;
+    }
+    disk_io->set_wake_callback({});
+
+    if (mode == server_prompt_cache_io_shutdown_mode::graceful) {
+        // Reconcile while admission is still open. In particular, a cleanup
+        // tombstone that previously hit the job/completion bound must be
+        // admitted before the engine seals; otherwise a logically retired
+        // discoverable LCPC file could be resurrected at the next startup.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (std::chrono::steady_clock::now() < deadline) {
+            poll_io_completions();
+            const auto stats = disk_io->stats();
+            const bool active_reconciliation = std::any_of(states.begin(), states.end(),
+                    [](const server_prompt_cache_state & state) { return state.io_reconcile_pending; });
+            if (stats.active_jobs == 0 && stats.completion_backlog == 0 &&
+                    retired_states.empty() && !active_reconciliation) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!retired_states.empty()) {
+            SRV_WRN("prompt cache graceful shutdown timed out with %zu exact-path retirements pending\n",
+                    retired_states.size());
+        }
+    }
+
+    const auto status = disk_io->shutdown(mode);
+    disk_io_shutdown = true;
+    poll_io_completions();
+    disk_io_stats = disk_io->stats();
+    return status;
+}
+
+void server_prompt_cache::set_next_io_faults_for_test(const server_prompt_cache_io_faults & faults) {
+    next_io_faults_for_test      = faults;
+    have_next_io_faults_for_test = true;
+}
+
+bool server_prompt_cache::test_wait_for_io_pause(
+        uint64_t job_id, server_prompt_cache_io_test_pause point, uint64_t timeout_ms) {
+    return disk_io && disk_io->test_wait_for_pause(job_id, point, timeout_ms);
+}
+
+void server_prompt_cache::test_release_io_pause(uint64_t job_id) {
+    if (disk_io) {
+        disk_io->test_release_pause(job_id);
+    }
+}
+
+void server_prompt_cache::test_reconcile_uncertain_for_test(server_prompt_cache_state & state) {
+    begin_uncertain_reconciliation(state);
+}
+
 void server_prompt_cache::publish_dashboard_state() {
+    if (disk_io) {
+        disk_io_stats = disk_io->stats();
+    }
+    const uint64_t disk_accounted = disk_io ?
+            disk_io_stats.initial_disk_bytes + disk_io_stats.disk_reserved_bytes +
+                    disk_io_stats.disk_committed_bytes + disk_io_stats.disk_uncertain_bytes :
+            size_disk_total();
+
     server_dashboard::cache_state out;
     out.enabled          = true;
     out.at_us            = (uint64_t) ggml_time_us();
@@ -3448,8 +4091,20 @@ void server_prompt_cache::publish_dashboard_state() {
     out.limit_disk_bytes = limit_disk;
     out.limit_tokens     = limit_tokens;
     out.used_ram_bytes   = size();
-    out.used_disk_bytes  = size_disk_total();
+    out.used_disk_bytes  = disk_accounted;
     out.tokens_total     = n_tokens();
+    out.io_accepting             = disk_io_stats.accepting;
+    out.io_active_jobs           = disk_io_stats.active_jobs;
+    out.io_queued_jobs           = disk_io_stats.queued_jobs;
+    out.io_writing_jobs          = disk_io_stats.writing_jobs;
+    out.io_completion_backlog    = disk_io_stats.completion_backlog;
+    out.io_pending_ram_bytes     = disk_io_stats.ram_held_bytes;
+    out.io_disk_reserved_bytes   = disk_io_stats.disk_reserved_bytes;
+    out.io_disk_committed_bytes  = disk_io_stats.disk_committed_bytes + disk_io_stats.initial_disk_bytes;
+    out.io_disk_uncertain_bytes  = disk_io_stats.disk_uncertain_bytes;
+    out.io_cooldown_until_ns     = disk_io_stats.cooldown_until_ns;
+    out.io_last_error            = disk_io_stats.last_error;
+    out.io_retirement_tombstones = retired_states.size();
 
     out.entries.reserve(states.size());
     for (const auto & state : states) {
@@ -3463,6 +4118,8 @@ void server_prompt_cache::publish_dashboard_state() {
         entry.last_hit_us = (uint64_t) std::max<int64_t>(0, state.dash_last_hit_us);
         entry.hits        = state.dash_hits;
         entry.request_id  = state.dash_req;
+        entry.persistence = server_prompt_cache_io_lifecycle_name(state.io_lifecycle);
+        entry.generation  = state.io_generation;
         if (state.on_disk()) {
             entry.file = std::filesystem::path(state.file).filename().string();
         }
@@ -3501,6 +4158,9 @@ void server_prompt_cache::publish_dashboard_state() {
     out.counters.bytes_saved     = dash_bytes_saved;
     out.counters.bytes_spilled   = dash_bytes_spilled;
     out.counters.bytes_disk_load = dash_bytes_disk_load;
+    out.counters.io_rejections   = dash_io_rejections;
+    out.counters.io_uncertain    = dash_io_uncertain;
+    out.counters.io_stale        = dash_io_stale;
 
     server_dashboard::instance().publish_cache_state(std::move(out));
 }

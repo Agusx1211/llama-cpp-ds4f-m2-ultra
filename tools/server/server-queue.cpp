@@ -836,18 +836,30 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             if (should_sleep()) {
                 QUE_INF("%s", "entering sleeping state\n");
                 sleeping = true;
-                callback_sleeping_state(true);
                 req_stop_sleeping = false;
+                // Model/cache teardown can join callbacks that wake this
+                // queue. Run it outside mutex_tasks so an ordinary, reliable
+                // request_update() handoff cannot invert those locks.
+                lock.unlock();
+                callback_sleeping_state(true);
+                lock.lock();
                 // wait until we are requested to exit sleeping state
                 condition_tasks.wait(lock, [&]{
-                    return (!running || req_stop_sleeping);
+                    return !running || req_stop_sleeping;
                 });
                 if (!running) { // may changed during sleep
+                    // The enter callback already released model resources, so
+                    // there is no resume callback on termination. Still close
+                    // the queue-side state and release wait_until_no_sleep().
+                    sleeping = false;
+                    condition_tasks.notify_all();
                     break; // terminate
                 }
                 QUE_INF("%s", "exiting sleeping state\n");
                 req_stop_sleeping = false;
+                lock.unlock();
                 callback_sleeping_state(false);
+                lock.lock();
                 sleeping = false;
                 time_last_task = ggml_time_ms();
                 condition_tasks.notify_all(); // notify wait_until_no_sleep()

@@ -7,6 +7,7 @@
 
 #include <array>
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstdio>
@@ -2660,6 +2661,63 @@ void test_bound_stream_timeout_and_cancel_race() {
             "deadline emits once and duplicate cancellation controls cannot retire the lease a second time");
 }
 
+void test_update_wake_does_not_block_sleep_transition() {
+    server_queue queue;
+
+    std::mutex              gate_mutex;
+    std::condition_variable gate_cv;
+    bool sleep_entered              = false;
+    bool worker_wake_returned       = false;
+    bool sleep_exited               = false;
+    bool wake_returned_during_callback = false;
+
+    std::thread worker([&] {
+        {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            gate_cv.wait(lock, [&] { return sleep_entered; });
+        }
+
+        // The sleep callback can join a prompt-cache callback that wakes this
+        // queue. request_update() must complete while teardown is still inside
+        // that callback, proving the queue mutex is not held across teardown.
+        queue.request_update();
+        {
+            std::lock_guard<std::mutex> lock(gate_mutex);
+            worker_wake_returned = true;
+        }
+        gate_cv.notify_all();
+
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        (void) gate_cv.wait_for(lock, std::chrono::seconds(2), [&] { return sleep_exited; });
+        lock.unlock();
+        // Always terminate the fixture. A broken wake records a failed
+        // assertion below instead of hanging the entire test process.
+        queue.terminate();
+    });
+
+    queue.on_new_task([](server_task &&) {});
+    queue.on_update_slots([] {});
+    queue.on_sleeping_state([&](bool entering) {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        if (entering) {
+            sleep_entered = true;
+            gate_cv.notify_all();
+            wake_returned_during_callback = gate_cv.wait_for(
+                    lock, std::chrono::seconds(2), [&] { return worker_wake_returned; });
+        } else {
+            sleep_exited = true;
+            gate_cv.notify_all();
+        }
+    });
+
+    queue.start_loop(/* idle_sleep_ms = */ 0);
+    worker.join();
+
+    require(wake_returned_during_callback,
+            "worker update wake blocked behind the sleep-transition callback");
+    require(sleep_exited, "worker update wake did not take the queue out of sleep");
+}
+
 }  // namespace
 
 int main() {
@@ -2707,6 +2765,7 @@ int main() {
         { "fast refill environment",         test_live_fast_refill_environment_is_atomic_and_bounded },
         { "live aging",                     test_live_aging                                         },
         { "bound stream timeout",         test_bound_stream_timeout_and_cancel_race     },
+        { "wake during sleep",             test_update_wake_does_not_block_sleep_transition       },
     };
 
     for (const auto & test : tests) {

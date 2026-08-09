@@ -200,6 +200,9 @@ struct server_prompt_cache_io_stats {
     int      last_error              = 0;
     uint64_t last_error_ns           = 0;
     uint64_t cooldown_until_ns       = 0;
+    uint64_t tracked_records         = 0;
+    uint64_t tracked_generations     = 0;
+    uint64_t tracked_paths           = 0;
 };
 
 // Whole-payload checksum used for optional caller/worker agreement. This is a
@@ -228,7 +231,9 @@ class server_prompt_cache_io {
 
     // Cancellation wins only before the publication fence. retire() also
     // handles post-fence/durable state and schedules an ownership-checked exact
-    // path cleanup when necessary.
+    // path cleanup when necessary. Once retirement has removed every record
+    // and owned path, the generation fence is released; callers must not reuse
+    // that retired stable entry ID.
     server_prompt_cache_io_status cancel(uint64_t entry_id, uint64_t generation);
     server_prompt_cache_io_status retire(uint64_t entry_id, uint64_t generation);
 
@@ -250,8 +255,10 @@ class server_prompt_cache_io {
     std::vector<server_prompt_cache_io_completion> poll_completions(size_t max_count = SIZE_MAX);
     server_prompt_cache_io_stats                   stats() const;
 
-    // The callback is a narrow wake signal. It runs after the engine lock is
-    // released, is exception-contained, and may safely call polling/stats.
+    // The callback is a narrow wake signal for completions and for the single
+    // delayed retry deadline armed when write admission returns cooldown. It
+    // runs after the engine lock is released, is exception-contained, and may
+    // safely call polling/stats.
     // Replacing/clearing it waits out prior calls; destruction joins the
     // worker, so it cannot fire after either lifetime boundary. A callback
     // must not call set_wake_callback() or shutdown() recursively.
@@ -260,10 +267,10 @@ class server_prompt_cache_io {
     void                          clear_error_cooldown();
     server_prompt_cache_io_status shutdown(server_prompt_cache_io_shutdown_mode mode);
 
-#ifdef SERVER_PROMPT_CACHE_IO_TESTING
+    // Dormant deterministic barriers for owner/worker integration tests. They
+    // have no effect unless a write carries a non-default test pause.
     bool test_wait_for_pause(uint64_t job_id, server_prompt_cache_io_test_pause point, uint64_t timeout_ms);
     void test_release_pause(uint64_t job_id);
-#endif
 
   private:
     struct impl;

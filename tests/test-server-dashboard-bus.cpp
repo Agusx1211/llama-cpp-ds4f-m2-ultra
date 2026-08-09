@@ -312,12 +312,27 @@ static void test_cache_state_json() {
     state.used_ram_bytes   = 4ull << 30;
     state.used_disk_bytes  = 100ull << 30;
     state.tokens_total     = 123456;
+    state.io_accepting             = true;
+    state.io_active_jobs           = 3;
+    state.io_queued_jobs           = 1;
+    state.io_writing_jobs          = 2;
+    state.io_completion_backlog    = 4;
+    state.io_pending_ram_bytes     = 5ull << 20;
+    state.io_disk_reserved_bytes   = 6ull << 20;
+    state.io_disk_committed_bytes  = 99ull << 30;
+    state.io_disk_uncertain_bytes  = 7ull << 20;
+    state.io_cooldown_until_ns     = 123456789;
+    state.io_last_error            = 28;
+    state.io_retirement_tombstones = 2;
     state.counters.lookups       = 10;
     state.counters.hits_entry    = 4;
     state.counters.hits_resident = 3;
     state.counters.misses        = 3;
     state.counters.spills        = 2;
     state.counters.disk_loads    = 1;
+    state.counters.io_rejections = 6;
+    state.counters.io_uncertain  = 7;
+    state.counters.io_stale      = 8;
 
     cache_entry_state ram_entry;
     ram_entry.id         = 1;
@@ -325,6 +340,8 @@ static void test_cache_state_json() {
     ram_entry.bytes_ram  = 1ull << 30;
     ram_entry.created_us = 4 * 1000 * 1000;
     ram_entry.hits       = 0;
+    ram_entry.persistence = "writing";
+    ram_entry.generation  = 11;
     state.entries.push_back(ram_entry);
 
     cache_entry_state disk_entry;
@@ -336,6 +353,8 @@ static void test_cache_state_json() {
     disk_entry.last_hit_us = 9 * 1000 * 1000;
     disk_entry.hits        = 5;
     disk_entry.file        = "pc-abc-1.lcpc";
+    disk_entry.persistence = "durable";
+    disk_entry.generation  = 12;
     state.entries.push_back(disk_entry);
 
     const uint64_t now_us = 12 * 1000 * 1000;
@@ -348,8 +367,23 @@ static void test_cache_state_json() {
     CHECK(out.at("ram").at("limit_bytes") == (8ull << 30));
     CHECK(out.at("disk").at("used_bytes") == (100ull << 30));
     CHECK(out.at("disk").at("limit_bytes") == (400ull << 30));
+    CHECK(out.at("disk").at("reserved_bytes") == (6ull << 20));
+    CHECK(out.at("disk").at("committed_bytes") == (99ull << 30));
+    CHECK(out.at("disk").at("uncertain_bytes") == (7ull << 20));
+    CHECK(out.at("io").at("accepting") == true);
+    CHECK(out.at("io").at("active_jobs") == 3);
+    CHECK(out.at("io").at("queued_jobs") == 1);
+    CHECK(out.at("io").at("writing_jobs") == 2);
+    CHECK(out.at("io").at("completion_backlog") == 4);
+    CHECK(out.at("io").at("pending_ram_bytes") == (5ull << 20));
+    CHECK(out.at("io").at("cooldown_until_ns") == 123456789);
+    CHECK(out.at("io").at("last_error") == 28);
+    CHECK(out.at("io").at("retirement_tombstones") == 2);
     CHECK(out.at("counters").at("lookups") == 10);
     CHECK(out.at("counters").at("hits_entry") == 4);
+    CHECK(out.at("counters").at("io_rejections") == 6);
+    CHECK(out.at("counters").at("io_uncertain") == 7);
+    CHECK(out.at("counters").at("io_stale") == 8);
     CHECK(out.at("entries").size() == 2);
 
     const auto & ram_row = out.at("entries").at(0);
@@ -357,6 +391,8 @@ static void test_cache_state_json() {
     CHECK(ram_row.at("bytes") == (1ull << 30));
     CHECK(ram_row.at("age_s").get<double>() == 8.0);
     CHECK(ram_row.at("last_hit_s").is_null());
+    CHECK(ram_row.at("persistence") == "writing");
+    CHECK(ram_row.at("generation") == 11);
     CHECK(!ram_row.contains("file"));
 
     const auto & disk_row = out.at("entries").at(1);
@@ -365,6 +401,8 @@ static void test_cache_state_json() {
     CHECK(disk_row.at("last_hit_s").get<double>() == 3.0);
     CHECK(disk_row.at("hits") == 5);
     CHECK(disk_row.at("file") == "pc-abc-1.lcpc");
+    CHECK(disk_row.at("persistence") == "durable");
+    CHECK(disk_row.at("generation") == 12);
 
     // default state serializes as disabled
     const json off = cache_state_to_json(cache_state{}, now_us);

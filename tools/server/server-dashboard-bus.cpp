@@ -408,6 +408,8 @@ json cache_state_to_json(const cache_state & state, uint64_t now_us) {
         if (!entry.file.empty()) {
             row["file"] = entry.file;
         }
+        row["persistence"] = entry.persistence;
+        row["generation"]  = entry.generation;
         // v3, additive: does a text preview exist for this entry, and which
         // request's save created it. The preview TEXT is never in this payload
         // — it is fetched one entry at a time from /m2-dashboard/cache-preview.
@@ -432,6 +434,20 @@ json cache_state_to_json(const cache_state & state, uint64_t now_us) {
         { "disk", {
             { "used_bytes", state.used_disk_bytes },
             { "limit_bytes", state.limit_disk_bytes },
+            { "reserved_bytes", state.io_disk_reserved_bytes },
+            { "committed_bytes", state.io_disk_committed_bytes },
+            { "uncertain_bytes", state.io_disk_uncertain_bytes },
+        } },
+        { "io", {
+            { "accepting", state.io_accepting },
+            { "active_jobs", state.io_active_jobs },
+            { "queued_jobs", state.io_queued_jobs },
+            { "writing_jobs", state.io_writing_jobs },
+            { "completion_backlog", state.io_completion_backlog },
+            { "pending_ram_bytes", state.io_pending_ram_bytes },
+            { "cooldown_until_ns", state.io_cooldown_until_ns },
+            { "last_error", state.io_last_error },
+            { "retirement_tombstones", state.io_retirement_tombstones },
         } },
         { "counters", {
             { "lookups", state.counters.lookups },
@@ -445,6 +461,9 @@ json cache_state_to_json(const cache_state & state, uint64_t now_us) {
             { "bytes_saved", state.counters.bytes_saved },
             { "bytes_spilled", state.counters.bytes_spilled },
             { "bytes_disk_load", state.counters.bytes_disk_load },
+            { "io_rejections", state.counters.io_rejections },
+            { "io_uncertain", state.counters.io_uncertain },
+            { "io_stale", state.counters.io_stale },
         } },
         { "entries", std::move(entries) },
     };

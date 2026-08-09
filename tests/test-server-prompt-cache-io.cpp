@@ -503,6 +503,43 @@ void test_graceful_and_fast_shutdown() {
     expect(fast.stats().active_jobs == 0 && fast.stats().ram_held_bytes == 0, "fast shutdown accounting leak");
 }
 
+void test_retired_metadata_is_pruned() {
+    temporary_directory    temp;
+    server_prompt_cache_io io(make_config());
+
+    for (uint64_t entry_id = 1; entry_id <= 64; ++entry_id) {
+        const std::string path = temp.path("prune-" + std::to_string(entry_id) + ".lcpc");
+        const auto write = io.submit(make_write(entry_id, 1, path, make_payload(64, (uint8_t) entry_id)));
+        expect_status(write.status, server_prompt_cache_io_status::ok, "metadata-prune write admission");
+        expect_status(wait_for_jobs(io, { write.job_id }).at(write.job_id).status,
+                      server_prompt_cache_io_status::ok, "metadata-prune durable write");
+
+        const auto cleanup = io.cleanup_exact(entry_id, 1, path);
+        expect_status(cleanup.status, server_prompt_cache_io_status::ok, "metadata-prune cleanup admission");
+        expect_status(wait_for_jobs(io, { cleanup.job_id }).at(cleanup.job_id).status,
+                      server_prompt_cache_io_status::ok, "metadata-prune cleanup completion");
+
+        const auto stats = io.stats();
+        expect(stats.tracked_records == 0 && stats.tracked_generations == 0 && stats.tracked_paths == 0,
+               "fully retired unique entry retained record/generation/path metadata");
+    }
+
+    const std::string adopted_path = temp.path("adopt-prune.lcpc");
+    write_file(adopted_path, *make_payload(32, 99));
+    auto adopt_config               = make_config();
+    adopt_config.initial_disk_bytes = 32;
+    server_prompt_cache_io adopted(adopt_config);
+    expect_status(adopted.adopt_existing(1000, 1, adopted_path, 32),
+                  server_prompt_cache_io_status::ok, "metadata-prune adoption");
+    const auto cleanup = adopted.cleanup_exact(1000, 1, adopted_path);
+    expect_status(wait_for_jobs(adopted, { cleanup.job_id }).at(cleanup.job_id).status,
+                  server_prompt_cache_io_status::ok, "metadata-prune adopted cleanup");
+    const auto adopted_stats = adopted.stats();
+    expect(adopted_stats.tracked_records == 0 && adopted_stats.tracked_generations == 0 &&
+               adopted_stats.tracked_paths == 0,
+           "fully retired adopted entry retained generation/path metadata");
+}
+
 void test_callback_locking_exception_and_lifetime() {
     temporary_directory temp;
     std::weak_ptr<int>  weak_token;
@@ -609,6 +646,7 @@ int main() {
         test_checksum_enospc_and_cooldown();
         test_commit_uncertain_retains_ram_until_cleanup();
         test_existing_adoption_and_same_path_accounting();
+        test_retired_metadata_is_pruned();
         test_graceful_and_fast_shutdown();
         test_callback_locking_exception_and_lifetime();
         test_abandoned_temp_startup_and_explicit_cleanup();

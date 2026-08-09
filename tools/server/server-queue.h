@@ -218,6 +218,8 @@ public:
     // Register callback for sleeping state change; multiple callbacks are allowed
     // note: when entering sleeping state, the callback is called AFTER sleeping is set to true
     //       when leaving sleeping state, the callback is called BEFORE sleeping is set to false
+    //       callbacks run without mutex_tasks so teardown may join a callback
+    //       that wakes this queue through request_update()
     void on_sleeping_state(std::function<void(bool)> callback) {
         if (callback_sleeping_state) {
             auto prev_callback = std::move(callback_sleeping_state);

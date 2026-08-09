@@ -1387,6 +1387,15 @@ private:
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
             SRV_INF("%s", "server is entering sleeping state\n");
+            if (prompt_cache) {
+                // Drain and release directory ownership before model reload can
+                // construct a replacement cache engine for the same path.
+                (void) prompt_cache->shutdown_io(server_prompt_cache_io_shutdown_mode::graceful);
+                prompt_cache.reset();
+                for (auto & slot : slots) {
+                    slot.cache_on_release = nullptr;
+                }
+            }
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -1845,6 +1854,11 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
+        if (prompt_cache) {
+            (void) prompt_cache->shutdown_io(server_prompt_cache_io_shutdown_mode::graceful);
+            prompt_cache.reset();
+        }
+
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -1932,6 +1946,12 @@ private:
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx,
                     params_base.cache_disk, params_base.cache_disk_limit_gib, fingerprint);
+            prompt_cache->set_io_wake_callback([this]() {
+                // Worker threads never reconcile cache/list state directly.
+                // They only wake the serialized owner loop, which polls exact
+                // generation completions at the start of update_slots().
+                queue_tasks.request_update();
+            });
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -4510,6 +4530,14 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        if (prompt_cache) {
+            // Must precede every idle early return: a wake from the filesystem
+            // worker is an owner-thread completion turn even with no live slot.
+            // Keep this hot-path hook to reconciliation only; update() also
+            // performs limit scans, tracing, and dashboard snapshot allocation.
+            prompt_cache->poll_io_completions();
+        }
 
         retry_pending_prefill_failures();
 

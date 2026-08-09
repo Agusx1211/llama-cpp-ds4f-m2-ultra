@@ -257,10 +257,8 @@ struct server_prompt_cache_io::impl {
         uint64_t                         started_ns           = 0;
         uint64_t                         publication_fence_ns = 0;
         uint64_t                         completed_ns         = 0;
-#ifdef SERVER_PROMPT_CACHE_IO_TESTING
         server_prompt_cache_io_test_pause pause_reached  = server_prompt_cache_io_test_pause::none;
         bool                              pause_released = false;
-#endif
     };
 
     struct cleanup_record {
@@ -375,6 +373,13 @@ struct server_prompt_cache_io::impl {
             const server_prompt_cache_io_status admission = write_admission_locked(*record);
             if (admission != server_prompt_cache_io_status::ok) {
                 result.status = admission;
+                if (admission == server_prompt_cache_io_status::cooldown) {
+                    // A rejected owner retry has no completion of its own. Arm
+                    // one bounded worker wake at the admission deadline so an
+                    // otherwise-idle owner can try the immutable payload again.
+                    cooldown_wake_deadline_ns = cooldown_until_ns;
+                    cv.notify_all();
+                }
                 return result;
             }
 
@@ -627,8 +632,10 @@ struct server_prompt_cache_io::impl {
 
         const auto owned = find_owned_path_locked(requested);
         if (owned == path_owners.end()) {
-            return found == records.end() ? server_prompt_cache_io_status::not_found :
-                                            server_prompt_cache_io_status::too_late;
+            // No worker or exact path remains to produce another event. Keep
+            // too_late reserved for the fenced-writing branch above, where a
+            // write completion is guaranteed by the accepted job contract.
+            return server_prompt_cache_io_status::not_found;
         }
         const server_prompt_cache_io_enqueue_result enqueued =
             enqueue_cleanup_locked(entry_id, generation, owned->first, {}, false);
@@ -824,6 +831,9 @@ struct server_prompt_cache_io::impl {
         result.last_error              = last_error;
         result.last_error_ns           = last_error_ns;
         result.cooldown_until_ns       = cooldown_until_ns;
+        result.tracked_records         = records.size();
+        result.tracked_generations     = latest_generation.size();
+        result.tracked_paths           = path_owners.size();
         return result;
     }
 
@@ -847,6 +857,10 @@ struct server_prompt_cache_io::impl {
     void clear_error_cooldown() {
         std::lock_guard<std::mutex> lock(mutex);
         cooldown_until_ns = 0;
+        if (cooldown_wake_deadline_ns != 0) {
+            cooldown_wake_deadline_ns = now_ns();
+            cv.notify_all();
+        }
     }
 
     server_prompt_cache_io_status shutdown(server_prompt_cache_io_shutdown_mode mode) {
@@ -876,7 +890,6 @@ struct server_prompt_cache_io::impl {
         return valid ? server_prompt_cache_io_status::ok : server_prompt_cache_io_status::invalid_argument;
     }
 
-#ifdef SERVER_PROMPT_CACHE_IO_TESTING
     bool test_wait_for_pause(uint64_t job_id, server_prompt_cache_io_test_pause point, uint64_t timeout_ms) {
         std::unique_lock<std::mutex> lock(mutex);
         return cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
@@ -899,7 +912,6 @@ struct server_prompt_cache_io::impl {
         }
         cv.notify_all();
     }
-#endif
 
     uint64_t next_nonzero_job_id_locked() {
         uint64_t result = next_job_id++;
@@ -919,14 +931,29 @@ struct server_prompt_cache_io::impl {
                             [&](const auto & value) { return value.second.owner == requested; });
     }
 
+    void maybe_erase_latest_locked(uint64_t entry_id) {
+        const auto record = records.lower_bound({ entry_id, 0 });
+        if (record != records.end() && record->first.first == entry_id) {
+            return;
+        }
+        const bool has_path = std::any_of(path_owners.begin(), path_owners.end(), [&](const auto & value) {
+            return value.second.owner.first == entry_id;
+        });
+        if (!has_path) {
+            latest_generation.erase(entry_id);
+        }
+    }
+
     void prune_records_locked() {
         for (auto iterator = records.begin(); iterator != records.end();) {
             const write_record & record   = *iterator->second;
             const bool           terminal = record.lifecycle != server_prompt_cache_io_lifecycle::queued &&
                                   record.lifecycle != server_prompt_cache_io_lifecycle::writing;
             const bool has_owner = find_owned_path_locked(iterator->first) != path_owners.end();
-            if (terminal && !record.payload && !record.cleanup_pending && !has_owner && !current_locked(record)) {
+            if (terminal && !record.payload && !record.cleanup_pending && !has_owner) {
+                const uint64_t entry_id = record.entry_id;
                 iterator = records.erase(iterator);
+                maybe_erase_latest_locked(entry_id);
             } else {
                 ++iterator;
             }
@@ -954,18 +981,49 @@ struct server_prompt_cache_io::impl {
         }
 
         for (;;) {
-            work_item item;
+            work_item           item;
+            wake_callback_handle deadline_wake;
+            bool                 deadline_expired = false;
+            bool                 stop             = false;
             {
                 std::unique_lock<std::mutex> lock(mutex);
-                cv.wait(lock, [&] { return !queue.empty() || !accepting; });
-                if (queue.empty()) {
-                    if (!accepting) {
+                for (;;) {
+                    if (!queue.empty() || !accepting) {
                         break;
                     }
-                    continue;
+                    if (cooldown_wake_deadline_ns == 0) {
+                        cv.wait(lock);
+                        continue;
+                    }
+
+                    const uint64_t now = now_ns();
+                    if (now >= cooldown_wake_deadline_ns) {
+                        cooldown_wake_deadline_ns = 0;
+                        deadline_expired          = true;
+                        deadline_wake             = take_wake_locked();
+                        break;
+                    }
+                    const uint64_t remaining = cooldown_wake_deadline_ns - now;
+                    const uint64_t bounded = std::min<uint64_t>(
+                        remaining, static_cast<uint64_t>(std::chrono::nanoseconds::max().count()));
+                    cv.wait_for(lock, std::chrono::nanoseconds(static_cast<int64_t>(bounded)));
                 }
-                item = std::move(queue.front());
-                queue.pop_front();
+                if (!deadline_expired) {
+                    if (queue.empty()) {
+                        stop = !accepting;
+                    } else {
+                        item = std::move(queue.front());
+                        queue.pop_front();
+                    }
+                }
+            }
+
+            if (stop) {
+                break;
+            }
+            if (deadline_expired) {
+                call_wake(std::move(deadline_wake));
+                continue;
             }
 
             if (item.kind == server_prompt_cache_io_event_kind::write) {
@@ -1055,8 +1113,12 @@ struct server_prompt_cache_io::impl {
             return;
         }
 
-        record->checksum = server_prompt_cache_io_checksum(record->payload->data(), record->payload->size());
-        if (record->verify_checksum && record->checksum != record->expected_checksum) {
+        const uint64_t checksum = server_prompt_cache_io_checksum(record->payload->data(), record->payload->size());
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            record->checksum = checksum;
+        }
+        if (record->verify_checksum && checksum != record->expected_checksum) {
             finalize_precommit(record, server_prompt_cache_io_status::checksum_mismatch, 0);
             return;
         }
@@ -1229,7 +1291,6 @@ struct server_prompt_cache_io::impl {
     }
 
     void maybe_pause(const std::shared_ptr<write_record> & record, server_prompt_cache_io_test_pause point) {
-#ifdef SERVER_PROMPT_CACHE_IO_TESTING
         if (record->faults.pause != point) {
             return;
         }
@@ -1240,10 +1301,6 @@ struct server_prompt_cache_io::impl {
             return record->pause_released || fast_stop ||
                    (!record->publication_fenced && (record->cancel_requested || !current_locked(*record)));
         });
-#else
-        (void) record;
-        (void) point;
-#endif
     }
 
     void finalize_precommit(const std::shared_ptr<write_record> & record,
@@ -1349,7 +1406,10 @@ struct server_prompt_cache_io::impl {
                 release_record_reservation_locked(*record);
             } else {
                 replace_path_owner_locked(*record, disk_charge::uncertain);
-                record->cleanup_pending = true;
+                // This was an inline cleanup attempt by the writer, not an
+                // accepted cleanup job. Leave the exact owner retryable;
+                // retire() must enqueue a real job and promise its completion.
+                record->cleanup_pending = false;
                 record_error_locked(cleanup.os_error);
             }
             release_record_payload_locked(*record);
@@ -1519,7 +1579,10 @@ struct server_prompt_cache_io::impl {
                     ++retired_writes;
                 } else {
                     replace_path_owner_locked(*record, disk_charge::uncertain);
-                    record->cleanup_pending = true;
+                    // No cleanup job exists for this inline recovery attempt.
+                    // A later retire() must enqueue one before reporting that
+                    // a future completion is armed.
+                    record->cleanup_pending = false;
                     record->status          = server_prompt_cache_io_status::commit_uncertain;
                     record->lifecycle       = server_prompt_cache_io_lifecycle::commit_uncertain;
                     ++uncertain_writes;
@@ -1757,6 +1820,7 @@ struct server_prompt_cache_io::impl {
     }
 
     void erase_path_owner_locked(std::map<std::string, path_owner>::iterator owner) {
+        const uint64_t entry_id = owner->second.owner.first;
         if (owner->second.charge == disk_charge::committed) {
             disk_committed_bytes -= owner->second.bytes;
         } else if (owner->second.charge == disk_charge::uncertain) {
@@ -1767,6 +1831,7 @@ struct server_prompt_cache_io::impl {
             record->second->charge = disk_charge::none;
         }
         path_owners.erase(owner);
+        maybe_erase_latest_locked(entry_id);
     }
 
     void record_error_locked(int error) {
@@ -1878,6 +1943,7 @@ struct server_prompt_cache_io::impl {
     int      last_error              = 0;
     uint64_t last_error_ns           = 0;
     uint64_t cooldown_until_ns       = 0;
+    uint64_t cooldown_wake_deadline_ns = 0;
 };
 
 server_prompt_cache_io::server_prompt_cache_io(server_prompt_cache_io_config config) :
@@ -1946,7 +2012,6 @@ server_prompt_cache_io_status server_prompt_cache_io::shutdown(server_prompt_cac
     return state->shutdown(mode);
 }
 
-#ifdef SERVER_PROMPT_CACHE_IO_TESTING
 bool server_prompt_cache_io::test_wait_for_pause(uint64_t                          job_id,
                                                  server_prompt_cache_io_test_pause point,
                                                  uint64_t                          timeout_ms) {
@@ -1956,4 +2021,3 @@ bool server_prompt_cache_io::test_wait_for_pause(uint64_t                       
 void server_prompt_cache_io::test_release_pause(uint64_t job_id) {
     state->test_release_pause(job_id);
 }
-#endif
