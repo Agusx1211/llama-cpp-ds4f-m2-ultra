@@ -108,6 +108,24 @@ static bool is_private_lan_address(const std::string & addr) {
     return false;
 }
 
+// Only the files needed to bootstrap the standalone M2 dashboard are public
+// on a trusted LAN. Keep this an explicit allowlist: dashboard API routes live
+// under the same prefix and must continue through normal API-key validation.
+static bool is_dashboard_static_path(const std::string & path) {
+    static const std::unordered_set<std::string> paths {
+        "/m2-dashboard",
+        "/m2-dashboard/",
+        "/m2-dashboard/index.html",
+        "/m2-dashboard/dashboard.js",
+        "/m2-dashboard/styles.css",
+        "/m2-dashboard/lib/content.mjs",
+        "/m2-dashboard/lib/core.mjs",
+        "/m2-dashboard/lib/events.mjs",
+        "/m2-dashboard/lib/sse.mjs",
+    };
+    return paths.count(path) != 0;
+}
+
 bool server_http_context::init(const common_params & params) {
     const gcp_params gcp;
 
@@ -256,13 +274,11 @@ bool server_http_context::init(const common_params & params) {
 
         // Trusted-LAN dashboard bootstrap: a browser cannot attach an
         // Authorization header to a plain bookmark, so let private-network
-        // peers GET the static dashboard files. The files carry no secrets
-        // and every API call the page makes still requires the key (the page
-        // reads it from the #key= URL fragment, which never reaches the
-        // server). Scope: GET only, /m2-dashboard subtree only, trusted-LAN
-        // mode only, RFC1918/loopback peers only.
+        // peers GET only the static files used by the dashboard. The files
+        // carry no secrets; every API route under the same prefix still
+        // requires the key read by the page from the #key= URL fragment.
         if (trust_lan && req.method == "GET" &&
-                req.path.rfind("/m2-dashboard", 0) == 0 &&
+                is_dashboard_static_path(req.path) &&
                 is_private_lan_address(req.remote_addr)) {
             return true;
         }
