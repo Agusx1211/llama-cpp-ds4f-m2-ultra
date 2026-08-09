@@ -1401,7 +1401,13 @@ function renderContentBlock(req, node) {
 
     const nodes = [];
     const bar = el("div", "content-bar");
-    bar.append(el("span", "reveal-flag", "content shown"));
+    // the flag marks an actual disclosure, so it stays off when the answer was
+    // "nothing retained" — otherwise it cries wolf and stops meaning anything
+    const showing = (entry?.status === "ok" && entry.view?.found) ||
+        (watching !== null && (watching.state?.text?.length ?? 0) > 0);
+    bar.append(showing
+        ? el("span", "reveal-flag", "content shown")
+        : el("span", "dim", "no content shown"));
     const hide = el("button", "", "hide");
     hide.type = "button";
     hide.addEventListener("click", (ev) => { ev.stopPropagation(); hideReveal(req); });
