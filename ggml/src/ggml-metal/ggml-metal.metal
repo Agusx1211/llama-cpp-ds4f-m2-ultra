@@ -14370,9 +14370,87 @@ kernel void kernel_dsv4_hc_post_f32(
     }
 }
 
-// Prefill assigns one threadgroup per token. Decode's compressed-only mode
-// assigns one threadgroup per selected row to expose enough random-read
-// parallelism. The packed masks remain adjacent to the F16 key storage.
+// Threadgroup staging for one row slice of the packed working set. The bound is
+// this target's n_swa + indexer_top_k; the host clamps a slice to it, so the
+// kernel is safe for any n_raw + n_comp.
+constexpr constant int DSV4_PACK_MAX_ROWS    = 128 + 512;
+constexpr constant int DSV4_PACK_MAX_THREADS = 128;
+
+// Compact the first `n_raw` finite entries of one raw SWA mask row and leave the
+// caller the slice [r0, r1) of that compaction in `sel_idx` / `sel_mask`
+// (slot i holds compaction rank r0 + i; a rank past the last finite entry gets
+// idx -1 and mask -inf, exactly as the serial form produced).
+//
+// Cooperative over the whole threadgroup: every thread counts the finite
+// entries in its own contiguous chunk of the mask row, a threadgroup prefix sum
+// turns those counts into ranks, and a second pass writes the entries whose
+// rank lands in the slice. This replaces a `tiitg == 0` scan that serialised up
+// to n_raw_k dependent device loads while the other 127 threads waited at the
+// barrier.
+static void dsv4_pack_compact_raw(
+        device const char * raw_mask,
+        int      n_raw_k,
+        uint64_t nb_rm0,
+        uint64_t nb_rm1,
+        uint64_t nb_rm3,
+        int      iq,
+        int      is,
+        int      r0,
+        int      r1,
+        threadgroup int  * sel_idx,
+        threadgroup half * sel_mask,
+        threadgroup int  * tg_cnt,
+        ushort   tiitg,
+        ushort   ntgx) {
+    for (int i = tiitg; i < r1 - r0; i += ntgx) {
+        sel_idx[i]  = -1;
+        sel_mask[i] = -INFINITY;
+    }
+
+    device const char * row = raw_mask + (uint64_t) iq*nb_rm1 + (uint64_t) is*nb_rm3;
+
+    const int per = (n_raw_k + ntgx - 1)/ntgx;
+    const int lo  = min((int) tiitg*per, n_raw_k);
+    const int hi  = min(lo + per, n_raw_k);
+
+    int c = 0;
+    for (int idx = lo; idx < hi; ++idx) {
+        if (isfinite(*(device const half *) (row + (uint64_t) idx*nb_rm0))) {
+            ++c;
+        }
+    }
+    tg_cnt[tiitg] = c;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // rank of this thread's first finite entry
+    int n = 0;
+    for (int t = 0; t < (int) tiitg; ++t) {
+        n += tg_cnt[t];
+    }
+
+    for (int idx = lo; idx < hi && n < r1; ++idx) {
+        const half m = *(device const half *) (row + (uint64_t) idx*nb_rm0);
+        if (isfinite(m)) {
+            if (n >= r0) {
+                sel_idx[n - r0]  = idx;
+                sel_mask[n - r0] = m;
+            }
+            ++n;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Decode's compressed-only mode (n_raw == 0) assigns one threadgroup per
+// selected row. The n_raw > 0 form slices the row range too: threadgroup x in
+// [0, n_raw_tg) owns rows_raw raw rows, the rest own rows_comp compressed rows,
+// and threadgroup y is the token. One threadgroup per token with a serial row
+// loop inside - what this used to do - leaves 148 of the M2 Ultra's 152 cores
+// idle at a 4-row speculative-verify batch and costs 104 us per token per layer
+// against 1.10 us at prefill (notes/2026-08-09-sparse-pack-routing.md 4.3).
+// The packed masks remain adjacent to the F16 key storage.
 template <typename k4_t, short nl, void (*dequantize_func)(device const k4_t *, short, thread half4 &)>
 kernel void kernel_dsv4_sparse_pack(
         constant ggml_metal_kargs_dsv4_sparse_pack & args,
@@ -14385,9 +14463,9 @@ kernel void kernel_dsv4_sparse_pack(
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort3  ntg[[threads_per_threadgroup]]) {
-    constexpr int max_selected = 128 + 512;
-    threadgroup int  selected_idx[max_selected];
-    threadgroup half selected_mask[max_selected];
+    threadgroup int  selected_idx [DSV4_PACK_MAX_ROWS];
+    threadgroup half selected_mask[DSV4_PACK_MAX_ROWS];
+    threadgroup int  tg_cnt       [DSV4_PACK_MAX_THREADS];
 
     if (args.n_raw == 0) {
         const int i  = tgpig.x;
@@ -14413,87 +14491,83 @@ kernel void kernel_dsv4_sparse_pack(
         return;
     }
 
-    const int it = tgpig.x;
-    const int iq = it % args.n_batch;
-    const int is = it / args.n_batch;
-    const int nk = args.n_raw + args.n_comp;
+    const int it  = tgpig.y;
+    const int iq  = it % args.n_batch;
+    const int is  = it / args.n_batch;
+    const int nk  = args.n_raw + args.n_comp;
+    const int ne4 = args.n_embd/4;
 
-    device half * out = (device half *) (dst + (uint64_t) it*args.nb_d1);
-    device half * out_k = out;
-    device half * out_m = out + args.n_embd*nk;
+    device half  * out   = (device half *) (dst + (uint64_t) it*args.nb_d1);
+    device half4 * out_k = (device half4 *) out;
+    device half  * out_m = out + args.n_embd*nk;
+
+    if ((int) tgpig.x < args.n_raw_tg) {
+        // raw slice: re-derive this slice of the SWA mask compaction, then copy
+        const int r0 = (int) tgpig.x*args.rows_raw;
+        const int r1 = min(r0 + args.rows_raw, args.n_raw);
+
+        dsv4_pack_compact_raw(raw_mask, args.n_raw_k,
+                args.nb_rm0, args.nb_rm1, args.nb_rm3,
+                iq, is, r0, r1, selected_idx, selected_mask, tg_cnt, tiitg, ntg.x);
+
+        const int nrows = r1 - r0;
+
+        // one flat (row, embedding lane) index space: every thread keeps nrows
+        // independent loads in flight instead of one per serialised row
+        for (int j = tiitg; j < nrows*ne4; j += ntg.x) {
+            const int r   = j/ne4;
+            const int e4  = j - r*ne4;
+            const int idx = selected_idx[r];
+
+            half4 values = half4(0.0h);
+            if (idx >= 0) {
+                device const k4_t * src = (device const k4_t *) (raw_k +
+                        (uint64_t) idx*args.nb_rk2 + (uint64_t) is*args.nb_rk3);
+                dequantize_func(src + e4/nl, e4%nl, values);
+            }
+            out_k[(r0 + r)*ne4 + e4] = values;
+        }
+
+        for (int i = tiitg; i < nrows; i += ntg.x) {
+            out_m[r0 + i] = selected_mask[i];
+        }
+
+        return;
+    }
+
+    // compressed slice
+    const int c0    = ((int) tgpig.x - args.n_raw_tg)*args.rows_comp;
+    const int c1    = min(c0 + args.rows_comp, args.n_comp);
+    const int nrows = c1 - c0;
 
     // Selection indices and masks are shared by every embedding lane/head. Load
-    // them once per token instead of issuing up to 512 identical device reads.
-    // The raw SWA mask has at most n_raw finite entries. Avoid a separate F32
-    // cast + top-k dispatch by compacting those entries directly here.
-    if (tiitg == 0) {
-        int n = 0;
-        for (int idx = 0; idx < args.n_raw_k && n < args.n_raw; ++idx) {
-            const half m = *(device const half *) (raw_mask +
-                    (uint64_t) idx*args.nb_rm0 + (uint64_t) iq*args.nb_rm1 + (uint64_t) is*args.nb_rm3);
-            if (isfinite(m)) {
-                selected_idx[n] = idx;
-                selected_mask[n] = m;
-                ++n;
-            }
-        }
-        for (; n < args.n_raw; ++n) {
-            selected_idx[n] = -1;
-            selected_mask[n] = -INFINITY;
-        }
-    }
-    for (int i = tiitg; i < args.n_comp; i += ntg.x) {
-        const int oi = args.n_raw + i;
+    // them once per slice instead of issuing ne4 identical device reads.
+    for (int i = tiitg; i < nrows; i += ntg.x) {
         const int idx = *(device const int *) (comp_idx +
-                (uint64_t) i*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
-        selected_idx[oi] = idx;
+                (uint64_t) (c0 + i)*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
+        selected_idx[i] = idx;
         const half mask = *(device const half *) (comp_mask +
                 (uint64_t) idx*args.nb_cm0 + (uint64_t) iq*args.nb_cm1 + (uint64_t) is*args.nb_cm3);
-        selected_mask[oi] = isfinite(mask) ? mask : -INFINITY;
+        selected_mask[i] = isfinite(mask) ? mask : -INFINITY;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int i = 0; i < args.n_raw; ++i) {
-        const int idx = selected_idx[i];
-        if (idx >= 0) {
-            device const k4_t * src = (device const k4_t *) (raw_k +
-                    (uint64_t) idx*args.nb_rk2 + (uint64_t) is*args.nb_rk3);
-            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
-                half4 values;
-                dequantize_func(src + e4/nl, e4%nl, values);
-                ((device half4 *) out_k)[i*args.n_embd/4 + e4] = values;
-            }
-        } else {
-            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
-                ((device half4 *) out_k)[i*args.n_embd/4 + e4] = 0.0h;
-            }
-        }
-        if (tiitg == 0) {
-            out_m[i] = selected_mask[i];
-        }
-    }
+    for (int j = tiitg; j < nrows*ne4; j += ntg.x) {
+        const int r  = j/ne4;
+        const int e4 = j - r*ne4;
 
-    for (int i = 0; i < args.n_comp; ++i) {
-        const int oi = args.n_raw + i;
-        const int idx = selected_idx[oi];
-        if (isfinite(selected_mask[oi])) {
+        half4 values = half4(0.0h);
+        if (isfinite(selected_mask[r])) {
             device const k4_t * src = (device const k4_t *) (comp_k +
-                    (uint64_t) idx*args.nb_ck2 + (uint64_t) is*args.nb_ck3);
-            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
-                half4 values;
-                dequantize_func(src + e4/nl, e4%nl, values);
-                ((device half4 *) out_k)[oi*args.n_embd/4 + e4] = values;
-            }
-        } else {
-            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
-                ((device half4 *) out_k)[oi*args.n_embd/4 + e4] = 0.0h;
-            }
+                    (uint64_t) selected_idx[r]*args.nb_ck2 + (uint64_t) is*args.nb_ck3);
+            dequantize_func(src + e4/nl, e4%nl, values);
         }
-        if (tiitg == 0) {
-            out_m[oi] = selected_mask[oi];
-        }
+        out_k[(args.n_raw + c0 + r)*ne4 + e4] = values;
     }
 
+    for (int i = tiitg; i < nrows; i += ntg.x) {
+        out_m[args.n_raw + c0 + i] = selected_mask[i];
+    }
 }
 
 typedef decltype(kernel_dsv4_sparse_pack<half4, 1, dequantize_f16_t4>) dsv4_sparse_pack_t;
@@ -14533,9 +14607,9 @@ kernel void kernel_dsv4_indexed_sparse_pack(
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort3  ntg[[threads_per_threadgroup]]) {
-    constexpr int max_selected = 128 + 512;
-    threadgroup int  selected_idx[max_selected];
-    threadgroup half selected_mask[max_selected];
+    threadgroup int  selected_idx [DSV4_PACK_MAX_ROWS];
+    threadgroup half selected_mask[DSV4_PACK_MAX_ROWS];
+    threadgroup int  tg_cnt       [DSV4_PACK_MAX_THREADS];
 
     if (args.n_raw == 0) {
         const int i  = tgpig.x;
@@ -14572,89 +14646,82 @@ kernel void kernel_dsv4_indexed_sparse_pack(
         return;
     }
 
-    const int it = tgpig.x;
-    const int iq = it % args.n_batch;
-    const int is = it / args.n_batch;
-    const int nk = args.n_raw + args.n_comp;
+    const int it  = tgpig.y;
+    const int iq  = it % args.n_batch;
+    const int is  = it / args.n_batch;
+    const int nk  = args.n_raw + args.n_comp;
+    const int ne4 = args.n_embd/4;
 
-    device half * out = (device half *) (dst + (uint64_t) it*args.nb_d1);
-    device half * out_k = out;
-    device half * out_m = out + args.n_embd*nk;
+    device half  * out   = (device half *) (dst + (uint64_t) it*args.nb_d1);
+    device half4 * out_k = (device half4 *) out;
+    device half  * out_m = out + args.n_embd*nk;
 
-    // Selection indices and masks are shared by every embedding lane/head. Load
-    // them once per token instead of issuing up to 512 identical device reads.
-    // The raw SWA mask has at most n_raw finite entries. Avoid a separate F32
-    // cast + top-k dispatch by compacting those entries directly here.
-    if (tiitg == 0) {
-        int n = 0;
-        for (int idx = 0; idx < args.n_raw_k && n < args.n_raw; ++idx) {
-            const half m = *(device const half *) (raw_mask +
-                    (uint64_t) idx*args.nb_rm0 + (uint64_t) iq*args.nb_rm1 + (uint64_t) is*args.nb_rm3);
-            if (isfinite(m)) {
-                selected_idx[n] = idx;
-                selected_mask[n] = m;
-                ++n;
+    if ((int) tgpig.x < args.n_raw_tg) {
+        const int r0 = (int) tgpig.x*args.rows_raw;
+        const int r1 = min(r0 + args.rows_raw, args.n_raw);
+
+        dsv4_pack_compact_raw(raw_mask, args.n_raw_k,
+                args.nb_rm0, args.nb_rm1, args.nb_rm3,
+                iq, is, r0, r1, selected_idx, selected_mask, tg_cnt, tiitg, ntg.x);
+
+        const int nrows = r1 - r0;
+
+        for (int j = tiitg; j < nrows*ne4; j += ntg.x) {
+            const int r   = j/ne4;
+            const int e4  = j - r*ne4;
+            const int idx = selected_idx[r];
+
+            half4 values = half4(0.0h);
+            if (idx >= 0) {
+                device const k4_t * src = (device const k4_t *) (raw_k +
+                        (uint64_t) idx*args.nb_rk2 + (uint64_t) is*args.nb_rk3);
+                dequantize_func(src + e4/nl, e4%nl, values);
             }
+            out_k[(r0 + r)*ne4 + e4] = values;
         }
-        for (; n < args.n_raw; ++n) {
-            selected_idx[n] = -1;
-            selected_mask[n] = -INFINITY;
+
+        for (int i = tiitg; i < nrows; i += ntg.x) {
+            out_m[r0 + i] = selected_mask[i];
         }
+
+        return;
     }
-    for (int i = tiitg; i < args.n_comp; i += ntg.x) {
-        const int oi = args.n_raw + i;
+
+    const int c0    = ((int) tgpig.x - args.n_raw_tg)*args.rows_comp;
+    const int c1    = min(c0 + args.rows_comp, args.n_comp);
+    const int nrows = c1 - c0;
+
+    // selected_idx holds the *physical* pool row (-1 when the directory entry is
+    // invalid); the caller-contract violation is still surfaced as NaN below
+    for (int i = tiitg; i < nrows; i += ntg.x) {
         const int idx = *(device const int *) (comp_idx +
-                (uint64_t) i*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
-        selected_idx[oi] = idx;
+                (uint64_t) (c0 + i)*args.nb_ci0 + (uint64_t) iq*args.nb_ci1 + (uint64_t) is*args.nb_ci3);
+        selected_idx[i] = dsv4_sparse_pack_physical_row(args, segment_ids, idx, is);
         const half mask = (idx >= 0 && idx < args.n_comp_k) ? *(device const half *) (comp_mask +
                 (uint64_t) idx*args.nb_cm0 + (uint64_t) iq*args.nb_cm1 + (uint64_t) is*args.nb_cm3) : -INFINITY;
-        selected_mask[oi] = isfinite(mask) ? mask : -INFINITY;
+        selected_mask[i] = isfinite(mask) ? mask : -INFINITY;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int i = 0; i < args.n_raw; ++i) {
-        const int idx = selected_idx[i];
-        if (idx >= 0) {
-            device const k4_t * src = (device const k4_t *) (raw_k +
-                    (uint64_t) idx*args.nb_rk2 + (uint64_t) is*args.nb_rk3);
-            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
-                half4 values;
-                dequantize_func(src + e4/nl, e4%nl, values);
-                ((device half4 *) out_k)[i*args.n_embd/4 + e4] = values;
-            }
-        } else {
-            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
-                ((device half4 *) out_k)[i*args.n_embd/4 + e4] = 0.0h;
-            }
-        }
-        if (tiitg == 0) {
-            out_m[i] = selected_mask[i];
-        }
-    }
+    for (int j = tiitg; j < nrows*ne4; j += ntg.x) {
+        const int r        = j/ne4;
+        const int e4       = j - r*ne4;
+        const int physical = selected_idx[r];
 
-    for (int i = 0; i < args.n_comp; ++i) {
-        const int oi = args.n_raw + i;
-        const int idx = selected_idx[oi];
-        const int physical = dsv4_sparse_pack_physical_row(args, segment_ids, idx, is);
-        if (physical >= 0 && isfinite(selected_mask[oi])) {
+        half4 values;
+        if (physical >= 0 && isfinite(selected_mask[r])) {
             device const k4_t * src = (device const k4_t *) (comp_k +
                     (uint64_t) physical*args.nb_ck1);
-            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
-                half4 values;
-                dequantize_func(src + e4/nl, e4%nl, values);
-                ((device half4 *) out_k)[oi*args.n_embd/4 + e4] = values;
-            }
+            dequantize_func(src + e4/nl, e4%nl, values);
         } else {
-            const half4 fill = physical >= 0 ? half4(0.0h) : half4(NAN);
-            for (int e4 = tiitg; e4 < args.n_embd/4; e4 += ntg.x) {
-                ((device half4 *) out_k)[oi*args.n_embd/4 + e4] = fill;
-            }
+            values = physical >= 0 ? half4(0.0h) : half4(NAN);
         }
-        if (tiitg == 0) {
-            out_m[oi] = physical >= 0 ? selected_mask[oi] : NAN;
-        }
+        out_k[(args.n_raw + c0 + r)*ne4 + e4] = values;
     }
 
+    for (int i = tiitg; i < nrows; i += ntg.x) {
+        out_m[args.n_raw + c0 + i] = selected_idx[i] >= 0 ? selected_mask[i] : (half) NAN;
+    }
 }
 
 typedef decltype(kernel_dsv4_indexed_sparse_pack<half4, 1, dequantize_f16_t4>) dsv4_indexed_sparse_pack_t;

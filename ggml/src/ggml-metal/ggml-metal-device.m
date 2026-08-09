@@ -685,6 +685,21 @@ struct ggml_metal_encoder_profile_barrier_command {
 #define GGML_METAL_KPROF_MAX_SB     32
 #define GGML_METAL_KPROF_MAX_SEGMENTS (GGML_METAL_KPROF_SEG_PER_SB*GGML_METAL_KPROF_MAX_SB)
 
+// Counter sample buffers are recycled through a free list instead of being
+// allocated per encoder. Encoding a graph creates one encoder - and so at least
+// one sample buffer - per command buffer, and the driver stops honouring new
+// ones after a few hundred: every arm died at the same submission (~283) with
+// kIOGPUCommandBufferCallbackErrorInvalidResource, which capped a profiling run
+// at ~19 graph_computes and made GPU attribution the binding constraint on this
+// fork's kernel work (notes/2026-08-09-sparse-pack-routing.md section 10).
+//
+// A sample buffer is safe to reuse as soon as it has been resolved, and
+// ggml_metal_kprof_flush only runs after every command buffer of the graph has
+// completed, so the free list is exactly the right place to put it. With this,
+// a process allocates about (n_cb + 1) sample buffers in total rather than that
+// many per graph.
+#define GGML_METAL_KPROF_MAX_FREE_SB 64
+
 struct ggml_metal_kprof_batch {
     id<MTLCounterSampleBuffer> sb[GGML_METAL_KPROF_MAX_SB];
     int    n_sb;
@@ -731,6 +746,13 @@ static struct {
     _Atomic int seq;        // monotonically increasing flush sequence
     struct ggml_metal_kprof_batch * pending;
     pthread_mutex_t mtx;
+
+    // recycled counter sample buffers (see GGML_METAL_KPROF_MAX_FREE_SB)
+    id<MTLCounterSampleBuffer> free_sb[GGML_METAL_KPROF_MAX_FREE_SB];
+    int    n_free_sb;
+    int    n_created_sb;    // lifetime allocations, for GGML_METAL_KPROF_DEBUG
+    int    n_reused_sb;
+    int    n_failed_sb;
 } g_kprof = {
     /*.stride      =*/ 0,
     /*.initialized =*/ false,
@@ -738,6 +760,63 @@ static struct {
     /*.pending     =*/ NULL,
     /*.mtx         =*/ PTHREAD_MUTEX_INITIALIZER,
 };
+
+// GGML_METAL_KPROF_DEBUG=1 adds a KPROFSB line per flush. Off by default so the
+// stderr stream stays exactly what the existing analysis scripts parse.
+static bool ggml_metal_kprof_debug(void) {
+    static bool initialized = false;
+    static bool enabled     = false;
+
+    if (!initialized) {
+        const char * v = getenv("GGML_METAL_KPROF_DEBUG");
+        enabled     = v != NULL && atoi(v) != 0;
+        initialized = true;
+    }
+
+    return enabled;
+}
+
+// caller must NOT hold g_kprof.mtx
+static id<MTLCounterSampleBuffer> ggml_metal_kprof_acquire_sb(id<MTLDevice> dev) {
+    pthread_mutex_lock(&g_kprof.mtx);
+    if (g_kprof.n_free_sb > 0) {
+        id<MTLCounterSampleBuffer> sb = g_kprof.free_sb[--g_kprof.n_free_sb];
+        g_kprof.free_sb[g_kprof.n_free_sb] = nil;
+        g_kprof.n_reused_sb++;
+        pthread_mutex_unlock(&g_kprof.mtx);
+        return sb;
+    }
+    pthread_mutex_unlock(&g_kprof.mtx);
+
+    id<MTLCounterSampleBuffer> sb = ggml_metal_kprof_new_sb(dev);
+
+    pthread_mutex_lock(&g_kprof.mtx);
+    if (sb) {
+        g_kprof.n_created_sb++;
+    } else {
+        g_kprof.n_failed_sb++;
+    }
+    pthread_mutex_unlock(&g_kprof.mtx);
+
+    return sb;
+}
+
+// caller must NOT hold g_kprof.mtx
+static void ggml_metal_kprof_recycle_sb(id<MTLCounterSampleBuffer> sb) {
+    if (!sb) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_kprof.mtx);
+    if (g_kprof.n_free_sb < GGML_METAL_KPROF_MAX_FREE_SB) {
+        g_kprof.free_sb[g_kprof.n_free_sb++] = sb;
+        pthread_mutex_unlock(&g_kprof.mtx);
+        return;
+    }
+    pthread_mutex_unlock(&g_kprof.mtx);
+
+    [sb release];
+}
 
 int ggml_metal_kprof_stride(void) {
     if (!g_kprof.initialized) {
@@ -773,7 +852,7 @@ static void ggml_metal_encoder_kprof_begin(ggml_metal_encoder_t encoder, int raw
     const int islot = b->n_seg % GGML_METAL_KPROF_SEG_PER_SB;
 
     if (b->n_seg < b->cap && islot == 0 && isb == b->n_sb) {
-        id<MTLCounterSampleBuffer> sb = ggml_metal_kprof_new_sb([encoder->cmd_buf device]);
+        id<MTLCounterSampleBuffer> sb = ggml_metal_kprof_acquire_sb([encoder->cmd_buf device]);
         if (sb) {
             b->sb[b->n_sb++] = sb;
         }
@@ -850,7 +929,11 @@ void ggml_metal_kprof_flush(void) {
             const int nseg = MIN(b->n_seg - seg0, GGML_METAL_KPROF_SEG_PER_SB);
 
             if (nseg <= 0) {
-                break;
+                // nothing recorded in this one, but it still has to go back
+                // (the old code broke out of the loop here and dropped it)
+                ggml_metal_kprof_recycle_sb(b->sb[isb]);
+                b->sb[isb] = nil;
+                continue;
             }
 
             NSData * data = [b->sb[isb] resolveCounterRange:NSMakeRange(0, 2*nseg)];
@@ -875,11 +958,19 @@ void ggml_metal_kprof_flush(void) {
                         seq, batch, isb, nseg);
             }
 
-            [b->sb[isb] release];
+            ggml_metal_kprof_recycle_sb(b->sb[isb]);
+            b->sb[isb] = nil;
         }
 
         free(b->nodes);
         free(b);
+    }
+
+    if (ggml_metal_kprof_debug()) {
+        pthread_mutex_lock(&g_kprof.mtx);
+        fprintf(stderr, "KPROFSB {\"seq\":%d,\"batches\":%d,\"created\":%d,\"reused\":%d,\"failed\":%d,\"free\":%d}\n",
+                seq, ibatch, g_kprof.n_created_sb, g_kprof.n_reused_sb, g_kprof.n_failed_sb, g_kprof.n_free_sb);
+        pthread_mutex_unlock(&g_kprof.mtx);
     }
 
     fflush(stderr);

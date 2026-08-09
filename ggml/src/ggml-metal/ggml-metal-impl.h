@@ -1302,6 +1302,13 @@ typedef struct {
     int32_t  n_raw;
     int32_t  n_raw_k;
     int32_t  n_comp;
+    // Row-slice decomposition of the n_raw > 0 form. Threadgroup x in
+    // [0, n_raw_tg) owns up to rows_raw raw rows; x in [n_raw_tg, ...) owns up
+    // to rows_comp compressed rows. Threadgroup y is the token. See
+    // ggml_metal_op_dsv4_sparse_pack for how the slice sizes are chosen.
+    int32_t  n_raw_tg;
+    int32_t  rows_raw;
+    int32_t  rows_comp;
     uint64_t nb_rk2;
     uint64_t nb_rk3;
     uint64_t nb_ck2;
@@ -1326,6 +1333,10 @@ typedef struct {
     int32_t  n_comp;
     int32_t  n_comp_k;
     int32_t  n_pool_segments;
+    // see ggml_metal_kargs_dsv4_sparse_pack
+    int32_t  n_raw_tg;
+    int32_t  rows_raw;
+    int32_t  rows_comp;
     uint64_t nb_rk2;
     uint64_t nb_rk3;
     uint64_t nb_ck1;
