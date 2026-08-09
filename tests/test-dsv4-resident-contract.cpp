@@ -1053,6 +1053,71 @@ void test_composite_detach_retains_raw_transaction() {
            "composite exclusion resident release failed");
 }
 
+void test_recurrent_logical_all_depth_roundtrip_and_validation() {
+    backend_scope backend;
+    composite_fixture fixture;
+    uint8_t seed = 0x11;
+    for (auto * state : fixture.execution_states()) {
+        fill_state_sequence(*state, 0, seed);
+        fill_state_sequence(*state, 1, (uint8_t) (seed + 0x61));
+        seed = (uint8_t) (seed + 0x20);
+    }
+    const auto source_snapshots      = snapshot_all_depths(fixture.execution_states(), 0);
+    const auto destination_snapshots = snapshot_all_depths(fixture.execution_states(), 1);
+
+    std::array<llama_dsv4_recurrent_sequence_state, 3> logical;
+    auto states = fixture.execution_states();
+    for (size_t family = 0; family < states.size(); ++family) {
+        logical[family] = states[family]->export_sequence_all_depths(0);
+        states[family]->validate_sequence_all_depths(logical[family]);
+        expect(logical[family].n_rs_seq == 2 && !logical[family].kv.empty() &&
+                   logical[family].kv.front().chunks.size() == 3,
+               "recurrent logical export omitted a rollback plane");
+
+        const auto expect_rejected = [&](llama_dsv4_recurrent_sequence_state malformed,
+                                         const std::string & phase) {
+            const uint64_t generation = states[family]->state_generation();
+            bool threw = false;
+            try {
+                states[family]->validate_sequence_all_depths(malformed);
+            } catch (const std::exception &) {
+                threw = true;
+            }
+            expect(threw, phase + " was accepted");
+            expect(states[family]->state_generation() == generation,
+                   phase + " changed recurrent generation");
+            for (uint32_t depth = 0; depth <= 2; ++depth) {
+                expect(state_snapshot(*states[family], 1, depth) == destination_snapshots[family][depth],
+                       phase + " changed destination bytes");
+            }
+        };
+
+        auto malformed = logical[family];
+        malformed.state_identity ^= UINT64_C(1);
+        expect_rejected(std::move(malformed), "wrong recurrent identity");
+
+        malformed = logical[family];
+        malformed.kv.front().chunks.front().bytes.pop_back();
+        expect_rejected(std::move(malformed), "truncated recurrent plane");
+
+        malformed = logical[family];
+        std::swap(malformed.kv.front().chunks[0], malformed.kv.front().chunks[1]);
+        expect_rejected(std::move(malformed), "reordered recurrent ranges");
+
+        malformed = logical[family];
+        malformed.score.front().chunks[1] = malformed.score.front().chunks[0];
+        expect_rejected(std::move(malformed), "duplicate recurrent range");
+    }
+
+    for (size_t family = 0; family < states.size(); ++family) {
+        const uint64_t generation = states[family]->state_generation();
+        states[family]->import_sequence_all_depths(1, logical[family]);
+        expect(states[family]->state_generation() == generation + 1,
+               "recurrent logical import generation");
+    }
+    expect_state_snapshots(states, 1, source_snapshots, "recurrent logical roundtrip");
+}
+
 }  // namespace
 
 int main() {
@@ -1064,6 +1129,7 @@ int main() {
         test_busy_stale_occupied_and_release();
         test_transaction_blocks_graph_and_destruction_fails_closed();
         test_composite_detach_retains_raw_transaction();
+        test_recurrent_logical_all_depth_roundtrip_and_validation();
     } catch (const std::exception & error) {
         std::cerr << "test-dsv4-resident-contract: " << error.what() << '\n';
         return 1;

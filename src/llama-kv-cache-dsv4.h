@@ -242,6 +242,110 @@ struct llama_dsv4_resident_usage {
     uint32_t handles        = 0;
 };
 
+constexpr uint32_t LLAMA_DSV4_LOGICAL_STATE_SCHEMA = 1;
+
+struct llama_dsv4_logical_row_chunk {
+    uint64_t             row_begin = 0;
+    uint64_t             row_count = 0;
+    std::vector<uint8_t> bytes;
+    uint64_t             checksum = 0;
+};
+
+struct llama_dsv4_logical_tensor_state {
+    uint32_t                                  layer_id = 0;
+    int32_t                                   type = -1;
+    uint64_t                                  ne0 = 0;
+    uint64_t                                  row_size = 0;
+    std::vector<llama_dsv4_logical_row_chunk> chunks;
+};
+
+struct llama_dsv4_logical_component_state {
+    uint32_t                                        schema_version = LLAMA_DSV4_LOGICAL_STATE_SCHEMA;
+    uint64_t                                        row_begin = 0;
+    uint64_t                                        row_end = 0;
+    std::vector<llama_dsv4_logical_tensor_state>    tensors;
+};
+
+struct llama_dsv4_recurrent_sequence_state {
+    uint32_t                                     schema_version = LLAMA_DSV4_LOGICAL_STATE_SCHEMA;
+    uint32_t                                     ratio = 0;
+    uint32_t                                     state_size = 0;
+    uint32_t                                     n_embd_state = 0;
+    uint32_t                                     n_rs_seq = 0;
+    uint64_t                                     state_identity = 0;
+    std::vector<llama_dsv4_logical_tensor_state> kv;
+    std::vector<llama_dsv4_logical_tensor_state> score;
+};
+
+// Canonical host image for one aggregate-compressed DSV4 sequence.  The
+// accepted frontier and component coverage are absolute.  Compressed tensors
+// are in logical row order and recurrent tensors contain every current and
+// rollback plane.  No pool, handle, segment, page, execution-stream identity,
+// mutable reference count, or placement generation is persistent content.
+struct llama_dsv4_logical_sequence_state {
+    uint32_t                              schema_version = LLAMA_DSV4_LOGICAL_STATE_SCHEMA;
+    uint64_t                              identity = 0;
+    llama_pos                             accepted_frontier = -1;
+    uint32_t                              rollback_index = 0;
+    uint32_t                              active_rollback_depth = 0;
+    uint32_t                              n_rs_seq = 0;
+    llama_kv_iswa_logical_sequence_state raw_swa;
+    llama_dsv4_logical_component_state   csa;
+    llama_dsv4_logical_component_state   hca;
+    llama_dsv4_logical_component_state   lid;
+    llama_dsv4_recurrent_sequence_state  csa_recurrent;
+    llama_dsv4_recurrent_sequence_state  hca_recurrent;
+    llama_dsv4_recurrent_sequence_state  lid_recurrent;
+    uint64_t                              fingerprint = 0;
+};
+
+// Stable semantic fingerprint for persistence framing and validation. It
+// covers every logical field and payload byte but no physical placement ID.
+uint64_t llama_dsv4_logical_sequence_fingerprint(
+        const llama_dsv4_logical_sequence_state & state);
+
+enum class llama_dsv4_logical_state_status : uint8_t {
+    ok,
+    invalid_sequence,
+    unsupported_layout,
+    invalid_schema,
+    identity_mismatch,
+    coverage_mismatch,
+    corrupt_payload,
+    stale_quote,
+    capacity_exhausted,
+    not_quiescent,
+    generation_exhausted,
+    resource_exhausted,
+    backend_error,
+};
+
+const char * llama_dsv4_logical_state_status_name(llama_dsv4_logical_state_status status);
+
+enum class llama_dsv4_logical_import_checkpoint : uint8_t {
+    after_raw_staging,
+    after_recurrent_staging,
+    after_segment_staging,
+    before_publication,
+};
+
+// One-shot host-test seam. The selected checkpoint returns a deterministic
+// resource failure before any execution component or pool reference changes.
+void llama_kv_cache_dsv4_test_fail_logical_import_at(
+        llama_dsv4_logical_import_checkpoint checkpoint);
+
+struct llama_dsv4_logical_import_plan;
+
+struct llama_dsv4_logical_import_quote {
+    llama_dsv4_logical_state_status status = llama_dsv4_logical_state_status::invalid_schema;
+    llama_seq_id                    destination = -1;
+    uint64_t                        fingerprint = 0;
+
+  private:
+    std::shared_ptr<llama_dsv4_logical_import_plan> plan;
+    friend class llama_kv_cache_dsv4;
+};
+
 // Host-testable policy used by llama_kv_cache_dsv4::quote_resident_detach.
 // This static policy assumes the default sequence-indexed raw/SWA layout.
 // llama_kv_cache_dsv4::quote_resident_detach separately adds the opt-in target
@@ -291,11 +395,20 @@ public:
     uint32_t get_n_rows()     const;
     uint64_t state_identity() const;
     uint64_t state_generation() const;
+    bool has_generation_headroom(uint64_t increments) const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, const std::vector<uint32_t> & rs_idx) const;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+
+    llama_dsv4_recurrent_sequence_state export_sequence_all_depths(llama_seq_id seq_id) const;
+    // Payload-free geometry for bounded persistence decoders. This lets a
+    // manifest be checked against the execution allocation before allocating
+    // any declared tensor payload.
+    std::vector<llama_dsv4_logical_tensor_state> logical_tensor_geometry(bool score) const;
+    void validate_sequence_all_depths(const llama_dsv4_recurrent_sequence_state & state) const;
+    void import_sequence_all_depths(llama_seq_id seq_id, const llama_dsv4_recurrent_sequence_state & state);
 
     ggml_tensor * get_kv       (ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_score    (ggml_context * ctx, int32_t il) const;
@@ -332,7 +445,6 @@ private:
 
     size_t total_size() const;
     void bump_generation() const;
-    bool has_generation_headroom(uint64_t increments) const;
 
     friend class llama_dsv4_composite_resident;
 };
@@ -465,8 +577,10 @@ public:
     llama_dsv4_comp_state * get_lid_state() const;
 
     bool is_aggregate_compressed() const;
+    uint64_t get_logical_state_identity() const;
     uint32_t get_c4_logical_rows() const;
     uint32_t get_hca_logical_rows() const;
+    uint32_t get_active_rs_depth() const;
     llama_dsv4_comp_pool * get_comp_pool() const;
 
     llama_dsv4_resident_detach_quote quote_resident_detach(llama_dsv4_resident_detach_request request) const;
@@ -485,6 +599,14 @@ public:
     bool set_rs_enabled(bool enabled);
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
     llama_dsv4_memory_usage_snapshot memory_usage_snapshot() const;
+
+    llama_dsv4_logical_sequence_state export_logical_sequence(llama_seq_id seq_id) const;
+    llama_dsv4_logical_import_quote   quote_logical_import(
+            llama_seq_id destination,
+            const llama_dsv4_logical_sequence_state & state) const;
+    llama_dsv4_logical_state_status   import_logical_sequence(
+            const llama_dsv4_logical_import_quote & quote,
+            const llama_dsv4_logical_sequence_state & state);
 
     llama_kv_admission_status quote_admission(
             const llama_kv_admission_span * spans,

@@ -1380,7 +1380,12 @@ void llama_kv_cache::resident_bind_guard(
 
 std::unique_lock<std::recursive_mutex> llama_kv_cache::resident_lock() const {
     if (resident_guard) {
-        return std::unique_lock<std::recursive_mutex>(resident_guard->mutex);
+        std::unique_lock<std::recursive_mutex> result(resident_guard->mutex);
+        resident_guard->transaction_released.wait(result, [&] {
+            return !resident_guard->resident_transaction_active ||
+                    resident_guard->resident_transaction_owner == std::this_thread::get_id();
+        });
+        return result;
     }
     return {};
 }

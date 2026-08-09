@@ -94,9 +94,25 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
-// (optional) get/set internal state
+// Per-sequence deferred-boundary state used by EAGLE3. Kept as a small value
+// type so reset semantics can be unit-tested without loading a model.
+struct common_speculative_deferred_state {
+    llama_pos pending_pos = -1;
+    std::vector<float> pending_embd;
+
+    llama_pos verify_pos_first = -1;
+    std::vector<float> verify_embd;
+    int32_t verify_rows = 0;
+
+    void clear();
+};
+
+// (optional) get/set internal state. clear_state is not equivalent to
+// set_state(..., {}): an empty serialized state is not a valid state blob and
+// historically left EAGLE3's deferred boundary untouched.
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
-void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+void common_speculative_clear_state(common_speculative * spec, llama_seq_id seq_id);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

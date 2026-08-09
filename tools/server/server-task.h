@@ -677,9 +677,111 @@ struct server_prompt_data {
     }
 };
 
+// A prompt-cache token match is only a restore candidate. Recurrent/hybrid
+// state can be landed at that match only when the represented frontier can be
+// rolled back directly or a complete checkpoint covers the landing.
+enum class server_prompt_restore_scope : uint8_t {
+    invalid          = 0,
+    target_only      = 1,
+    target_and_draft = 2,
+};
+
+enum class server_prompt_restore_kind : uint8_t {
+    unusable   = 0,
+    direct     = 1,
+    checkpoint = 2,
+};
+
+static constexpr uint8_t SERVER_PROMPT_RESTORE_COMPONENT_TARGET = 1u << 0;
+static constexpr uint8_t SERVER_PROMPT_RESTORE_COMPONENT_DRAFT  = 1u << 1;
+static constexpr uint8_t SERVER_PROMPT_RESTORE_COMPONENT_SPEC   = 1u << 2;
+
+struct server_prompt_restore_checkpoint {
+    int64_t   n_tokens = 0;
+    llama_pos pos_min  = -1;
+    llama_pos pos_max  = -1;
+    uint8_t   components = 0;
+};
+
+// Restore limits for one sequence-state domain. Keeping these values together
+// prevents target/draft positional and rollback properties from being mixed at
+// call sites, and lets paired restores use each model's own SWA geometry.
+struct server_prompt_restore_domain {
+    llama_pos pos_min = -1;
+    llama_pos pos_max = -1;
+
+    // Recurrent/hybrid removal is bounded by rollback_tokens (zero means no
+    // direct rollback); attention-only state is unbounded and uses seq_rm.
+    uint32_t rollback_tokens  = 0;
+    uint32_t swa_tokens       = 0;
+    bool     rollback_bounded = false;
+};
+
+struct server_prompt_restore_coverage {
+    server_prompt_restore_scope scope = server_prompt_restore_scope::invalid;
+
+    server_prompt_restore_domain target;
+    server_prompt_restore_domain draft;
+
+    std::vector<server_prompt_restore_checkpoint> checkpoints;
+};
+
+struct server_prompt_restore_plan {
+    server_prompt_restore_kind  kind  = server_prompt_restore_kind::unusable;
+    server_prompt_restore_scope scope = server_prompt_restore_scope::invalid;
+
+    size_t matched_tokens   = 0; // raw LCP
+    size_t effective_tokens = 0; // n_past after the restore landing
+    size_t recompute_tokens = 0; // matched_tokens - effective_tokens
+
+    llama_pos pos_next             = 0;
+    llama_pos target_pos_threshold = 0;
+    llama_pos draft_pos_threshold  = 0;
+    llama_pos landing_pos           = 0;
+
+    bool full_match = false;
+
+    // Set only for kind == checkpoint. These fields identify the exact
+    // checkpoint selected by the pure planner in reverse-newest order.
+    size_t  checkpoint_index = SIZE_MAX;
+    int64_t checkpoint_n_tokens = -1;
+};
+
+// Build a coverage summary from the represented top-level frontier and the
+// prompt's checkpoint blobs. Target-only summaries deliberately omit draft and
+// speculative components; paired summaries retain only paired checkpoints.
+server_prompt_restore_coverage server_prompt_build_restore_coverage(
+        const server_prompt & prompt,
+        server_prompt_restore_scope scope,
+        const server_prompt_restore_domain & target,
+        const server_prompt_restore_domain & draft = {});
+
+// Capture the current live sequence-state domains with the same recurrent,
+// hybrid, rollback, and SWA semantics used by save, lookup, and admission.
+server_prompt_restore_coverage server_prompt_capture_restore_coverage(
+        const server_prompt & prompt,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        llama_seq_id seq_id,
+        bool force_target_only = false);
+
+bool server_prompt_restore_coverage_is_valid(
+        const server_prompt_restore_coverage & coverage,
+        const server_tokens & source_tokens);
+
+// Shared, pure restore decision used by cache supersession/lookup and the live
+// donor/admission/landing paths. `common_tokens` is a raw LCP; a full match is
+// adjusted by one token for [TAG_PROMPT_LOGITS].
+server_prompt_restore_plan server_prompt_make_restore_plan(
+        const server_prompt_restore_coverage & coverage,
+        const server_tokens & source_tokens,
+        size_t common_tokens,
+        size_t request_tokens);
+
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+    server_prompt_restore_coverage coverage;
 
     // SSD tier: when set, the state blobs and the checkpoints live in this
     // file and the in-RAM copies above are empty; only prompt.tokens stays
@@ -715,9 +817,9 @@ struct server_prompt_cache_state {
 // SSD tier ("prompt cache disk tier") file format and identity
 //
 // One `.lcpc` file per spilled prompt state. A file holds the prompt tokens (so
-// the index can be rebuilt at startup), the serialized target *and* draft
-// sequence states, and the context checkpoints. Byte order is the host order of
-// the target machine (M2 Ultra).
+// the index can be rebuilt at startup), the serialized target state, an
+// optional paired draft state, and the context checkpoints. Byte order is the
+// host order of the target machine (M2 Ultra).
 //
 // Two independent guards decide whether a file may be restored:
 //
@@ -727,18 +829,50 @@ struct server_prompt_cache_state {
 //      (model artifacts, state-serialization ABI, KV representation, layout
 //      sensitive runtime parameters). See server_prompt_cache_fingerprint().
 //
-// Integrity is checked with two hashes: `hash_header` covers the header itself
-// (so a garbage header can never drive an allocation) and `hash_payload` covers
-// every byte after it. rescan_disk() verifies the header hash plus all declared
-// lengths against the real file size; the payload hash is verified by
-// load_from_disk(), which is the only path that actually reads the blobs.
+// Integrity is checked with a header hash, a small independently verifiable
+// coverage hash, and a full payload hash. rescan_disk() verifies the header,
+// coverage summary and token array without touching the large state blobs;
+// load_from_disk() verifies the full payload before installing any state.
 
 static constexpr uint32_t PCACHE_DISK_MAGIC   = 0x4350434Cu; // "LCPC"
 
 // v1: unversioned fingerprint, no checksums, no bounds checks (2026-08-07)
 // v2: fingerprint schema v2, header+payload hashes, checked lengths, atomic
 //     temp-file publication (2026-08-08)
-static constexpr uint32_t PCACHE_DISK_VERSION = 2u;
+// v3: restore-coverage prefix with an independent startup-verifiable hash
+//     (2026-08-09)
+static constexpr uint32_t PCACHE_DISK_VERSION = 3u;
+
+static constexpr uint32_t PCACHE_COVERAGE_VERSION = 2u;
+
+struct pcache_disk_coverage {
+    uint32_t version;
+    uint8_t  scope;
+    uint8_t  flags; // bit 0 target rollback bounded, bit 1 draft bounded
+    uint16_t reserved;
+    int64_t  n_tokens;
+    int32_t  target_pos_min;
+    int32_t  target_pos_max;
+    int32_t  draft_pos_min;
+    int32_t  draft_pos_max;
+    uint32_t target_rollback_tokens;
+    uint32_t draft_rollback_tokens;
+    uint32_t n_checkpoints;
+    uint32_t target_swa_tokens;
+    uint32_t draft_swa_tokens;
+};
+
+struct pcache_disk_checkpoint_coverage {
+    int64_t  n_tokens;
+    int32_t  pos_min;
+    int32_t  pos_max;
+    uint8_t  components;
+    uint8_t  reserved[7];
+};
+
+static_assert(sizeof(pcache_disk_coverage) == 56, "pcache_disk_coverage must stay packed and stable");
+static_assert(sizeof(pcache_disk_checkpoint_coverage) == 24,
+        "pcache_disk_checkpoint_coverage must stay packed and stable");
 
 struct pcache_disk_header {
     uint32_t magic;         // PCACHE_DISK_MAGIC
@@ -748,12 +882,14 @@ struct pcache_disk_header {
     uint64_t size_drft;     // bytes of serialized draft sequence state (0 = none)
     uint64_t n_tokens;      // prompt tokens stored before the state blobs
     uint64_t n_checkpoints; // context checkpoints stored after the state blobs
+    uint64_t size_coverage; // coverage prefix bytes before the token array
     uint64_t size_payload;  // bytes after this header; must equal file_size - sizeof(header)
+    uint64_t hash_coverage; // hash over exactly size_coverage bytes; checked at startup
     uint64_t hash_payload;  // hash over those size_payload bytes
     uint64_t hash_header;   // hash over the preceding bytes of this header (must stay last)
 };
 
-static_assert(sizeof(pcache_disk_header) == 72, "pcache_disk_header must stay packed and stable");
+static_assert(sizeof(pcache_disk_header) == 88, "pcache_disk_header must stay packed and stable");
 
 // Hard ceilings applied to every file-controlled length *before* it is used to
 // size an allocation. They are deliberately far above any healthy value: the
@@ -871,7 +1007,11 @@ struct server_prompt_cache {
 
     size_t size_disk_total() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(
+            const server_prompt & prompt,
+            const server_prompt_restore_coverage & coverage,
+            size_t state_size_main,
+            size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
@@ -896,6 +1036,10 @@ struct server_prompt_cache {
         int      source   = 4; // server_dashboard::restore_code numeric value (4 = miss)
         uint64_t n_tokens = 0; // prefix tokens restored (entry hit) or kept (resident)
         uint64_t n_bytes  = 0; // state bytes restored into the slot (entry hits only)
+        // Set only when load() installed an entry. Top-level entries do not
+        // serialize speculative implementation state, so the slot wrapper
+        // uses this to clear the displaced sequence boundary after any load.
+        server_prompt_restore_scope restored_scope = server_prompt_restore_scope::invalid;
     };
     dash_load_report dash_last_load;
 

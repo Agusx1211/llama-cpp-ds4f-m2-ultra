@@ -163,6 +163,17 @@ void expect_family_equal(const llama_dsv4_comp_family_usage & lhs,
 #undef EXPECT_FIELD
 }
 
+void expect_semantic_usage_equal(const llama_dsv4_comp_memory_usage & lhs,
+                                 const llama_dsv4_comp_memory_usage & rhs,
+                                 const std::string &                  message) {
+    expect_family_equal(lhs.c4, rhs.c4, message + " C4");
+    expect_family_equal(lhs.hca, rhs.hca, message + " HCA");
+    expect(lhs.handles == rhs.handles, message + ": handles");
+    expect(lhs.bindings == rhs.bindings, message + ": bindings");
+    expect(lhs.resident_handles == rhs.resident_handles, message + ": resident handles");
+    expect(lhs.active_tickets == rhs.active_tickets, message + ": active tickets");
+}
+
 void expect_page_partition(const llama_dsv4_comp_family_usage & usage, const std::string & family) {
     expect(usage.capacity_pages == usage.free_pages + usage.reserved_pages + usage.mapped_pages,
            family + " page partition mismatch");
@@ -1170,6 +1181,154 @@ void test_deterministic_quotes_and_full_context_boundary() {
     }
 }
 
+void test_detached_import_abort_preserves_semantics_and_monotonicity() {
+    {
+        llama_dsv4_comp_pool pool({ 4, 2 });
+        const auto baseline = pool.memory_usage_snapshot();
+        const auto detached = create_handle(pool);
+        const auto created  = pool.memory_usage_snapshot();
+        expect(created.epoch > baseline.epoch, "detached handle creation did not advance epoch");
+        expect_status(pool.abort_empty_detached_handle(detached, baseline.epoch),
+                      llama_dsv4_comp_status::ok, "abort empty detached handle");
+        const auto aborted = pool.memory_usage_snapshot();
+        expect_semantic_usage_equal(aborted, baseline, "empty detached abort baseline");
+        expect(aborted.epoch > created.epoch, "empty detached abort rewound epoch");
+        llama_dsv4_comp_handle_info stale;
+        expect_status(pool.get_handle(detached, stale), llama_dsv4_comp_status::handle_not_found,
+                      "aborted empty handle remained live");
+        const auto replacement = create_handle(pool);
+        expect(replacement > detached, "aborted empty handle ID was reused");
+        expect_status(pool.remove_handle(replacement), llama_dsv4_comp_status::ok,
+                      "remove empty abort replacement");
+    }
+
+    {
+        llama_dsv4_comp_pool pool({ 8, 4 });
+        const auto baseline     = pool.memory_usage_snapshot();
+        const auto create_epoch = baseline.epoch;
+        const auto detached     = create_handle(pool);
+        const auto quote        = quote_change(pool, detached, llama_dsv4_comp_family::c4, 65);
+        expect_status(quote.status, llama_dsv4_comp_status::ok, "quote detached import abort");
+        const auto reservation = pool.try_reserve(quote);
+        expect_status(reservation.status, llama_dsv4_comp_status::ok, "reserve detached import abort");
+        const auto reserved = pool.memory_usage_snapshot();
+        expect(reserved.active_tickets == 1 && reserved.c4.reserved_segments == 2,
+               "detached import abort did not reserve exact segments");
+
+        expect_status(pool.abort_detached_import(detached, reservation.ticket, create_epoch),
+                      llama_dsv4_comp_status::ok, "abort detached import");
+        const auto aborted = pool.memory_usage_snapshot();
+        expect_semantic_usage_equal(aborted, baseline, "detached import abort baseline");
+        expect(aborted.epoch > reserved.epoch, "detached import abort rewound epoch");
+        expect(aborted.retained_ticket_records >= baseline.retained_ticket_records + 1,
+               "detached import abort discarded ticket tombstone");
+        expect_status(pool.commit(reservation.ticket), llama_dsv4_comp_status::stale_ticket,
+                      "cancelled detached ticket became live");
+        expect_status(pool.abort_detached_import(detached, reservation.ticket, create_epoch),
+                      llama_dsv4_comp_status::stale_ticket, "detached import abort replay succeeded");
+        llama_dsv4_comp_handle_info stale;
+        expect_status(pool.get_handle(detached, stale), llama_dsv4_comp_status::handle_not_found,
+                      "aborted detached handle remained live");
+        const auto replacement = create_handle(pool);
+        expect(replacement > detached, "aborted detached handle ID was reused");
+        expect_status(pool.remove_handle(replacement), llama_dsv4_comp_status::ok,
+                      "remove detached abort replacement");
+    }
+
+    {
+        llama_dsv4_comp_pool pool({ 2, 1 });
+        const auto baseline = pool.memory_usage_snapshot();
+        llama_dsv4_comp_handle_result failed;
+        {
+            allocation_scope allocations(true);
+            failed = pool.create_handle();
+        }
+        expect_status(failed.status, llama_dsv4_comp_status::resource_exhausted,
+                      "detached handle allocation failure status");
+        expect_semantic_usage_equal(pool.memory_usage_snapshot(), baseline,
+                                    "detached handle allocation failure baseline");
+
+        const auto handle = create_handle(pool);
+        const auto quote  = quote_change(pool, handle, llama_dsv4_comp_family::c4, 1);
+        expect_status(quote.status, llama_dsv4_comp_status::ok, "quote reserve allocation failure");
+        const auto before_reserve = pool.memory_usage_snapshot();
+        llama_dsv4_comp_reserve_result reservation;
+        {
+            allocation_scope allocations(true);
+            reservation = pool.try_reserve(quote);
+        }
+        expect_status(reservation.status, llama_dsv4_comp_status::resource_exhausted,
+                      "reserve allocation failure status");
+        expect_semantic_usage_equal(pool.memory_usage_snapshot(), before_reserve,
+                                    "reserve allocation failure baseline");
+        expect(pool.memory_usage_snapshot().epoch == before_reserve.epoch,
+               "reserve allocation failure advanced epoch");
+        expect_status(pool.remove_handle(handle), llama_dsv4_comp_status::ok,
+                      "remove allocation failure handle");
+    }
+}
+
+void test_generation_checked_binding_replacement() {
+    llama_dsv4_comp_pool pool({ 12, 4 });
+    const auto           original = create_handle(pool);
+    commit_change(pool, original, llama_dsv4_comp_family::c4, 65);
+    commit_change(pool, original, llama_dsv4_comp_family::hca, 1);
+    expect_status(pool.bind(3, original), llama_dsv4_comp_status::ok, "bind replacement original");
+    const auto alias = pool.copy_handle(original);
+    expect_status(alias.status, llama_dsv4_comp_status::ok, "copy replacement original");
+
+    const auto replacement = create_handle(pool);
+    commit_change(pool, replacement, llama_dsv4_comp_family::c4, 3);
+    const auto original_info    = handle_info(pool, original);
+    const auto alias_info       = handle_info(pool, alias.handle);
+    const auto replacement_info = handle_info(pool, replacement);
+    const auto before_failures  = pool.memory_usage_snapshot();
+
+    expect_status(pool.replace_binding(3, original, original_info.generation + 1,
+                                       replacement, replacement_info.generation),
+                  llama_dsv4_comp_status::stale_handle, "replace stale original generation");
+    expect_status(pool.replace_binding(3, original, original_info.generation,
+                                       replacement, replacement_info.generation + 1),
+                  llama_dsv4_comp_status::stale_handle, "replace stale replacement generation");
+    expect_semantic_usage_equal(pool.memory_usage_snapshot(), before_failures,
+                                "failed replacement semantic baseline");
+    expect(pool.memory_usage_snapshot().epoch == before_failures.epoch,
+           "failed replacement advanced epoch");
+
+    llama_dsv4_comp_status status;
+    size_t allocations = 0;
+    {
+        allocation_scope scope(true);
+        status      = pool.replace_binding(3, original, original_info.generation,
+                                           replacement, replacement_info.generation);
+        allocations = scope.finish();
+    }
+    expect_status(status, llama_dsv4_comp_status::ok, "replace exact generations");
+    expect(allocations == 0, "binding replacement allocated");
+
+    llama_dsv4_comp_handle_id binding = 0;
+    expect_status(pool.get_binding(3, binding), llama_dsv4_comp_status::ok,
+                  "replacement binding missing");
+    expect(binding == replacement, "replacement binding published wrong root");
+    llama_dsv4_comp_handle_info removed;
+    expect_status(pool.get_handle(original, removed), llama_dsv4_comp_status::handle_not_found,
+                  "replacement retained old root");
+    const auto alias_after = handle_info(pool, alias.handle);
+    expect(alias_after.c4_segment_ids == alias_info.c4_segment_ids &&
+               alias_after.hca_segment_ids == alias_info.hca_segment_ids &&
+               alias_after.generation == alias_info.generation,
+           "replacement changed COW alias root");
+    const auto after = pool.memory_usage_snapshot();
+    expect(after.handles == before_failures.handles - 1 && after.bindings == before_failures.bindings,
+           "replacement ownership counts");
+    expect(after.c4.shared_segments == 0 && after.hca.shared_segments == 0,
+           "replacement did not release only the old root references");
+
+    expect_status(pool.unbind(3), llama_dsv4_comp_status::ok, "unbind replacement root");
+    expect_status(pool.remove_handle(replacement), llama_dsv4_comp_status::ok, "remove replacement root");
+    expect_status(pool.remove_handle(alias.handle), llama_dsv4_comp_status::ok, "remove replacement alias");
+}
+
 }  // namespace
 
 int main() {
@@ -1187,6 +1346,8 @@ int main() {
         test_recreated_pool_rejects_old_handles();
         test_sixty_four_handle_rounded_capacity_contract();
         test_deterministic_quotes_and_full_context_boundary();
+        test_detached_import_abort_preserves_semantics_and_monotonicity();
+        test_generation_checked_binding_replacement();
     } catch (const std::exception & error) {
         std::cerr << "test-dsv4-comp-pool: " << error.what() << '\n';
         return 1;

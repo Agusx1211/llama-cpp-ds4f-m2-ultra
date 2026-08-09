@@ -190,6 +190,14 @@ target_include_directories(test-server-prompt-cache PRIVATE ${PROJECT_SOURCE_DIR
 target_link_libraries(test-server-prompt-cache PRIVATE server-context)
 target_compile_features(test-server-prompt-cache PRIVATE cxx_std_17)
 
+llama_build_and_test(
+    test-server-prompt-cache-io.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-prompt-cache-io.cpp
+)
+target_include_directories(test-server-prompt-cache-io PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-prompt-cache-io PRIVATE cxx_std_17)
+target_compile_definitions(test-server-prompt-cache-io PRIVATE SERVER_PROMPT_CACHE_IO_TESTING=1)
+
 llama_build_and_test(test-server-queue-runtime.cpp)
 target_include_directories(test-server-queue-runtime PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_link_libraries(test-server-queue-runtime PRIVATE server-context)
@@ -312,6 +320,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-dsv4-resident-contract.cpp)
     target_include_directories(test-dsv4-resident-contract PRIVATE
+        ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-dsv4-segment-store.cpp)
+    target_include_directories(test-dsv4-segment-store PRIVATE
         ${PROJECT_SOURCE_DIR}/src)
     # Manual exact-model Phase 4 resident lifecycle gate. This target is
     # intentionally not registered with CTest: it requires the pinned

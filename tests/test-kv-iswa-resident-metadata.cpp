@@ -7,8 +7,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <new>
@@ -273,7 +275,7 @@ struct vector_reader : llama_io_read_i {
     size_t offset = 0;
 };
 
-llama_hparams make_hparams() {
+llama_hparams make_hparams(bool k_only = false) {
     llama_hparams hparams = {};
     hparams.n_layer_all = 2;
     hparams.n_embd = 8;
@@ -288,6 +290,10 @@ llama_hparams make_hparams() {
     hparams.n_swa = 4;
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     hparams.rope_type = LLAMA_ROPE_TYPE_NONE;
+    if (k_only) {
+        hparams.n_embd_head_k_mla_impl = 8;
+        hparams.n_embd_head_v_mla_impl = 8;
+    }
     return hparams;
 }
 
@@ -296,9 +302,9 @@ struct cache_fixture {
     llama_hparams hparams;
     llama_kv_cache_iswa cache;
 
-    explicit cache_fixture(uint32_t resident_slots = 2) :
+    explicit cache_fixture(uint32_t resident_slots = 2, bool k_only = false) :
         model(llama_model_default_params()),
-        hparams(make_hparams()),
+        hparams(make_hparams(k_only)),
         cache(init_model(), hparams,
                 GGML_TYPE_F32, GGML_TYPE_F32,
                 false, false, true, false,
@@ -1059,6 +1065,178 @@ void test_disabled_path_does_not_offer_residency() {
     assert(f.cache.get_swa()->get_cells(0).get_used() == 0);
 }
 
+bool logical_plane_equal(
+        const llama_kv_iswa_logical_plane_state & lhs,
+        const llama_kv_iswa_logical_plane_state & rhs) {
+    if (lhs.schema_version != rhs.schema_version || lhs.positions != rhs.positions ||
+            lhs.tensor_payload != rhs.tensor_payload || lhs.checksum != rhs.checksum ||
+            lhs.extensions.size() != rhs.extensions.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.extensions.size(); ++i) {
+        if (lhs.extensions[i].x != rhs.extensions[i].x || lhs.extensions[i].y != rhs.extensions[i].y) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool logical_state_equal(
+        const llama_kv_iswa_logical_sequence_state & lhs,
+        const llama_kv_iswa_logical_sequence_state & rhs) {
+    return lhs.schema_version == rhs.schema_version &&
+            logical_plane_equal(lhs.base, rhs.base) && logical_plane_equal(lhs.swa, rhs.swa);
+}
+
+void test_logical_sequence_prepared_replacement() {
+    backend_scope backend;
+    cache_fixture f(2, true);
+    for (llama_pos pos = 0; pos <= 2; ++pos) {
+        f.put_metadata(0, (uint32_t) pos, (uint32_t) pos, pos);
+    }
+    f.fill_stream(f.base_k(), 0, 0x31);
+    f.fill_stream(f.swa_k(),  0, 0x72);
+    f.put_metadata(1, 5, 5, 5);
+    f.put_metadata(1, 6, 6, 6);
+    f.fill_stream(f.base_k(), 1, 0xa4);
+    f.fill_stream(f.swa_k(),  1, 0xb5);
+
+    const auto source = f.cache.export_logical_sequence(0);
+    const auto destination_before = f.cache.export_logical_sequence(1);
+    assert(source.base.positions == std::vector<llama_pos>({ 0, 1, 2 }));
+    assert(source.swa.positions  == std::vector<llama_pos>({ 0, 1, 2 }));
+
+    for (int malformed = 0; malformed < 3; ++malformed) {
+        auto state = source;
+        if (malformed == 0) {
+            state.base.tensor_payload.pop_back();
+        } else if (malformed == 1) {
+            std::swap(state.base.positions[0], state.base.positions[1]);
+        } else {
+            state.swa.positions[1] = state.swa.positions[0];
+        }
+        assert_throws([&] { f.cache.validate_logical_sequence(state, 2); });
+        assert(logical_state_equal(f.cache.export_logical_sequence(1), destination_before));
+    }
+
+    auto transaction = f.cache.acquire_resident_transaction();
+    assert(static_cast<bool>(transaction));
+    auto plan = f.cache.prepare_logical_sequence_import(1, source, 2);
+    assert(f.cache.validate_logical_sequence_import(plan));
+    assert(logical_state_equal(f.cache.export_logical_sequence(1), destination_before));
+
+    auto changed_after_prepare = source;
+    changed_after_prepare.swa.tensor_payload.back() ^= 0xff;
+    assert(!f.cache.commit_logical_sequence_import(plan, changed_after_prepare));
+    assert(logical_state_equal(f.cache.export_logical_sequence(1), destination_before));
+    assert(f.cache.commit_logical_sequence_import(plan, source));
+    assert(logical_state_equal(f.cache.export_logical_sequence(1), source));
+    transaction.release();
+    assert(!static_cast<bool>(transaction));
+
+}
+
+void test_logical_sequence_staleness_and_empty_replacement() {
+    backend_scope backend;
+    cache_fixture f(2, true);
+    f.put_metadata(0, 0, 0, 0);
+    f.put_metadata(1, 4, 4, 4);
+    const auto source = f.cache.export_logical_sequence(0);
+    {
+        auto transaction = f.cache.acquire_resident_transaction();
+        assert(static_cast<bool>(transaction));
+        auto plan = f.cache.prepare_logical_sequence_import(1, source, 0);
+        assert(f.cache.seq_rm(1, 999, 1000));
+        assert(!f.cache.validate_logical_sequence_import(plan));
+        transaction.release();
+    }
+
+    // A prepared plan belongs to exactly one gate generation. Releasing that
+    // transaction and acquiring another must not make the old plan valid
+    // again merely because the raw cache versions did not change.
+    std::shared_ptr<llama_kv_iswa_logical_import_plan> stale_generation_plan;
+    {
+        auto transaction = f.cache.acquire_resident_transaction();
+        assert(static_cast<bool>(transaction));
+        stale_generation_plan = f.cache.prepare_logical_sequence_import(1, source, 0);
+        assert(f.cache.validate_logical_sequence_import(stale_generation_plan));
+        transaction.release();
+    }
+    {
+        auto transaction = f.cache.acquire_resident_transaction();
+        assert(static_cast<bool>(transaction));
+        assert(!f.cache.validate_logical_sequence_import(stale_generation_plan));
+        assert(!f.cache.commit_logical_sequence_import(stale_generation_plan, source));
+        transaction.release();
+    }
+
+    assert(f.cache.seq_rm(0, -1, -1));
+    const auto empty = f.cache.export_logical_sequence(0);
+    assert(empty.base.positions.empty() && empty.swa.positions.empty());
+    auto sparse_tail = source;
+    sparse_tail.swa = empty.swa; // valid empty payload/checksum, but missing accepted position 0
+    assert_throws([&] { f.cache.validate_logical_sequence(sparse_tail, 0); });
+    {
+        auto transaction = f.cache.acquire_resident_transaction();
+        assert(static_cast<bool>(transaction));
+        auto plan = f.cache.prepare_logical_sequence_import(1, empty, -1);
+        assert(f.cache.commit_logical_sequence_import(plan, empty));
+        transaction.release();
+    }
+    assert(logical_state_equal(f.cache.export_logical_sequence(1), empty));
+}
+
+void test_cross_thread_transaction_release_and_destruction() {
+    backend_scope backend;
+    cache_fixture f;
+
+    auto token = std::make_shared<llama_kv_iswa_resident_transaction>(
+            f.cache.acquire_resident_transaction());
+    assert(static_cast<bool>(*token));
+    std::promise<void> waiter_started;
+    std::promise<void> waiter_done;
+    auto waiter_started_future = waiter_started.get_future();
+    auto waiter_done_future    = waiter_done.get_future();
+    std::thread waiter([&] {
+        waiter_started.set_value();
+        f.cache.clear(false);
+        waiter_done.set_value();
+    });
+    waiter_started_future.wait();
+    assert(waiter_done_future.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+
+    // Release on a non-owner thread. The consumed token stays alive after the
+    // waiter passes, proving lifetime and gate lifetime are decoupled.
+    std::thread releaser([token] { token->release(); });
+    releaser.join();
+    assert(waiter_done_future.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    waiter.join();
+    assert(!static_cast<bool>(*token));
+    auto retry = f.cache.acquire_resident_transaction();
+    assert(static_cast<bool>(retry));
+    retry.release();
+
+    // Destruction itself is also a terminal cross-thread release and cannot
+    // strand a waiter during shutdown-style ownership transfer.
+    auto destroyed = std::make_unique<llama_kv_iswa_resident_transaction>(
+            f.cache.acquire_resident_transaction());
+    std::promise<void> destroy_waiter_started;
+    std::promise<void> destroy_waiter_done;
+    auto destroy_waiter_started_future = destroy_waiter_started.get_future();
+    auto destroy_waiter_done_future    = destroy_waiter_done.get_future();
+    std::thread destroy_waiter([&] {
+        destroy_waiter_started.set_value();
+        (void) f.cache.seq_rm(0, 100, 101);
+        destroy_waiter_done.set_value();
+    });
+    destroy_waiter_started_future.wait();
+    assert(destroy_waiter_done_future.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+    std::thread destroyer([token = std::move(destroyed)]() mutable { token.reset(); });
+    destroyer.join();
+    assert(destroy_waiter_done_future.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    destroy_waiter.join();
+}
+
 } // namespace
 
 int main() {
@@ -1074,6 +1252,9 @@ int main() {
     test_release_audit_adversarial_cases();
     test_cross_pool_handle_rejected();
     test_disabled_path_does_not_offer_residency();
+    test_logical_sequence_prepared_replacement();
+    test_logical_sequence_staleness_and_empty_replacement();
+    test_cross_thread_transaction_release_and_destruction();
     assert(std::strcmp(llama_kv_iswa_resident_status_name(
             llama_kv_iswa_resident_status::resource_exhausted), "resource_exhausted") == 0);
     std::cout << "ISWA resident transaction tests passed\n";

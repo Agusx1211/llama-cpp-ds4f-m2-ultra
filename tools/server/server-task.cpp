@@ -17,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <vector>
 
 #ifndef _WIN32
@@ -1875,6 +1876,182 @@ struct pcache_reader {
     }
 };
 
+static bool pcache_checkpoint_coverage_equal(
+        const server_prompt_restore_checkpoint & a,
+        const server_prompt_restore_checkpoint & b) {
+    return a.n_tokens == b.n_tokens && a.pos_min == b.pos_min && a.pos_max == b.pos_max &&
+           a.components == b.components;
+}
+
+static bool restore_domain_equal(
+        const server_prompt_restore_domain & a,
+        const server_prompt_restore_domain & b) {
+    return a.pos_min == b.pos_min && a.pos_max == b.pos_max &&
+           a.rollback_tokens == b.rollback_tokens && a.swa_tokens == b.swa_tokens &&
+           a.rollback_bounded == b.rollback_bounded;
+}
+
+static bool pcache_coverage_equal(
+        const server_prompt_restore_coverage & a,
+        const server_prompt_restore_coverage & b) {
+    if (a.scope != b.scope ||
+            !restore_domain_equal(a.target, b.target) ||
+            !restore_domain_equal(a.draft, b.draft) ||
+            a.checkpoints.size() != b.checkpoints.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.checkpoints.size(); ++i) {
+        if (!pcache_checkpoint_coverage_equal(a.checkpoints[i], b.checkpoints[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool pcache_state_coverage_matches_payload(const server_prompt_cache_state & state) {
+    if (state.data.main.empty() ||
+            !server_prompt_restore_coverage_is_valid(state.coverage, state.prompt.tokens)) {
+        return false;
+    }
+
+    if (state.coverage.scope == server_prompt_restore_scope::target_only) {
+        if (!state.data.drft.empty()) {
+            return false;
+        }
+    } else if (state.coverage.scope == server_prompt_restore_scope::target_and_draft) {
+        if (state.data.drft.empty()) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    const auto actual = server_prompt_build_restore_coverage(
+            state.prompt,
+            state.coverage.scope,
+            state.coverage.target,
+            state.coverage.draft);
+
+    if (!pcache_coverage_equal(actual, state.coverage) ||
+            actual.checkpoints.size() != state.prompt.checkpoints.size()) {
+        return false;
+    }
+
+    if (state.coverage.scope == server_prompt_restore_scope::target_only) {
+        for (const auto & checkpoint : state.prompt.checkpoints) {
+            if (!checkpoint.data_dft.empty() || !checkpoint.data_spec.empty()) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+static bool pcache_write_coverage(
+        pcache_writer & writer,
+        const server_prompt_cache_state & state,
+        uint64_t & size,
+        uint64_t & hash) {
+    pcache_disk_coverage disk = {};
+    disk.version                 = PCACHE_COVERAGE_VERSION;
+    disk.scope                   = (uint8_t) state.coverage.scope;
+    disk.flags                   = (state.coverage.target.rollback_bounded ? 1u : 0u) |
+                                   (state.coverage.draft.rollback_bounded  ? 2u : 0u);
+    disk.n_tokens                = state.prompt.n_tokens();
+    disk.target_pos_min          = state.coverage.target.pos_min;
+    disk.target_pos_max          = state.coverage.target.pos_max;
+    disk.draft_pos_min           = state.coverage.draft.pos_min;
+    disk.draft_pos_max           = state.coverage.draft.pos_max;
+    disk.target_rollback_tokens  = state.coverage.target.rollback_tokens;
+    disk.draft_rollback_tokens   = state.coverage.draft.rollback_tokens;
+    disk.n_checkpoints           = (uint32_t) state.coverage.checkpoints.size();
+    disk.target_swa_tokens       = state.coverage.target.swa_tokens;
+    disk.draft_swa_tokens        = state.coverage.draft.swa_tokens;
+
+    const uint64_t begin = writer.payload_size;
+    bool ok = writer.write_pod(disk);
+    for (const auto & checkpoint : state.coverage.checkpoints) {
+        pcache_disk_checkpoint_coverage item = {};
+        item.n_tokens   = checkpoint.n_tokens;
+        item.pos_min    = checkpoint.pos_min;
+        item.pos_max    = checkpoint.pos_max;
+        item.components = checkpoint.components;
+        ok = ok && writer.write_pod(item);
+    }
+
+    size = writer.payload_size - begin;
+    hash = writer.payload_hash;
+    return ok;
+}
+
+static bool pcache_read_coverage(
+        pcache_reader & reader,
+        const pcache_disk_header & header,
+        server_prompt_restore_coverage & coverage,
+        const char * & reason) {
+    const uint64_t begin_left = reader.left;
+
+    pcache_disk_coverage disk = {};
+    if (!reader.read_pod(disk)) {
+        reason = "truncated restore coverage";
+        return false;
+    }
+    if (disk.version != PCACHE_COVERAGE_VERSION || disk.reserved != 0 ||
+            (disk.flags & ~3u) != 0 || disk.n_tokens != (int64_t) header.n_tokens ||
+            disk.n_checkpoints != header.n_checkpoints) {
+        reason = "invalid restore coverage header";
+        return false;
+    }
+
+    coverage = {};
+    coverage.scope                   = (server_prompt_restore_scope) disk.scope;
+    coverage.target.pos_min          = disk.target_pos_min;
+    coverage.target.pos_max          = disk.target_pos_max;
+    coverage.target.rollback_tokens  = disk.target_rollback_tokens;
+    coverage.target.swa_tokens       = disk.target_swa_tokens;
+    coverage.target.rollback_bounded = (disk.flags & 1u) != 0;
+    coverage.draft.pos_min           = disk.draft_pos_min;
+    coverage.draft.pos_max           = disk.draft_pos_max;
+    coverage.draft.rollback_tokens   = disk.draft_rollback_tokens;
+    coverage.draft.swa_tokens        = disk.draft_swa_tokens;
+    coverage.draft.rollback_bounded  = (disk.flags & 2u) != 0;
+
+    try {
+        coverage.checkpoints.reserve(disk.n_checkpoints);
+        for (uint32_t i = 0; i < disk.n_checkpoints; ++i) {
+            pcache_disk_checkpoint_coverage item = {};
+            if (!reader.read_pod(item)) {
+                reason = "truncated checkpoint coverage";
+                return false;
+            }
+            for (uint8_t byte : item.reserved) {
+                if (byte != 0) {
+                    reason = "invalid checkpoint coverage padding";
+                    return false;
+                }
+            }
+            coverage.checkpoints.push_back({ item.n_tokens, item.pos_min, item.pos_max, item.components });
+        }
+    } catch (const std::bad_alloc &) {
+        coverage = {};
+        reason = "restore coverage allocation failed";
+        return false;
+    }
+
+    if (begin_left - reader.left != header.size_coverage || reader.hash != header.hash_coverage) {
+        reason = "restore coverage checksum mismatch";
+        return false;
+    }
+    if ((coverage.scope == server_prompt_restore_scope::target_only && header.size_drft != 0) ||
+            (coverage.scope == server_prompt_restore_scope::target_and_draft && header.size_drft == 0)) {
+        reason = "restore scope does not match state blobs";
+        return false;
+    }
+
+    return true;
+}
+
 // Read and fully validate a header. On failure `reason` explains why, and the
 // caller must treat the file as unusable - never fatal, never trusted.
 static bool pcache_read_header(std::ifstream & in,
@@ -1936,6 +2113,13 @@ static bool pcache_read_header(std::ifstream & in,
         return false;
     }
 
+    const uint64_t expected_coverage = sizeof(pcache_disk_coverage) +
+            hdr.n_checkpoints*(uint64_t) sizeof(pcache_disk_checkpoint_coverage);
+    if (hdr.size_coverage != expected_coverage) {
+        reason = "restore coverage size does not match the checkpoint count";
+        return false;
+    }
+
     if (hdr.size_main > PCACHE_MAX_BLOB_BYTES || hdr.size_drft > PCACHE_MAX_BLOB_BYTES) {
         reason = "state blob above the maximum";
         return false;
@@ -1945,8 +2129,9 @@ static bool pcache_read_header(std::ifstream & in,
     // already capped, so these products cannot overflow
     const uint64_t ckpt_fixed_bytes = sizeof(int64_t) + sizeof(int) + 2*sizeof(llama_pos) + 3*sizeof(uint64_t);
 
-    uint64_t need = hdr.n_tokens*(uint64_t) sizeof(llama_token);
-    if (!pcache_add_checked(need, hdr.size_main) ||
+    uint64_t need = hdr.size_coverage;
+    if (!pcache_add_checked(need, hdr.n_tokens*(uint64_t) sizeof(llama_token)) ||
+        !pcache_add_checked(need, hdr.size_main) ||
         !pcache_add_checked(need, hdr.size_drft) ||
         !pcache_add_checked(need, hdr.n_checkpoints*ckpt_fixed_bytes)) {
         reason = "declared lengths overflow";
@@ -2094,6 +2279,270 @@ uint64_t server_prompt_cache_fingerprint(const server_prompt_cache_fingerprint_i
     return fp.h;
 }
 
+server_prompt_restore_coverage server_prompt_build_restore_coverage(
+        const server_prompt & prompt,
+        server_prompt_restore_scope scope,
+        const server_prompt_restore_domain & target,
+        const server_prompt_restore_domain & draft) {
+    server_prompt_restore_coverage coverage;
+
+    coverage.scope  = scope;
+    coverage.target = target;
+
+    if (scope == server_prompt_restore_scope::target_and_draft) {
+        coverage.draft = draft;
+    }
+
+    coverage.checkpoints.reserve(prompt.checkpoints.size());
+    for (const common_prompt_checkpoint & checkpoint : prompt.checkpoints) {
+        if (checkpoint.data_tgt.empty()) {
+            continue;
+        }
+
+        uint8_t components = SERVER_PROMPT_RESTORE_COMPONENT_TARGET;
+        if (!checkpoint.data_dft.empty()) {
+            components |= SERVER_PROMPT_RESTORE_COMPONENT_DRAFT;
+        }
+        if (!checkpoint.data_spec.empty()) {
+            components |= SERVER_PROMPT_RESTORE_COMPONENT_SPEC;
+        }
+
+        // A paired top-level state must never land on a target-only checkpoint:
+        // doing so would leave the draft frontier ahead of the target. Keep
+        // only checkpoints that can restore the same state domain atomically.
+        if (scope == server_prompt_restore_scope::target_and_draft &&
+                (components & SERVER_PROMPT_RESTORE_COMPONENT_DRAFT) == 0) {
+            continue;
+        }
+
+        if (scope == server_prompt_restore_scope::target_only) {
+            components = SERVER_PROMPT_RESTORE_COMPONENT_TARGET;
+        }
+
+        coverage.checkpoints.push_back({
+            checkpoint.n_tokens,
+            checkpoint.pos_min,
+            checkpoint.pos_max,
+            components,
+        });
+    }
+
+    return coverage;
+}
+
+server_prompt_restore_coverage server_prompt_capture_restore_coverage(
+        const server_prompt & prompt,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        llama_seq_id seq_id,
+        bool force_target_only) {
+    if (ctx_tgt == nullptr || prompt.tokens.empty()) {
+        return {};
+    }
+
+    const auto capture_domain = [seq_id](llama_context * ctx) {
+        server_prompt_restore_domain domain;
+        const llama_model * model = llama_get_model(ctx);
+        domain.pos_min          = llama_memory_seq_pos_min(llama_get_memory(ctx), seq_id);
+        domain.pos_max          = llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id);
+        domain.rollback_tokens  = llama_n_rs_seq(ctx);
+        domain.swa_tokens       = (uint32_t) std::max(0, llama_model_n_swa(model));
+        domain.rollback_bounded = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
+        return domain;
+    };
+
+    const auto target = capture_domain(ctx_tgt);
+    server_prompt_restore_domain draft;
+    if (!force_target_only && ctx_dft != nullptr) {
+        draft = capture_domain(ctx_dft);
+    }
+
+    // Different SWA widths legitimately produce different retained minima.
+    // Pairing requires one decoded frontier, not identical retained windows.
+    const bool paired = !force_target_only && ctx_dft != nullptr &&
+            target.pos_min >= 0 && draft.pos_min >= 0 && target.pos_max == draft.pos_max;
+    return server_prompt_build_restore_coverage(
+            prompt,
+            paired ? server_prompt_restore_scope::target_and_draft
+                   : server_prompt_restore_scope::target_only,
+            target,
+            paired ? draft : server_prompt_restore_domain {});
+}
+
+bool server_prompt_restore_coverage_is_valid(
+        const server_prompt_restore_coverage & coverage,
+        const server_tokens & source_tokens) {
+    const auto represented_tokens = [&](llama_pos pos_max, size_t & represented) {
+        if (pos_max < 0 || pos_max == std::numeric_limits<llama_pos>::max()) {
+            return false;
+        }
+
+        const llama_pos pos_next = pos_max + 1;
+        represented = source_tokens.size_up_to_pos(pos_next);
+
+        // size_up_to_pos() advances media atomically. Requiring the inverse
+        // mapping to land exactly rejects a frontier in the middle of a media
+        // chunk and avoids treating positions as token indexes.
+        return represented > 0 && represented <= source_tokens.size() &&
+               source_tokens.pos_next((int64_t) represented) == pos_next;
+    };
+
+    size_t target_represented = 0;
+    if (source_tokens.empty() || coverage.scope == server_prompt_restore_scope::invalid ||
+            coverage.target.pos_min < 0 || coverage.target.pos_max < coverage.target.pos_min ||
+            !represented_tokens(coverage.target.pos_max, target_represented)) {
+        return false;
+    }
+
+    if (coverage.scope == server_prompt_restore_scope::target_only) {
+        const server_prompt_restore_domain empty_draft;
+        if (!restore_domain_equal(coverage.draft, empty_draft)) {
+            return false;
+        }
+    } else if (coverage.scope == server_prompt_restore_scope::target_and_draft) {
+        // A full entry is one atomic target+draft restore domain. Divergent
+        // decoded frontiers are downgraded before capture and rejected on
+        // disk. The retained minima can differ when the models' SWA widths do.
+        size_t draft_represented = 0;
+        if (coverage.draft.pos_min < 0 || coverage.draft.pos_max < coverage.draft.pos_min ||
+                coverage.draft.pos_max != coverage.target.pos_max ||
+                !represented_tokens(coverage.draft.pos_max, draft_represented) ||
+                draft_represented != target_represented) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    int64_t checkpoint_n_tokens_prev = -1;
+    for (const auto & checkpoint : coverage.checkpoints) {
+        const bool has_target = (checkpoint.components & SERVER_PROMPT_RESTORE_COMPONENT_TARGET) != 0;
+        const bool has_draft  = (checkpoint.components & SERVER_PROMPT_RESTORE_COMPONENT_DRAFT) != 0;
+        const uint8_t known_components =
+                SERVER_PROMPT_RESTORE_COMPONENT_TARGET |
+                SERVER_PROMPT_RESTORE_COMPONENT_DRAFT  |
+                SERVER_PROMPT_RESTORE_COMPONENT_SPEC;
+
+        if (!has_target || (checkpoint.components & ~known_components) != 0 ||
+                checkpoint.n_tokens < 0 || (uint64_t) checkpoint.n_tokens > target_represented ||
+                checkpoint.n_tokens < checkpoint_n_tokens_prev ||
+                checkpoint.pos_min < 0 || checkpoint.pos_max < checkpoint.pos_min ||
+                checkpoint.pos_max > coverage.target.pos_max ||
+                (checkpoint.n_tokens > 0 &&
+                 checkpoint.pos_max >= source_tokens.pos_next(checkpoint.n_tokens))) {
+            return false;
+        }
+        if (coverage.scope == server_prompt_restore_scope::target_only &&
+                checkpoint.components != SERVER_PROMPT_RESTORE_COMPONENT_TARGET) {
+            return false;
+        }
+        if (coverage.scope == server_prompt_restore_scope::target_and_draft && !has_draft) {
+            return false;
+        }
+
+        checkpoint_n_tokens_prev = checkpoint.n_tokens;
+    }
+
+    return true;
+}
+
+server_prompt_restore_plan server_prompt_make_restore_plan(
+        const server_prompt_restore_coverage & coverage,
+        const server_tokens & source_tokens,
+        size_t common_tokens,
+        size_t request_tokens) {
+    server_prompt_restore_plan plan;
+    plan.scope = coverage.scope;
+
+    const size_t source_size = source_tokens.size();
+    common_tokens = std::min(common_tokens, std::min(source_size, request_tokens));
+    plan.matched_tokens = common_tokens;
+
+    if (common_tokens == 0 || !server_prompt_restore_coverage_is_valid(coverage, source_tokens)) {
+        return plan;
+    }
+
+    plan.full_match = common_tokens == request_tokens;
+
+    // The prompt token vector can contain the most recently sampled token
+    // before that token has been decoded into the sequence state. Derive the
+    // represented token count from the actual positional frontier, then cap
+    // the raw LCP at that count. For a paired entry both frontiers are an
+    // atomic restore domain and therefore both cap the landing.
+    const size_t target_represented = source_tokens.size_up_to_pos(coverage.target.pos_max + 1);
+    const size_t draft_represented = coverage.scope == server_prompt_restore_scope::target_and_draft ?
+            source_tokens.size_up_to_pos(coverage.draft.pos_max + 1) : target_represented;
+    const size_t requested_tokens = common_tokens - (plan.full_match ? 1 : 0);
+    const size_t direct_tokens = std::min(requested_tokens,
+            std::min(target_represented, draft_represented));
+    if (direct_tokens == 0) {
+        return plan;
+    }
+
+    plan.pos_next = source_tokens.pos_next((int64_t) direct_tokens);
+    plan.target_pos_threshold = std::max<llama_pos>(0,
+            plan.pos_next - (llama_pos) coverage.target.swa_tokens);
+    plan.draft_pos_threshold = coverage.scope == server_prompt_restore_scope::target_and_draft ?
+            std::max<llama_pos>(0, plan.pos_next - (llama_pos) coverage.draft.swa_tokens) :
+            plan.target_pos_threshold;
+
+    const size_t target_tail_tokens = target_represented - direct_tokens;
+    const size_t draft_tail_tokens  = draft_represented  - direct_tokens;
+    const bool target_direct = coverage.target.pos_min < plan.target_pos_threshold &&
+            (!coverage.target.rollback_bounded ||
+             target_tail_tokens <= coverage.target.rollback_tokens);
+    const bool draft_direct = coverage.scope != server_prompt_restore_scope::target_and_draft ||
+            (coverage.draft.pos_min < plan.draft_pos_threshold &&
+             (!coverage.draft.rollback_bounded ||
+              draft_tail_tokens <= coverage.draft.rollback_tokens));
+
+    if (target_direct && draft_direct) {
+        plan.kind             = server_prompt_restore_kind::direct;
+        plan.effective_tokens = direct_tokens;
+        plan.recompute_tokens = common_tokens - direct_tokens;
+        plan.landing_pos      = plan.pos_next;
+        return plan;
+    }
+
+    // Newest covering checkpoint wins, exactly matching the prefill landing
+    // rule. The strict pos_min threshold guarantees at least one token is
+    // evaluated on a full match ([TAG_PROMPT_LOGITS]).
+    for (size_t i = coverage.checkpoints.size(); i > 0; --i) {
+        const auto & checkpoint = coverage.checkpoints[i - 1];
+        const bool target_boundary = checkpoint.pos_min < plan.target_pos_threshold || checkpoint.pos_min == 0;
+        const bool draft_boundary = coverage.scope != server_prompt_restore_scope::target_and_draft ||
+                checkpoint.pos_min < plan.draft_pos_threshold || checkpoint.pos_min == 0;
+        if (checkpoint.pos_max > plan.pos_next || !target_boundary || !draft_boundary) {
+            continue;
+        }
+        if (coverage.scope == server_prompt_restore_scope::target_and_draft &&
+                (checkpoint.components & SERVER_PROMPT_RESTORE_COMPONENT_DRAFT) == 0) {
+            continue;
+        }
+
+        const llama_pos landing_pos = std::min(
+                plan.pos_next,
+                std::max(checkpoint.pos_min + 1, checkpoint.pos_max));
+        const size_t effective_tokens = std::min(
+                source_tokens.size_up_to_pos(landing_pos),
+                (size_t) checkpoint.n_tokens);
+
+        if (effective_tokens == 0 || effective_tokens > direct_tokens) {
+            continue;
+        }
+
+        plan.kind                = server_prompt_restore_kind::checkpoint;
+        plan.effective_tokens    = effective_tokens;
+        plan.recompute_tokens    = common_tokens - effective_tokens;
+        plan.landing_pos         = landing_pos;
+        plan.checkpoint_index    = i - 1;
+        plan.checkpoint_n_tokens = checkpoint.n_tokens;
+        return plan;
+    }
+
+    return plan;
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -2149,6 +2598,11 @@ bool server_prompt_cache::spill_to_disk(server_prompt_cache_state & state) {
                 tokens.size(), state.prompt.checkpoints.size(), state.data.size());
         return false;
     }
+    if (!pcache_state_coverage_matches_payload(state)) {
+        SRV_WRN(" - prompt cache entry (%zu tokens) has invalid restore coverage, not spilling\n",
+                tokens.size());
+        return false;
+    }
 
     std::string path;
     do {
@@ -2174,7 +2628,10 @@ bool server_prompt_cache::spill_to_disk(server_prompt_cache_state & state) {
             ok = bool(w.out.write(reinterpret_cast<const char *>(&hdr), sizeof(hdr)));
         }
 
+        uint64_t size_coverage = 0;
+        uint64_t hash_coverage = 0;
         ok = ok &&
+             pcache_write_coverage(w, state, size_coverage, hash_coverage) &&
              w.write_raw(tokens.data(), tokens.size()*sizeof(llama_token)) &&
              w.write_raw(state.data.main.data(), state.data.main.size()) &&
              w.write_raw(state.data.drft.data(), state.data.drft.size());
@@ -2198,7 +2655,9 @@ bool server_prompt_cache::spill_to_disk(server_prompt_cache_state & state) {
             hdr.size_drft     = state.data.drft.size();
             hdr.n_tokens      = tokens.size();
             hdr.n_checkpoints = state.prompt.checkpoints.size();
+            hdr.size_coverage = size_coverage;
             hdr.size_payload  = w.payload_size;
+            hdr.hash_coverage = hash_coverage;
             hdr.hash_payload  = w.payload_hash;
             hdr.hash_header   = server_pcache_header_hash(hdr);
 
@@ -2310,6 +2769,14 @@ bool server_prompt_cache::load_from_disk(server_prompt_cache_state & state) {
 
     r.left = hdr.size_payload;
 
+    server_prompt_restore_coverage disk_coverage;
+    if (!pcache_read_coverage(r, hdr, disk_coverage, reason)) {
+        return reject(reason);
+    }
+    if (!pcache_coverage_equal(disk_coverage, state.coverage)) {
+        return reject("restore coverage does not match the index entry");
+    }
+
     // tokens: bounded by the header check above, so this resize is safe
     llama_tokens tokens((size_t) hdr.n_tokens);
     if (!r.read_raw(tokens.data(), hdr.n_tokens*(uint64_t) sizeof(llama_token))) {
@@ -2318,6 +2785,9 @@ bool server_prompt_cache::load_from_disk(server_prompt_cache_state & state) {
 
     if (tokens != state.prompt.tokens.get_tokens()) {
         return reject("tokens do not match the index entry");
+    }
+    if (!server_prompt_restore_coverage_is_valid(disk_coverage, state.prompt.tokens)) {
+        return reject("invalid restore coverage semantics");
     }
 
     bool ok = r.read_sized(state.data.main, hdr.size_main, PCACHE_MAX_BLOB_BYTES) &&
@@ -2350,6 +2820,10 @@ bool server_prompt_cache::load_from_disk(server_prompt_cache_state & state) {
     // chunking the writer used
     if (r.hash != hdr.hash_payload) {
         return reject("payload checksum mismatch");
+    }
+
+    if (!pcache_state_coverage_matches_payload(state)) {
+        return reject("restore coverage does not match the state payload");
     }
 
     const double dt_ms = (ggml_time_us() - t_start) / 1000.0;
@@ -2450,6 +2924,7 @@ void server_prompt_cache::rescan_disk() {
         const char *       reason = "unknown";
 
         llama_tokens tokens;
+        server_prompt_restore_coverage coverage;
 
         try {
             pcache_reader r;
@@ -2460,14 +2935,24 @@ void server_prompt_cache::rescan_disk() {
             } else if (pcache_read_header(r.in, (uint64_t) f.size, disk_fingerprint, disk_max_tokens, hdr, reason)) {
                 r.left = hdr.size_payload;
 
-                // n_tokens is bounded by disk_max_tokens (<= the context size)
-                // and by the payload the file really has, so this is the only
-                // allocation the rescan performs
-                tokens.resize((size_t) hdr.n_tokens);
-
-                ok = r.read_raw(tokens.data(), hdr.n_tokens*(uint64_t) sizeof(llama_token));
-                if (!ok) {
-                    reason = "truncated token array";
+                // Coverage is small, independently hashed, and precedes the
+                // tokens. Startup can therefore reject a non-restorable entry
+                // without reading either state blob.
+                ok = pcache_read_coverage(r, hdr, coverage, reason);
+                if (ok) {
+                    // n_tokens is bounded by disk_max_tokens (<= the context
+                    // size) and by the payload the file really has.
+                    tokens.resize((size_t) hdr.n_tokens);
+                    ok = r.read_raw(tokens.data(), hdr.n_tokens*(uint64_t) sizeof(llama_token));
+                    if (!ok) {
+                        reason = "truncated token array";
+                    } else {
+                        server_tokens indexed_tokens(tokens, false);
+                        ok = server_prompt_restore_coverage_is_valid(coverage, indexed_tokens);
+                        if (!ok) {
+                            reason = "invalid restore coverage semantics";
+                        }
+                    }
                 }
 
                 // note: the payload hash is deliberately *not* verified here -
@@ -2492,6 +2977,7 @@ void server_prompt_cache::rescan_disk() {
 
         server_prompt_cache_state state;
         state.prompt.tokens = server_tokens(tokens, false);
+        state.coverage      = std::move(coverage);
         state.file          = f.path;
         state.size_disk     = f.size;
 
@@ -2560,21 +3046,75 @@ bool server_prompt_cache::evict_oldest_ram() {
     return false;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
-    // first check if the current state is contained fully in the cache
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+server_prompt_cache_state * server_prompt_cache::alloc(
+        const server_prompt & prompt,
+        const server_prompt_restore_coverage & coverage,
+        size_t state_size_tgt,
+        size_t state_size_dft) {
+    server_prompt prompt_new;
+    prompt_new.tokens = prompt.tokens.clone();
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+    // Normalize the checkpoint payload to the entry's restore domain. A
+    // target-only publication is intentionally incapable of carrying draft or
+    // speculative state, even when the live slot's checkpoint list did.
+    for (const auto & checkpoint : prompt.checkpoints) {
+        if (checkpoint.data_tgt.empty()) {
+            continue;
+        }
+        if (coverage.scope == server_prompt_restore_scope::target_and_draft &&
+                checkpoint.data_dft.empty()) {
+            continue;
+        }
+
+        auto copy = checkpoint;
+        if (coverage.scope == server_prompt_restore_scope::target_only) {
+            copy.clear_dft();
+        }
+        prompt_new.checkpoints.push_back(std::move(copy));
+    }
+
+    auto coverage_new = server_prompt_build_restore_coverage(
+            prompt_new,
+            coverage.scope,
+            coverage.target,
+            coverage.draft);
+
+    if (!server_prompt_restore_coverage_is_valid(coverage_new, prompt_new.tokens) ||
+            state_size_tgt == 0 ||
+            (coverage_new.scope == server_prompt_restore_scope::target_only && state_size_dft != 0) ||
+            (coverage_new.scope == server_prompt_restore_scope::target_and_draft && state_size_dft == 0)) {
+        SRV_WRN(" - prompt with length %d has inconsistent restore coverage, skipping\n", prompt.n_tokens());
+        return nullptr;
+    }
+
+    const auto scope_covers = [](server_prompt_restore_scope replacement, server_prompt_restore_scope required) {
+        return (uint8_t) replacement >= (uint8_t) required;
+    };
+    const auto exact_landing = [](size_t n_tokens) {
+        return n_tokens > 0 ? n_tokens - 1 : 0;
+    };
+
+    // Suppress this entry only when an existing token superset can reproduce
+    // the new entry's exact effective landing in the same state domain.
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const size_t lcp = it->prompt.tokens.get_common_prefix(prompt_new.tokens);
+        if (lcp != prompt_new.tokens.size() || !scope_covers(it->coverage.scope, coverage_new.scope)) {
+            continue;
+        }
+
+        const auto plan = server_prompt_make_restore_plan(
+                it->coverage, it->prompt.tokens, lcp, prompt_new.tokens.size());
+        if (plan.kind != server_prompt_restore_kind::unusable &&
+                plan.effective_tokens == exact_landing(prompt_new.tokens.size())) {
+            SRV_TRC("%s", " - prompt exact landing is already covered by the cache, skipping\n");
             return nullptr;
         }
     }
 
-    // calculate checkpoints size to see if it will fit with the prompt
+    // calculate normalized checkpoint size to see if it will fit
     size_t checkpoints_size = 0;
-    for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
+    for (const auto & checkpoint : prompt_new.checkpoints) {
+        checkpoints_size += checkpoint.size();
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
@@ -2586,13 +3126,18 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
-    // remove any cached prompts that are fully contained in the current prompt
+    // Remove a contained entry only if the replacement reproduces that exact
+    // landing and does not downgrade target+draft state to target-only.
     for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+        const size_t len = it->prompt.tokens.get_common_prefix(prompt_new.tokens);
+        const auto plan = server_prompt_make_restore_plan(
+                coverage_new, prompt_new.tokens, len, it->prompt.tokens.size());
 
-        if (len == (int) it->prompt.tokens.size()) {
-            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
-
+        if (len == it->prompt.tokens.size() &&
+                scope_covers(coverage_new.scope, it->coverage.scope) &&
+                plan.kind != server_prompt_restore_kind::unusable &&
+                plan.effective_tokens == exact_landing(it->prompt.tokens.size())) {
+            SRV_TRC(" - removing superseded cached prompt with exact landing length %zu\n", len);
             it = drop_entry(it);
         } else {
             ++it;
@@ -2629,8 +3174,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     server_prompt_cache_state state_new;
-    state_new.prompt.tokens      = prompt.tokens.clone();
-    state_new.prompt.checkpoints = prompt.checkpoints;
+    state_new.prompt             = std::move(prompt_new);
+    state_new.coverage           = std::move(coverage_new);
     state_new.data.main          = std::move(state_data_tgt);
     state_new.data.drft          = std::move(state_data_dft);
     state_new.dash_id            = dash_id_next++;
@@ -2656,53 +3201,59 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     ++dash_lookups;
     dash_last_load = {};
 
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    const size_t lcp_resident = prompt.tokens.get_common_prefix(tokens_new);
+    const auto coverage_resident = server_prompt_capture_restore_coverage(
+            prompt, ctx_tgt, ctx_dft, id_slot);
+    const auto plan_resident = server_prompt_make_restore_plan(
+            coverage_resident, prompt.tokens, lcp_resident, tokens_new.size());
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
-
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    size_t reusable_best = plan_resident.effective_tokens;
+    SRV_TRC(" - looking for better prompt, resident raw lcp = %zu, effective = %zu, kind = %u\n",
+            lcp_resident, reusable_best, (unsigned) plan_resident.kind);
 
     auto it_best = states.end();
+    server_prompt_restore_plan plan_best;
 
-    // find the most similar cached prompt, that would also preserve the most context
+    // Rank only coverage-qualified effective tokens. A long state with an exact
+    // system/tool/user checkpoint is valuable even when that boundary is less
+    // than 25% of the serialized prompt, so raw f_keep is not an admission gate.
+    // Ties stay resident, avoiding a state restore with no reuse gain.
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
-
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
-
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
-
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
+        if (it->coverage.scope == server_prompt_restore_scope::target_and_draft && ctx_dft == nullptr) {
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
+        const size_t lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        const auto plan_cur = server_prompt_make_restore_plan(
+                it->coverage, it->prompt.tokens, lcp_cur, tokens_new.size());
 
+        SRV_TRC("   - prompt with length %7zu, raw lcp = %7zu, effective = %7zu, kind = %u\n",
+                it->prompt.tokens.size(), lcp_cur, plan_cur.effective_tokens, (unsigned) plan_cur.kind);
+
+        if (plan_cur.kind != server_prompt_restore_kind::unusable &&
+                plan_cur.effective_tokens > reusable_best) {
+            reusable_best = plan_cur.effective_tokens;
             it_best = it;
+            plan_best = plan_cur;
         }
     }
 
     if (it_best == states.end()) {
         // no cache entry beats the resident state
-        if (lcp_best > 0) {
+        if (reusable_best > 0) {
             ++dash_hits_resident;
             dash_last_load.source   = 0; // resident
-            dash_last_load.n_tokens = (uint64_t) lcp_best;
+            dash_last_load.n_tokens = (uint64_t) reusable_best;
         } else {
             ++dash_misses;
         }
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+        SRV_TRC(" - found better coverage-qualified prompt with %zu effective tokens\n", reusable_best);
 
         const bool from_disk = it_best->on_disk();
-        const int  lcp_restored = it_best->prompt.tokens.get_common_prefix(tokens_new);
+        const size_t tokens_restored = plan_best.effective_tokens;
 
         if (from_disk && !load_from_disk(*it_best)) {
             // unreadable or stale file - drop the entry so it is not retried
@@ -2732,6 +3283,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu - dropping cache entry\n", size);
 
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
+                if (ctx_dft) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
+                }
+
                 // the entry failed to restore once - it will fail again, so
                 // drop it (and its file) instead of retrying it forever
                 drop_entry(it_best);
@@ -2755,6 +3311,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu - dropping cache entry\n", size);
 
+                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
+
                     drop_entry(it_best);
 
                     ++dash_misses;
@@ -2770,10 +3329,33 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             // stale rows.
         }
 
+        // Fail closed if the restored representation does not produce the
+        // same coverage decision advertised before the I/O. This is what
+        // prevents a screened cache hit from becoming an admission-time clear.
+        const auto coverage_actual = server_prompt_capture_restore_coverage(
+                it_best->prompt, ctx_tgt, ctx_dft, id_slot);
+        const size_t lcp_actual = it_best->prompt.tokens.get_common_prefix(tokens_new);
+        const auto plan_actual = server_prompt_make_restore_plan(
+                coverage_actual, it_best->prompt.tokens, lcp_actual, tokens_new.size());
+        if (!pcache_coverage_equal(coverage_actual, it_best->coverage) ||
+                plan_actual.kind != plan_best.kind ||
+                plan_actual.effective_tokens != plan_best.effective_tokens ||
+                plan_actual.checkpoint_index != plan_best.checkpoint_index) {
+            SRV_WRN("%s", "restored state did not satisfy its advertised coverage - dropping cache entry\n");
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
+            if (ctx_dft) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
+            }
+            drop_entry(it_best);
+            ++dash_misses;
+            return false;
+        }
+
         ++dash_hits_entry;
         dash_last_load.source   = from_disk ? 2 : 1; // disk : ram
-        dash_last_load.n_tokens = (uint64_t) std::max(0, lcp_restored);
+        dash_last_load.n_tokens = (uint64_t) tokens_restored;
         dash_last_load.n_bytes  = bytes_restored;
+        dash_last_load.restored_scope = plan_best.scope;
 
         if (from_disk) {
             // keep the file and a slim index entry: the same prefix can be
@@ -2781,6 +3363,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             // after a server restart) at SSD cost instead of a re-prefill
             server_prompt_cache_state slim;
             slim.prompt.tokens = it_best->prompt.tokens.clone();
+            slim.coverage      = it_best->coverage;
             slim.file          = std::move(it_best->file);
             slim.size_disk     = it_best->size_disk;
 

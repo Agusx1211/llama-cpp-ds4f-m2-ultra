@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 //
@@ -114,11 +115,35 @@ struct llama_kv_iswa_resident_attach_quote {
     friend class llama_kv_cache_iswa;
 };
 
+// Placement-independent K-only sequence image used by the DSV4 aggregate
+// state container.  Positions are absolute and strictly increasing.  The
+// tensor payload is emitted in that same logical order and contains tensor
+// geometry plus row bytes, but no execution stream, cell, sparse-page, or
+// resident-handle identity.
+constexpr uint32_t LLAMA_KV_ISWA_LOGICAL_STATE_SCHEMA = 1;
+
+struct llama_kv_iswa_logical_plane_state {
+    uint32_t                       schema_version = LLAMA_KV_ISWA_LOGICAL_STATE_SCHEMA;
+    std::vector<llama_pos>         positions;
+    std::vector<llama_kv_cell_ext> extensions;
+    std::vector<uint8_t>           tensor_payload;
+    uint64_t                       checksum = 0;
+};
+
+struct llama_kv_iswa_logical_sequence_state {
+    uint32_t                          schema_version = LLAMA_KV_ISWA_LOGICAL_STATE_SCHEMA;
+    llama_kv_iswa_logical_plane_state base;
+    llama_kv_iswa_logical_plane_state swa;
+};
+
+struct llama_kv_iswa_logical_import_plan;
+
 // Move-only exclusive capability for a composite resident transaction. The
-// token retains the raw/SWA recursive mutex for its entire lifetime, so
-// ordinary cache mutation and graph preparation in other threads cannot enter
-// between component validation and publication. Coordinator calls on the
-// owning thread may safely re-enter the same mutex.
+// token retains a generation-bound raw/SWA gate, so ordinary cache mutation
+// and graph preparation in other threads cannot enter between component
+// validation and publication. Coordinator calls on the owning thread may
+// safely re-enter the recursive mutex; release/destruction is cross-thread
+// safe and wakes every waiter immediately.
 class llama_kv_iswa_resident_transaction {
   public:
     llama_kv_iswa_resident_transaction() = default;
@@ -131,12 +156,19 @@ class llama_kv_iswa_resident_transaction {
 
     explicit operator bool() const { return active; }
 
+    // Coordinator work is same-thread so recursive calls remain well-defined,
+    // but release/destruction is cross-thread safe. release() lets a consumed
+    // quote drop quiescence immediately even while the quote remains alive.
+    bool owned_by_current_thread() const;
+    void release() noexcept;
+
   private:
     llama_kv_iswa_resident_transaction(std::shared_ptr<llama_kv_cache_resident_guard> guard,
                                        std::unique_lock<std::recursive_mutex>         lock);
 
     std::shared_ptr<llama_kv_cache_resident_guard> guard;
-    std::unique_lock<std::recursive_mutex>         lock;
+    std::thread::id                                owner_thread;
+    uint64_t                                       generation = 0;
     bool                                           active = false;
 
     friend class llama_kv_cache_iswa;
@@ -169,7 +201,8 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         ggml_backend_buffer_type_t buft_override = nullptr,
-                    uint32_t   n_resident = 0);
+                    uint32_t   n_resident = 0,
+                         bool   logical_transactions = false);
 
     llama_kv_cache_iswa(
             const llama_model & model,
@@ -189,7 +222,8 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         ggml_backend_buffer_type_t buft_override = nullptr,
-                    uint32_t   n_resident = 0);
+                    uint32_t   n_resident = 0,
+                         bool   logical_transactions = false);
 
     ~llama_kv_cache_iswa();
 
@@ -232,6 +266,27 @@ public:
 
     llama_kv_cache * get_base() const;
     llama_kv_cache * get_swa () const;
+
+    // Canonical raw/SWA state for one DSV4 sequence.  These operations are
+    // intentionally K-only: DSV4 removes V storage from both ISWA planes.
+    // A prepared import builds complete replacement metadata without touching
+    // the execution stream. commit_logical_sequence_import() performs only
+    // validated tensor writes and noexcept metadata moves, so an occupied
+    // destination remains byte-for-byte intact until the caller crosses its
+    // own multi-component publication boundary.
+    llama_kv_iswa_logical_sequence_state export_logical_sequence(llama_seq_id seq_id) const;
+    void validate_logical_sequence(
+            const llama_kv_iswa_logical_sequence_state & state,
+            llama_pos                                    accepted_frontier) const;
+    std::shared_ptr<llama_kv_iswa_logical_import_plan> prepare_logical_sequence_import(
+            llama_seq_id                                 seq_id,
+            const llama_kv_iswa_logical_sequence_state & state,
+            llama_pos                                    accepted_frontier) const;
+    bool validate_logical_sequence_import(
+            const std::shared_ptr<llama_kv_iswa_logical_import_plan> & plan) const;
+    bool commit_logical_sequence_import(
+            const std::shared_ptr<llama_kv_iswa_logical_import_plan> & plan,
+            const llama_kv_iswa_logical_sequence_state & state) noexcept;
 
     // Dormant DSV4 ownership primitive. A detach quote validates raw and SWA
     // metadata plus one free resident aperture before any mapping changes.
@@ -284,6 +339,11 @@ private:
 
     std::unique_ptr<llama_kv_cache> kv_base;
     std::unique_ptr<llama_kv_cache> kv_swa;
+
+    // DSV4 logical restore needs the same quiescence boundary as resident
+    // moves even when no resident aperture was requested. Generic ISWA keeps
+    // this null and pays no locking or graph-lease cost.
+    std::shared_ptr<llama_kv_cache_resident_guard> logical_guard;
 
     struct resident_impl;
     std::unique_ptr<resident_impl> resident;
