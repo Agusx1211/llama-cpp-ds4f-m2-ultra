@@ -1670,6 +1670,287 @@ void test_hash_throughput() {
     printf("  ok: payload hash runs at %.1f GiB/s (informational)\n", gib_s);
 }
 
+struct fake_restore_sequence {
+    bool    occupied = false;
+    uint8_t marker   = 0;
+};
+
+struct fake_restore_engine {
+    fake_restore_sequence target;
+    fake_restore_sequence draft;
+
+    std::vector<std::pair<uint8_t, server_prompt_restore_coverage>> coverage_by_marker;
+    std::vector<uint8_t> fail_target;
+    std::vector<uint8_t> fail_draft;
+    std::vector<uint8_t> target_attempts;
+    std::vector<uint8_t> draft_attempts;
+    std::vector<uint8_t> captured_markers;
+    size_t clears_target = 0;
+    size_t clears_draft  = 0;
+
+    server_prompt_restore_coverage coverage_for(uint8_t marker) const {
+        const auto it = std::find_if(coverage_by_marker.begin(), coverage_by_marker.end(),
+                [&](const auto & item) { return item.first == marker; });
+        return it == coverage_by_marker.end() ?
+                server_prompt_restore_coverage {} : it->second;
+    }
+};
+
+llama_context * fake_context(fake_restore_sequence & sequence) {
+    return reinterpret_cast<llama_context *>(&sequence);
+}
+
+server_prompt_cache::restore_test_hooks fake_restore_hooks(fake_restore_engine & engine) {
+    server_prompt_cache::restore_test_hooks hooks;
+    hooks.capture_coverage = [&](const server_prompt &, llama_context *, llama_context *, llama_seq_id) {
+        if (!engine.target.occupied) {
+            return server_prompt_restore_coverage {};
+        }
+        engine.captured_markers.push_back(engine.target.marker);
+        return engine.coverage_for(engine.target.marker);
+    };
+    hooks.get_size = [](llama_context * ctx, llama_seq_id) {
+        const auto & sequence = *reinterpret_cast<fake_restore_sequence *>(ctx);
+        return sequence.occupied ? size_t(1) : size_t(0);
+    };
+    hooks.get_data = [](llama_context * ctx, uint8_t * data, size_t size, llama_seq_id) {
+        const auto & sequence = *reinterpret_cast<fake_restore_sequence *>(ctx);
+        if (!sequence.occupied || size != 1) {
+            return size_t(0);
+        }
+        data[0] = sequence.marker;
+        return size_t(1);
+    };
+    hooks.set_data = [&](llama_context * ctx, const uint8_t * data, size_t size, llama_seq_id) {
+        auto & sequence = *reinterpret_cast<fake_restore_sequence *>(ctx);
+        if (size != 1) {
+            return size_t(0);
+        }
+
+        const uint8_t marker = data[0];
+        const bool is_target = &sequence == &engine.target;
+        auto & attempts = is_target ? engine.target_attempts : engine.draft_attempts;
+        const auto & failures = is_target ? engine.fail_target : engine.fail_draft;
+        attempts.push_back(marker);
+        if (std::find(failures.begin(), failures.end(), marker) != failures.end()) {
+            return size_t(0);
+        }
+
+        sequence.occupied = true;
+        sequence.marker   = marker;
+        return size;
+    };
+    hooks.clear = [&](llama_context * ctx, llama_seq_id) {
+        auto & sequence = *reinterpret_cast<fake_restore_sequence *>(ctx);
+        sequence.occupied = false;
+        sequence.marker   = 0;
+        if (&sequence == &engine.target) {
+            ++engine.clears_target;
+        } else {
+            ++engine.clears_draft;
+        }
+    };
+    return hooks;
+}
+
+constexpr int RESTORE_TEST_TOKEN_SEED = 701;
+
+server_prompt_cache_state make_direct_restore_state(
+        size_t n_tokens,
+        uint8_t target_marker,
+        bool paired = false,
+        uint8_t draft_marker = 0) {
+    entry_spec spec;
+    spec.n_tokens = n_tokens;
+    spec.n_main   = 1;
+    spec.n_drft   = paired ? 1 : 0;
+    spec.n_ckpt   = 0;
+    spec.seed     = RESTORE_TEST_TOKEN_SEED;
+
+    auto state = make_state(spec);
+    state.data.main = { target_marker };
+    state.data.drft = paired ? std::vector<uint8_t> { draft_marker } : std::vector<uint8_t> {};
+
+    const auto target = restore_domain(0, (llama_pos) n_tokens - 2, 0, 0, false);
+    const auto draft  = paired ? target : server_prompt_restore_domain {};
+    state.coverage = server_prompt_build_restore_coverage(
+            state.prompt,
+            paired ? server_prompt_restore_scope::target_and_draft
+                   : server_prompt_restore_scope::target_only,
+            target,
+            draft);
+    return state;
+}
+
+void test_failed_candidate_restores_target_only_resident() {
+    server_prompt_cache cache(64, TEST_LIMIT_TOKENS, "", 0, TEST_FINGERPRINT);
+
+    const auto resident = make_direct_restore_state(50, 10);
+    auto bad = make_direct_restore_state(100, 30);
+    cache.states.push_back(std::move(bad));
+
+    fake_restore_engine engine;
+    engine.target = { true, 10 };
+    engine.draft  = { true, 99 };
+    engine.coverage_by_marker = {
+        { 10, resident.coverage },
+        { 30, cache.states.front().coverage },
+    };
+    engine.fail_target = { 30 };
+    cache.set_restore_test_hooks(fake_restore_hooks(engine));
+
+    server_prompt prompt = resident.prompt.clone();
+    const server_tokens request(make_tokens(140, RESTORE_TEST_TOKEN_SEED), false);
+    require(cache.load(prompt, request, fake_context(engine.target), fake_context(engine.draft), 0),
+            "bad target-only candidate destroyed the resident fallback");
+    require(prompt.tokens.size() == resident.prompt.tokens.size(),
+            "resident fallback changed the published prompt");
+    require(engine.target.occupied && engine.target.marker == 10,
+            "resident target bytes were not restored after candidate failure");
+    require(!engine.draft.occupied,
+            "target-only rollback resurrected stale draft state");
+    require(engine.target_attempts == std::vector<uint8_t>({ 30, 10 }),
+            "restore did not attempt the bad candidate then the resident snapshot");
+    require(cache.states.empty() && cache.dash_drops == 1,
+            "bad target-only entry was not retired");
+    require(cache.dash_last_load.source == 0 &&
+                    cache.dash_last_load.n_tokens == 49 &&
+                    cache.dash_last_load.restored_scope == server_prompt_restore_scope::target_only,
+            "resident rollback was not reported as reusable target-only coverage");
+
+    printf("  ok: failed target-only candidate restores resident reuse and clears stale draft state\n");
+}
+
+void test_failed_paired_draft_restores_paired_resident() {
+    server_prompt_cache cache(64, TEST_LIMIT_TOKENS, "", 0, TEST_FINGERPRINT);
+
+    const auto resident = make_direct_restore_state(50, 10, true, 11);
+    auto bad = make_direct_restore_state(100, 40, true, 41);
+    cache.states.push_back(std::move(bad));
+
+    fake_restore_engine engine;
+    engine.target = { true, 10 };
+    engine.draft  = { true, 11 };
+    engine.coverage_by_marker = {
+        { 10, resident.coverage },
+        { 40, cache.states.front().coverage },
+    };
+    engine.fail_draft = { 41 };
+    cache.set_restore_test_hooks(fake_restore_hooks(engine));
+
+    server_prompt prompt = resident.prompt.clone();
+    const server_tokens request(make_tokens(140, RESTORE_TEST_TOKEN_SEED), false);
+    require(cache.load(prompt, request, fake_context(engine.target), fake_context(engine.draft), 0),
+            "draft restore failure destroyed the paired resident fallback");
+    require(engine.target.occupied && engine.target.marker == 10 &&
+                    engine.draft.occupied && engine.draft.marker == 11,
+            "paired resident target/draft state was not restored atomically");
+    require(engine.target_attempts == std::vector<uint8_t>({ 40, 10 }) &&
+                    engine.draft_attempts == std::vector<uint8_t>({ 41, 11 }),
+            "paired transaction did not clear and restore both domains");
+    require(std::find(engine.captured_markers.begin(), engine.captured_markers.end(), 40) ==
+                    engine.captured_markers.end(),
+            "candidate with a failed draft domain was coverage-validated or published");
+    require(cache.states.empty() && cache.dash_last_load.source == 0,
+            "failed paired entry survived or displaced the resident report");
+
+    printf("  ok: failed draft restore cannot publish partial target state and paired resident survives\n");
+}
+
+void test_multiple_bad_candidates_fall_through_to_ssd() {
+    scratch_dir dir("transactional-fallback");
+    server_prompt_cache cache(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT,
+            integration_io_config());
+
+    auto durable = make_direct_restore_state(90, 20);
+    cache.states.push_back(std::move(durable));
+    require(cache.spill_to_disk(cache.states.back()), "could not spill valid fallback candidate");
+    wait_for_cache_io(cache, [&] { return cache.states.front().on_disk(); },
+            "valid fallback candidate did not become durable");
+
+    auto mismatch = make_direct_restore_state(110, 31);
+    const auto mismatch_coverage = mismatch.coverage;
+    cache.states.push_back(std::move(mismatch));
+    auto structural = make_direct_restore_state(120, 30);
+    const auto structural_coverage = structural.coverage;
+    cache.states.push_back(std::move(structural));
+
+    const auto resident = make_direct_restore_state(50, 10);
+    const auto degraded = make_direct_restore_state(70, 31);
+
+    fake_restore_engine engine;
+    engine.target = { true, 10 };
+    engine.coverage_by_marker = {
+        { 10, resident.coverage },
+        { 20, cache.states.front().coverage },
+        { 30, structural_coverage },
+        { 31, degraded.coverage },
+    };
+    engine.fail_target = { 30 };
+    cache.set_restore_test_hooks(fake_restore_hooks(engine));
+
+    server_prompt prompt = resident.prompt.clone();
+    const server_tokens request(make_tokens(150, RESTORE_TEST_TOKEN_SEED), false);
+    require(cache.load(prompt, request, fake_context(engine.target), nullptr, 0),
+            "multiple bad candidates prevented the valid SSD fallback");
+    require(prompt.tokens.size() == 90 && engine.target.occupied && engine.target.marker == 20,
+            "best still-valid SSD fallback was not installed");
+    require(engine.target_attempts == std::vector<uint8_t>({ 30, 31, 20 }),
+            "candidates were not attempted in descending effective-coverage order");
+    require(cache.states.size() == 1 && cache.states.front().on_disk(),
+            "bad candidates survived or the reusable SSD index was consumed");
+    require(cache.dash_drops == 2 && cache.dash_last_load.source == 2,
+            "candidate retirement or SSD hit reporting is incorrect");
+
+    const auto attempts_before_repeat = engine.target_attempts;
+    require(cache.load(prompt, request, fake_context(engine.target), nullptr, 0),
+            "resident SSD result was not reusable on a repeated consultation");
+    require(engine.target_attempts == attempts_before_repeat && cache.dash_drops == 2,
+            "retired bad candidates were retried on a repeated consultation");
+    require(mismatch_coverage.target.pos_max > degraded.coverage.target.pos_max,
+            "coverage-mismatch fixture does not advertise more state than it restores");
+
+    printf("  ok: repeated bad RAM candidates retire once and fall through to a valid SSD prefix\n");
+}
+
+void test_failed_candidate_without_fallback_misses_closed() {
+    server_prompt_cache cache(64, TEST_LIMIT_TOKENS, "", 0, TEST_FINGERPRINT);
+    auto bad = make_direct_restore_state(100, 30);
+    cache.states.push_back(std::move(bad));
+
+    fake_restore_engine engine;
+    engine.coverage_by_marker = {
+        { 30, cache.states.front().coverage },
+    };
+    engine.fail_target = { 30 };
+    cache.set_restore_test_hooks(fake_restore_hooks(engine));
+
+    server_prompt prompt;
+    const server_tokens request(make_tokens(140, RESTORE_TEST_TOKEN_SEED), false);
+    require(!cache.load(prompt, request, fake_context(engine.target), fake_context(engine.draft), 0),
+            "failed candidate with no resident or alternate fallback reported success");
+    require(!engine.target.occupied && !engine.draft.occupied,
+            "no-fallback failure left target or draft state published");
+    require(cache.states.empty() && cache.dash_drops == 1 && cache.dash_misses == 1,
+            "no-fallback failure did not retire the bad entry and record one safe miss");
+
+    printf("  ok: true no-fallback restore failures retire the entry and miss with empty domains\n");
+}
+
+void test_discard_unpopulated_allocation() {
+    server_prompt_cache cache(64, TEST_LIMIT_TOKENS, "", 0, TEST_FINGERPRINT);
+    cache.states.push_back(make_direct_restore_state(64, 10));
+    auto * allocated = &cache.states.back();
+
+    require(cache.discard(allocated), "discard rejected a live allocated cache node");
+    require(cache.states.empty() && cache.dash_drops == 1,
+            "discard left a partially populated allocation visible");
+    require(!cache.discard(allocated),
+            "discard accepted a pointer after its exact node was retired");
+
+    printf("  ok: incomplete cache allocations can be retired by exact owner-thread identity\n");
+}
+
 } // namespace
 
 int main() {
@@ -1701,6 +1982,11 @@ int main() {
         { "poisoned startup directory", test_startup_survives_a_poisoned_directory },
         { "startup cleanup failure",     test_startup_cleanup_failure_disables_live_writes },
         { "startup non-regular path",    test_startup_nonregular_cache_path_disables_live_writes },
+        { "resident transaction",        test_failed_candidate_restores_target_only_resident },
+        { "paired transaction",          test_failed_paired_draft_restores_paired_resident },
+        { "ranked fallback",             test_multiple_bad_candidates_fall_through_to_ssd },
+        { "no-fallback miss",            test_failed_candidate_without_fallback_misses_closed },
+        { "discard incomplete",          test_discard_unpopulated_allocation     },
         { "hash throughput",            test_hash_throughput                     },
     };
 
