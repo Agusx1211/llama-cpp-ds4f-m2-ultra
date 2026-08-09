@@ -1071,19 +1071,33 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     // (ne01 = n_ubatch) already packs. So 2..7 was the one shape paying the
     // scatter penalty. See notes/2026-08-09-sparse-pack-routing.md.
     //
-    // MEASURED, and the reason the default stays at 8: closing the gap makes
-    // things WORSE. At 4k and 24k, where both arms produce byte-identical
-    // transcripts and the A/B is fully controlled, threshold 2 costs -9.90% and
-    // -1.93% t/s; at 37k it is -2.14%. GGML_METAL_KPROF says why: at a 4-row
-    // verify, DSV4_SPARSE_PACK costs 8.743 ms of a 20.642 ms compressed-attention
-    // chain, because ggml_metal_op_dsv4_sparse_pack dispatches ONE THREADGROUP
-    // PER TOKEN for the n_raw > 0 form - 4 threadgroups on a 152-core GPU, with
-    // a serial 640-iteration row loop inside. Per token per layer that is 104 us
-    // against 1.10 us at prefill, 95x worse. The packed flash attention itself is
-    // NOT cheaper than the masked one (5.885 vs 5.745 ms) despite a 4.8x smaller
-    // K, because the vec kernel is floor-limited per dispatch geometry. Give the
-    // pack kernel parallelism at small nt and this is worth re-measuring; until
-    // then the knob is a measurement seam, not a tuning parameter.
+    // MEASURED TWICE, and the answer changed in between.
+    //
+    // Round 1 (sparse-pack-routing, default kept at 8): closing the gap made
+    // things WORSE - threshold 2 cost -9.90% t/s at 4k and -1.93% at 24k on
+    // byte-identical transcripts. GGML_METAL_KPROF said why: at a 4-row verify
+    // DSV4_SPARSE_PACK cost 8.743 ms of a 20.642 ms compressed-attention chain,
+    // because ggml_metal_op_dsv4_sparse_pack dispatched ONE THREADGROUP PER
+    // TOKEN for the n_raw > 0 form - 4 threadgroups on a 152-core GPU, with a
+    // serial 640-iteration row loop inside. 104 us per token per layer against
+    // 1.10 us at prefill, 95x worse.
+    //
+    // Round 2 (sparse-pack-kernel, this default): that kernel now slices the row
+    // range as well as the token range, the same node costs 0.792 ms (11.0x
+    // less; 0.040 ms on the steady-state reused graph), and the verdict inverts.
+    // Controlled A/Bs - same transcript sha AND same accepted/drafted counts in
+    // both arms except where noted:
+    //   24k  23.161 -> 25.343 t/s  (+9.42%)
+    //   37k  24.865 -> 26.313 t/s  (+5.82%, transcripts diverge; -17.1% per
+    //                               verify iteration despite acceptance
+    //                               falling 14.3 pp)
+    //   12k  28.691 -> 32.581 t/s  (+13.56%, transcripts diverge)
+    //   4k   25.728 -> 25.334 t/s  (-1.53%)  <- the one loss, see MIN_CSA below
+    // The packed flash attention is still NOT cheaper than the masked one at 4k
+    // (5.876 vs 5.752 ms) because the vec kernel is floor-limited per dispatch
+    // geometry; the win comes from depth, where the mask path's K grows with
+    // n_csa while the packed path's stays at n_swa + top_k = 640 rows.
+    // See notes/2026-08-09-sparse-pack-kernel.md.
     //
     // The threshold is process-wide on purpose. The DSpark drafter is a DeepSeek
     // V4 model and derives from this same graph class, so a per-model threshold
@@ -1094,25 +1108,50 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     // 142/182 draft counts). dspark-0731-expertsonly never reaches this builder.
     static const int64_t sparse_pack_min_tokens = []() {
         const char * v = std::getenv("GGML_DSV4_SPARSE_PACK_MIN_TOKENS");
-        const int64_t n = v != nullptr ? atoll(v) : 8;
+        const int64_t n = v != nullptr ? atoll(v) : 2;
         return n < 2 ? (int64_t) 2 : n;
+    }();
+
+    // GGML_DSV4_SPARSE_PACK_MIN_CSA_MULT: the packed working set is a FIXED
+    // n_swa + top_k = 640 rows per token, so packing only pays once the mask
+    // path has meaningfully more than that to walk. At n_csa = 758 (4k) it does
+    // not - the two paths cost the same in the compressed-attention chain
+    // (0.792 vs 0.791 ms steady state) and the packed graph measures ~1% slower
+    // end-to-end. At n_csa = 2304 (12k) and above it does. The floor is
+    // <mult>*indexer_top_k, i.e. 1024 by default, the same ratio the
+    // gather_decode predicate above already uses.
+    //
+    // It applies ONLY below the historical 8-row boundary, so prefill routing
+    // (nt = n_ubatch) is unaffected by either knob and stays bit-identical to
+    // master at any setting.
+    static const int64_t sparse_pack_min_csa_mult = []() {
+        const char * v = std::getenv("GGML_DSV4_SPARSE_PACK_MIN_CSA_MULT");
+        const int64_t n = v != nullptr ? atoll(v) : 2;
+        return n < 1 ? (int64_t) 1 : n;
     }();
     const bool is_dspark_draft = hparams.n_dspark_block_size > 0;
 
-    // The pack kernel stages the whole per-token working set in threadgroup
-    // memory (kernel_dsv4_sparse_pack / kernel_dsv4_indexed_sparse_pack in
-    // ggml-metal.metal, `constexpr int max_selected = 128 + 512`). That bound
-    // is this target's n_swa + indexer_top_k exactly, so it holds for DSV4
-    // Flash - but it is a silent threadgroup-memory overrun if a future model
-    // widens either, and it is now reachable from decode as well as prefill.
-    // Fall back to the mask path rather than corrupt memory.
+    // The pack kernel stages ONE ROW SLICE of the per-token working set in
+    // threadgroup memory (DSV4_PACK_MAX_ROWS in ggml-metal.metal), and
+    // ggml_metal_dsv4_sparse_pack_slices clamps a slice to that bound, so the
+    // kernel is memory-safe for any n_raw + n_comp. This predicate is therefore
+    // no longer load-bearing for safety; it is kept as a cheap invariant so a
+    // future model that widens n_swa or indexer_top_k past the shape this fork
+    // has actually measured takes the (slower) mask path rather than an
+    // untested one.
     constexpr int64_t sparse_pack_max_selected = 128 + 512;
     const int64_t sparse_pack_nk = top_k != nullptr ?
             std::min<int64_t>(hparams.n_swa, raw_k->ne[2]) + top_k->ne[0] : 0;
     const bool sparse_pack_fits = top_k != nullptr && sparse_pack_nk <= sparse_pack_max_selected;
 
-    const bool sparse_prefill = q->ne[2] >= sparse_pack_min_tokens &&
+    // historical predicate, unchanged: prefill-sized batches always pack
+    const bool sparse_prefill_hist = q->ne[2] >= 8 &&
             n_csa > (int64_t) hparams.indexer_top_k;
+    // the speculative-verify range opened by GGML_DSV4_SPARSE_PACK_MIN_TOKENS
+    const bool sparse_verify = q->ne[2] >= sparse_pack_min_tokens && q->ne[2] < 8 &&
+            n_csa > (int64_t) hparams.indexer_top_k &&
+            n_csa >= sparse_pack_min_csa_mult*(int64_t) hparams.indexer_top_k;
+    const bool sparse_prefill = sparse_prefill_hist || sparse_verify;
     if (cparams.fused_dsv4_sparse && cparams.flash_attn &&
             sparse_k_type && sparse_pack_fits &&
             (sparse_probe || sparse_prefill)) {
