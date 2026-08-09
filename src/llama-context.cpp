@@ -3552,7 +3552,11 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
             // This is the first operation which changes an occupied
             // destination. Until here, every read and tensor write was scoped
             // to the unused candidate sequence.
-            dsv4->seq_cp(candidate_seq_id, seq_id, -1, -1);
+            if (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
+                dsv4->seq_cp(candidate_seq_id, seq_id, -1, -1);
+            } else {
+                dsv4->seq_cp_state(candidate_seq_id, seq_id);
+            }
             if (!memory_update(false)) {
                 throw std::runtime_error("failed to publish DSV4 restore candidate");
             }

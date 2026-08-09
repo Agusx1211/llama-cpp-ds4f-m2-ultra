@@ -26,11 +26,11 @@ static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
 
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
-static constexpr uint32_t DSV4_STATE_VERSION       = 2;
+static constexpr uint32_t DSV4_STATE_VERSION       = 3;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
-static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
+static constexpr uint32_t DSV4_COMP_STATE_VER      = 2;
 
 // Host-overhead profiler (LLAMA_HOST_PROFILE=1). Sub-phase attribution of the
 // per-decode DSV4 sparse page reservation, which llama_context reports as the
@@ -1352,12 +1352,13 @@ static void dsv4_state_write_tensor_streams(
 }
 
 static void dsv4_state_read_tensor_streams(
-        llama_io_read_i & io,
-        ggml_tensor     * tensor,
-        uint32_t          tensor_rows,
-        uint32_t          n_rows,
-        uint32_t          s0,
-        uint32_t          ns) {
+        llama_io_read_i                & io,
+        ggml_tensor                    * tensor,
+        uint32_t                         tensor_rows,
+        uint32_t                         n_rows,
+        uint32_t                         s0,
+        uint32_t                         ns,
+        const std::vector<uint32_t>     * stream_ids = nullptr) {
     int32_t  type_i_ref;
     uint64_t ne0_ref;
     uint64_t rows_ref;
@@ -1379,6 +1380,9 @@ static void dsv4_state_read_tensor_streams(
     if (n_rows > tensor_rows) {
         throw std::runtime_error("DSV4 state tensor row count exceeds storage");
     }
+    if (stream_ids && stream_ids->size() != ns) {
+        throw std::runtime_error("DSV4 state tensor stream map size mismatch");
+    }
 
     const size_t stream_stride = (size_t) tensor_rows*row_size;
     const size_t size          = (size_t) n_rows*row_size;
@@ -1387,7 +1391,11 @@ static void dsv4_state_read_tensor_streams(
     }
 
     for (uint32_t s = 0; s < ns; ++s) {
-        const size_t offset = (size_t) (s0 + s)*stream_stride;
+        const uint32_t stream = stream_ids ? (*stream_ids)[s] : s0 + s;
+        if ((int64_t) stream >= tensor->ne[2]) {
+            throw std::runtime_error("DSV4 state tensor stream out of range");
+        }
+        const size_t offset = (size_t) stream*stream_stride;
         io.read_tensor(tensor, offset, size);
     }
 }
@@ -2087,6 +2095,25 @@ void llama_dsv4_comp_state::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_
     sc_info.sdst.push_back((uint32_t) seq_id_dst);
 }
 
+void llama_dsv4_comp_state::seq_cp_all_depths(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst) {
+    GGML_ASSERT(seq_id_src >= 0 && (uint32_t) seq_id_src < n_stream);
+    GGML_ASSERT(seq_id_dst >= 0 && (uint32_t) seq_id_dst < n_stream);
+
+    if (seq_id_src == seq_id_dst) {
+        return;
+    }
+
+    clear(seq_id_dst, true);
+    sc_info.ssrc.reserve(sc_info.ssrc.size() + (size_t) n_rs_seq + 1);
+    sc_info.sdst.reserve(sc_info.sdst.size() + (size_t) n_rs_seq + 1);
+    for (uint32_t depth = 0; depth <= n_rs_seq; ++depth) {
+        sc_info.ssrc.push_back(depth*n_stream + (uint32_t) seq_id_src);
+        sc_info.sdst.push_back(depth*n_stream + (uint32_t) seq_id_dst);
+    }
+}
+
 void llama_dsv4_comp_state::apply_copies(const stream_copy_info & sc_info) const {
     if (!sc_info.ssrc.empty()) {
         bump_generation();
@@ -2239,42 +2266,45 @@ void llama_dsv4_comp_state::state_write(
         llama_seq_id seq_id,
         llama_state_seq_flags flags,
         const std::vector<uint32_t> & rs_idx) const {
-    GGML_UNUSED(flags);
-
     uint32_t s0;
     uint32_t ns;
     dsv4_state_src_stream_range(n_stream, seq_id, s0, ns);
 
-    std::vector<uint32_t> stream_ids(ns);
-    for (uint32_t s = 0; s < ns; ++s) {
-        const uint32_t seq = seq_id >= 0 ? (uint32_t) seq_id : s0 + s;
-        if (seq >= rs_idx.size() || rs_idx[seq] > n_rs_seq) {
-            throw std::runtime_error("DSV4 recurrent state rollback index out of range");
-        }
-        stream_ids[s] = rs_idx[seq]*n_stream + s0 + s;
-    }
-
+    const bool all_depths = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
+    const uint32_t serialized_depths = all_depths ? n_rs_seq + 1 : 1;
     const uint32_t version      = DSV4_COMP_STATE_VER;
     const uint32_t n_layer      = layers.size();
 
-    io.write(&version,      sizeof(version));
-    io.write(&ratio,        sizeof(ratio));
-    io.write(&state_size,   sizeof(state_size));
-    io.write(&n_embd_state, sizeof(n_embd_state));
-    io.write(&ns,           sizeof(ns));
-    io.write(&n_layer,      sizeof(n_layer));
+    io.write(&version,           sizeof(version));
+    io.write(&ratio,             sizeof(ratio));
+    io.write(&state_size,        sizeof(state_size));
+    io.write(&n_embd_state,      sizeof(n_embd_state));
+    io.write(&ns,                sizeof(ns));
+    io.write(&n_layer,           sizeof(n_layer));
+    io.write(&serialized_depths, sizeof(serialized_depths));
 
+    std::vector<uint32_t> stream_ids(ns);
     for (const auto & layer : layers) {
         io.write(&layer.il, sizeof(layer.il));
 
-        dsv4_state_write_tensor_streams(io, layer.kv,    state_size, state_size, s0, ns, &stream_ids);
-        dsv4_state_write_tensor_streams(io, layer.score, state_size, state_size, s0, ns, &stream_ids);
+        for (uint32_t depth = 0; depth < serialized_depths; ++depth) {
+            for (uint32_t s = 0; s < ns; ++s) {
+                const uint32_t seq = seq_id >= 0 ? (uint32_t) seq_id : s0 + s;
+                if (seq >= rs_idx.size() || rs_idx[seq] > n_rs_seq) {
+                    throw std::runtime_error("DSV4 recurrent state rollback index out of range");
+                }
+                const uint32_t source_depth = all_depths ? depth : rs_idx[seq];
+                stream_ids[s] = source_depth*n_stream + s0 + s;
+            }
+            dsv4_state_write_tensor_streams(
+                    io, layer.kv, state_size, state_size, s0, ns, &stream_ids);
+            dsv4_state_write_tensor_streams(
+                    io, layer.score, state_size, state_size, s0, ns, &stream_ids);
+        }
     }
 }
 
 void llama_dsv4_comp_state::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    GGML_UNUSED(flags);
-
     bump_generation();
 
     uint32_t version;
@@ -2283,13 +2313,15 @@ void llama_dsv4_comp_state::state_read(llama_io_read_i & io, llama_seq_id seq_id
     uint32_t n_embd_state_ref;
     uint32_t ns;
     uint32_t n_layer_ref;
+    uint32_t serialized_depths;
 
-    io.read(&version,          sizeof(version));
-    io.read(&ratio_ref,        sizeof(ratio_ref));
-    io.read(&state_size_ref,   sizeof(state_size_ref));
-    io.read(&n_embd_state_ref, sizeof(n_embd_state_ref));
-    io.read(&ns,               sizeof(ns));
-    io.read(&n_layer_ref,      sizeof(n_layer_ref));
+    io.read(&version,           sizeof(version));
+    io.read(&ratio_ref,         sizeof(ratio_ref));
+    io.read(&state_size_ref,    sizeof(state_size_ref));
+    io.read(&n_embd_state_ref,  sizeof(n_embd_state_ref));
+    io.read(&ns,                sizeof(ns));
+    io.read(&n_layer_ref,       sizeof(n_layer_ref));
+    io.read(&serialized_depths, sizeof(serialized_depths));
 
     if (version != DSV4_COMP_STATE_VER) {
         throw std::runtime_error("DSV4 compressor state version mismatch");
@@ -2300,9 +2332,15 @@ void llama_dsv4_comp_state::state_read(llama_io_read_i & io, llama_seq_id seq_id
     if (n_layer_ref != layers.size()) {
         throw std::runtime_error("DSV4 compressor state layer count mismatch");
     }
+    const bool all_depths = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
+    const uint32_t expected_depths = all_depths ? n_rs_seq + 1 : 1;
+    if (serialized_depths != expected_depths) {
+        throw std::runtime_error("DSV4 compressor state rollback-plane coverage mismatch");
+    }
 
     uint32_t s0;
     dsv4_state_dst_stream_range(n_stream, seq_id, ns, s0);
+    std::vector<uint32_t> stream_ids(ns);
 
     for (const auto & layer : layers) {
         uint32_t il_ref;
@@ -2311,8 +2349,15 @@ void llama_dsv4_comp_state::state_read(llama_io_read_i & io, llama_seq_id seq_id
             throw std::runtime_error("DSV4 compressor state layer id mismatch");
         }
 
-        dsv4_state_read_tensor_streams(io, layer.kv,    state_size, state_size, s0, ns);
-        dsv4_state_read_tensor_streams(io, layer.score, state_size, state_size, s0, ns);
+        for (uint32_t depth = 0; depth < serialized_depths; ++depth) {
+            for (uint32_t s = 0; s < ns; ++s) {
+                stream_ids[s] = depth*n_stream + s0 + s;
+            }
+            dsv4_state_read_tensor_streams(
+                    io, layer.kv, state_size, state_size, s0, ns, &stream_ids);
+            dsv4_state_read_tensor_streams(
+                    io, layer.score, state_size, state_size, s0, ns, &stream_ids);
+        }
     }
 }
 
@@ -4133,6 +4178,24 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     }
 }
 
+void llama_kv_cache_dsv4::seq_cp_state(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst) {
+    seq_cp(seq_id_src, seq_id_dst, -1, -1);
+    if (seq_id_src == seq_id_dst) {
+        return;
+    }
+
+    // seq_cp() deliberately canonicalizes an inference clone to current plane
+    // zero. A persisted state advertises the complete bounded rollback domain,
+    // so overwrite that queued canonical copy with every source plane and
+    // retain the selected pending rollback index.
+    csa_state->seq_cp_all_depths(seq_id_src, seq_id_dst);
+    hca_state->seq_cp_all_depths(seq_id_src, seq_id_dst);
+    lid_state->seq_cp_all_depths(seq_id_src, seq_id_dst);
+    rs_idx[seq_id_dst] = rs_idx[seq_id_src];
+}
+
 void llama_kv_cache_dsv4::seq_keep(llama_seq_id seq_id) {
     GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < n_seq_max);
 
@@ -4717,6 +4780,18 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     io.write(&version, sizeof(version));
     io.write(&mode,    sizeof(mode));
     io.write(&state_identity_hash, sizeof(state_identity_hash));
+    const uint32_t domain_count = seq_id >= 0 ? 1 : n_seq_max;
+    io.write(&domain_count,    sizeof(domain_count));
+    io.write(&n_rs_seq_active, sizeof(n_rs_seq_active));
+    io.write(&n_rs_seq,        sizeof(n_rs_seq));
+    for (uint32_t i = 0; i < domain_count; ++i) {
+        const llama_seq_id domain_seq = seq_id >= 0 ? seq_id : (llama_seq_id) i;
+        const llama_pos frontier = kv_raw->seq_pos_max(domain_seq);
+        const uint32_t rollback = partial_only ? 0 : rs_idx[(uint32_t) domain_seq];
+        io.write(&frontier, sizeof(frontier));
+        io.write(&rollback, sizeof(rollback));
+    }
+
 
     kv_raw->state_write(io, seq_id, flags);
 
@@ -4758,6 +4833,12 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     uint32_t version;
     uint32_t mode = DSV4_STATE_MODE_FULL;
     uint64_t identity;
+    uint32_t domain_count;
+    uint32_t active_rollback_depth;
+    uint32_t allocated_rollback_depth;
+    std::vector<llama_pos> frontiers;
+    std::vector<uint32_t> rollback_indices;
+
 
     io.read(&magic,   sizeof(magic));
     io.read(&version, sizeof(version));
@@ -4782,6 +4863,26 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     if (identity != state_identity_hash) {
         throw std::runtime_error("DSV4 state model/cache geometry identity mismatch");
     }
+    io.read(&domain_count,             sizeof(domain_count));
+    io.read(&active_rollback_depth,    sizeof(active_rollback_depth));
+    io.read(&allocated_rollback_depth, sizeof(allocated_rollback_depth));
+    const uint32_t expected_domains = seq_id >= 0 ? 1 : n_seq_max;
+    if (domain_count != expected_domains ||
+            active_rollback_depth != n_rs_seq_active ||
+            allocated_rollback_depth != n_rs_seq) {
+        throw std::runtime_error("DSV4 state sequence/rollback domain mismatch");
+    }
+    frontiers.resize(domain_count);
+    rollback_indices.resize(domain_count);
+    for (uint32_t i = 0; i < domain_count; ++i) {
+        io.read(&frontiers[i],       sizeof(frontiers[i]));
+        io.read(&rollback_indices[i], sizeof(rollback_indices[i]));
+        if (frontiers[i] < -1 || rollback_indices[i] > n_rs_seq_active ||
+                (partial_only && rollback_indices[i] != 0)) {
+            throw std::runtime_error("DSV4 state frontier/rollback metadata is invalid");
+        }
+    }
+
 
     if (!partial_only) {
         if (seq_id >= 0) {
@@ -4794,6 +4895,13 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     }
 
     kv_raw->state_read(io, seq_id, flags);
+    for (uint32_t i = 0; i < domain_count; ++i) {
+        const llama_seq_id domain_seq = seq_id >= 0 ? seq_id : (llama_seq_id) i;
+        if (kv_raw->seq_pos_max(domain_seq) != frontiers[i]) {
+            throw std::runtime_error("DSV4 restored raw/SWA frontier does not match serialized domain");
+        }
+    }
+
 
     if (!partial_only) {
         dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
@@ -4807,9 +4915,10 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
 
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
-        rs_idx[seq_id] = 0;
+        rs_idx[seq_id] = rollback_indices[0];
     } else {
-        std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        GGML_ASSERT(rollback_indices.size() == rs_idx.size());
+        std::copy(rollback_indices.begin(), rollback_indices.end(), rs_idx.begin());
     }
 }
 

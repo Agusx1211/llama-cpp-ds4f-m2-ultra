@@ -13,6 +13,9 @@
 #include <map>
 #include <stdexcept>
 
+static constexpr uint32_t LLAMA_RECURRENT_STATE_MAGIC   = 0x53524352; // RCRS
+static constexpr uint32_t LLAMA_RECURRENT_STATE_VERSION = 1;
+
 //
 // llama_memory_recurrent
 //
@@ -730,57 +733,24 @@ size_t llama_memory_recurrent::size_s_bytes() const {
     return size_s_bytes;
 }
 
-void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    GGML_UNUSED(flags);
-
-    std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
-    std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
+void llama_memory_recurrent::state_write(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) const {
+    std::vector<std::pair<uint32_t, uint32_t>> cell_ranges;
     uint32_t cell_count = 0;
 
-    // Count the number of cells with the specified seq_id
-    // Find all the ranges of cells with this seq id (or all, when -1)
     uint32_t cell_range_begin = size;
     for (uint32_t i = 0; i < size; ++i) {
         const auto & cell = cells[i];
         if ((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) {
             ++cell_count;
-            uint32_t rs_idx_cur = 0;
-
-            if (n_rs_seq != 0) {
-                if (seq_id != -1) {
-                    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < rs_idx.size());
-                    rs_idx_cur = rs_idx[seq_id];
-                } else {
-                    bool has_rs_idx = false;
-                    for (const llama_seq_id cell_seq_id : cell.seq_id) {
-                        GGML_ASSERT(cell_seq_id >= 0 && (size_t) cell_seq_id < rs_idx.size());
-
-                        const uint32_t seq_rs_idx = rs_idx[cell_seq_id];
-                        if (!has_rs_idx) {
-                            rs_idx_cur = seq_rs_idx;
-                            has_rs_idx = true;
-                        } else if (rs_idx_cur != seq_rs_idx) {
-                            GGML_ABORT("cannot write shared recurrent state with different rollback indices");
-                        }
-                    }
-                }
-            }
-
-            const uint32_t cell_id = rs_idx_cur * size + (cell.src >= 0 ? cell.src : (int32_t) i);
-            if (cell_ranges_data.empty() || cell_ranges_data.back().second != cell_id) {
-                cell_ranges_data.emplace_back(cell_id, cell_id + 1);
-            } else {
-                cell_ranges_data.back().second++;
-            }
-
             if (cell_range_begin == size) {
                 cell_range_begin = i;
             }
-        } else {
-            if (cell_range_begin != size) {
-                cell_ranges.emplace_back(cell_range_begin, i);
-                cell_range_begin = size;
-            }
+        } else if (cell_range_begin != size) {
+            cell_ranges.emplace_back(cell_range_begin, i);
+            cell_range_begin = size;
         }
     }
     if (cell_range_begin != size) {
@@ -791,37 +761,108 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
         GGML_ABORT("cannot save/load multiple ranges of cells to/from device memory\n");
     }
 
-    // DEBUG CHECK: Sum of cell counts in ranges should equal the total cell count
     uint32_t cell_count_check = 0;
     for (const auto & range : cell_ranges) {
         cell_count_check += range.second - range.first;
     }
     GGML_ASSERT(cell_count == cell_count_check);
 
+    const bool all_depths = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
+    const uint32_t serialized_depths = all_depths ? n_rs_seq + 1 : 1;
+    const uint32_t rollback_count = seq_id == -1 ? n_seq_max : 1;
+    const uint32_t magic = LLAMA_RECURRENT_STATE_MAGIC;
+    const uint32_t version = LLAMA_RECURRENT_STATE_VERSION;
+
+    io.write(&cell_count,        sizeof(cell_count));
+    io.write(&magic,             sizeof(magic));
+    io.write(&version,           sizeof(version));
+    io.write(&serialized_depths, sizeof(serialized_depths));
+    io.write(&rollback_count,    sizeof(rollback_count));
+    for (uint32_t i = 0; i < rollback_count; ++i) {
+        const uint32_t source = seq_id == -1 ? i : (uint32_t) seq_id;
+        GGML_ASSERT(source < rs_idx.size() && rs_idx[source] <= n_rs_seq);
+        const uint32_t rollback = all_depths ? rs_idx[source] : 0;
+        io.write(&rollback, sizeof(rollback));
+    }
+
+    state_write_meta(io, cell_ranges, seq_id);
+
+    std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data;
+    for (uint32_t depth = 0; depth < serialized_depths; ++depth) {
+        for (const auto & range : cell_ranges) {
+            for (uint32_t i = range.first; i < range.second; ++i) {
+                uint32_t source_depth = depth;
+                if (!all_depths) {
+                    if (seq_id != -1) {
+                        source_depth = rs_idx[(uint32_t) seq_id];
+                    } else {
+                        const auto & cell = cells[i];
+                        bool found = false;
+                        for (const llama_seq_id cell_seq_id : cell.seq_id) {
+                            const uint32_t current = rs_idx[(uint32_t) cell_seq_id];
+                            if (found && source_depth != current) {
+                                GGML_ABORT("cannot write shared recurrent state with different rollback indices");
+                            }
+                            source_depth = current;
+                            found = true;
+                        }
+                    }
+                }
+
+                const auto & cell = cells[i];
+                const uint32_t source_cell = cell.src >= 0 ? (uint32_t) cell.src : i;
+                const uint32_t cell_id = source_depth*size + source_cell;
+                if (cell_ranges_data.empty() || cell_ranges_data.back().second != cell_id) {
+                    cell_ranges_data.emplace_back(cell_id, cell_id + 1);
+                } else {
+                    ++cell_ranges_data.back().second;
+                }
+            }
+        }
+    }
+
     cell_count_check = 0;
     for (const auto & range : cell_ranges_data) {
         cell_count_check += range.second - range.first;
     }
-    GGML_ASSERT(cell_count == cell_count_check);
-
-    io.write(&cell_count, sizeof(cell_count));
-
-    state_write_meta(io, cell_ranges, seq_id);
+    GGML_ASSERT(cell_count_check == cell_count*serialized_depths);
     state_write_data(io, cell_ranges_data);
 }
 
-void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    GGML_UNUSED(flags);
-
+void llama_memory_recurrent::state_read(
+        llama_io_read_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) {
     uint32_t cell_count;
-    io.read(&cell_count, sizeof(cell_count));
+    uint32_t magic;
+    uint32_t version;
+    uint32_t serialized_depths;
+    uint32_t rollback_count;
+    io.read(&cell_count,        sizeof(cell_count));
+    io.read(&magic,             sizeof(magic));
+    io.read(&version,           sizeof(version));
+    io.read(&serialized_depths, sizeof(serialized_depths));
+    io.read(&rollback_count,    sizeof(rollback_count));
 
-    bool res = true;
+    const bool all_depths = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
+    const uint32_t expected_depths = all_depths ? n_rs_seq + 1 : 1;
+    const uint32_t expected_rollbacks = seq_id == -1 ? n_seq_max : 1;
+    if (magic != LLAMA_RECURRENT_STATE_MAGIC || version != LLAMA_RECURRENT_STATE_VERSION ||
+            serialized_depths != expected_depths || rollback_count != expected_rollbacks) {
+        throw std::runtime_error("recurrent state schema or rollback-plane coverage mismatch");
+    }
 
-    res = res && state_read_meta(io, cell_count, seq_id);
+    std::vector<uint32_t> rollback_indices(rollback_count);
+    for (uint32_t & rollback : rollback_indices) {
+        io.read(&rollback, sizeof(rollback));
+        if (rollback > n_rs_seq || (!all_depths && rollback != 0)) {
+            throw std::runtime_error("recurrent state rollback index is invalid");
+        }
+    }
 
+    bool res = state_read_meta(io, cell_count, seq_id);
     try {
-        res = res && state_read_data(io, cell_count);
+        res = res && state_read_data(io, cell_count, serialized_depths);
     } catch (...) {
         res = false;
     }
@@ -832,15 +873,14 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
         } else {
             seq_rm(seq_id, -1, -1);
         }
-        throw std::runtime_error("failed to restore kv cache");
+        throw std::runtime_error("failed to restore recurrent state");
     }
 
-    if (n_rs_seq != 0) {
-        if (seq_id == -1) {
-            std::fill(rs_idx.begin(), rs_idx.end(), 0);
-        } else {
-            set_rs_idx(seq_id, 0);
-        }
+    if (seq_id == -1) {
+        GGML_ASSERT(rollback_indices.size() == rs_idx.size());
+        std::copy(rollback_indices.begin(), rollback_indices.end(), rs_idx.begin());
+    } else {
+        set_rs_idx(seq_id, rollback_indices[0]);
     }
 }
 
@@ -1043,7 +1083,10 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
     return true;
 }
 
-bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell_count) {
+bool llama_memory_recurrent::state_read_data(
+        llama_io_read_i & io,
+        uint32_t cell_count,
+        uint32_t serialized_depths) {
     uint32_t s_trans;
     uint32_t n_layer;
     io.read(&s_trans, sizeof(s_trans));
@@ -1085,9 +1128,11 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             return false;
         }
 
-        if (cell_count) {
-            // Read and set the keys for the whole cell range
-            io.read_tensor(r_l[il], head * r_size_row, cell_count * r_size_row);
+        for (uint32_t depth = 0; depth < serialized_depths; ++depth) {
+            if (cell_count) {
+                const size_t dst = ((size_t) depth*size + head)*r_size_row;
+                io.read_tensor(r_l[il], dst, cell_count*r_size_row);
+            }
         }
     }
 
@@ -1115,9 +1160,11 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
                 return false;
             }
 
-            if (cell_count) {
-                // Read and set the values for the whole cell range
-                io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
+            for (uint32_t depth = 0; depth < serialized_depths; ++depth) {
+                if (cell_count) {
+                    const size_t dst = ((size_t) depth*size + head)*s_size_row;
+                    io.read_tensor(s_l[il], dst, cell_count*s_size_row);
+                }
             }
         }
     } else {
@@ -1155,10 +1202,15 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             }
 
             if (cell_count) {
-                // For each row in the transposed matrix, read the values for the whole cell range
+                // This format currently writes s_trans=0. Keep a bounded
+                // parser for completeness if that representation is enabled.
                 for (uint32_t j = 0; j < n_embd_s; ++j) {
-                    const size_t dst_offset = (head + j * size) * s_size_el;
-                    io.read_tensor(s_l[il], dst_offset, cell_count * s_size_el);
+                    for (uint32_t depth = 0; depth < serialized_depths; ++depth) {
+                        const size_t row_stride = (size_t) size*serialized_depths;
+                        const size_t dst_offset =
+                                ((size_t) depth*size + head + (size_t) j*row_stride)*s_size_el;
+                        io.read_tensor(s_l[il], dst_offset, cell_count*s_size_el);
+                    }
                 }
             }
         }

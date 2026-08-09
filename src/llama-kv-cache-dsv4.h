@@ -377,6 +377,7 @@ public:
 
     void clear(llama_seq_id seq_id, bool data);
     void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, uint32_t src_depth = 0);
+    void seq_cp_all_depths(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
     void apply_copies(const stream_copy_info & sc_info) const;
 
     // Copy every current and rollback plane for one sequence between separate
@@ -567,6 +568,9 @@ public:
     //
     // llama_kv_cache_dsv4 specific API
     //
+    // Transactional state publication must preserve rollback capability, not
+    // normalize the source's active plane as an ordinary inference clone does.
+    void seq_cp_state(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
 
     llama_kv_cache_iswa * get_raw() const;
     llama_kv_cache      * get_csa() const;

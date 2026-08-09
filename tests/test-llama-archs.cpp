@@ -2192,11 +2192,11 @@ static bool test_dsv4_restore_long_compressed_history(size_t seed, ggml_backend_
 
     const bool elastic = dsv4_test_has_elastic_pages(dev, n_seq_max);
     dsv4_test_context test(
-            seed, dev, n_seq_max, elastic, n_chunk, 1, n_seq_max*n_ctx_seq, n_chunk, nullptr, nullptr, 2);
+            seed, dev, n_seq_max, elastic, n_chunk, 1, n_seq_max*n_ctx_seq, n_chunk, nullptr, nullptr, 4);
     auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(test.lctx.get()));
     GGML_ASSERT(memory != nullptr);
 
-    const auto history_tokens = get_tokens(n_history + 1, n_vocab, seed + 50);
+    const auto history_tokens = get_tokens(n_history + 40, n_vocab, seed + 50);
     const auto survivor_tokens = get_tokens(n_survivor, n_vocab, seed + 51);
     dsv4_decode_sequence(test, survivor_tokens, survivor_seq, "long-restore survivor");
 
@@ -2267,8 +2267,76 @@ static bool test_dsv4_restore_long_compressed_history(size_t seed, ggml_backend_
     GGML_ASSERT(rows_after_continuation[LLAMA_DSV4_MEMORY_RAW][dest_seq] == n_swa + 1);
     assert_residents_unchanged(rows_after_continuation);
 
-    const bool logits_ok = compare_dsv4_trace(
+    bool logits_ok = compare_dsv4_trace(
             "restore-2048", "next", reference_logits, restored_logits);
+    // Exercise the production residue shape: a long accepted prefix followed
+    // by repeated speculative-like advances, bounded rejection and replay.
+    // Leave the final rejection pending at save time so the snapshot must
+    // preserve both the selected rollback plane and every future rollback
+    // plane, rather than flattening one plane and advertising the old domain.
+    llama_pos next_pos = n_history + 1;
+    for (uint32_t cycle = 0; cycle < 4; ++cycle) {
+        for (uint32_t step = 0; step < 8; ++step) {
+            test.add(history_tokens[(size_t) next_pos], next_pos, { source_seq });
+            test.decode("long-restore generated residue");
+            test.clear_batch();
+            ++next_pos;
+        }
+
+        const uint32_t rollback = 2 + cycle%2;
+        next_pos -= rollback;
+        GGML_ASSERT(llama_memory_seq_rm(memory, source_seq, next_pos, -1));
+        GGML_ASSERT(memory->get_rs_idx()[source_seq] == rollback);
+
+        if (cycle + 1 < 4) {
+            for (uint32_t step = 0; step < rollback; ++step) {
+                test.add(history_tokens[(size_t) next_pos], next_pos, { source_seq });
+                test.decode("long-restore accepted replay");
+                test.clear_batch();
+                ++next_pos;
+            }
+            GGML_ASSERT(memory->get_rs_idx()[source_seq] == 0);
+        }
+    }
+
+    const uint32_t pending_rollback = memory->get_rs_idx()[source_seq];
+    GGML_ASSERT(pending_rollback == 3);
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, source_seq) == next_pos - 1);
+    const auto generated_state = dsv4_sequence_state(test.lctx.get(), source_seq);
+
+    // Restore over a different occupied stream. Sequence 3 is empty and is
+    // therefore also the transactional publication staging lane.
+    GGML_ASSERT(llama_state_seq_set_data(
+            test.lctx.get(), generated_state.data(), generated_state.size(), dest_seq) ==
+            generated_state.size());
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, dest_seq) == next_pos - 1);
+    GGML_ASSERT(memory->get_rs_idx()[dest_seq] == pending_rollback);
+
+    // Physical stream IDs make raw blobs differ. Transcoding source and
+    // destination through one empty stream proves exact logical domain
+    // equality, including raw/SWA absolute positions and every recurrent
+    // rollback plane.
+    static constexpr llama_seq_id canonical_seq = 3;
+    const auto canonicalize = [&](llama_seq_id seq) {
+        const auto state = dsv4_sequence_state(test.lctx.get(), seq);
+        GGML_ASSERT(llama_memory_seq_pos_max(memory, canonical_seq) == -1);
+        GGML_ASSERT(llama_state_seq_set_data(
+                test.lctx.get(), state.data(), state.size(), canonical_seq) == state.size());
+        const auto canonical = dsv4_sequence_state(test.lctx.get(), canonical_seq);
+        GGML_ASSERT(llama_memory_seq_rm(memory, canonical_seq, -1, -1));
+        GGML_ASSERT(llama_memory_seq_pos_max(memory, canonical_seq) == -1);
+        return canonical;
+    };
+    const auto canonical_source = canonicalize(source_seq);
+    const auto canonical_dest   = canonicalize(dest_seq);
+    GGML_ASSERT(canonical_source == canonical_dest);
+
+    test.add(history_tokens[(size_t) next_pos], next_pos, { source_seq });
+    test.add(history_tokens[(size_t) next_pos], next_pos, { dest_seq });
+    test.decode("long-restore generated next token");
+    logits_ok = compare_dsv4_trace(
+            "restore-generated", "next", dsv4_logits_ith(test, 0), dsv4_logits_ith(test, 1)) && logits_ok;
+    test.clear_batch();
     printf("DSV4 long compressed restore (%s): %s, state = %zu bytes, "
            "rows raw source/restored/continued = %" PRIu64 "/%" PRIu64 "/%" PRIu64
            ", CSA/HCA/LID = %" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
@@ -2422,11 +2490,12 @@ static bool test_dsv4_transactional_restore(size_t seed, ggml_backend_dev_t dev)
     assert_survivor_pages();
 
     // Host restore over the same occupied ID exercises the staging path and
-    // proves the selected rollback plane round-trips byte-for-byte.
+    // proves every rollback plane plus the selected rollback index round-trip
+    // byte-for-byte instead of being flattened into current plane zero.
     GGML_ASSERT(llama_state_seq_set_data(
             test.lctx.get(), source_full.data(), source_full.size(), source_seq) == source_full.size());
     GGML_ASSERT(dsv4_sequence_state(test.lctx.get(), source_seq) == source_full);
-    GGML_ASSERT(memory->get_rs_idx()[source_seq] == 0);
+    GGML_ASSERT(memory->get_rs_idx()[source_seq] == 1);
 
     GGML_ASSERT(llama_state_seq_set_data_ext(
             test.lctx.get(), source_partial.data(), source_partial.size(),
