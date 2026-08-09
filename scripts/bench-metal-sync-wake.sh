@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Controlled M2 Ultra baseline for Metal command-buffer wake latency. This
-# script deliberately owns the production window for its whole lifetime and
-# restores the normal elastic4 service through an EXIT trap.
+# Controlled M2 Ultra blocking-wait baseline for Metal command-buffer wake
+# latency. This script deliberately owns the production window for its whole
+# lifetime and restores the normal elastic4 service through an EXIT trap.
 
 set -euo pipefail
 
@@ -186,6 +186,7 @@ run_server() {
         cd "$lane_root"
         env \
             LLAMA_HOST_PROFILE="$profile" \
+            GGML_METAL_FAST_SYNC=0 \
             LLAMA_DSV4_ADMISSION_VERTICAL=1 \
             GGML_E4M3_MM_NT2_MIN_N=512 \
             DYLD_LIBRARY_PATH="$lane_root/build-m2/bin" \

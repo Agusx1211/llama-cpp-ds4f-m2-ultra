@@ -230,10 +230,10 @@ struct ggml_metal {
     bool has_error;
 };
 
-// GGML_METAL_FAST_SYNC=1 replaces the blocking wait for the final relevant
-// command buffer with a status poll. This is intentionally M2-Ultra-only and
-// opt-in: it keeps the caller runnable for the full GPU wait and can therefore
-// occupy one CPU core per active inference lane.
+// Apple M2 Ultra uses a status poll for the final relevant command buffer by
+// default. Set GGML_METAL_FAST_SYNC=0 to use the blocking wait instead. Other
+// devices always block. Polling keeps the caller runnable for the full GPU wait
+// and can therefore occupy one CPU core per active inference lane.
 static MTLCommandBufferStatus ggml_metal_cmd_buf_wait(
         id<MTLCommandBuffer> cmd_buf,
         bool fast_sync,
@@ -604,15 +604,27 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     {
         const char * value = getenv("GGML_METAL_FAST_SYNC");
-        const bool requested = value != NULL && strcmp(value, "1") == 0;
         const char * device_name = [[device name] UTF8String];
-        res->use_fast_sync = requested && strcmp(device_name, "Apple M2 Ultra") == 0;
+        const bool is_m2_ultra = strcmp(device_name, "Apple M2 Ultra") == 0;
+        const bool explicitly_disabled = value != NULL && strcmp(value, "0") == 0;
+        const bool explicitly_enabled  = value != NULL && strcmp(value, "1") == 0;
+        const bool valid_value = value == NULL || explicitly_disabled || explicitly_enabled;
 
-        if (requested && !res->use_fast_sync) {
+        res->use_fast_sync = is_m2_ultra && !explicitly_disabled;
+
+        if (!valid_value) {
+            GGML_LOG_WARN("%s: invalid GGML_METAL_FAST_SYNC value '%s'; using the device default\n",
+                    __func__, value);
+        }
+        if (explicitly_enabled && !is_m2_ultra) {
             GGML_LOG_WARN("%s: GGML_METAL_FAST_SYNC ignored on non-M2-Ultra device '%s'\n",
                     __func__, device_name);
         } else if (res->use_fast_sync) {
-            GGML_LOG_WARN("%s: fast command-buffer status polling enabled; one CPU core may be occupied per active lane\n",
+            GGML_LOG_WARN("%s: fast command-buffer status polling enabled%s; one CPU core may be occupied per "
+                          "active lane (set GGML_METAL_FAST_SYNC=0 to disable)\n",
+                    __func__, value == NULL || !valid_value ? " by default on Apple M2 Ultra" : "");
+        } else if (explicitly_disabled && is_m2_ultra) {
+            GGML_LOG_INFO("%s: fast command-buffer status polling disabled by GGML_METAL_FAST_SYNC=0\n",
                     __func__);
         }
     }
