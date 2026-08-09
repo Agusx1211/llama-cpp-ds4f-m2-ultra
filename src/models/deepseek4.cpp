@@ -1092,7 +1092,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     //                               verify iteration despite acceptance
     //                               falling 14.3 pp)
     //   12k  28.691 -> 32.581 t/s  (+13.56%, transcripts diverge)
-    //   4k   25.728 -> 25.334 t/s  (-1.53%)  <- the one loss, see MIN_CSA below
+    //   4k   25.728 -> 25.334 t/s  (-1.53%)  <- the one loss; the n_csa
+    //                               floor below keeps 4k on the mask path and
+    //                               takes it back to 25.71
     // The packed flash attention is still NOT cheaper than the masked one at 4k
     // (5.876 vs 5.752 ms) because the vec kernel is floor-limited per dispatch
     // geometry; the win comes from depth, where the mask path's K grows with
@@ -1114,19 +1116,32 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
 
     // GGML_DSV4_SPARSE_PACK_MIN_CSA_MULT: the packed working set is a FIXED
     // n_swa + top_k = 640 rows per token, so packing only pays once the mask
-    // path has meaningfully more than that to walk. At n_csa = 758 (4k) it does
-    // not - the two paths cost the same in the compressed-attention chain
-    // (0.792 vs 0.791 ms steady state) and the packed graph measures ~1% slower
-    // end-to-end. At n_csa = 2304 (12k) and above it does. The floor is
-    // <mult>*indexer_top_k, i.e. 1024 by default, the same ratio the
-    // gather_decode predicate above already uses.
+    // path has meaningfully more than that to walk. The floor is
+    // <mult>*indexer_top_k = 2048 rows by default.
+    //
+    // It can only decline a gain, never create a loss: below the floor the
+    // shape takes exactly the route master took. That is why it is set
+    // conservatively - packing was measured LOSING at n_csa <= 1024 and WINNING
+    // from n_csa 2304 up, and the crossover inside that interval was not
+    // measured.
+    //
+    // 4k is the depth this protects (prompt 3,034 -> n_csa 768, growing to
+    // 1024 during a 256-token generation because the compressed mask pads to
+    // 256-row granularity). Measured at 4k, mean of two runs per server, stdev
+    // <= 0.08 t/s, arm order swapped to rule out start-order bias:
+    //   threshold 8 (master routing)     25.70 / 25.76 t/s
+    //   threshold 2, no floor            25.33
+    //   threshold 2, floor 2*top_k=1024  25.46 / 25.46   <- n_csa crosses it
+    //   threshold 2, floor 4*top_k=2048  25.71           <- == master
+    // and at 12k (n_csa 2304) the 4*top_k floor keeps the full packed gain
+    // (32.62 vs 32.58/32.67 unfloored, vs 28.69 masked).
     //
     // It applies ONLY below the historical 8-row boundary, so prefill routing
     // (nt = n_ubatch) is unaffected by either knob and stays bit-identical to
     // master at any setting.
     static const int64_t sparse_pack_min_csa_mult = []() {
         const char * v = std::getenv("GGML_DSV4_SPARSE_PACK_MIN_CSA_MULT");
-        const int64_t n = v != nullptr ? atoll(v) : 2;
+        const int64_t n = v != nullptr ? atoll(v) : 4;
         return n < 1 ? (int64_t) 1 : n;
     }();
     const bool is_dspark_draft = hparams.n_dspark_block_size > 0;
