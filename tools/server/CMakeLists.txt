@@ -45,6 +45,8 @@ add_library(${TARGET} STATIC
     server-trusted-scheduling.h
     server-prefix-cache.cpp
     server-prefix-cache.h
+    server-prompt-cache-io.cpp
+    server-prompt-cache-io.h
     server-kv-store.cpp
     server-kv-store.h
     server-capture.cpp
