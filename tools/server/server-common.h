@@ -235,6 +235,14 @@ public:
     // split the tokens into message spans, skipping over media chunks
     common_chat_msg_spans find_message_spans(const common_chat_msg_delimiters & delims) const;
 
+    // Map rendered byte offsets to complete token-prefix lengths. Each prefix
+    // is tokenized independently and compared with this exact token stream;
+    // mismatching or out-of-range offsets are omitted.
+    std::vector<size_t> find_checkpoint_boundaries(
+            const llama_vocab * vocab,
+            const std::string & prompt,
+            const std::vector<size_t> & byte_offsets) const;
+
     // make sure all text tokens are within the vocab range
     bool validate(const struct llama_context * ctx) const;
 

@@ -6793,6 +6793,74 @@ static void test_deepseek_v4_thinking_retention() {
     }
 }
 
+// Explicit DSV4 checkpoint metadata is derived from a byte-identical prefix
+// before the second leading system block. Rendering must remain unchanged, and
+// changing only a later system block must keep the same stable anchor.
+static void test_deepseek_v4_system_checkpoint_boundaries() {
+    LOG_DBG("%s\n", __func__);
+
+    auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4.jinja");
+
+    common_chat_msg system_first;
+    system_first.role = "system";
+    system_first.content = "STABLE_FIRST_SYSTEM";
+
+    common_chat_msg system_second;
+    system_second.role = "system";
+    system_second.content = "SECOND_SYSTEM_A";
+
+    common_chat_msg user;
+    user.role = "user";
+    user.content = "USER_CONTENT";
+
+    common_chat_templates_inputs inputs;
+    inputs.messages = { system_first, system_second, user };
+    inputs.tools = { get_time_tool };
+    inputs.add_generation_prompt = true;
+
+    const auto params_a = common_chat_templates_apply(tmpls.get(), inputs);
+    if (params_a.message_boundaries.empty()) {
+        throw std::runtime_error("Test failed: missing DSV4 system checkpoint boundary");
+    }
+    assert_equals<size_t>(1, params_a.message_boundaries.size());
+
+    const size_t anchor_byte = params_a.message_boundaries.front();
+    if (anchor_byte == 0 || anchor_byte > params_a.prompt.size()) {
+        throw std::runtime_error("Test failed: invalid DSV4 checkpoint boundary");
+    }
+    const auto stable_prefix = params_a.prompt.substr(0, anchor_byte);
+    assert_contains(stable_prefix, system_first.content);
+    assert_not_contains(stable_prefix, system_second.content);
+    assert_not_contains(stable_prefix, "## Tools");
+
+    system_second.content = "SECOND_SYSTEM_B";
+    inputs.messages = { system_first, system_second, user };
+    const auto params_b = common_chat_templates_apply(tmpls.get(), inputs);
+    assert_equals<size_t>(1, params_b.message_boundaries.size());
+    assert_equals(anchor_byte, params_b.message_boundaries.front());
+    assert_equals(stable_prefix, params_b.prompt.substr(0, anchor_byte));
+
+    // Metadata is not part of the rendered prompt bytes.
+    auto params_without_metadata = params_a;
+    params_without_metadata.message_boundaries.clear();
+    assert_equals(params_a.prompt, params_without_metadata.prompt);
+
+    // A system block after a user turn is not a leading system-prefix anchor.
+    inputs.messages = { system_first, user, system_second };
+    const auto non_leading = common_chat_templates_apply(tmpls.get(), inputs);
+    assert_equals<size_t>(0, non_leading.message_boundaries.size());
+
+    // Multiple leading system blocks retain the earliest anchor while exposing
+    // later boundaries for ordinary policy evaluation.
+    common_chat_msg system_third;
+    system_third.role = "system";
+    system_third.content = "THIRD_SYSTEM";
+    inputs.messages = { system_first, system_second, system_third, user };
+    const auto long_history = common_chat_templates_apply(tmpls.get(), inputs);
+    assert_equals<size_t>(2, long_history.message_boundaries.size());
+    assert_equals(anchor_byte, long_history.message_boundaries.front());
+}
+
 // Verify that consecutive tool results are rendered in the tool call order of the
 // preceding assistant message (matched by tool call id), as required by the reference
 // DeepSeek-V4 implementation.
@@ -7067,6 +7135,7 @@ int main(int argc, char ** argv) {
         test_developer_role_to_system_workaround();
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();
+        test_deepseek_v4_system_checkpoint_boundaries();
         test_template_generation_prompt();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();

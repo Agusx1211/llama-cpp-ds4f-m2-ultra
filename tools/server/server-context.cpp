@@ -3654,12 +3654,40 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
+        const auto & explicit_boundaries = slot.task->params.checkpoint_boundaries;
+        const auto is_anchor = [&](const common_prompt_checkpoint & checkpoint) {
+            return !explicit_boundaries.empty() && checkpoint.n_tokens >= 0 &&
+                    static_cast<size_t>(checkpoint.n_tokens) == explicit_boundaries.front();
+        };
+        const int64_t checkpoint_n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
+        const bool creating_anchor = !explicit_boundaries.empty() && checkpoint_n_tokens >= 0 &&
+                static_cast<size_t>(checkpoint_n_tokens) == explicit_boundaries.front();
+        if (creating_anchor) {
+            const auto existing = std::find_if(
+                    slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                    [&](const common_prompt_checkpoint & checkpoint) {
+                        return checkpoint.n_tokens == checkpoint_n_tokens;
+                    });
+            if (existing != slot.prompt.checkpoints.end()) {
+                if (ctx_dft == nullptr || !existing->data_dft.empty()) {
+                    SLT_TRC(slot, "retaining existing system-prefix checkpoint at n_tokens = %" PRId64 "\n",
+                            checkpoint_n_tokens);
+                    return;
+                }
+
+                SLT_TRC(slot, "refreshing target-only system-prefix checkpoint at n_tokens = %" PRId64 "\n",
+                        checkpoint_n_tokens);
+                slot.prompt.checkpoints.erase(existing);
+            }
+        }
+
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
+        // created by the current task or are the explicit system-prefix anchor
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (!is_anchor(*it) && it->id_task != id_task && last >= 0 &&
+                    it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -3672,13 +3700,22 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // Make room for the new checkpoint without displacing the
+            // request's earliest explicit system-prefix anchor.
+            const auto evict = std::find_if(
+                    slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                    [&](const common_prompt_checkpoint & checkpoint) {
+                        return !is_anchor(checkpoint);
+                    });
+            if (evict == slot.prompt.checkpoints.end()) {
+                SLT_TRC(slot, "%s", "retaining protected system-prefix checkpoint; skipping later checkpoint\n");
+                return;
+            }
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                    evict->pos_min, evict->pos_max, evict->n_tokens, (float) evict->size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(evict);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
@@ -3688,7 +3725,7 @@ private:
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
-        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+        cur.update_pos(checkpoint_n_tokens, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -5731,6 +5768,30 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    const auto & checkpoint_boundaries = slot.task->params.checkpoint_boundaries;
+
+                    // Explicit boundaries are considered only after the
+                    // token stream reaches them. The earliest one is a
+                    // protected anchor; later ones still obey ordinary
+                    // checkpoint spacing and end-of-prompt policy.
+                    const auto explicit_boundary_should_break = [&](size_t pos) {
+                        const auto it = std::lower_bound(
+                                checkpoint_boundaries.begin(), checkpoint_boundaries.end(), pos);
+                        if (it == checkpoint_boundaries.end() || *it != pos) {
+                            return false;
+                        }
+                        if (it == checkpoint_boundaries.begin()) {
+                            return true;
+                        }
+
+                        const auto & checkpoints = slot.prompt.checkpoints;
+                        return checkpoints.empty() ||
+                                pos > static_cast<size_t>(checkpoints.back().n_tokens) +
+                                        static_cast<size_t>(params_base.checkpoint_min_step) ||
+                                static_cast<size_t>(slot.task->n_tokens()) <
+                                        pos + static_cast<size_t>(n_ubatch);
+                    };
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() &&
                            static_cast<uint64_t>(slot.prompt.n_tokens()) < chunk_limit.end_token &&
@@ -5770,6 +5831,11 @@ private:
                             }
                         }
 
+                        if (do_checkpoint &&
+                                explicit_boundary_should_break(slot.prompt.n_tokens())) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
@@ -5796,6 +5862,13 @@ private:
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
+                    const auto explicit_boundary_it = std::find(
+                            checkpoint_boundaries.begin(), checkpoint_boundaries.end(),
+                            static_cast<size_t>(n_tokens_start));
+                    const bool is_explicit_boundary = n_tokens_cur > 0 &&
+                            explicit_boundary_it != checkpoint_boundaries.end();
+                    const bool is_anchor_boundary = is_explicit_boundary &&
+                            explicit_boundary_it == checkpoint_boundaries.begin();
 
                     if (n_tokens_cur > 0) {
                         GGML_ASSERT(!prefill_batch);
@@ -5848,9 +5921,10 @@ private:
 
                         slot.init_sampler();
                     } else {
-                        // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // Skip ordinary mid-prompt checkpoints unless the batch starts a user
+                        // message, is near the end, or starts at an explicit system boundary.
+                        // The spacing gate below still applies to every boundary except the anchor.
+                        if (!is_user_start && !near_prompt_end && !is_explicit_boundary) {
                             do_checkpoint = false;
                         }
                     }
@@ -5869,6 +5943,7 @@ private:
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
+                            is_anchor_boundary ||
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
@@ -6662,6 +6737,36 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         auto delimiters = common_chat_msg_delimiters_parse(json_value(data, "message_delimiters", json::array()));
         delimiters.tokenize(ctx_server.vocab);
 
+        std::vector<size_t> checkpoint_boundaries;
+        if (res_type != TASK_RESPONSE_TYPE_NONE && res_type != TASK_RESPONSE_TYPE_OAI_CMPL &&
+                inputs.size() == 1 && prompt.is_string() && !inputs[0].has_media() &&
+                data.contains("message_boundaries") && data.at("message_boundaries").is_array()) {
+            std::vector<size_t> byte_offsets;
+            for (const auto & value : data.at("message_boundaries")) {
+                uint64_t offset = 0;
+                if (value.is_number_unsigned()) {
+                    offset = value.get<uint64_t>();
+                } else if (value.is_number_integer()) {
+                    const int64_t signed_offset = value.get<int64_t>();
+                    if (signed_offset < 0) {
+                        continue;
+                    }
+                    offset = static_cast<uint64_t>(signed_offset);
+                } else {
+                    continue;
+                }
+                if (offset > std::numeric_limits<size_t>::max()) {
+                    continue;
+                }
+                byte_offsets.push_back(static_cast<size_t>(offset));
+            }
+
+            checkpoint_boundaries = inputs[0].find_checkpoint_boundaries(
+                ctx_server.vocab, prompt.get<std::string>(), byte_offsets);
+            SRV_TRC("chat checkpoint boundaries: %zu rendered byte offsets -> %zu token positions\n",
+                    byte_offsets.size(), checkpoint_boundaries.size());
+        }
+
         for (size_t i = 0; i < inputs.size(); i++) {
             server_task task = server_task(type);
 
@@ -6675,6 +6780,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
+            task.params.checkpoint_boundaries = checkpoint_boundaries;
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;

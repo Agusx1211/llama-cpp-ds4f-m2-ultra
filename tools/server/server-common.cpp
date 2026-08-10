@@ -548,6 +548,38 @@ common_chat_msg_spans server_tokens::find_message_spans(const common_chat_msg_de
     return delims.split(tokens, skips);
 }
 
+std::vector<size_t> server_tokens::find_checkpoint_boundaries(
+        const llama_vocab * vocab,
+        const std::string & prompt,
+        const std::vector<size_t> & byte_offsets) const {
+    if (vocab == nullptr || prompt.empty() || byte_offsets.empty() || has_media()) {
+        return {};
+    }
+
+    std::vector<size_t> boundaries;
+    boundaries.reserve(byte_offsets.size());
+    for (const size_t byte_offset : byte_offsets) {
+        if (byte_offset == 0 || byte_offset > prompt.size()) {
+            continue;
+        }
+
+        const auto prefix_tokens = common_tokenize(
+            vocab, prompt.substr(0, byte_offset), /* add_special = */ true, /* parse_special = */ true);
+        const size_t max_match = std::min(prefix_tokens.size(), tokens.size());
+        size_t n_match = 0;
+        while (n_match < max_match && prefix_tokens[n_match] == tokens[n_match]) {
+            n_match++;
+        }
+        if (n_match > 0) {
+            boundaries.push_back(n_match);
+        }
+    }
+
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+    return boundaries;
+}
+
 bool server_tokens::validate(const struct llama_context * ctx) const {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -1144,6 +1176,12 @@ json oaicompat_chat_params_parse(
     }
 
     llama_params["message_delimiters"] = chat_params.message_delimiters.to_json();
+
+    auto message_boundaries = json::array();
+    for (const size_t boundary : chat_params.message_boundaries) {
+        message_boundaries.push_back(boundary);
+    }
+    llama_params["message_boundaries"] = std::move(message_boundaries);
 
     // Reasoning budget: pass parameters through to sampling layer
     {
