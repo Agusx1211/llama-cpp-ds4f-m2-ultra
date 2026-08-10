@@ -185,12 +185,10 @@ void test_dispatch_permits_cover_selection_defer_and_caps() {
     permits = fast.permits();
     require(permits.total == 2 && permits.bound[static_cast<size_t>(lane::fast)] == 2,
             "bind converts permits without double accounting");
-    require(fast.release_slot(1, 0, 18) && !fast.take_next(19).selected,
-            "closed fast cohort cannot refill after one staggered release");
-    require(fast.release_slot(2, 1, 20) && fast.take_next(21).request_id == 3,
-            "fast refill waits for the prior cohort to drain completely");
-    require(fast.fail(3, 22) && fast.permits().total == 0,
-            "deferred and selected permit lifecycle retires without leaks");
+    require(fast.release_slot(1, 0, 18) && fast.take_next(19).request_id == 3 && fast.bind_slot(3, 0, 20),
+            "default same-fast refill immediately fills staggered free width");
+    require(fast.release_slot(2, 1, 21) && fast.release_slot(3, 0, 22) && fast.permits().total == 0,
+            "elastic fast refill drains without permit leaks");
 
     for (lane priority : { lane::normal, lane::low }) {
         request_runtime capped;
@@ -210,11 +208,9 @@ void test_dispatch_permits_cover_selection_defer_and_caps() {
         require(permits.claimed[static_cast<size_t>(priority)] == cap && permits.total == cap,
                 "live lane ceiling is exact");
         require(capped.release_slot(bound[0].first, bound[0].second, 1001), "release first lane-cap request");
-        // Elastic same-lane refill: a normal/low cohort that closed while at
-        // its ceiling reopens to its own lane as soon as one permit drains.
-        // (Previously the excess request waited for the WHOLE cohort to
-        // drain, which serialized turnover under sustained multi-agent load;
-        // the fast lane keeps its bounded epoch refill semantics.)
+        // Every lane refills elastically after a staggered release. An
+        // explicitly configured bounded-fast epoch can still impose an
+        // operational member/time limit, but the shipped default does not.
         const dispatch_result refilled = capped.take_next(1002, 64);
         require(refilled.selected, "elastic same-lane refill joins after one staggered release");
         require(capped.bind_slot(refilled.request_id, bound[0].second, 1003), "bind refilled lane-cap request");
@@ -237,6 +233,43 @@ void test_dispatch_permits_cover_selection_defer_and_caps() {
     require(physical.take_next(1, 2).selected && physical.take_next(2, 2).selected &&
                 !physical.take_next(3, 2).selected && physical.permits().total == 2,
             "physical permits are claimed at selection, before binding");
+}
+
+void test_higher_lane_upgrade_ignores_paused_lower_width() {
+    const std::array<std::pair<lane, lane>, 3> transitions = {
+        std::pair{ lane::low,    lane::normal },
+        std::pair{ lane::low,    lane::fast   },
+        std::pair{ lane::normal, lane::fast   },
+    };
+
+    for (const auto & [lower, higher] : transitions) {
+        request_runtime runtime;
+        for (uint64_t id = 1; id <= 4; ++id) {
+            require(runtime.admit(make_request(id, lower, id)), "admit lower-priority resident work");
+        }
+        for (uint64_t id = 1; id <= 3; ++id) {
+            const auto selected = runtime.take_next(10 + id, 4);
+            require(selected.request_id == id && runtime.bind_slot(id, static_cast<slot_id>(id - 1), 20 + id),
+                    "bind lower-priority resident work");
+        }
+
+        require(runtime.admit(make_request(10, higher, 30)), "admit higher-priority arrival");
+        const auto upgraded = runtime.take_next(31, 4);
+        require(upgraded.request_id == 10 && upgraded.lane == higher && runtime.bind_slot(10, 3, 32),
+                "higher lane claims free physical width regardless of paused lower permits");
+        const auto permits = runtime.permits();
+        require(permits.total == 4 && permits.claimed[static_cast<size_t>(lower)] == 3 &&
+                    permits.claimed[static_cast<size_t>(higher)] == 1,
+                "priority upgrade keeps lower state resident outside the dominant decode cap");
+
+        require(runtime.release_slot(10, 3, 33) && runtime.cancel(4, 34),
+                "dominant completion releases width and queued lower cleanup remains valid");
+        for (uint64_t id = 1; id <= 3; ++id) {
+            require(runtime.release_slot(id, static_cast<slot_id>(id - 1), 40 + id),
+                    "release resident lower-priority work");
+        }
+        require(runtime.permits().total == 0, "priority transition leaves no permit residue");
+    }
 }
 
 void test_bounded_same_fast_cohort_refill() {
@@ -888,24 +921,25 @@ void test_deterministic_replay() {
 
 int main() {
     const std::vector<std::pair<const char *, void (*)()>> tests = {
-        { "live ingress and dispatch",  test_live_ingress_and_dispatch         },
-        { "queue cap and cancellation", test_queue_cap_and_queued_cancellation },
-        { "defer, resume, and cancel",  test_defer_resume_and_cancel           },
-        { "cancel while bound",         test_cancel_while_bound                },
-        { "passive child binding",      test_passive_child_binding             },
-        { "dispatch permit lifecycle",  test_dispatch_permits_cover_selection_defer_and_caps },
-        { "bounded fast refill",        test_bounded_same_fast_cohort_refill                  },
-        { "fast refill boundaries",     test_fast_refill_window_and_terminal_boundaries       },
-        { "fast refill telemetry",      test_fast_refill_telemetry_is_authoritative_at_sample_time },
-        { "fast refill total budget",   test_fast_member_budget_covers_initial_fill_and_upgrade },
-        { "fast refill reentry",        test_fast_refill_reentry_and_unbound_terminal_budget    },
-        { "profiled low widths",        test_profiled_exclusive_low_widths                   },
-        { "queue deadlines",            test_queue_deadlines_and_exact_capacity_reuse  },
-        { "run deadline races",         test_run_deadline_and_first_terminal_wins      },
-        { "stall expiry and backstop",  test_stall_expiry_progress_and_backstop        },
-        { "zero timeout defaults",      test_zero_configuration_keeps_bounded_defaults },
-        { "proportional cache affinity", test_cache_affinity_scales_partial_hits_without_overflow },
-        { "deterministic replay",       test_deterministic_replay              },
+        { "live ingress and dispatch",   test_live_ingress_and_dispatch                             },
+        { "queue cap and cancellation",  test_queue_cap_and_queued_cancellation                     },
+        { "defer, resume, and cancel",   test_defer_resume_and_cancel                               },
+        { "cancel while bound",          test_cancel_while_bound                                    },
+        { "passive child binding",       test_passive_child_binding                                 },
+        { "dispatch permit lifecycle",   test_dispatch_permits_cover_selection_defer_and_caps       },
+        { "strict priority upgrade",     test_higher_lane_upgrade_ignores_paused_lower_width        },
+        { "bounded fast refill",         test_bounded_same_fast_cohort_refill                       },
+        { "fast refill boundaries",      test_fast_refill_window_and_terminal_boundaries            },
+        { "fast refill telemetry",       test_fast_refill_telemetry_is_authoritative_at_sample_time },
+        { "fast refill total budget",    test_fast_member_budget_covers_initial_fill_and_upgrade    },
+        { "fast refill reentry",         test_fast_refill_reentry_and_unbound_terminal_budget       },
+        { "profiled low widths",         test_profiled_exclusive_low_widths                         },
+        { "queue deadlines",             test_queue_deadlines_and_exact_capacity_reuse              },
+        { "run deadline races",          test_run_deadline_and_first_terminal_wins                  },
+        { "stall expiry and backstop",   test_stall_expiry_progress_and_backstop                    },
+        { "zero timeout defaults",       test_zero_configuration_keeps_bounded_defaults             },
+        { "proportional cache affinity", test_cache_affinity_scales_partial_hits_without_overflow   },
+        { "deterministic replay",        test_deterministic_replay                                  },
     };
 
     for (const auto & test : tests) {

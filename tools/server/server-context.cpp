@@ -126,12 +126,9 @@ static uint32_t server_env_u32(const char * name, uint32_t fallback) {
 // 10623 generated, then immediately returned to 2048-token chunks when that
 // generator released.
 //
-// Keep every generating lane on the same large-M priority chunk policy. The
-// fast lane gets an explicit source-level service bound from the established
-// prefill-progress cadence: generators are serviced on the first mixed
-// iteration and after at most LLAMA_SERVER_PREFILL_DECODE_EVERY committed
-// prompt chunks. This avoids the circular wall-clock throttle previously shown
-// to be ineffective. The target gate measures the resulting time bound.
+// Keep every generating lane on the same large-M priority chunk policy. New
+// prompt work now finishes before any resident generator resumes so equal-fast
+// arrivals reach the efficient shared decode shape as soon as possible.
 //
 // LLAMA_SERVER_PREFILL_PRIORITY=0 restores the previous behavior exactly
 // (small chunks + a decode step every iteration) and is the rollback lever.
@@ -141,10 +138,11 @@ static const bool SERVER_PREFILL_PRIORITY = server_env_flag("LLAMA_SERVER_PREFIL
 // rebuild. 0 = no extra cap (full idle_chunk_tokens).
 static const uint32_t SERVER_PREFILL_PRIORITY_CHUNK = server_env_u32("LLAMA_SERVER_PREFILL_PRIORITY_CHUNK", 0);
 
-// Generators join a decode batch once every N committed prefill chunks while a
-// prompt still needs prefill. 1 = a clear one-chunk maximum service gap. 0 =
-// no decode until prefill finishes, except for the empty-batch liveness escape.
-static const uint32_t SERVER_PREFILL_DECODE_EVERY = server_env_u32("LLAMA_SERVER_PREFILL_DECODE_EVERY", 1);
+// Prompt completion has priority over every generating slot. The environment
+// override remains an experimental rollback/sweep lever: N > 0 admits one
+// decode iteration after every N committed chunks, while 0 waits for prompt
+// completion except for the empty-batch liveness escape.
+static const uint32_t SERVER_PREFILL_DECODE_EVERY = server_env_u32("LLAMA_SERVER_PREFILL_DECODE_EVERY", 0);
 
 static server_prefill::coordinator_config server_prefill_config_from_environment() {
     server_prefill::coordinator_config config;
@@ -1321,6 +1319,14 @@ private:
     // service. It advances only after an exact chunk commit; an aborted chunk
     // did not happen and must not buy a decode step.
     server_prefill::decode_cadence prefill_decode_cadence{ SERVER_PREFILL_DECODE_EVERY };
+    // NICE-like execution policy: only the highest resident lane decodes at
+    // full rate. Lower resident generators receive one mixed service turn
+    // after every 64 dominant-only turns so their streams keep making bounded
+    // progress without diluting priority responsiveness.
+    server_prefill::priority_decode_cadence priority_decode_cadence{ 64 };
+    bool                                    priority_mixed_decode             = false;
+    bool                                    priority_dominant_decode_selected = false;
+    bool                                    priority_lower_decode_selected    = false;
     // Did this iteration skip at least one generating slot?
     bool prefill_decode_gate_closed = false;
     // One log line per prefill window rather than per iteration.
@@ -4768,6 +4774,10 @@ private:
                 break; // stop any further processing
             }
         }
+        const bool decode_completed = batch.size() > 0 && off_next == batch.size();
+        priority_decode_cadence.note_iteration(priority_mixed_decode,
+                                               decode_completed && priority_dominant_decode_selected,
+                                               decode_completed && priority_lower_decode_selected);
 
         abort_incomplete_prefill_batch();
     }
@@ -4799,7 +4809,7 @@ private:
         }
     }
 
-    void update_speculative_parallel_policy() {
+    void update_speculative_parallel_policy(server_scheduler::lane dominant_lane, bool include_lower_priority) {
         if (!spec_mtp && !spec_dspark) {
             return;
         }
@@ -4820,6 +4830,10 @@ private:
         if (!spec_parallel_bypass) {
             size_t n_active_requests = 0;
             for (const auto & slot : slots) {
+                if (spec_dspark && !include_lower_priority && slot.task &&
+                    server_prefill_lane(slot.task->scheduling.lane) != dominant_lane) {
+                    continue;
+                }
                 if (slot.is_processing() && slot.task && slot.task->need_sampling()) {
                     ++n_active_requests;
                 }
@@ -4866,8 +4880,6 @@ private:
     }
 
     void pre_decode() {
-        update_speculative_parallel_policy();
-
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -4943,16 +4955,54 @@ private:
         std::vector<server_slot *> drafting;
         server_prefill::decode_activity prefill_decode;
 
-        // [TAG_PREFILL_PRIORITY] Meter the generator trickle against prefill
-        // progress. A prefill window is open while any non-child slot still
-        // has a prompt to process. Generators join the first mixed iteration
-        // and then at the configured committed-chunk cadence. Outside a
-        // prefill window decode runs at full speed immediately.
-        const bool prefill_pending = SERVER_PREFILL_PRIORITY &&
-                std::any_of(slots.begin(), slots.end(), [](const server_slot & s) {
-                    return (s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT) &&
-                           s.task && !s.task->is_child();
-                });
+        // Compute priority follows NICE semantics: the highest resident lane
+        // runs at full rate, while lower generators are normally omitted and
+        // lower prefills are not eligible for ownership. Their slots and KV
+        // remain resident so they can resume immediately when the dominant
+        // lane drains.
+        server_scheduler::lane dominant_lane = server_scheduler::lane::count;
+        for (const server_slot & slot : slots) {
+            if (!slot.is_processing() || !slot.task) {
+                continue;
+            }
+            const auto priority = server_prefill_lane(slot.task->scheduling.lane);
+            GGML_ASSERT(priority != server_scheduler::lane::count);
+            if (dominant_lane == server_scheduler::lane::count ||
+                static_cast<uint8_t>(priority) > static_cast<uint8_t>(dominant_lane)) {
+                dominant_lane = priority;
+            }
+        }
+        GGML_ASSERT(dominant_lane != server_scheduler::lane::count);
+
+        bool dominant_generating = false;
+        bool lower_generating    = false;
+        for (const server_slot & slot : slots) {
+            if (slot.state != SLOT_STATE_GENERATING || !slot.task) {
+                continue;
+            }
+            const auto priority = server_prefill_lane(slot.task->scheduling.lane);
+            dominant_generating = dominant_generating || priority == dominant_lane;
+            lower_generating    = lower_generating || priority != dominant_lane;
+        }
+        priority_mixed_decode             = dominant_generating && lower_generating;
+        const bool lower_decode_due       = priority_decode_cadence.begin_iteration(priority_mixed_decode);
+        priority_dominant_decode_selected = false;
+        priority_lower_decode_selected    = false;
+
+        // Deferred lower lanes do not consume target rows or draft work. Keep
+        // DSpark in its efficient single-stream shape until the sparse mixed
+        // keepalive iteration is actually due.
+        update_speculative_parallel_policy(dominant_lane, lower_decode_due);
+
+        // [TAG_PREFILL_PRIORITY] Only dominant-lane prompt work opens a
+        // prefill window. A lower prompt stays resident but cannot stall a
+        // higher-lane generator. With the shipped zero decode cadence, a new
+        // equal- or higher-priority prompt finishes before generation resumes.
+        const bool prefill_pending =
+            SERVER_PREFILL_PRIORITY && std::any_of(slots.begin(), slots.end(), [&](const server_slot & s) {
+                return (s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT) && s.task &&
+                       !s.task->is_child() && server_prefill_lane(s.task->scheduling.lane) == dominant_lane;
+            });
 
         const bool decode_due = prefill_decode_cadence.begin_iteration(prefill_pending);
         prefill_decode_gate_closed = false;
@@ -4960,12 +5010,13 @@ private:
         if (prefill_pending != prefill_priority_window_open) {
             prefill_priority_window_open = prefill_pending;
             if (prefill_pending) {
-                SRV_INF("prefill priority: window open (chunk cap under active decode = %u tokens, "
-                        "decode after at most %u committed prefill chunks; "
-                        "LLAMA_SERVER_PREFILL_PRIORITY=0 to revert)\n",
-                        prefill.config().priority_chunk_tokens != 0 ? prefill.config().priority_chunk_tokens :
-                                                                      prefill.config().idle_chunk_tokens,
-                        prefill_decode_cadence.chunks_per_decode());
+                SRV_INF(
+                    "prefill priority: window open (chunk cap = %u tokens, "
+                    "decode cadence = %u committed chunks (0 = after prompt completion); "
+                    "LLAMA_SERVER_PREFILL_PRIORITY=0 to revert)\n",
+                    prefill.config().priority_chunk_tokens != 0 ? prefill.config().priority_chunk_tokens :
+                                                                  prefill.config().idle_chunk_tokens,
+                    prefill_decode_cadence.chunks_per_decode());
             }
         }
 
@@ -4975,7 +5026,11 @@ private:
                 return;
             }
 
-            if (!decode_due) {
+            const auto priority = server_prefill_lane(slot.task->scheduling.lane);
+            GGML_ASSERT(priority != server_scheduler::lane::count);
+            const bool lower_priority_deferred = priority != dominant_lane && !lower_decode_due;
+
+            if (!decode_due || lower_priority_deferred) {
                 // Skipping is pure batch construction: handle_last_sampled_token
                 // is not called, i_batch was invalidated after the previous
                 // sampling, and slot.sampled/spec_draft are inert while the
@@ -4985,16 +5040,18 @@ private:
                 if (spec) {
                     common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
                 }
-                prefill_decode_gate_closed = true;
-                SLT_DBG(slot, "prefill priority: deferring decode (%u/%u committed chunks since last decode step)\n",
-                        prefill_decode_cadence.chunks_since_decode(),
-                        prefill_decode_cadence.chunks_per_decode());
+                if (!decode_due) {
+                    prefill_decode_gate_closed = true;
+                    SLT_DBG(slot,
+                            "prefill priority: deferring decode (%u/%u committed chunks since last decode step)\n",
+                            prefill_decode_cadence.chunks_since_decode(), prefill_decode_cadence.chunks_per_decode());
+                } else {
+                    SLT_DBG(slot, "strict priority: deferring lower lane decode (%u/%u dominant iterations)\n",
+                            priority_decode_cadence.dominant_iterations_since_lower(),
+                            priority_decode_cadence.dominant_iterations_per_lower());
+                }
                 return;
             }
-
-            const auto priority = server_prefill_lane(slot.task->scheduling.lane);
-            GGML_ASSERT(priority != server_scheduler::lane::count);
-            prefill_decode.include(priority);
 
             // check if we can batch this slot with the previous one
             if (!slot_batched) {
@@ -5004,6 +5061,12 @@ private:
             }
 
             generating.push_back(&slot);
+            prefill_decode.include(priority);
+            if (priority == dominant_lane) {
+                priority_dominant_decode_selected = true;
+            } else {
+                priority_lower_decode_selected = true;
+            }
 
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
@@ -5131,10 +5194,14 @@ private:
                 !slot.task || slot.task->is_child()) {
                 continue;
             }
+            const auto priority = server_prefill_lane(slot.task->scheduling.lane);
+            if (priority != dominant_lane) {
+                continue;
+            }
             prefill_candidates.push_back({
                 static_cast<uint64_t>(slot.task->id) + 1,
                 static_cast<uint64_t>(slot.task->id) + 1,
-                server_prefill_lane(slot.task->scheduling.lane),
+                priority,
                 slot.task->scheduling.arrival_us,
             });
         }

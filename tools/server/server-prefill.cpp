@@ -82,6 +82,39 @@ void decode_cadence::force_decode_next() {
     force_next_ = true;
 }
 
+priority_decode_cadence::priority_decode_cadence(uint32_t dominant_iterations_per_lower) :
+    dominant_iterations_per_lower_(dominant_iterations_per_lower) {
+    if (dominant_iterations_per_lower_ == 0) {
+        throw std::invalid_argument("invalid priority decode cadence");
+    }
+}
+
+bool priority_decode_cadence::begin_iteration(bool mixed_priority_decode) {
+    if (!mixed_priority_decode) {
+        window_open_                     = false;
+        dominant_iterations_since_lower_ = 0;
+        return true;
+    }
+    if (!window_open_) {
+        window_open_                     = true;
+        dominant_iterations_since_lower_ = 0;
+    }
+    return dominant_iterations_since_lower_ >= dominant_iterations_per_lower_;
+}
+
+void priority_decode_cadence::note_iteration(bool mixed_priority_decode, bool dominant_selected, bool lower_selected) {
+    if (!mixed_priority_decode) {
+        window_open_                     = false;
+        dominant_iterations_since_lower_ = 0;
+        return;
+    }
+    if (lower_selected) {
+        dominant_iterations_since_lower_ = 0;
+    } else if (dominant_selected && dominant_iterations_since_lower_ != std::numeric_limits<uint32_t>::max()) {
+        ++dominant_iterations_since_lower_;
+    }
+}
+
 bool chunk_lease::operator==(const chunk_lease & other) const {
     return request_id == other.request_id && cohort_id == other.cohort_id && generation == other.generation &&
            begin_token == other.begin_token && end_token == other.end_token && yield_boundary == other.yield_boundary &&
