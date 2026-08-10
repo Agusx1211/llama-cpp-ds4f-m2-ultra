@@ -281,6 +281,11 @@ struct common_chat_params {
     std::vector<std::string>            additional_stops;
     std::string                         parser;
     common_chat_msg_delimiters          message_delimiters;
+
+    // Byte offsets in prompt for explicit boundaries before the second and
+    // later leading system/developer blocks. These are advisory metadata:
+    // callers must verify an exact rendered-prefix match before using them.
+    std::vector<size_t>                 message_boundaries;
 };
 
 // per-message parsing syntax

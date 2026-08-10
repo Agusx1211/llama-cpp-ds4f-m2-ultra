@@ -100,6 +100,10 @@ struct task_params {
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
 
+    // Exact token-prefix boundaries derived from rendered chat metadata.
+    // The earliest entry is the protected system-prefix anchor.
+    std::vector<size_t> checkpoint_boundaries;
+
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
 

@@ -940,6 +940,57 @@ static std::string common_chat_template_direct_apply_impl(
     return result;
 }
 
+static bool common_chat_leading_system_role(const json & message) {
+    const auto role = message.value("role", std::string());
+    return role == "system" || role == "developer";
+}
+
+static std::vector<size_t> common_chat_template_leading_system_boundaries(
+        const common_chat_template & tmpl,
+        const autoparser::generation_params & inputs,
+        const std::optional<json> & messages_override,
+        const std::string & full_prompt) {
+    const auto & messages = messages_override.has_value() ? *messages_override : inputs.messages;
+    if (!messages.is_array() || messages.size() < 2 ||
+            !common_chat_leading_system_role(messages[0])) {
+        return {};
+    }
+
+    size_t n_leading_system = 1;
+    while (n_leading_system < messages.size() &&
+           common_chat_leading_system_role(messages[n_leading_system])) {
+        n_leading_system++;
+    }
+
+    std::vector<size_t> boundaries;
+    boundaries.reserve(n_leading_system - 1);
+    for (size_t i = 1; i < n_leading_system; i++) {
+        json prefix_messages = json::array();
+        for (size_t j = 0; j < i; j++) {
+            prefix_messages.push_back(messages[j]);
+        }
+
+        auto prefix_inputs = inputs;
+        prefix_inputs.messages = prefix_messages;
+        prefix_inputs.tools.clear();
+        prefix_inputs.add_generation_prompt = false;
+        prefix_inputs.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+
+        // Tool and response-format context is deliberately omitted here. It
+        // is request-dependent and must not be mistaken for a stable prefix.
+        const auto prefix = common_chat_template_direct_apply_impl(
+            tmpl, prefix_inputs, prefix_messages, std::nullopt, std::nullopt);
+        if (prefix.empty() || prefix.size() > full_prompt.size() ||
+                full_prompt.compare(0, prefix.size(), prefix) != 0) {
+            continue;
+        }
+
+        boundaries.push_back(prefix.size());
+    }
+
+    return boundaries;
+}
+
 std::string common_chat_template_direct_apply(
     const common_chat_template & tmpl,
     const autoparser::generation_params & inputs) {
@@ -2180,6 +2231,11 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
         }
 
         data.prompt += data.generation_prompt;
+    }
+
+    if (is_v4) {
+        data.message_boundaries = common_chat_template_leading_system_boundaries(
+            tmpl, inputs, adjusted_messages, data.prompt);
     }
 
     bool require_tools  = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
