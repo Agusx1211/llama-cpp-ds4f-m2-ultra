@@ -508,9 +508,13 @@ struct server_slot {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
-        if (!res) {
+    server_prompt_cache_load_result prompt_load(
+            server_prompt_cache & prompt_cache,
+            const server_tokens & tokens,
+            size_t alternative_tokens) {
+        const auto res = prompt_cache.load_best(
+                prompt, tokens, ctx_tgt, ctx_dft, id, alternative_tokens);
+        if (res == server_prompt_cache_load_result::failed) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         } else if (prompt_cache.dash_last_load.restored_scope !=
                 server_prompt_restore_scope::invalid) {
@@ -2261,21 +2265,14 @@ private:
             ret->residue_tokens = 0;
             ret->residue_ms     = 0.0;
 
-            // Zero-copy prefix sharing from a live donor slot. Another slot
-            // (generating or idle) may hold a longer common prefix with the
-            // task than both the selected slot's residue and any cache entry
-            // (e.g. parallel agents with a shared system prompt). Under the
-            // unified KV, seq_cp only tags the donor's cells for the new
-            // sequence: the physical pages are shared and refcounted, later
-            // divergent writes go through the sparse pool's copy-on-write
-            // path, and the serialized scheduler loop makes the donor's state
-            // a consistent snapshot. Donors that are mid-prefill are skipped
-            // (their KV is incomplete). Target-only: the destination draft
-            // sequence is cleared, and speculation re-prefills it.
+            // Discover the best zero-copy prefix in another live slot before
+            // changing the selected slot. The prompt cache receives that
+            // coverage as a ranking floor so RAM/SSD, resident, and donor
+            // sources are compared in one admission decision.
+            server_slot * donor = nullptr;
+            size_t lcp_donor = 0;
+            server_prompt_restore_plan donor_plan;
             if (task.type == SERVER_TASK_TYPE_COMPLETION && task.id_slot == -1) {
-                server_slot * donor = nullptr;
-                size_t lcp_donor = 0;
-                server_prompt_restore_plan donor_plan;
                 for (server_slot & other : slots) {
                     if (other.id == ret->id || other.prompt.tokens.empty() || other.prompt.tokens.has_mtmd) {
                         continue;
@@ -2297,77 +2294,66 @@ private:
                         donor_plan = plan;
                     }
                 }
-
-                const size_t lcp_self = ret->prompt.tokens.get_common_prefix(task.tokens);
-                const auto self_plan = server_prompt_make_restore_plan(
-                        ret->prompt_restore_coverage(), ret->prompt.tokens, lcp_self, task.tokens.size());
-                if (donor != nullptr && donor_plan.effective_tokens >= 1024 &&
-                        donor_plan.effective_tokens > self_plan.effective_tokens) {
-                    const int64_t t_share = ggml_time_us();
-
-                    if (update_cache) {
-                        // the displaced residue is still snapshotted first
-                        ret->prompt_save(*prompt_cache);
-                    }
-
-                    ret->prompt_clear();
-                    llama_memory_seq_cp(llama_get_memory(ctx_tgt), donor->id, ret->id, -1, -1);
-                    if (ctx_dft) {
-                        llama_memory_seq_rm(llama_get_memory(ctx_dft), ret->id, -1, -1);
-                    }
-
-                    ret->prompt.tokens = donor->prompt.tokens.clone();
-                    for (const auto & checkpoint : donor->prompt.checkpoints) {
-                        if (checkpoint.data_tgt.empty()) {
-                            continue;
-                        }
-                        auto target_only = checkpoint;
-                        target_only.clear_dft();
-                        ret->prompt.checkpoints.push_back(std::move(target_only));
-                    }
-
-                    const double share_ms = (ggml_time_us() - t_share) / 1000.0;
-
-                    ret->residue_from   = server_slot::residue_origin::donor_share;
-                    ret->residue_tokens = donor_plan.effective_tokens;
-                    ret->residue_ms     = share_ms;
-
-                    SLT_INF(*ret,
-                            "shared coverage-qualified prefix from slot %d via zero-copy seq_cp "
-                            "(raw=%zu effective=%zu kind=%u, %.2f ms, task has %d)\n",
-                            donor->id, lcp_donor, donor_plan.effective_tokens,
-                            (unsigned) donor_plan.kind, share_ms, (int) task.tokens.size());
-
-                    {
-                        server_dashboard::event ev;
-                        ev.kind       = server_dashboard::event_kind::cache_restore;
-                        ev.request_id = static_cast<uint64_t>(task.id) + 1;
-                        ev.slot       = ret->id;
-                        ev.code       = (uint16_t) server_dashboard::restore_code::donor;
-                        ev.a          = (int64_t) donor_plan.effective_tokens;
-                        ev.c          = (int64_t) task.tokens.size();
-                        ev.d          = donor->id;
-                        ev.f          = (ggml_time_us() - t_share) / 1000.0;
-                        server_dashboard::instance().emit(ev);
-                    }
-
-                    if (prompt_cache) {
-                        prompt_cache->update();
-                    }
-
-                    return ret;
-                }
             }
 
-            // Cache fallback (no live donor beat the resident prefix): always
-            // CONSULT for completion tasks, not only on LRU or low-keep
-            // selections - the published-prefix library may hold a longer
-            // prefix than the selected slot's residue. load() initializes its
-            // baseline from the resident state and only restores a strictly
-            // better entry, so the same-conversation retention fast path is
-            // unaffected. The SAVE stays gated on the displacement conditions
-            // (LRU or f_keep < 0.5) - an every-selection save would serialize
-            // multi-GiB states on each turn of a retained conversation.
+            const bool donor_eligible = donor != nullptr && donor_plan.effective_tokens >= 1024;
+            const auto share_donor = [&]() -> server_slot * {
+                GGML_ASSERT(donor_eligible);
+                const int64_t t_share = ggml_time_us();
+
+                ret->prompt_clear();
+                llama_memory_seq_cp(llama_get_memory(ctx_tgt), donor->id, ret->id, -1, -1);
+                if (ctx_dft) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), ret->id, -1, -1);
+                }
+
+                ret->prompt.tokens = donor->prompt.tokens.clone();
+                for (const auto & checkpoint : donor->prompt.checkpoints) {
+                    if (checkpoint.data_tgt.empty()) {
+                        continue;
+                    }
+                    auto target_only = checkpoint;
+                    target_only.clear_dft();
+                    ret->prompt.checkpoints.push_back(std::move(target_only));
+                }
+
+                const double share_ms = (ggml_time_us() - t_share) / 1000.0;
+
+                ret->residue_from   = server_slot::residue_origin::donor_share;
+                ret->residue_tokens = donor_plan.effective_tokens;
+                ret->residue_ms     = share_ms;
+
+                SLT_INF(*ret,
+                        "shared coverage-qualified prefix from slot %d via zero-copy seq_cp "
+                        "(raw=%zu effective=%zu kind=%u, %.2f ms, task has %d)\n",
+                        donor->id, lcp_donor, donor_plan.effective_tokens,
+                        (unsigned) donor_plan.kind, share_ms, (int) task.tokens.size());
+
+                {
+                    server_dashboard::event ev;
+                    ev.kind       = server_dashboard::event_kind::cache_restore;
+                    ev.request_id = static_cast<uint64_t>(task.id) + 1;
+                    ev.slot       = ret->id;
+                    ev.code       = (uint16_t) server_dashboard::restore_code::donor;
+                    ev.a          = (int64_t) donor_plan.effective_tokens;
+                    ev.c          = (int64_t) task.tokens.size();
+                    ev.d          = donor->id;
+                    ev.f          = share_ms;
+                    server_dashboard::instance().emit(ev);
+                }
+
+                if (prompt_cache) {
+                    prompt_cache->update();
+                }
+
+                return ret;
+            };
+
+            // Always consult for completion tasks: the published-prefix
+            // library may beat both the selected slot and a live donor. Saves
+            // remain gated on displacement (LRU or f_keep < 0.5) because an
+            // every-selection save would serialize multi-GiB states on each
+            // retained turn.
             if (consult_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
@@ -2377,7 +2363,15 @@ private:
                     ret->prompt_save(*prompt_cache);
                 }
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                const auto load_result = ret->prompt_load(
+                        *prompt_cache,
+                        task.tokens,
+                        donor_eligible ? donor_plan.effective_tokens : 0);
+                if (load_result == server_prompt_cache_load_result::alternative ||
+                        (load_result == server_prompt_cache_load_result::failed && donor_eligible)) {
+                    return share_donor();
+                }
+                if (load_result == server_prompt_cache_load_result::failed) {
                     ret->prompt_clear();
                 }
 
@@ -2410,6 +2404,14 @@ private:
                     ev.d          = -1;
                     ev.f          = consult_ms;
                     server_dashboard::instance().emit(ev);
+                }
+            } else if (donor_eligible) {
+                // Cache-disabled builds retain the old live-source comparison.
+                const size_t lcp_self = ret->prompt.tokens.get_common_prefix(task.tokens);
+                const auto self_plan = server_prompt_make_restore_plan(
+                        ret->prompt_restore_coverage(), ret->prompt.tokens, lcp_self, task.tokens.size());
+                if (donor_plan.effective_tokens > self_plan.effective_tokens) {
+                    return share_donor();
                 }
             }
         }

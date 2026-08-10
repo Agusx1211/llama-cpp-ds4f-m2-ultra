@@ -1798,6 +1798,91 @@ server_prompt_cache_state make_direct_restore_state(
     return state;
 }
 
+void test_live_alternative_ranking() {
+    const server_tokens request(make_tokens(140, RESTORE_TEST_TOKEN_SEED), false);
+
+    {
+        server_prompt_cache cache(64, TEST_LIMIT_TOKENS, "", 0, TEST_FINGERPRINT);
+        const auto resident = make_direct_restore_state(50, 10);
+        cache.states.push_back(make_direct_restore_state(100, 30));
+
+        fake_restore_engine engine;
+        engine.target = { true, 10 };
+        engine.coverage_by_marker = {
+            { 10, resident.coverage },
+            { 30, cache.states.front().coverage },
+        };
+        cache.set_restore_test_hooks(fake_restore_hooks(engine));
+
+        server_prompt prompt = resident.prompt.clone();
+        const auto result = cache.load_best(
+                prompt, request, fake_context(engine.target), nullptr, 0, 70);
+        require(result == server_prompt_cache_load_result::cache_entry,
+                "a longer RAM cache entry lost to the live alternative");
+        require(prompt.tokens.size() == 100 && engine.target.marker == 30,
+                "the longer RAM cache entry was not installed");
+        require(cache.dash_last_load.source == 1 && cache.dash_last_load.n_tokens == 99,
+                "the RAM winner was not reported with its effective coverage");
+    }
+
+    {
+        server_prompt_cache cache(64, TEST_LIMIT_TOKENS, "", 0, TEST_FINGERPRINT);
+        const auto resident = make_direct_restore_state(50, 10);
+        cache.states.push_back(make_direct_restore_state(71, 30));
+
+        fake_restore_engine engine;
+        engine.target = { true, 10 };
+        engine.coverage_by_marker = {
+            { 10, resident.coverage },
+            { 30, cache.states.front().coverage },
+        };
+        cache.set_restore_test_hooks(fake_restore_hooks(engine));
+
+        server_prompt prompt = resident.prompt.clone();
+        const auto result = cache.load_best(
+                prompt, request, fake_context(engine.target), nullptr, 0, 70);
+        require(result == server_prompt_cache_load_result::alternative,
+                "a cache tie did not keep the cheaper live alternative");
+        require(prompt.tokens.size() == 50 && engine.target.marker == 10 &&
+                        engine.target_attempts.empty(),
+                "ranking a live alternative destructively touched the destination");
+        require(cache.dash_last_load.source == 3 && cache.dash_last_load.n_tokens == 70,
+                "the live alternative was not reported with its effective coverage");
+    }
+
+    {
+        scratch_dir dir("live-alternative-ranking");
+        server_prompt_cache cache(64, TEST_LIMIT_TOKENS, dir.path, 8, TEST_FINGERPRINT,
+                integration_io_config());
+        cache.states.push_back(make_direct_restore_state(90, 20));
+        require(cache.spill_to_disk(cache.states.back()),
+                "could not spill the longer SSD candidate");
+        wait_for_cache_io(cache, [&] { return cache.states.front().on_disk(); },
+                "longer SSD candidate did not become durable");
+
+        const auto resident = make_direct_restore_state(50, 10);
+        fake_restore_engine engine;
+        engine.target = { true, 10 };
+        engine.coverage_by_marker = {
+            { 10, resident.coverage },
+            { 20, cache.states.front().coverage },
+        };
+        cache.set_restore_test_hooks(fake_restore_hooks(engine));
+
+        server_prompt prompt = resident.prompt.clone();
+        const auto result = cache.load_best(
+                prompt, request, fake_context(engine.target), nullptr, 0, 70);
+        require(result == server_prompt_cache_load_result::cache_entry,
+                "a longer SSD cache entry lost to the live alternative");
+        require(prompt.tokens.size() == 90 && engine.target.marker == 20,
+                "the longer SSD cache entry was not installed");
+        require(cache.dash_last_load.source == 2 && cache.dash_last_load.n_tokens == 89,
+                "the SSD winner was not reported with its effective coverage");
+    }
+
+    printf("  ok: resident, live donor, RAM, and SSD sources rank by effective coverage\n");
+}
+
 void test_failed_candidate_restores_target_only_resident() {
     server_prompt_cache cache(64, TEST_LIMIT_TOKENS, "", 0, TEST_FINGERPRINT);
 
@@ -2002,6 +2087,7 @@ int main() {
         { "paired transaction",          test_failed_paired_draft_restores_paired_resident },
         { "ranked fallback",             test_multiple_bad_candidates_fall_through_to_ssd },
         { "no-fallback miss",            test_failed_candidate_without_fallback_misses_closed },
+        { "live alternative ranking",  test_live_alternative_ranking              },
         { "discard incomplete",          test_discard_unpopulated_allocation     },
         { "hash throughput",            test_hash_throughput                     },
     };

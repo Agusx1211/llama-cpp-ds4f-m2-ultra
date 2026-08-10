@@ -1005,6 +1005,13 @@ uint64_t server_prompt_cache_fingerprint(const server_prompt_cache_fingerprint_i
 // together with the size. Returns 0 when the file cannot be read.
 uint64_t server_prompt_cache_file_probe(const std::string & path);
 
+enum class server_prompt_cache_load_result : uint8_t {
+    failed,
+    unchanged,
+    cache_entry,
+    alternative,
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens,
                         const std::string & disk_dir, int32_t disk_limit_gib, uint64_t disk_fingerprint,
@@ -1057,7 +1064,15 @@ struct server_prompt_cache {
             size_t state_size_main,
             size_t state_size_drft);
 
+    server_prompt_cache_load_result load_best(
+            server_prompt & prompt,
+            const server_tokens & tokens_new,
+            llama_context * ctx_tgt,
+            llama_context * ctx_dft,
+            int32_t id_slot,
+            size_t alternative_tokens);
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
 
     void update();
 

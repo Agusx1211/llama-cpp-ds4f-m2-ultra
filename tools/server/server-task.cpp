@@ -3775,6 +3775,17 @@ bool server_prompt_cache::load(
         llama_context * ctx_tgt,
         llama_context * ctx_dft,
         int32_t id_slot) {
+    return load_best(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, 0) !=
+            server_prompt_cache_load_result::failed;
+}
+
+server_prompt_cache_load_result server_prompt_cache::load_best(
+        server_prompt & prompt,
+        const server_tokens & tokens_new,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        int32_t id_slot,
+        size_t alternative_tokens) {
     poll_io_completions();
 
     ++dash_lookups;
@@ -3825,14 +3836,31 @@ bool server_prompt_cache::load(
 
     SRV_TRC(" - looking for better prompt, resident raw lcp = %zu, effective = %zu, kind = %u\n",
             lcp_resident, plan_resident.effective_tokens, (unsigned) plan_resident.kind);
+    const auto choose_unchanged_or_alternative = [&]() {
+        if (alternative_tokens > plan_resident.effective_tokens) {
+            dash_last_load.source   = 3;
+            dash_last_load.n_tokens = (uint64_t) alternative_tokens;
+            return server_prompt_cache_load_result::alternative;
+        }
+
+        if (plan_resident.effective_tokens > 0) {
+            ++dash_hits_resident;
+            dash_last_load.source   = 0;
+            dash_last_load.n_tokens = (uint64_t) plan_resident.effective_tokens;
+        } else {
+            ++dash_misses;
+        }
+        return server_prompt_cache_load_result::unchanged;
+    };
+
 
     const auto find_best_candidate = [&](server_prompt_restore_plan & plan_best) {
-        size_t reusable_best = plan_resident.effective_tokens;
+        size_t reusable_best = std::max(plan_resident.effective_tokens, alternative_tokens);
         auto it_best = states.end();
 
-        // Rank only coverage-qualified effective tokens. A long state with an
-        // exact system/tool/user checkpoint is valuable even when that boundary
-        // is less than 25% of the serialized prompt. Ties stay resident.
+        // Rank only coverage-qualified effective tokens. A cache entry must
+        // strictly beat both the resident state and the live alternative.
+        // Ties keep the cheaper already-live source.
         for (auto it = states.begin(); it != states.end(); ++it) {
             if (it->coverage.scope == server_prompt_restore_scope::target_and_draft && ctx_dft == nullptr) {
                 continue;
@@ -3859,15 +3887,7 @@ bool server_prompt_cache::load(
     server_prompt_restore_plan plan_best;
     auto it_best = find_best_candidate(plan_best);
     if (it_best == states.end()) {
-        // No cache entry beats the resident state.
-        if (plan_resident.effective_tokens > 0) {
-            ++dash_hits_resident;
-            dash_last_load.source   = 0;
-            dash_last_load.n_tokens = (uint64_t) plan_resident.effective_tokens;
-        } else {
-            ++dash_misses;
-        }
-        return true;
+        return choose_unchanged_or_alternative();
     }
 
     // Restoring an entry requires clearing the destination sequence first.
@@ -3901,19 +3921,16 @@ bool server_prompt_cache::load(
         }
 
         if (!snapshot_ok) {
-            SRV_WRN("%s", " - could not snapshot resident state; keeping it instead of attempting cache restore\n");
-            ++dash_hits_resident;
-            dash_last_load.source   = 0;
-            dash_last_load.n_tokens = (uint64_t) plan_resident.effective_tokens;
-            return true;
+            SRV_WRN("%s", " - could not snapshot resident state; keeping a live source instead of attempting cache restore\n");
+            return choose_unchanged_or_alternative();
         }
         have_resident_fallback = true;
     }
 
     // A failed entry is retired and selection is repeated, allowing the next
-    // ranked RAM or SSD candidate to win. Selection always uses the original
-    // resident plan as its floor; the quarantined resident snapshot is the
-    // final fallback once every strictly better candidate has failed.
+    // ranked RAM or SSD candidate to win. Selection always uses the better of
+    // the original resident plan and the live alternative as its floor. The
+    // quarantined resident snapshot is the final fallback only when it wins.
     while (it_best != states.end()) {
         SRV_TRC(" - attempting coverage-qualified prompt with %zu effective tokens\n",
                 plan_best.effective_tokens);
@@ -4034,7 +4051,13 @@ bool server_prompt_cache::load(
             erase_entry(it_best, false);
             prompt = std::move(restored);
         }
-        return true;
+        return server_prompt_cache_load_result::cache_entry;
+    }
+
+    if (alternative_tokens > plan_resident.effective_tokens) {
+        dash_last_load.source   = 3;
+        dash_last_load.n_tokens = (uint64_t) alternative_tokens;
+        return server_prompt_cache_load_result::alternative;
     }
 
     if (have_resident_fallback) {
@@ -4058,7 +4081,7 @@ bool server_prompt_cache::load(
             dash_last_load.source         = 0;
             dash_last_load.n_tokens       = (uint64_t) plan_resident.effective_tokens;
             dash_last_load.restored_scope = plan_resident.scope;
-            return true;
+            return server_prompt_cache_load_result::unchanged;
         }
 
         SRV_WRN("failed to restore quarantined resident state "
@@ -4069,7 +4092,7 @@ bool server_prompt_cache::load(
 
     clear_destination();
     ++dash_misses;
-    return false;
+    return server_prompt_cache_load_result::failed;
 }
 
 void server_prompt_cache::update() {
