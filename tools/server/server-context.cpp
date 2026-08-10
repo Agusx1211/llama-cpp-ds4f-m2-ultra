@@ -4809,7 +4809,7 @@ private:
         }
     }
 
-    void update_speculative_parallel_policy() {
+    void update_speculative_parallel_policy(server_scheduler::lane dominant_lane, bool include_lower_priority) {
         if (!spec_mtp && !spec_dspark) {
             return;
         }
@@ -4830,6 +4830,10 @@ private:
         if (!spec_parallel_bypass) {
             size_t n_active_requests = 0;
             for (const auto & slot : slots) {
+                if (spec_dspark && !include_lower_priority && slot.task &&
+                    server_prefill_lane(slot.task->scheduling.lane) != dominant_lane) {
+                    continue;
+                }
                 if (slot.is_processing() && slot.task && slot.task->need_sampling()) {
                     ++n_active_requests;
                 }
@@ -4876,8 +4880,6 @@ private:
     }
 
     void pre_decode() {
-        update_speculative_parallel_policy();
-
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -4986,6 +4988,11 @@ private:
         const bool lower_decode_due       = priority_decode_cadence.begin_iteration(priority_mixed_decode);
         priority_dominant_decode_selected = false;
         priority_lower_decode_selected    = false;
+
+        // Deferred lower lanes do not consume target rows or draft work. Keep
+        // DSpark in its efficient single-stream shape until the sparse mixed
+        // keepalive iteration is actually due.
+        update_speculative_parallel_policy(dominant_lane, lower_decode_due);
 
         // [TAG_PREFILL_PRIORITY] Only dominant-lane prompt work opens a
         // prefill window. A lower prompt stays resident but cannot stall a
