@@ -71,11 +71,12 @@ export LLAMA_SERVER_TRUSTED_FAST_REFILL_WINDOW_MS=30000
 ```
 
 Relaunch with the exact server command above so these values are present in the
-server process. Both refill variables are required: member limits from 3 through
-16 and windows from 1 through 30000 milliseconds are accepted. Missing,
-malformed, partial, or out-of-range settings leave refill disabled. Confirm the
-startup log reports `trusted fast refill enabled: at most 4 fast members within
-30000 ms per cohort` before running the client.
+server process. Both limiter variables are required: member limits from 3
+through 16 and windows from 1 through 30000 milliseconds are accepted. Missing,
+malformed, partial, or out-of-range settings leave the bounded limiter disabled
+while same-fast arrivals continue to refill elastically. Confirm the startup log
+reports `bounded trusted fast refill limiter enabled: at most 4 fast members
+within 30000 ms per cohort` before running the pinned bounded client.
 
 To watch this prototype while playing with the sequential bursts, serve the
 dependency-free read-only dashboard from a third shell:
@@ -97,8 +98,9 @@ fast-dominant cohort and bounded window. It neither limits a same-fast family to
 one member nor promises admission. At the exact deadline the server sample
 reports the window closed. The browser also counts a sampled open window down
 from receipt and will not reopen it without a newer server sample; this bounds
-staleness but cannot remove transport latency. With either refill variable
-absent or invalid, the card explicitly reports the default disabled state.
+staleness but cannot remove transport latency. With either limiter variable
+absent or invalid, the card reports the bounded limiter's disabled state; this
+does not mean elastic same-fast refill is disabled.
 
 Then run the client from the credentialed shell:
 
@@ -129,19 +131,41 @@ match its isolated oracle. The reference before/after,
 stage/commit, one-owner, aligned-yield, active-fast chunk, trace overflow,
 cardinality, and output-hash gates remain enabled.
 
-The runner does not itself change admission. Without both bounded-refill
-variables above, the default closed-cohort rule intentionally leaves a later
-burst queued while the low member remains bound. Extending the 30-second queue
-deadline alone is not a fast-service result, and resident request parking is
-not required for this two-slot low-plus-one-fast-at-a-time geometry. The member
-budget is cumulative for the live cohort: cancellation, timeout, or failure
-releases physical width but does not refund a claimed member. Trace `cohort_id`
-identifies prefill ownership, not a runtime permit epoch; the runner's refill
-proof is the completed burst followed by new mixed-low progress before the next
-request completes. Burst 03 must complete before the exact low response; the
-02-to-03 handoff already proves low progress while burst 03 is active, so the
+The runner does not itself change admission. The current default admits a later
+same-fast burst elastically whenever physical and fast-lane width is available.
+Setting both bounded-refill variables replaces that unbounded default with the
+member/time budget used for the historical measurement below. The member budget
+is cumulative for the live cohort: cancellation, timeout, or failure releases
+physical width but does not refund a claimed member. At the pinned historical
+commit below, omitting the limiter instead selected the then-current
+closed-cohort rule and left a later burst queued while the low member remained
+bound. Trace `cohort_id` identifies prefill ownership, not a runtime permit
+epoch; the runner's refill proof is the completed burst followed by new
+mixed-low progress before the next request completes. Burst 03 must complete
+before the exact low response; the 02-to-03 handoff already proves low progress
+while burst 03 is active, so the
 runner does not require an impossible post-teardown prompt frame after a finite
 low prompt has already reached its final token.
+
+## Strict priority regression gate
+
+The live strict-priority client exercises fast-to-fast, low-to-fast, and
+normal-to-fast late arrivals through the public model IDs:
+
+```sh
+python3 tools/server/tests/strict-priority-smoke.py \
+  --base-url http://127.0.0.1:8080 \
+  --api-key "$LLAMA_API_KEY" \
+  --artifact "/tmp/strict-priority-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+It requires the incumbent to emit no output from the arrival's first prompt
+progress through TTFT. After prompt completion, equal-fast requests must both
+decode, while a lower incumbent must receive non-zero service at no more than
+ten percent of the fast request's output. The default 512-token fast decode is
+long enough to cross the shipped 64-iteration lower-lane keepalive interval.
+Use `--observe-only` to collect a pre-change baseline without turning expected
+policy violations into a non-zero client exit.
 
 Clean commit `129fb3bba9d7706437439562b858f85f8f127c52` passed this
 horizontal gate on the M2 Ultra with the pinned UD-Q8_K_XL model and exact
