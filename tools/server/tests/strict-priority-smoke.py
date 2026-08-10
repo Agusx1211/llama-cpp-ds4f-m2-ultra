@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import pathlib
 import threading
@@ -40,6 +41,7 @@ class Result:
     end_ns: int = 0
     status: int = 0
     reported_tokens_predicted: int = -1
+    token_ids: list[int] = dataclasses.field(default_factory=list)
     token_times_ns: list[int] = dataclasses.field(default_factory=list)
     progress_times_ns: list[int] = dataclasses.field(default_factory=list)
     error: str = ""
@@ -57,6 +59,9 @@ class Result:
             "prompt_tokens": self.prompt_tokens,
             "requested_tokens": self.requested_tokens,
             "generated_tokens": len(self.token_times_ns),
+            "token_sha256": hashlib.sha256(
+                json.dumps(self.token_ids, separators=(",", ":")).encode("ascii")
+            ).hexdigest(),
             "reported_tokens_predicted": self.reported_tokens_predicted,
             "status": self.status,
             "start_ns": self.start_ns,
@@ -116,6 +121,7 @@ def run_request(base_url: str, api_key: str, result: Result, salt: int, timeout:
                     if not isinstance(tokens, list) or not all(isinstance(token, int) for token in tokens):
                         raise RuntimeError(f"{result.tag}: response contained invalid token IDs")
                     if tokens:
+                        result.token_ids.extend(tokens)
                         result.token_times_ns.extend([timestamp] * len(tokens))
                         if not result.first_token_ns:
                             result.first_token_ns = timestamp
@@ -142,7 +148,7 @@ def wait_for_first_token(result: Result, timeout: int) -> None:
 def require_complete(result: Result) -> None:
     if result.error or result.status != 200:
         raise RuntimeError(f"{result.tag} failed: HTTP {result.status}; {result.error}")
-    if len(result.token_times_ns) != result.requested_tokens:
+    if len(result.token_ids) != result.requested_tokens or len(result.token_times_ns) != result.requested_tokens:
         raise RuntimeError(
             f"{result.tag} generated {len(result.token_times_ns)} tokens, expected {result.requested_tokens}"
         )
@@ -267,11 +273,24 @@ def main() -> int:
         scenarios.append(scenario)
         violations.extend(f"{scenario['name']}: {item}" for item in scenario_violations)
 
+    cross_scenario_checks = []
+    arrival_hashes = {scenario["arrival"]["token_sha256"] for scenario in scenarios}
+    incumbent_hashes = {scenario["incumbent"]["token_sha256"] for scenario in scenarios}
+    if len(arrival_hashes) == 1:
+        cross_scenario_checks.append("fast output is exact across equal-fast and preempted-lower cohorts")
+    else:
+        violations.append("fast token IDs changed with the resident incumbent lane")
+    if len(incumbent_hashes) == 1:
+        cross_scenario_checks.append("incumbent output is exact across fast, normal, and low scheduling")
+    else:
+        violations.append("incumbent token IDs changed with scheduling lane or interruption")
+
     summary = {
         "schema": 1,
         "status": "OBSERVED" if args.observe_only else ("PASS" if not violations else "FAIL"),
         "observe_only": args.observe_only,
         "violations": violations,
+        "cross_scenario_checks": cross_scenario_checks,
         "scenarios": scenarios,
     }
     output = json.dumps(summary, indent=2, sort_keys=True) + "\n"
