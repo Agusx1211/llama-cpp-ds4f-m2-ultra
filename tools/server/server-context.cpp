@@ -88,8 +88,9 @@ static const bool SERVER_SPEC_SAMPLER_CLONE_OPT_DISABLED = []() {
     return env != nullptr && env[0] == '1' && env[1] == '\0';
 }();
 
-// Exact two-slot DSV4 vertical. This remains opt-in until target-Metal
-// lifecycle/capacity validation is complete.
+// Exact DSV4 admission vertical. The core admission API supports at most
+// eight sequence spans in one atomic reservation.
+static constexpr int32_t SERVER_DSV4_ADMISSION_MAX_SLOTS = 8;
 static const bool SERVER_DSV4_ADMISSION_VERTICAL = []() {
     const char * env = std::getenv("LLAMA_DSV4_ADMISSION_VERTICAL");
     return env != nullptr && env[0] == '1' && env[1] == '\0';
@@ -1728,9 +1729,9 @@ private:
         }
 
         if (SERVER_DSV4_ADMISSION_VERTICAL) {
-            if (params_base.n_parallel < 2 || params_base.n_parallel > 4 ||
+            if (params_base.n_parallel < 2 || params_base.n_parallel > SERVER_DSV4_ADMISSION_MAX_SLOTS ||
                     !params_base.kv_unified || params_base.ctx_shift || has_mmproj) {
-                SRV_ERR("%s", "LLAMA_DSV4_ADMISSION_VERTICAL requires 2-4 unified elastic-KV text slots with context shift disabled\n");
+                SRV_ERR("%s", "LLAMA_DSV4_ADMISSION_VERTICAL requires 2-8 unified elastic-KV text slots with context shift disabled\n");
                 return false;
             }
             const llama_kv_admission_span probe_span = { 0, 0, 1 };
