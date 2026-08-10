@@ -2301,83 +2301,42 @@ void test_live_hdrr_starts_sustained_wide_cohorts() {
             "sustained wide-cohort fixture cleanup");
 }
 
-void test_staggered_cohorts_drain_before_same_lane_refill() {
-    struct active_slot {
-        int id;
-        int slot;
-        server_task::trusted_lane lane;
-    };
-
+void test_default_fast_refill_preempts_resident_low() {
     server_queue queue;
     queue.set_physical_slot_capacity(2);
-    std::array<size_t, server_scheduler::lane_count> cohort_starts = {};
-    std::array<bool, 2>                              slot_busy = {};
-    std::vector<active_slot>                         active;
-    std::unordered_set<int>                          live_ids;
-    uint64_t                                         arrival = 1;
-    size_t                                           epochs = 0;
-    bool                                             stopping = false;
 
-    const auto post_lane = [&](server_task::trusted_lane lane) {
-        server_task task                 = make_user(queue, lane, arrival++);
-        task.scheduling.predicted_gpu_us = 1000;
-        const int task_id                = task.id;
-        live_ids.insert(task_id);
-        require_posted(queue.post(std::move(task)), task_id, "post staggered cohort task");
-    };
-    for (int i = 0; i < 3; ++i) {
-        post_lane(server_task::trusted_lane::low);
-        post_lane(server_task::trusted_lane::normal);
-        post_lane(server_task::trusted_lane::fast);
-    }
+    server_task low    = make_user(queue, server_task::trusted_lane::low, 1);
+    const int   low_id = low.id;
+    require_posted(queue.post(std::move(low)), low_id, "post resident low request");
 
+    std::vector<int> fast_ids;
+    std::vector<int> fast_order;
     queue.on_new_task([&](server_task && selected) {
-        if (active.empty()) {
-            ++cohort_starts[static_cast<size_t>(selected.scheduling.lane)];
-            ++epochs;
-            if (epochs >= 210 && std::all_of(cohort_starts.begin(), cohort_starts.end(),
-                                              [](size_t starts) { return starts >= 5; })) {
-                stopping = true;
+        if (selected.id == low_id) {
+            require(queue.bind_slot(selected.id, 0), "bind resident low request");
+            for (int i = 0; i < 2; ++i) {
+                server_task fast = make_user(queue, server_task::trusted_lane::fast, i + 2);
+                fast_ids.push_back(fast.id);
+                require_posted(queue.post(std::move(fast)), fast_ids.back(), "post equal-fast arrival");
             }
-            require(epochs <= 420, "staggered cohort fairness converges within a deterministic bound");
+            return;
         }
-        const auto free_slot = std::find(slot_busy.begin(), slot_busy.end(), false);
-        require(free_slot != slot_busy.end(), "staggered cohort never exceeds two physical slots");
-        const int slot = static_cast<int>(free_slot - slot_busy.begin());
-        slot_busy[slot] = true;
-        live_ids.erase(selected.id);
-        require(queue.bind_slot(selected.id, slot), "bind staggered cohort member");
-        active.push_back({ selected.id, slot, selected.scheduling.lane });
+
+        require(queue.bind_slot(selected.id, 1), "bind reusable fast slot");
+        fast_order.push_back(selected.id);
+        require(queue.dispatch_permits().total == 2 && queue.release_slot(selected.id, 1),
+                "fast completion releases only its reusable physical width");
     });
     queue.on_update_slots([&] {
-        require(!active.empty() && active.size() <= 2, "staggered update owns a bounded live cohort");
-        const active_slot completed = active.front();
-        active.erase(active.begin());
-        require(queue.release_slot(completed.id, completed.slot), "release one staggered cohort member");
-        slot_busy[completed.slot] = false;
-
-        if (stopping) {
-            if (active.empty()) {
-                queue.terminate();
-            }
-        } else {
-            post_lane(completed.lane);
-        }
+        require(fast_order == fast_ids && queue.dispatch_permits().total == 1 &&
+                    queue.request_summary().active_requests == 1,
+                "default same-fast refill serves every equal-priority arrival before resident low resumes alone");
+        require(queue.release_slot(low_id, 0) && queue.dispatch_permits().total == 0,
+                "strict-priority refill fixture drains without permit leaks");
+        queue.terminate();
     });
     queue.on_sleeping_state([](bool) {});
     queue.start_loop();
-    require(std::all_of(cohort_starts.begin(), cohort_starts.end(), [](size_t starts) { return starts >= 5; }),
-            "every HDRR lane repeatedly begins cohorts under staggered continuous completion");
-
-    std::vector<server_task> cancellations;
-    for (int id : live_ids) {
-        server_task cancel(SERVER_TASK_TYPE_CANCEL);
-        cancel.id_target = id;
-        cancellations.push_back(std::move(cancel));
-    }
-    require(queue.post(std::move(cancellations), true) && queue.request_summary().active_requests == 0 &&
-                queue.dispatch_permits().total == 0,
-            "staggered cohort fixture drains and cancels without permit leaks");
 }
 
 void test_bounded_fast_refill_reuses_one_live_slot() {
@@ -2559,11 +2518,13 @@ void test_live_fast_refill_environment_is_atomic_and_bounded() {
         queue.start_loop();
     };
 
-    run_fixture(nullptr, nullptr, 1);
-    run_fixture("3", nullptr, 1);
-    run_fixture("0", "1", 1);
-    run_fixture("17", "30001", 1);
-    run_fixture("three", "1", 1);
+    // Missing or invalid limiter configuration leaves the shipped elastic
+    // same-fast policy unbounded rather than reverting to closed cohorts.
+    run_fixture(nullptr, nullptr, 2);
+    run_fixture("3", nullptr, 2);
+    run_fixture("0", "1", 2);
+    run_fixture("17", "30001", 2);
+    run_fixture("three", "1", 2);
     run_fixture("3", "30000", 2);
 }
 
@@ -2722,50 +2683,50 @@ void test_update_wake_does_not_block_sleep_transition() {
 
 int main() {
     const std::vector<std::pair<const char *, void (*)()>> tests = {
-        { "internal and lane dispatch",   test_internal_and_three_lane_dispatch         },
-        { "deferred policy reentry",      test_deferred_request_reenters_policy         },
-        { "cancel before dispatch",       test_cancel_before_dispatch                   },
-        { "generation-safe admin cancel", test_admin_cancel_requires_current_handle_and_is_idempotent_while_live },
-        { "cancel deferred payload",      test_cancel_deferred_payload                  },
-        { "cancel preparation atomicity", test_external_cancel_preparation_is_fault_atomic },
-        { "live fast queue cap",          test_live_fast_queue_cap                      },
-        { "internal defer compatibility", test_internal_defer_path_is_preserved         },
-        { "parallel child registration",  test_parallel_children_share_parent_admission },
-        { "non-overload unavailable",     test_non_overload_rejection_stays_unavailable },
-        { "transactional rollback",       test_transactional_multi_post_rollback        },
-        { "queue and deferred deadlines", test_queue_and_deferred_deadlines             },
-        { "selected pre-bind deadline",   test_selected_request_expires_before_bind     },
-        { "passive child deadlines",      test_passive_child_deadline_order             },
-        { "passive child cancellation",   test_passive_child_cancellation               },
-        { "parent family cancellation",   test_parent_cancellation_retires_family       },
-        { "parent family failure",        test_parent_failure_retires_queued_family     },
-        { "partial family launch failure", test_partial_family_launch_failure_retires_permits },
-        { "bound parent family cancellation", test_bound_parent_cancellation_releases_family_slots },
-        { "bound parent family failure",      test_bound_parent_failure_releases_family_slots      },
-        { "atomic family width",               test_family_width_admission_is_atomic                 },
-        { "final publication gate",       test_final_result_publication_deadline_gate   },
-        { "staged family publication",    test_staged_family_publication_is_exception_safe_and_at_most_once },
-        { "atomic terminal preparation",  test_terminal_expiry_and_failure_preparation_are_atomic          },
-        { "atomic family failure",        test_family_failure_prepares_all_results_before_live_cancel       },
-        { "stream publication gate",      test_stream_result_publication_deadline_gate  },
-        { "concurrent publication expiry", test_concurrent_update_publication_after_expiry },
-        { "publication scale isolation",  test_publication_gate_scales_without_global_sweep },
-        { "live lane and physical permits", test_start_loop_enforces_live_lane_and_physical_permits },
-        { "profiled live low widths",       test_start_loop_uses_profiled_exclusive_low_shapes      },
-        { "fast arrival bypass",            test_fast_arrival_bypasses_ready_low_backlog            },
-        { "trusted live cache costs",       test_live_cache_affinity_uses_trusted_costs              },
-        { "cache lane and cohort bounds",   test_live_cache_affinity_is_lane_and_cohort_bounded      },
-        { "cache lookahead and bypass",     test_live_cache_lookahead_and_bypass_bound               },
-        { "cache atomic families",          test_cache_affinity_preserves_atomic_families            },
-        { "sustained live HDRR",            test_live_hdrr_under_sustained_mixed_queues             },
-        { "sustained wide HDRR cohorts",    test_live_hdrr_starts_sustained_wide_cohorts            },
-        { "staggered draining HDRR cohorts", test_staggered_cohorts_drain_before_same_lane_refill   },
-        { "bounded fast cohort refill",      test_bounded_fast_refill_reuses_one_live_slot           },
-        { "fast refill terminal boundaries", test_fast_refill_timeout_and_cancel_boundaries         },
-        { "fast refill environment",         test_live_fast_refill_environment_is_atomic_and_bounded },
-        { "live aging",                     test_live_aging                                         },
-        { "bound stream timeout",         test_bound_stream_timeout_and_cancel_race     },
-        { "wake during sleep",             test_update_wake_does_not_block_sleep_transition       },
+        { "internal and lane dispatch",       test_internal_and_three_lane_dispatch                                  },
+        { "deferred policy reentry",          test_deferred_request_reenters_policy                                  },
+        { "cancel before dispatch",           test_cancel_before_dispatch                                            },
+        { "generation-safe admin cancel",     test_admin_cancel_requires_current_handle_and_is_idempotent_while_live },
+        { "cancel deferred payload",          test_cancel_deferred_payload                                           },
+        { "cancel preparation atomicity",     test_external_cancel_preparation_is_fault_atomic                       },
+        { "live fast queue cap",              test_live_fast_queue_cap                                               },
+        { "internal defer compatibility",     test_internal_defer_path_is_preserved                                  },
+        { "parallel child registration",      test_parallel_children_share_parent_admission                          },
+        { "non-overload unavailable",         test_non_overload_rejection_stays_unavailable                          },
+        { "transactional rollback",           test_transactional_multi_post_rollback                                 },
+        { "queue and deferred deadlines",     test_queue_and_deferred_deadlines                                      },
+        { "selected pre-bind deadline",       test_selected_request_expires_before_bind                              },
+        { "passive child deadlines",          test_passive_child_deadline_order                                      },
+        { "passive child cancellation",       test_passive_child_cancellation                                        },
+        { "parent family cancellation",       test_parent_cancellation_retires_family                                },
+        { "parent family failure",            test_parent_failure_retires_queued_family                              },
+        { "partial family launch failure",    test_partial_family_launch_failure_retires_permits                     },
+        { "bound parent family cancellation", test_bound_parent_cancellation_releases_family_slots                   },
+        { "bound parent family failure",      test_bound_parent_failure_releases_family_slots                        },
+        { "atomic family width",              test_family_width_admission_is_atomic                                  },
+        { "final publication gate",           test_final_result_publication_deadline_gate                            },
+        { "staged family publication",        test_staged_family_publication_is_exception_safe_and_at_most_once      },
+        { "atomic terminal preparation",      test_terminal_expiry_and_failure_preparation_are_atomic                },
+        { "atomic family failure",            test_family_failure_prepares_all_results_before_live_cancel            },
+        { "stream publication gate",          test_stream_result_publication_deadline_gate                           },
+        { "concurrent publication expiry",    test_concurrent_update_publication_after_expiry                        },
+        { "publication scale isolation",      test_publication_gate_scales_without_global_sweep                      },
+        { "live lane and physical permits",   test_start_loop_enforces_live_lane_and_physical_permits                },
+        { "profiled live low widths",         test_start_loop_uses_profiled_exclusive_low_shapes                     },
+        { "fast arrival bypass",              test_fast_arrival_bypasses_ready_low_backlog                           },
+        { "trusted live cache costs",         test_live_cache_affinity_uses_trusted_costs                            },
+        { "cache lane and cohort bounds",     test_live_cache_affinity_is_lane_and_cohort_bounded                    },
+        { "cache lookahead and bypass",       test_live_cache_lookahead_and_bypass_bound                             },
+        { "cache atomic families",            test_cache_affinity_preserves_atomic_families                          },
+        { "sustained live HDRR",              test_live_hdrr_under_sustained_mixed_queues                            },
+        { "sustained wide HDRR cohorts",      test_live_hdrr_starts_sustained_wide_cohorts                           },
+        { "default strict fast refill",       test_default_fast_refill_preempts_resident_low                         },
+        { "bounded fast cohort refill",       test_bounded_fast_refill_reuses_one_live_slot                          },
+        { "fast refill terminal boundaries",  test_fast_refill_timeout_and_cancel_boundaries                         },
+        { "fast refill environment",          test_live_fast_refill_environment_is_atomic_and_bounded                },
+        { "live aging",                       test_live_aging                                                        },
+        { "bound stream timeout",             test_bound_stream_timeout_and_cancel_race                              },
+        { "wake during sleep",                test_update_wake_does_not_block_sleep_transition                       },
     };
 
     for (const auto & test : tests) {

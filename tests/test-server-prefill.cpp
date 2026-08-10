@@ -1015,6 +1015,35 @@ void test_fast_generators_and_long_prefill_keep_large_chunks_with_bounded_servic
     }
 }
 
+void test_priority_decode_cadence_strictly_preempts_then_trickles() {
+    priority_decode_cadence cadence(2);
+
+    require(cadence.begin_iteration(false), "single-lane decode remains unrestricted");
+    cadence.note_iteration(false, true, false);
+
+    require(!cadence.begin_iteration(true), "priority window starts with dominant-only decode");
+    cadence.note_iteration(true, true, false);
+    require(!cadence.begin_iteration(true), "lower decode waits through the configured dominant interval");
+    cadence.note_iteration(true, true, false);
+    require(cadence.begin_iteration(true), "lower decode becomes due after the exact dominant interval");
+
+    cadence.note_iteration(true, true, false);
+    require(cadence.begin_iteration(true), "an unserved lower turn remains due");
+    cadence.note_iteration(true, true, true);
+    require(!cadence.begin_iteration(true), "a served lower turn restarts the dominant-only interval");
+
+    cadence.note_iteration(true, true, false);
+    require(cadence.begin_iteration(false), "dominant drain immediately restores unrestricted decode");
+
+    bool rejected = false;
+    try {
+        priority_decode_cadence invalid(0);
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    require(rejected, "zero priority decode interval is rejected");
+}
+
 }  // namespace
 
 int main() {
@@ -1028,17 +1057,18 @@ int main() {
         { "cursor rejects gaps overlaps replay",  test_committed_cursor_rejects_gaps_overlaps_and_replay          },
         { "transactional text media text",        test_text_media_text_ranges_are_transactional                   },
         { "media live policy cleanup",            test_media_live_policy_rejects_tail_and_clears_failed_mutation  },
-        { "parent activation after exact commit", test_parent_activation_waits_for_complete_retry_split_commit   },
+        { "parent activation after exact commit", test_parent_activation_waits_for_complete_retry_split_commit    },
         { "incomplete mutation abort cleanup",    test_incomplete_mutation_abort_clears_all_prompt_state          },
         { "small batch alignment recovery",       test_small_batches_make_progress_then_recover_alignment         },
         { "three cohort round robin",             test_three_cohort_round_robin_survives_arrival_and_removal      },
         { "weighted cross lane service",          test_weighted_cross_lane_service_is_bounded_and_work_conserving },
         { "late fast committed-token bound",      test_late_fast_arrival_has_finite_committed_token_bound         },
-        { "prefill priority all decode lanes",    test_prefill_priority_keeps_full_chunks_for_every_decode_lane  },
-        { "prefill priority policy knobs",        test_prefill_priority_knobs_select_priority_and_rollback       },
-        { "prefill decode cadence bound",         test_decode_cadence_bounds_service_and_empty_escape            },
+        { "prefill priority all decode lanes",    test_prefill_priority_keeps_full_chunks_for_every_decode_lane   },
+        { "prefill priority policy knobs",        test_prefill_priority_knobs_select_priority_and_rollback        },
+        { "prefill decode cadence bound",         test_decode_cadence_bounds_service_and_empty_escape             },
+        { "strict priority decode cadence",       test_priority_decode_cadence_strictly_preempts_then_trickles    },
         { "fast generators with long prefill",
-          test_fast_generators_and_long_prefill_keep_large_chunks_with_bounded_service },
+         test_fast_generators_and_long_prefill_keep_large_chunks_with_bounded_service                             },
     };
 
     try {

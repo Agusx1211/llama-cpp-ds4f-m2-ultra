@@ -298,56 +298,36 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
         return std::min(limit, physical_slot_capacity);
     };
 
-    const bool has_cohort = cohort.active;
-    lane       eligible_lane = cohort.dominant;
-    size_t     eligible_limit = cohort.limit;
+    const bool has_cohort        = cohort.active;
+    lane       eligible_lane     = cohort.dominant;
+    size_t     eligible_limit    = has_cohort ? cohort_limit_for(cohort.dominant) : 0;
     bool       upgrading         = false;
-    bool       allow_new_members = !has_cohort || cohort.open;
+    bool       allow_new_members = !has_cohort;
     if (has_cohort) {
+        cohort.limit              = eligible_limit;
         const bool permit_reentry = std::any_of(records.begin(), records.end(), [](const auto & entry) {
             return entry.second.scheduler_queued && entry.second.permit != record::permit_state::none;
         });
+
         lane higher = lane::count;
         if (cohort.dominant != lane::fast && scheduler.queued(lane::fast) != 0) {
             higher = lane::fast;
         } else if (cohort.dominant == lane::low && scheduler.queued(lane::normal) != 0) {
             higher = lane::normal;
         }
-
         if (higher != lane::count) {
-            const size_t higher_limit = cohort_limit_for(higher);
-            if (permit_counts.total >= higher_limit) {
-                allow_new_members = false;
-                cohort.open      = false;
-                if (!permit_reentry) {
-                    return {};
-                }
-            } else {
-                eligible_lane     = higher;
-                eligible_limit    = higher_limit;
-                upgrading         = true;
-                allow_new_members = true;
-            }
-        } else if (!allow_new_members && !permit_reentry) {
-            const bool can_refill_fast = fast_refill_enabled() && cohort.dominant == lane::fast &&
-                                         scheduler.queued(lane::fast) != 0 && permit_counts.total < cohort.limit &&
-                                         fast_claim_within_epoch(1, now_us);
-            // Elastic same-lane refill: a normal/low cohort that closed while
-            // full reopens to its own lane as soon as a permit drains below
-            // the cohort limit. Without this, a request that arrived while
-            // all slots were busy waited for the ENTIRE cohort to drain
-            // (permit_counts.total == 0 resets the epoch) instead of joining
-            // when one slot freed - serializing turnover under sustained
-            // multi-agent load. The fast lane keeps its bounded epoch refill
-            // above, and cross-lane upgrades keep the stricter width rule in
-            // the `higher` branch.
-            const bool can_refill_elastic = cohort.dominant != lane::fast &&
-                                            scheduler.queued(cohort.dominant) != 0 &&
-                                            permit_counts.total < cohort.limit;
-            if (!can_refill_fast && !can_refill_elastic) {
-                return {};
-            }
-            allow_new_members = true;
+            eligible_lane  = higher;
+            eligible_limit = cohort_limit_for(higher);
+            upgrading      = true;
+        }
+
+        const size_t eligible_index = lane_index(eligible_lane);
+        allow_new_members =
+            scheduler.queued(eligible_lane) != 0 && permit_counts.claimed[eligible_index] < eligible_limit &&
+            (eligible_lane != lane::fast || !fast_refill_enabled() || fast_claim_within_epoch(1, now_us));
+        cohort.open = allow_new_members;
+        if (!allow_new_members && !permit_reentry) {
+            return {};
         }
     }
 
@@ -386,8 +366,10 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
                 result.state = feasibility::temporarily_blocked;
                 return result;
             }
-            const size_t cohort_limit = has_cohort ? eligible_limit : cohort_limit_for(request.priority);
-            if (demand.total > cohort_limit || permit_counts.total > cohort_limit - demand.total) {
+            const size_t cohort_limit  = has_cohort ? eligible_limit : cohort_limit_for(request.priority);
+            const size_t cohort_index  = lane_index(has_cohort ? eligible_lane : request.priority);
+            const size_t cohort_demand = demand.lanes[cohort_index];
+            if (cohort_demand > cohort_limit || permit_counts.claimed[cohort_index] > cohort_limit - cohort_demand) {
                 result.state = feasibility::temporarily_blocked;
                 return result;
             }
@@ -439,8 +421,10 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
         throw std::logic_error("scheduler selected work without physical permit capacity");
     }
     const size_t selected_cohort_limit = has_cohort ? eligible_limit : cohort_limit_for(decision.selected_lane);
-    if (selected_demand.total > selected_cohort_limit ||
-        permit_counts.total > selected_cohort_limit - selected_demand.total) {
+    const size_t selected_lane_index   = lane_index(decision.selected_lane);
+    const size_t selected_lane_demand  = selected_demand.lanes[selected_lane_index];
+    if (selected_lane_demand > selected_cohort_limit ||
+        permit_counts.claimed[selected_lane_index] > selected_cohort_limit - selected_lane_demand) {
         throw std::logic_error("scheduler selected work beyond dominant lane cohort limit");
     }
     if (!has_cohort) {
@@ -476,7 +460,8 @@ dispatch_result request_runtime::take_next(uint64_t now_us, size_t physical_slot
             ++permit_counts.total;
         }
     }
-    if (permit_counts.total >= cohort.limit) {
+    if (permit_counts.claimed[lane_index(cohort.dominant)] >= cohort.limit ||
+        permit_counts.total >= physical_slot_capacity) {
         cohort.open = false;
     }
     request.metadata.virtual_runtime_us = saturating_add(request.metadata.virtual_runtime_us, charged_us);

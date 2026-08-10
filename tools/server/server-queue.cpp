@@ -101,8 +101,10 @@ server_request_runtime::runtime_config live_runtime_config() {
         return config;
     }
     if (members_value == nullptr || window_value == nullptr) {
-        QUE_WRN("trusted fast refill disabled: set both %s and %s\n",
-                fast_refill_members_environment, fast_refill_window_environment);
+        QUE_WRN(
+            "bounded trusted fast refill limiter disabled: set both %s and %s; "
+            "elastic same-fast refill remains enabled\n",
+            fast_refill_members_environment, fast_refill_window_environment);
         return config;
     }
 
@@ -115,21 +117,19 @@ server_request_runtime::runtime_config live_runtime_config() {
         window_value, server_request_runtime::runtime_config::fast_refill_min_window_us / 1000,
         server_request_runtime::runtime_config::fast_refill_max_window_us / 1000, window_ms);
     if (!valid_members || !valid_window) {
-        QUE_WRN("trusted fast refill disabled: %s must be [%zu, %zu] and %s must be [%llu, %llu] ms\n",
-                fast_refill_members_environment,
-                server_request_runtime::runtime_config::fast_refill_min_members,
-                server_request_runtime::runtime_config::fast_refill_max_members,
-                fast_refill_window_environment,
-                static_cast<unsigned long long>(
-                    server_request_runtime::runtime_config::fast_refill_min_window_us / 1000),
-                static_cast<unsigned long long>(
-                    server_request_runtime::runtime_config::fast_refill_max_window_us / 1000));
+        QUE_WRN(
+            "bounded trusted fast refill limiter disabled: %s must be [%zu, %zu] and %s must be "
+            "[%llu, %llu] ms; elastic same-fast refill remains enabled\n",
+            fast_refill_members_environment, server_request_runtime::runtime_config::fast_refill_min_members,
+            server_request_runtime::runtime_config::fast_refill_max_members, fast_refill_window_environment,
+            static_cast<unsigned long long>(server_request_runtime::runtime_config::fast_refill_min_window_us / 1000),
+            static_cast<unsigned long long>(server_request_runtime::runtime_config::fast_refill_max_window_us / 1000));
         return config;
     }
 
     config.fast_refill_max_members_per_epoch = static_cast<size_t>(members);
     config.fast_refill_window_us              = window_ms * 1000;
-    QUE_INF("trusted fast refill enabled: at most %zu fast members within %llu ms per cohort\n",
+    QUE_INF("bounded trusted fast refill limiter enabled: at most %zu fast members within %llu ms per cohort\n",
             config.fast_refill_max_members_per_epoch, static_cast<unsigned long long>(window_ms));
     return config;
 }

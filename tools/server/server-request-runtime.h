@@ -166,9 +166,9 @@ struct runtime_config {
     uint64_t                                 default_run_timeout_us       = run_timeout_default_us;
     uint64_t                                 default_run_stall_timeout_us = run_stall_timeout_default_us;
     uint32_t                                 overload_retry_after_seconds = 1;
-    // Both fields must be in range to opt into bounded same-fast-lane refill.
-    // The member limit counts every fast permit first claimed in one cohort,
-    // while the window starts when that cohort first becomes fast-dominant.
+    // Same-fast arrivals refill available width by default. Setting both
+    // fields opts into the legacy bounded member/time limiter for controlled
+    // experiments; zero leaves elastic refill unbounded.
     size_t                                   fast_refill_max_members_per_epoch = 0;
     uint64_t                                 fast_refill_window_us              = 0;
 };
@@ -266,11 +266,12 @@ class request_runtime {
         permit_state                                        permit            = permit_state::none;
     };
 
-    // A cohort normally closes after its initial fill opportunity and stays
-    // closed across staggered releases. An explicitly configured fast epoch
-    // may refill only its fast member within the bounded member/time budget.
-    // Every cohort resets after all permits drain, and each higher lane may
-    // otherwise reopen it once as a bounded priority upgrade.
+    // The dominant lane is the highest lane admitted while any resident permit
+    // survives. New work in that lane elastically refills free physical width;
+    // a higher lane upgrades dominance immediately and lower work remains
+    // resident for compute-level trickle service. The epoch resets only after
+    // every permit drains. An explicit bounded-fast configuration limits
+    // same-fast refills without changing the shipped elastic default.
     struct cohort_epoch {
         bool                   active                  = false;
         bool                   open                    = false;

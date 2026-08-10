@@ -101,6 +101,28 @@ class decode_cadence {
     bool     force_next_          = false;
 };
 
+// Keeps resident lower-priority generators alive without letting them dilute
+// the highest runnable lane. A preemption window starts with dominant-only
+// iterations; after every interval successful dominant selections, one mixed
+// iteration is due. If no lower row can join that due iteration, service stays
+// due rather than silently restarting the interval.
+class priority_decode_cadence {
+  public:
+    explicit priority_decode_cadence(uint32_t dominant_iterations_per_lower = 64);
+
+    bool begin_iteration(bool mixed_priority_decode);
+    void note_iteration(bool mixed_priority_decode, bool dominant_selected, bool lower_selected);
+
+    uint32_t dominant_iterations_per_lower() const { return dominant_iterations_per_lower_; }
+
+    uint32_t dominant_iterations_since_lower() const { return dominant_iterations_since_lower_; }
+
+  private:
+    uint32_t dominant_iterations_per_lower_   = 64;
+    uint32_t dominant_iterations_since_lower_ = 0;
+    bool     window_open_                     = false;
+};
+
 struct owner_selection {
     bool                   selected   = false;
     uint64_t               request_id = 0;
