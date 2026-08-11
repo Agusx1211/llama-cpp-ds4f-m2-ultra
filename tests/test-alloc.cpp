@@ -548,6 +548,66 @@ static void test_buffer_size_zero() {
     GGML_ASSERT(backend_b.context->allocated_total() == 0);
 }
 
+// A multi-backend scheduler sees a small number of stable graph topologies
+// during token generation. Verify that gallocr can switch between previously
+// reserved plans without another reserve or backing-buffer allocation.
+static void test_alternating_graph_plan_cache() {
+    dummy_backend backend_a = dummy_backend_init(32, /*align*/ 4);
+    dummy_backend backend_b = dummy_backend_init(32, /*align*/ 4);
+    ggml_backend_buffer_type_t bufts[2] = { &backend_a.buffer_type, &backend_b.buffer_type };
+    ggml_gallocr_ptr galloc(ggml_gallocr_new_n(bufts, 2));
+
+    auto make_chain = [](int n_ops, size_t input_size = 16) {
+        auto graph_ctx = make_context();
+        ggml_tensor * value = make_input_with_size(graph_ctx.ctx, input_size);
+        for (int i = 0; i < n_ops; ++i) {
+            value = ggml_scale(graph_ctx.ctx, value, 2.0f);
+        }
+        ggml_set_output(value);
+        ggml_build_forward_expand(graph_ctx.graph, value);
+        assign_names(graph_ctx.ctx);
+        return graph_ctx;
+    };
+
+    auto reserved_a = make_chain(1);
+    auto reserved_b = make_chain(2);
+    int leaf_buffer_ids[1] = { 0 };
+    int node_buffer_ids_a[1] = { 0 };
+    int node_buffer_ids_b[2] = { 0, 1 };
+
+    GGML_ASSERT(ggml_gallocr_reserve_n(
+        galloc.get(), reserved_a.graph, node_buffer_ids_a, leaf_buffer_ids));
+    GGML_ASSERT(ggml_gallocr_reserve_n(
+        galloc.get(), reserved_b.graph, node_buffer_ids_b, leaf_buffer_ids));
+
+    const size_t allocated_after_reserve =
+        backend_a.context->allocated_total() + backend_b.context->allocated_total();
+
+    // Matching only the node count is unsafe. A different tensor layout must
+    // remain a miss and ask the caller to reserve a new plan.
+    auto different_a = make_chain(1, 20);
+    GGML_ASSERT(!ggml_gallocr_alloc_graph_n(
+        galloc.get(), different_a.graph, node_buffer_ids_a, leaf_buffer_ids));
+
+    // The active plan is B. A fresh A graph must come from the cache.
+    auto live_a = make_chain(1);
+    GGML_ASSERT(ggml_gallocr_alloc_graph_n(
+        galloc.get(), live_a.graph, node_buffer_ids_a, leaf_buffer_ids));
+    check_all_allocated(live_a.graph);
+    check_no_overlap(live_a.graph);
+
+    // Switch back to a fresh B graph, exercising the other cached plan.
+    auto live_b = make_chain(2);
+    GGML_ASSERT(ggml_gallocr_alloc_graph_n(
+        galloc.get(), live_b.graph, node_buffer_ids_b, leaf_buffer_ids));
+    check_all_allocated(live_b.graph);
+    check_no_overlap(live_b.graph);
+
+    GGML_ASSERT(
+        backend_a.context->allocated_total() + backend_b.context->allocated_total() ==
+        allocated_after_reserve);
+}
+
 // Test re-using gallocr for a different graph. The new graph has the same
 // total size, but one of the chunks is larger, so reallocation is required.
 static void test_reallocation() {
@@ -603,6 +663,7 @@ int main() {
     run("test_prefer_already_allocated_memory", test_prefer_already_allocated_memory);
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
+    run("test_alternating_graph_plan_cache", test_alternating_graph_plan_cache);
     run("test_reallocation", test_reallocation);
     return 0;
 }
