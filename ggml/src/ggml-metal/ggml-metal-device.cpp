@@ -797,10 +797,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(
-        ggml_metal_library_t lib,
-        const ggml_tensor * op,
-        bool paired) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];
 
@@ -893,13 +890,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(
         e4m3_nt1 = 2;
     }
 
-    if (paired) {
-        GGML_ASSERT(tsrc0 == GGML_TYPE_E4M3_M2 && !e4m3_shared &&
-                    getenv("GGML_E4M3_MM_TMPL") == NULL &&
-                    getenv("GGML_E4M3_MM_STYLE") == NULL);
-        snprintf(base, 256, "kernel_mul_mm_%s_%s_nt%d_u16c_pair",
-                 ggml_type_name(tsrc0), ggml_type_name(tsrc1), e4m3_nt1);
-    } else if (tsrc0 == GGML_TYPE_E4M3_M2 && getenv("GGML_E4M3_MM_TMPL") != NULL) {
+    if (tsrc0 == GGML_TYPE_E4M3_M2 && getenv("GGML_E4M3_MM_TMPL") != NULL) {
         // A/B probe: the shared-template instantiation (part-2 ship state)
         e4m3_nt1 = 1;
         snprintf(base, 256, "kernel_mul_mm_%s_%s_tmpl", ggml_type_name(tsrc0), ggml_type_name(tsrc1));

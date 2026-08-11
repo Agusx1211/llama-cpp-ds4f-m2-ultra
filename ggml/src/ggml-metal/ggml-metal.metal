@@ -12520,14 +12520,12 @@ template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mul_mm_t kernel_mul_m
 // value by construction: the artifact was recovered from served bf16
 // weights, so code*2^k never leaves the normal range; the ggml test
 // quantizer's amax-derived scales satisfy the same property.
-template<short NT1, short DECODE_STYLE, bool PAIRED = false>
+template<short NT1, short DECODE_STYLE>
 kernel void kernel_mul_mm_e4m3_m2(
         constant ggml_metal_kargs_mul_mm & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
-        device const char * src0_pair,
-        device       char * dst_pair,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -12545,11 +12543,7 @@ kernel void kernel_mul_mm_e4m3_m2(
     threadgroup float  * lutg = (threadgroup float  *)(shmem + 4096 + NT1*2048);       // 256-entry f32 LUT (1024 B, style 0)
     threadgroup ushort * lutu = (threadgroup ushort *)(shmem + 4096 + NT1*2048);       // 256-entry bf16-bits LUT (512 B, style 2)
 
-    const uint n_batch = uint(FC_mul_mm_ne12)*uint(FC_mul_mm_ne13);
-    const bool pair = PAIRED && tgpig.z >= n_batch;
-    const int im = PAIRED ? int(tgpig.z % n_batch) : int(tgpig.z);
-    device const char * src0_selected = pair ? src0_pair : src0;
-    device       char * dst_selected  = pair ? dst_pair  : dst;
+    const int im = tgpig.z;
     const int r0 = tgpig.y*NR0;
     const int r1 = tgpig.x*(NT1*NR1);
 
@@ -12590,7 +12584,7 @@ kernel void kernel_mul_mm_e4m3_m2(
 
     const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
 
-    device const block_e4m3_m2 * x = (device const block_e4m3_m2 *)(src0_selected + args.nb01*(r0 + lr0) + offset0);
+    device const block_e4m3_m2 * x = (device const block_e4m3_m2 *)(src0 + args.nb01*(r0 + lr0) + offset0);
 
     const short iy = 8*(tiitg % NL1);
 
@@ -12734,7 +12728,7 @@ kernel void kernel_mul_mm_e4m3_m2(
     if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NT1*NR1 <= args.ne1)) {
         // no bounds checks on the output: direct device stores per tile
         FOR_UNROLL (short t = 0; t < NT1; ++t) {
-            device float * C = (device float *) dst_selected +
+            device float * C = (device float *) dst +
                 (r0 + 32*(sgitg &  1)) + \
                 (r1 + t*NR1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
 
@@ -12762,7 +12756,7 @@ kernel void kernel_mul_mm_e4m3_m2(
 
             if (sgitg == 0) {
                 for (int j = tiitg; j < nr1[t]; j += NR1) {
-                    device float  * D  = (device float  *) dst_selected + r0 + (r1 + t*NR1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                    device float  * D  = (device float  *) dst + r0 + (r1 + t*NR1 + j)*args.ne0 + im*args.ne1*args.ne0;
                     device float4 * D4 = (device float4 *) D;
 
                     threadgroup float  * C  = ((threadgroup float *) shmem) + (j*NR0);
@@ -13003,7 +12997,7 @@ kernel void kernel_mul_mm_e4m3_m2_s(
     }
 }
 
-typedef decltype(kernel_mul_mm_e4m3_m2<1, 0, false>) mul_mm_e4m3_m2_t;
+typedef decltype(kernel_mul_mm_e4m3_m2<1, 0>) mul_mm_e4m3_m2_t;
 
 // probe: the shared-template instantiation (part-2 ship state), for A/B
 // attribution against the dedicated kernel above
@@ -13017,10 +13011,6 @@ template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt1_u16")]]  kernel mul_mm_e4m3_
 template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt2_u16")]]  kernel mul_mm_e4m3_m2_t kernel_mul_mm_e4m3_m2<2, 2>;
 template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt1_u16c")]] kernel mul_mm_e4m3_m2_t kernel_mul_mm_e4m3_m2<1, 3>;
 template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt2_u16c")]] kernel mul_mm_e4m3_m2_t kernel_mul_mm_e4m3_m2<2, 3>;
-
-typedef decltype(kernel_mul_mm_e4m3_m2<1, 3, true>) mul_mm_e4m3_m2_pair_t;
-template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt1_u16c_pair")]] kernel mul_mm_e4m3_m2_pair_t kernel_mul_mm_e4m3_m2<1, 3, true>;
-template [[host_name("kernel_mul_mm_e4m3_m2_f32_nt2_u16c_pair")]] kernel mul_mm_e4m3_m2_pair_t kernel_mul_mm_e4m3_m2<2, 3, true>;
 
 typedef decltype(kernel_mul_mm_e4m3_m2_s<2>) mul_mm_e4m3_m2_s_t;
 
