@@ -4553,6 +4553,62 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// Two independent DSV4 compressor projections sharing one prompt activation.
+// The final ADD keeps both outputs live; fusion_test_nodes() compares each
+// projection separately so swapped or aliased paired-kernel outputs fail.
+struct test_dsv4_compressor_pair : public test_case {
+    const int64_t m;
+    const int64_t n;
+    ggml_tensor * out0 = nullptr;
+    ggml_tensor * out1 = nullptr;
+
+    test_dsv4_compressor_pair(int64_t m, int64_t n) : m(m), n(n) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(m, n);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 4 * m * n * 4096;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a0 = ggml_new_tensor_2d(ctx, GGML_TYPE_E4M3_M2, 4096, m);
+        ggml_tensor * a1 = ggml_new_tensor_2d(ctx, GGML_TYPE_E4M3_M2, 4096, m);
+        ggml_tensor * b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, n);
+        ggml_set_name(a0, "compressor_wkv");
+        ggml_set_name(a1, "compressor_wgate");
+        ggml_set_name(b,  "compressor_input");
+
+        out0 = ggml_mul_mat(ctx, a0, b);
+        out1 = ggml_mul_mat(ctx, a1, b);
+        ggml_set_name(out0, "compressor_kv");
+        ggml_set_name(out1, "compressor_score");
+
+        ggml_tensor * out = ggml_add(ctx, out0, out1);
+        ggml_set_name(out, "compressor_pair_sum");
+        return out;
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return { out0, out1 };
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_COMPRESSOR_PAIR";
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -10120,6 +10176,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int64_t m : { 128, 256 }) {
+        for (int64_t n : { 9, 224, 512 }) {
+            test_cases.emplace_back(new test_dsv4_compressor_pair(m, n));
+        }
+    }
+
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
@@ -11165,6 +11227,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 4096, 1, 1, 1, GGML_TYPE_F16));
     for (int n_tokens : { 224, 512, 2048 }) {
         test_cases.emplace_back(new test_dsv4_swiglu_clamp_fusion(n_tokens));
+    }
+    for (int64_t m : { 128, 256 }) {
+        for (int64_t n : { 224, 512, 2048 }) {
+            test_cases.emplace_back(new test_dsv4_compressor_pair(m, n));
+        }
     }
     // DSV4 CSA decode after selecting 512 compressed rows plus the 128-row
     // raw window. Compare the normal 64-head vector layout with the sparse
