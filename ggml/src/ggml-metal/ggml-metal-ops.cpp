@@ -3139,6 +3139,52 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+static ggml_tensor * ggml_metal_op_mul_mat_dsv4_compressor_pair(
+        ggml_metal_op_t ctx,
+        int idx,
+        ggml_tensor * op) {
+    static const bool enabled = std::getenv("GGML_METAL_DSV4_COMPRESS_PAIR_DISABLE") == nullptr;
+    static constexpr ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
+    static constexpr int outputs[] = { 0, 1 };
+
+    const bool target_shape =
+        op->src[0]->type == GGML_TYPE_E4M3_M2 &&
+        op->src[1]->type == GGML_TYPE_F32 &&
+        op->type == GGML_TYPE_F32 &&
+        op->src[0]->ne[0] == 4096 &&
+        (op->src[0]->ne[1] == 128 || op->src[0]->ne[1] == 256) &&
+        op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+        op->src[1]->ne[1] > 8 &&
+        op->ne[0] == op->src[0]->ne[1] &&
+        ggml_is_contiguous(op->src[0]) &&
+        ggml_is_contiguous(op->src[1]) &&
+        ggml_is_contiguous(op);
+
+    if (!enabled || !ctx->use_fusion || !target_shape ||
+            std::getenv("GGML_E4M3_MM_STYLE") != nullptr ||
+            std::getenv("GGML_E4M3_MM_SHARED") != nullptr ||
+            std::getenv("GGML_E4M3_MM_TMPL") != nullptr ||
+            ctx->can_fuse_subgraph_raw(idx, ops, 2, outputs, 2) != 2) {
+        return nullptr;
+    }
+
+    ggml_tensor * pair = ctx->node(idx + 1);
+    const bool same_input = pair->src[1] == op->src[1];
+    const bool same_weight_layout =
+        pair->src[0] != op->src[0] &&
+        pair->src[0]->type == op->src[0]->type &&
+        ggml_are_same_shape(pair->src[0], op->src[0]) &&
+        ggml_are_same_stride(pair->src[0], op->src[0]) &&
+        ggml_is_contiguous(pair->src[0]);
+    const bool same_output_layout =
+        pair->type == op->type &&
+        ggml_are_same_shape(pair, op) &&
+        ggml_are_same_stride(pair, op) &&
+        ggml_is_contiguous(pair);
+
+    return same_input && same_weight_layout && same_output_layout ? pair : nullptr;
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3165,6 +3211,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+    ggml_tensor * dsv4_compressor_pair = props_dev->has_simdgroup_mm
+        ? ggml_metal_op_mul_mat_dsv4_compressor_pair(ctx, idx, op)
+        : nullptr;
 
     GGML_ASSERT(ne00 == ne10);
 
@@ -3326,7 +3375,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //    default: break;
         //}
 
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op, dsv4_compressor_pair != nullptr);
 
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,
@@ -3350,6 +3399,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        if (dsv4_compressor_pair) {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(dsv4_compressor_pair->src[0]), 4);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(dsv4_compressor_pair),         5);
+        }
 
         const size_t smem = pipeline.smem;
 
@@ -3359,7 +3412,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const int nr1 = pipeline.nr1;
         const int nsg = pipeline.nsg;
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0),
+                ne12 * ne13 * (dsv4_compressor_pair ? 2 : 1), 32, nsg, 1);
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
 
@@ -3413,7 +3467,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    return 1;
+    return dsv4_compressor_pair ? 2 : 1;
 }
 
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
