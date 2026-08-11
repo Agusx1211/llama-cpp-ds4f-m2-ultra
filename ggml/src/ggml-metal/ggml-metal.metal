@@ -12545,9 +12545,9 @@ kernel void kernel_mul_mm_e4m3_m2(
     threadgroup float  * lutg = (threadgroup float  *)(shmem + 4096 + NT1*2048);       // 256-entry f32 LUT (1024 B, style 0)
     threadgroup ushort * lutu = (threadgroup ushort *)(shmem + 4096 + NT1*2048);       // 256-entry bf16-bits LUT (512 B, style 2)
 
-    const int n_batch = FC_mul_mm_ne12*FC_mul_mm_ne13;
+    const uint n_batch = uint(FC_mul_mm_ne12)*uint(FC_mul_mm_ne13);
     const bool pair = PAIRED && tgpig.z >= n_batch;
-    const int im = PAIRED ? tgpig.z % n_batch : tgpig.z;
+    const int im = PAIRED ? int(tgpig.z % n_batch) : int(tgpig.z);
     device const char * src0_selected = pair ? src0_pair : src0;
     device       char * dst_selected  = pair ? dst_pair  : dst;
     const int r0 = tgpig.y*NR0;
