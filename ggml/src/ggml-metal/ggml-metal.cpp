@@ -1411,9 +1411,23 @@ static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t
     GGML_UNUSED(reg);
 }
 
+static void ggml_backend_metal_dsv4_sparse_upload_soft_fail_begin(void) {
+    ggml_metal_sparse_upload_soft_fail_begin();
+}
+
+static bool ggml_backend_metal_dsv4_sparse_upload_soft_fail_end(void) {
+    return ggml_metal_sparse_upload_soft_fail_end();
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_upload_soft_fail_begin") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_upload_soft_fail_begin;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv4_sparse_upload_soft_fail_end") == 0) {
+        return (void *)ggml_backend_metal_dsv4_sparse_upload_soft_fail_end;
     }
     if (strcmp(name, "ggml_backend_metal_dsv4_sparse_buffer_type") == 0) {
         return (void *)ggml_backend_metal_dsv4_sparse_buffer_type;

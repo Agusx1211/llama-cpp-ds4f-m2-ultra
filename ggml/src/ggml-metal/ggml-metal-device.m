@@ -3608,6 +3608,36 @@ bool ggml_metal_buffer_sparse_map_write(
     return false;
 }
 
+// DSV4 sparse uploads: while a thread-local soft-fail window is open, a
+// destination that cannot back its pages under reservation pressure is
+// recorded and skipped instead of aborting the process. State-restore callers
+// open the window, check it on close, and roll the destination back.
+static _Thread_local bool g_sparse_upload_soft_fail_open = false;
+static _Thread_local bool g_sparse_upload_soft_fail_hit  = false;
+
+void ggml_metal_sparse_upload_soft_fail_begin(void) {
+    g_sparse_upload_soft_fail_open = true;
+    g_sparse_upload_soft_fail_hit  = false;
+}
+
+bool ggml_metal_sparse_upload_soft_fail_end(void) {
+    const bool hit = g_sparse_upload_soft_fail_hit;
+    g_sparse_upload_soft_fail_open = false;
+    g_sparse_upload_soft_fail_hit  = false;
+    return hit;
+}
+
+static bool ggml_metal_sparse_upload_soft_fail_note(const char * op) {
+    if (!g_sparse_upload_soft_fail_open) {
+        return false;
+    }
+    if (!g_sparse_upload_soft_fail_hit) {
+        GGML_LOG_WARN("%s: sparse upload skipped under reservation pressure (soft-fail window open)\n", op);
+    }
+    g_sparse_upload_soft_fail_hit = true;
+    return true;
+}
+
 bool ggml_metal_buffer_sparse_get_usage(
         ggml_metal_buffer_t buf,
         struct ggml_metal_sparse_usage * usage) {
@@ -4533,6 +4563,9 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
 
         const size_t dst_offset = bid_dst.offs;
         if (!ggml_metal_buffer_sparse_map_write(buf, &dst_offset, &size, 1)) {
+            if (ggml_metal_sparse_upload_soft_fail_note(__func__)) {
+                return;
+            }
             GGML_ABORT("failed to back sparse Metal tensor write");
         }
 
@@ -4562,6 +4595,18 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
     }
 
     @autoreleasepool {
+        // dst
+        struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
+        bid_dst.offs += offset;
+
+        const size_t dst_offset = bid_dst.offs;
+        if (!ggml_metal_buffer_sparse_map_write(buf, &dst_offset, &size, 1)) {
+            if (ggml_metal_sparse_upload_soft_fail_note(__func__)) {
+                return;
+            }
+            GGML_ABORT("failed to back sparse Metal tensor upload");
+        }
+
         // src
         void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
         id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
@@ -4570,15 +4615,6 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
                                                           deallocator:nil];
 
         GGML_ASSERT(buf_src);
-
-        // dst
-        struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
-        bid_dst.offs += offset;
-
-        const size_t dst_offset = bid_dst.offs;
-        if (!ggml_metal_buffer_sparse_map_write(buf, &dst_offset, &size, 1)) {
-            GGML_ABORT("failed to back sparse Metal tensor upload");
-        }
 
         // note: for experimentation purposes, here we use a semaphore to wait for the copy to complete
         //       this is alternative to waitUntilCompleted, which should be faster, but don't seem to make much difference

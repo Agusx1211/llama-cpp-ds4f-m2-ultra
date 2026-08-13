@@ -580,6 +580,15 @@ bool ggml_metal_buffer_sparse_map_write(
         const size_t * sizes,
         size_t n_ranges);
 
+// Thread-local soft-fail window for sparse tensor uploads. While open on the
+// calling thread, a set/memset whose destination pages cannot be backed under
+// reservation pressure records the failure and returns instead of aborting;
+// end() closes the window and reports whether any upload was skipped. Callers
+// that open a window MUST check end() and discard the destination state on
+// failure.
+void ggml_metal_sparse_upload_soft_fail_begin(void);
+bool ggml_metal_sparse_upload_soft_fail_end(void);
+
 bool ggml_metal_buffer_sparse_alias(
         ggml_metal_buffer_t buf,
         size_t src_offset,

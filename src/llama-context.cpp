@@ -3443,6 +3443,49 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     }
 }
 
+using llama_dsv4_soft_fail_begin_fn = void (*)(void);
+using llama_dsv4_soft_fail_end_fn   = bool (*)(void);
+
+// Open the Metal DSV4 sparse upload soft-fail window if any model layer lives
+// on a backend that provides it, returning the close/query hook (null when
+// unavailable). The window is thread-local; see ggml-metal-device.h.
+static llama_dsv4_soft_fail_end_fn llama_dsv4_sparse_soft_fail_open(const llama_model & model) {
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        auto * dev = model.dev_layer(il);
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            continue;
+        }
+        auto begin = (llama_dsv4_soft_fail_begin_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_metal_dsv4_sparse_upload_soft_fail_begin");
+        auto end = (llama_dsv4_soft_fail_end_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_metal_dsv4_sparse_upload_soft_fail_end");
+        if (begin != nullptr && end != nullptr) {
+            begin();
+            return end;
+        }
+    }
+    return nullptr;
+}
+
+struct llama_dsv4_soft_fail_window {
+    llama_dsv4_soft_fail_end_fn end = nullptr;
+
+    // returns whether an upload was skipped under reservation pressure
+    bool consume() {
+        if (end == nullptr) {
+            return false;
+        }
+        auto fn = end;
+        end = nullptr;
+        return fn();
+    }
+
+    ~llama_dsv4_soft_fail_window() {
+        consume();
+    }
+};
+
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
     const int64_t hp_ts = hp_enabled ? ggml_time_us() : 0;
 
@@ -3523,6 +3566,15 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
             }
         }
 
+        // A restore that cannot back its sparse destination pages under
+        // reservation pressure must surface as a recoverable failure — the
+        // catch below rolls the candidate back and the caller re-prefills —
+        // not as the historical hard abort inside the Metal upload path.
+        llama_dsv4_soft_fail_window soft_fail;
+        if (dsv4 != nullptr) {
+            soft_fail.end = llama_dsv4_sparse_soft_fail_open(model);
+        }
+
         if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
             const auto storage = mem_storage.find(seq_id_read);
             if (storage == mem_storage.end()) {
@@ -3547,6 +3599,10 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
         io->commit();
         synchronize();
+
+        if (soft_fail.consume()) {
+            throw std::runtime_error("sparse restore upload skipped under reservation pressure");
+        }
 
         if (candidate_is_staging) {
             // This is the first operation which changes an occupied
