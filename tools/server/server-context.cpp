@@ -6485,20 +6485,29 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
 
+                // shifted according to the current sub-batch: spec_i_batch is
+                // recorded in whole-batch coordinates, but logits rows are
+                // addressed in the last decoded view, whose start moves past
+                // zero when a KV-pressure victim span is skipped at the head
+                std::vector<int32_t> spec_i_view(slot.spec_i_batch.size());
+                for (size_t i = 0; i < slot.spec_i_batch.size(); ++i) {
+                    spec_i_view[i] = slot.spec_i_batch[i] - off;
+                }
+
                 std::string trace_pre;
                 if (server_spec_trace_enabled()) {
                     const int32_t n_vocab =
                             llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(slot.ctx_tgt)));
                     trace_pre = string_format("SPECTRACE ver slot=%d n_dec=%d n_past=%d n_draft=%zu h=[",
                             slot.id, slot.n_decoded, slot.prompt.n_tokens(), n_draft);
-                    for (size_t i = 0; i < slot.spec_i_batch.size(); ++i) {
+                    for (size_t i = 0; i < spec_i_view.size(); ++i) {
                         trace_pre += string_format(i ? ",%016" PRIx64 : "%016" PRIx64,
-                                server_logits_row_hash(slot.ctx_tgt, slot.spec_i_batch[i], n_vocab));
+                                server_logits_row_hash(slot.ctx_tgt, spec_i_view[i], n_vocab));
                     }
                     trace_pre += "]";
                 }
 
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_view, slot.spec_draft);
                 slot.spec_i_batch.clear();
 
                 if (server_spec_trace_enabled()) {
