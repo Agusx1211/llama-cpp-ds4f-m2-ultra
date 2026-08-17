@@ -1,6 +1,8 @@
 #include "server-context.h"
 #include "server-admin-dashboard.h"
 #include "server-admission.h"
+#include "server-capture-requests.h"
+#include "server-capture-store.h"
 #include "server-dashboard-bus.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -149,6 +151,23 @@ static const uint32_t SERVER_PREFILL_DECODE_EVERY = server_env_u32("LLAMA_SERVER
 // this only caps the server-configured ceiling.
 static const uint32_t SERVER_DSV4_DSPARK_SINGLE_N_MAX =
         server_env_u32("LLAMA_DSV4_DSPARK_SINGLE_N_MAX", 3);
+
+static server_capture::proposer server_capture_proposer(enum common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_NONE:          return server_capture::proposer::none;
+        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return server_capture::proposer::draft_simple;
+        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return server_capture::proposer::eagle3;
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return server_capture::proposer::mtp;
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return server_capture::proposer::dflash;
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return server_capture::proposer::dspark;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return server_capture::proposer::ngram_simple;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return server_capture::proposer::ngram_map_k;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return server_capture::proposer::ngram_map_k4v;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return server_capture::proposer::ngram_mod;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return server_capture::proposer::ngram_cache;
+        default:                                    return server_capture::proposer::other;
+    }
+}
 
 
 static server_prefill::coordinator_config server_prefill_config_from_environment() {
@@ -1306,6 +1325,16 @@ private:
     // active rollback depth must never fall below what they can emit.
     uint32_t spec_rs_depth_min = 0;
 
+    // Speculative-cycle and request-stream capture: the training-data flywheel
+    // from notes/2026-08-03-dsv4-dspark-domain-distillation-and-ane.md. Both
+    // sinks are enabled only by LLAMA_SERVER_CAPTURE_DIR, share one random
+    // identity salt so their salted request tags join offline, and drop
+    // records rather than ever blocking inference.
+    std::unique_ptr<server_capture::capture_store> capture_cycles;
+    std::unique_ptr<server_capture::request_log>   capture_requests;
+    uint32_t capture_cycle_seq     = 0;
+    uint32_t capture_draft_time_us = 0;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1388,7 +1417,126 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // Enable the speculative-cycle store and the request-stream sidecar when
+    // LLAMA_SERVER_CAPTURE_DIR is set. Failure to arm either sink is reported
+    // and leaves capture off; it never fails server startup.
+    void init_capture() {
+        const char * dir_env = std::getenv("LLAMA_SERVER_CAPTURE_DIR");
+        if (dir_env == nullptr || dir_env[0] == '\0') {
+            return;
+        }
+        const std::string root = dir_env;
+
+        auto capture_mode = server_capture::mode::sampled_rich;
+        if (const char * mode_env = std::getenv("LLAMA_SERVER_CAPTURE_MODE")) {
+            const std::string requested = mode_env;
+            if (requested == "off") {
+                return;
+            }
+            if (requested == "metrics") {
+                capture_mode = server_capture::mode::metrics_only;
+            } else if (requested == "compact") {
+                capture_mode = server_capture::mode::compact;
+            } else if (requested == "rich") {
+                capture_mode = server_capture::mode::sampled_rich;
+            } else {
+                SRV_ERR("capture disabled: unknown LLAMA_SERVER_CAPTURE_MODE '%s' (off|metrics|compact|rich)\n",
+                        requested.c_str());
+                return;
+            }
+        }
+
+        std::array<uint8_t, 16> salt = {};
+        {
+            FILE * urandom = std::fopen("/dev/urandom", "rb");
+            const bool have_salt =
+                    urandom != nullptr && std::fread(salt.data(), 1, salt.size(), urandom) == salt.size();
+            if (urandom != nullptr) {
+                std::fclose(urandom);
+            }
+            if (!have_salt) {
+                SRV_ERR("%s", "capture disabled: failed to read an identity salt from /dev/urandom\n");
+                return;
+            }
+        }
+
+        {
+            server_capture::capture_store_config config;
+            config.root_path        = root + "/cycles";
+            config.capture_mode     = capture_mode;
+            config.identity_salt    = salt;
+            config.ring_capacity    = server_env_u32("LLAMA_SERVER_CAPTURE_RING", 4096);
+            config.max_shard_records = 4096;
+            config.max_shard_bytes   = 4ull * 1024 * 1024;
+            // valid_config caps retention at 64 * CAPTURE_MAX_SHARD_BYTES (4 GiB)
+            const uint64_t cycle_budget =
+                    std::min<uint64_t>(server_env_u32("LLAMA_SERVER_CAPTURE_CYCLES_MB", 2048), 4096) * 1024ull * 1024ull;
+            config.max_retained_bytes   = std::max<uint64_t>(cycle_budget, config.max_shard_bytes);
+            config.max_retained_shards  = std::max<uint64_t>(config.max_retained_bytes / config.max_shard_bytes, 1);
+            config.max_retained_records = std::max<uint64_t>(
+                    config.max_retained_shards * config.max_shard_records, config.max_shard_records);
+            config.allow_sampled_rich = capture_mode == server_capture::mode::sampled_rich;
+            config.rich_sample_every  = 1;
+            try {
+                capture_cycles = std::make_unique<server_capture::capture_store>(std::move(config));
+            } catch (const std::exception & e) {
+                SRV_ERR("capture disabled: cycle store rejected '%s/cycles': %s\n", root.c_str(), e.what());
+                return;
+            }
+        }
+
+        {
+            server_capture::request_log_config config;
+            config.root_path       = root + "/requests";
+            config.identity_salt   = salt;
+            config.max_total_bytes = std::max<uint64_t>(server_env_u32("LLAMA_SERVER_CAPTURE_REQUESTS_MB", 8192), 64)
+                    * 1024ull * 1024ull;
+            config.runtime_commit     = llama_build_info();
+            config.model_identity     = params_base.model.path;
+            config.draft_identity     = params_base.speculative.draft.mparams.path;
+            config.speculative_config = string_format(
+                    "%s n_max=%d n_min=%d p_min=%.3f ngram_mod={n_match=%d n_min=%d n_max=%d}",
+                    common_speculative_type_name_str(params_base.speculative.types).c_str(),
+                    params_base.speculative.draft.n_max, params_base.speculative.draft.n_min,
+                    params_base.speculative.draft.p_min, params_base.speculative.ngram_mod.n_match,
+                    params_base.speculative.ngram_mod.n_min, params_base.speculative.ngram_mod.n_max);
+            try {
+                capture_requests = std::make_unique<server_capture::request_log>(std::move(config));
+            } catch (const std::exception & e) {
+                SRV_ERR("capture disabled: request log rejected '%s/requests': %s\n", root.c_str(), e.what());
+                capture_cycles.reset();
+                return;
+            }
+        }
+
+        SRV_INF("capture enabled: root '%s', mode %s, ring %zu\n", root.c_str(),
+                capture_mode == server_capture::mode::sampled_rich ? "rich"
+                : capture_mode == server_capture::mode::compact    ? "compact"
+                                                                   : "metrics",
+                capture_cycles->config().ring_capacity);
+    }
+
+    void shutdown_capture() {
+        if (capture_requests) {
+            const auto stats = capture_requests->stats();
+            SRV_INF("capture requests: %llu written (%llu dropped, %llu failed writes)\n",
+                    (unsigned long long) stats.written_records, (unsigned long long) stats.dropped,
+                    (unsigned long long) stats.failed_writes);
+            capture_requests->shutdown();
+            capture_requests.reset();
+        }
+        if (capture_cycles) {
+            (void) capture_cycles->shutdown(true);
+            const auto stats = capture_cycles->stats();
+            SRV_INF("capture cycles: %llu committed (%llu ring-dropped)\n",
+                    (unsigned long long) stats.committed_records, (unsigned long long) stats.ring.dropped);
+            capture_cycles.reset();
+        }
+    }
+
     void destroy() {
+        shutdown_capture();
+
         spec.reset();
         spec_init.reset();
 
@@ -1803,6 +1951,8 @@ private:
             ctx_dft   = nullptr;
             model_dft = nullptr;
         }
+
+        init_capture();
 
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
@@ -3386,6 +3536,34 @@ private:
                 server_dashboard::watches().sync(dash_req, slot.id, slot.generated_text, slot.n_decoded);
                 server_dashboard::watches().finish(dash_req, slot.n_decoded);
             }
+        }
+
+        // Request-stream capture: copy the token streams before the non-stream
+        // branch below moves generated_tokens out of the slot. The copy is a
+        // plain vector duplication; serialization and I/O happen on the log's
+        // background worker, and a full queue drops the record.
+        if (capture_requests) {
+            server_capture::request_record rec;
+            rec.request_id       = static_cast<uint64_t>(slot.task->id) + 1;
+            rec.slot_id          = slot.id;
+            rec.wall_time_s      = (int64_t) std::time(nullptr);
+            rec.monotonic_ns     = (uint64_t) ggml_time_us() * 1000ull;
+            rec.prompt_tokens    = slot.task->tokens.get_text_tokens();
+            rec.generated_tokens = slot.generated_tokens;
+            rec.n_prompt_cached  = slot.n_prompt_tokens_cache;
+            rec.truncated        = slot.truncated;
+            rec.n_decoded        = slot.n_decoded;
+            rec.n_draft_total    = slot.n_draft_total;
+            rec.n_draft_accepted = slot.n_draft_accepted;
+            rec.prompt_ms        = slot.t_prompt_processing;
+            rec.generation_ms    = std::max<int64_t>(1, ggml_time_us() - slot.t_start_generation) / 1e3;
+            const auto & sampling = slot.task->params.sampling;
+            rec.temperature      = sampling.temp;
+            rec.top_k            = sampling.top_k;
+            rec.top_p            = sampling.top_p;
+            rec.min_p            = sampling.min_p;
+            rec.seed             = sampling.seed;
+            (void) capture_requests->try_enqueue(std::move(rec));
         }
 
         // keep copy of last generated text for debugging purposes
@@ -5142,7 +5320,14 @@ private:
 
         // generate the actual drafts (if any)
         {
+            const int64_t t_draft_start = capture_cycles ? ggml_time_us() : 0;
             common_speculative_draft(spec.get());
+            if (capture_cycles) {
+                // shared across every slot drafted this iteration; recorded
+                // per cycle as attribution context, not a per-slot measurement
+                capture_draft_time_us = (uint32_t) std::min<int64_t>(
+                        ggml_time_us() - t_draft_start, std::numeric_limits<uint32_t>::max());
+            }
         }
 
         // make checkpoints if needed
@@ -6473,6 +6658,58 @@ private:
             slot.dash_note_decode();
         });
 
+        size_t capture_decode_width = 0;
+        if (capture_cycles) {
+            iterate(slots, [&](server_slot & slot) {
+                if (is_selected(slot) &&
+                    (slot.state == SLOT_STATE_GENERATING || slot.state == SLOT_STATE_GENERATING_STAGED)) {
+                    capture_decode_width++;
+                }
+            });
+        }
+
+        // Record one capture observation per verify event: the proposals, the
+        // accepted prefix, and the target's correction/bonus token. A restore
+        // cycle is recorded at truncation time with flag_checkpoint_restore
+        // and its replay pass again with flag_replay, so offline consumers
+        // keep exactly one record per logical cycle by dropping flag_replay.
+        const auto capture_spec_cycle = [&](server_slot & slot, size_t n_draft, const llama_tokens & accepted,
+                                            uint8_t extra_flags) {
+            if (!capture_cycles) {
+                return;
+            }
+            server_capture::cycle_observation obs;
+            obs.request_id         = (uint64_t) slot.task->id + 1;
+            obs.committed_position =
+                    (uint64_t) std::max<int64_t>(0, (int64_t) slot.prompt.n_tokens() - (int64_t) n_draft);
+            obs.scheduler_epoch = (uint64_t) slot.n_decoded;
+            obs.monotonic_ns    = (uint64_t) ggml_time_us() * 1000ull;
+            obs.cycle_sequence  = capture_cycle_seq++;
+            const size_t n_store = std::min(n_draft, server_capture::MAX_PROPOSAL_TOKENS);
+            for (size_t i = 0; i < n_store; ++i) {
+                obs.proposal_token_ids[i] = slot.spec_draft[i];
+            }
+            obs.target_correction_or_bonus_id = accepted.back();
+            obs.draft_time_us                 = capture_draft_time_us;
+            obs.scheduled_decode_width        = (uint8_t) std::min<size_t>(capture_decode_width, UINT8_MAX);
+            obs.verifier_geometry             = (uint8_t) std::min<size_t>(n_draft + 1, UINT8_MAX);
+            obs.proposal_count                = (uint8_t) std::min<size_t>(n_draft, UINT8_MAX);
+            const size_t n_accepted_prefix = accepted.size() - 1;
+            obs.accepted_prefix_length     = (uint8_t) std::min<size_t>(n_accepted_prefix, UINT8_MAX);
+            obs.first_rejection            = n_accepted_prefix < n_draft
+                               ? (uint8_t) std::min<size_t>(n_accepted_prefix, server_capture::NO_REJECTION - 1)
+                               : server_capture::NO_REJECTION;
+            obs.proposed_by = server_capture_proposer(common_speculative_last_draft_type(spec.get(), slot.id));
+            obs.flags       = extra_flags;
+            if (n_draft > server_capture::MAX_PROPOSAL_TOKENS) {
+                obs.flags |= server_capture::flag_truncated_proposals;
+            }
+            if (slot.spec_is_replay) {
+                obs.flags |= server_capture::flag_replay;
+            }
+            (void) capture_cycles->try_enqueue(obs);
+        };
+
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {
             if (!is_selected(slot)) {
@@ -6553,6 +6790,8 @@ private:
                         }
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                        capture_spec_cycle(slot, n_draft, accepted, server_capture::flag_checkpoint_restore);
+
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
 
@@ -6579,6 +6818,8 @@ private:
                 if (trace > 0) {
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
+
+                capture_spec_cycle(slot, n_draft, accepted, 0);
 
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 

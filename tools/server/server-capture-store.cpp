@@ -802,7 +802,7 @@ void append_record(const cycle_observation &       observation,
     record.push_back(observation.proposal_count);
     record.push_back(observation.accepted_prefix_length);
     record.push_back(observation.first_rejection);
-    record.push_back(static_cast<uint8_t>(observation.active_mode));
+    record.push_back(static_cast<uint8_t>(observation.proposed_by));
     record.push_back(static_cast<uint8_t>(observation.bypass));
     record.push_back(observation.flags);
     append_zeroes(record, 4);
@@ -892,6 +892,10 @@ size_t checked_ring_capacity(const capture_store_config & config) {
 }
 
 }  // namespace
+
+capture_digest capture_request_tag(const std::array<uint8_t, 16> & salt, uint64_t request_id) {
+    return request_tag(salt, request_id);
+}
 
 const char * capture_store_status_name(capture_store_status status) noexcept {
     switch (status) {

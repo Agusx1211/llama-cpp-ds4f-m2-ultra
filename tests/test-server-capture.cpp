@@ -34,7 +34,7 @@ static cycle_observation observation(uint64_t sequence) {
     result.proposal_count                = 5;
     result.accepted_prefix_length        = 3;
     result.first_rejection               = 3;
-    result.active_mode                   = dspark_mode::adaptive_depth_one;
+    result.proposed_by                   = proposer::dspark;
     for (size_t i = 0; i < MAX_PROPOSAL_TOKENS; ++i) {
         result.proposal_token_ids[i]     = static_cast<int32_t>(sequence + i);
         result.selected_probabilities[i] = 0.5f + 0.01f * static_cast<float>(i);
@@ -62,7 +62,7 @@ static void assert_same(const cycle_observation & actual, const cycle_observatio
     assert(actual.proposal_count == expected.proposal_count);
     assert(actual.accepted_prefix_length == expected.accepted_prefix_length);
     assert(actual.first_rejection == expected.first_rejection);
-    assert(actual.active_mode == expected.active_mode);
+    assert(actual.proposed_by == expected.proposed_by);
     assert(actual.bypass == expected.bypass);
     assert(actual.flags == expected.flags);
 }

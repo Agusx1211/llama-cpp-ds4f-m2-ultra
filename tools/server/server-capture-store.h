@@ -18,7 +18,10 @@ namespace server_capture {
 // shards unreadable, and makes it possible to prove that compact records do
 // not contain token IDs or request-owned content.
 constexpr uint32_t CAPTURE_STORE_FORMAT_VERSION  = 1;
-constexpr uint32_t CAPTURE_RECORD_FORMAT_VERSION = 1;
+// Record format 2: sixteen proposal slots (was five) and a proposer byte in
+// place of the retired dspark_mode byte. No format-1 shards were ever written
+// by a deployed server, so no migration path exists or is needed.
+constexpr uint32_t CAPTURE_RECORD_FORMAT_VERSION = 2;
 constexpr uint32_t CAPTURE_SHARD_FORMAT_VERSION  = 1;
 using capture_digest                             = std::array<uint8_t, 32>;
 constexpr size_t CAPTURE_SHARD_HEADER_BYTES      = 72;
@@ -26,8 +29,8 @@ constexpr size_t CAPTURE_SHARD_FOOTER_BYTES      = sizeof(capture_digest);
 constexpr size_t CAPTURE_MANIFEST_HEADER_BYTES   = 80;
 constexpr size_t CAPTURE_MANIFEST_FOOTER_BYTES   = sizeof(capture_digest);
 constexpr size_t CAPTURE_RECORD_HEADER_BYTES     = 16;
-constexpr size_t CAPTURE_COMPACT_RECORD_BYTES    = 128;
-constexpr size_t CAPTURE_RICH_RECORD_BYTES       = 156;
+constexpr size_t CAPTURE_COMPACT_RECORD_BYTES    = 192;
+constexpr size_t CAPTURE_RICH_RECORD_BYTES       = 264;
 constexpr size_t CAPTURE_MAX_RING_CAPACITY       = 1U << 20;
 constexpr size_t CAPTURE_MAX_SHARD_BYTES         = 64U * 1024U * 1024U;
 constexpr size_t CAPTURE_MAX_MANIFEST_BYTES      = 16U * 1024U * 1024U;
@@ -58,6 +61,12 @@ enum class capture_store_status : uint8_t {
 };
 
 const char * capture_store_status_name(capture_store_status status) noexcept;
+
+// The salted, non-reversible request tag persisted in cycle records. Exposed
+// so a sidecar request log written with the same salt can carry the same tag
+// and let offline training join cycle records to their request streams
+// without either file containing the raw request ID.
+capture_digest capture_request_tag(const std::array<uint8_t, 16> & salt, uint64_t request_id);
 
 enum class capture_store_phase : uint8_t {
     before_shard_write = 0,

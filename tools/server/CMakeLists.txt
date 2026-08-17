@@ -55,6 +55,8 @@ add_library(${TARGET} STATIC
     server-capture-sha256.h
     server-capture-store.cpp
     server-capture-store.h
+    server-capture-requests.cpp
+    server-capture-requests.h
     server-capture-resync-journal.cpp
     server-capture-resync-journal.h
     server-request-history.cpp

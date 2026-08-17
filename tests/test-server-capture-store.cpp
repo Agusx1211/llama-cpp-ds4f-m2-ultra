@@ -103,7 +103,7 @@ cycle_observation make_observation(uint32_t sequence) {
     observation.proposal_count                = 5;
     observation.accepted_prefix_length        = 3;
     observation.first_rejection               = 3;
-    observation.active_mode                   = dspark_mode::adaptive_depth_one;
+    observation.proposed_by                   = proposer::dspark;
     observation.bypass                        = bypass_reason::none;
     for (size_t index = 0; index < MAX_PROPOSAL_TOKENS; ++index) {
         observation.proposal_token_ids[index]     = 0x504f0000 + static_cast<int32_t>(sequence * 8 + index);
@@ -218,17 +218,18 @@ void test_sha256_file_footers() {
 
     const std::vector<uint8_t> manifest_bytes = read_bytes(temp.path() / "capture.manifest");
     const std::vector<uint8_t> shard_bytes    = read_bytes(only_shard(temp.path()));
-    expect(manifest_bytes.size() == 184 && shard_bytes.size() == 392, "digest fixture sizes");
+    // 80 + 72 + 32 manifest; 72 + 32 shard framing + 2 * (16 + 192) records
+    expect(manifest_bytes.size() == 184 && shard_bytes.size() == 520, "digest fixture sizes");
 
     // These values come from Python hashlib.sha256 over each payload prefix,
     // independently of the in-tree implementation under test.
     const capture_digest expected_manifest = {
-        { 0xa2, 0x1e, 0x7c, 0x9f, 0x86, 0xd5, 0x53, 0x17, 0x9b, 0x40, 0xed, 0xd9, 0x84, 0x94, 0xf8, 0xc5,
-          0x83, 0x0d, 0x4f, 0x80, 0xa2, 0x53, 0xe4, 0xdc, 0x1c, 0x0b, 0xaf, 0x81, 0x31, 0x45, 0xe7, 0x6a }
+        { 0xf4, 0xed, 0x7c, 0x43, 0x74, 0x13, 0x01, 0x0b, 0xe3, 0x06, 0x95, 0xae, 0xf1, 0xd6, 0x7e, 0x93,
+          0x95, 0x9b, 0xe4, 0xa4, 0x6e, 0x98, 0x93, 0x41, 0x57, 0x6b, 0xe4, 0xdb, 0xe5, 0x4f, 0x4b, 0x76 }
     };
     const capture_digest expected_shard = {
-        { 0x5c, 0x5d, 0x56, 0xdb, 0x04, 0x51, 0xfe, 0x5f, 0x8f, 0x39, 0xaf, 0x5e, 0xdc, 0x5a, 0x71, 0x14,
-          0xe9, 0xe1, 0xa1, 0x3c, 0xe8, 0x46, 0x29, 0x42, 0xbb, 0xc0, 0x25, 0xd5, 0x58, 0xfd, 0x9b, 0xc7 }
+        { 0x3f, 0xc2, 0x92, 0x81, 0x01, 0xcb, 0x09, 0x1a, 0xb6, 0x8a, 0xc6, 0xd3, 0xee, 0x50, 0xe4, 0x19,
+          0x3e, 0xf3, 0x60, 0x91, 0x17, 0x17, 0xa5, 0xe8, 0x0c, 0x8d, 0x04, 0xf8, 0xc8, 0xc2, 0x6f, 0x27 }
     };
     const auto footer = [](const std::vector<uint8_t> & bytes) {
         capture_digest digest = {};
@@ -482,9 +483,10 @@ void test_crash_seams_and_cancellation() {
 void test_byte_retention() {
     temporary_directory  temp;
     capture_store_config config = make_config(temp.path());
+    // one compact-record shard is 72 + 32 + 16 + 192 = 312 bytes
     config.max_shard_records    = 1;
-    config.max_shard_bytes      = 300;
-    config.max_retained_bytes   = 300;
+    config.max_shard_bytes      = 320;
+    config.max_retained_bytes   = 320;
     capture_store store(config);
     expect(store.try_enqueue(make_observation(1)), "byte retention first enqueue");
     expect_status(store.flush().status, capture_store_status::ok, "byte retention first flush");

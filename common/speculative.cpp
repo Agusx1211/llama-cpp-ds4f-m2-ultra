@@ -3044,6 +3044,14 @@ void common_speculative_draft(common_speculative * spec) {
     }
 }
 
+enum common_speculative_type common_speculative_last_draft_type(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || seq_id < 0 || (size_t) seq_id >= spec->impl_last.size() || spec->impl_last[seq_id] == nullptr) {
+        return COMMON_SPECULATIVE_TYPE_NONE;
+    }
+
+    return spec->impl_last[seq_id]->type;
+}
+
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 

@@ -94,6 +94,10 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// which implementation produced the last non-empty draft for this sequence
+// (COMMON_SPECULATIVE_TYPE_NONE before any draft was produced)
+enum common_speculative_type common_speculative_last_draft_type(common_speculative * spec, llama_seq_id seq_id);
+
 // Per-sequence deferred-boundary state used by EAGLE3. Kept as a small value
 // type so reset semantics can be unit-tested without loading a model.
 struct common_speculative_deferred_state {
