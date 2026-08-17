@@ -146,11 +146,12 @@ static const uint32_t SERVER_PREFILL_PRIORITY_CHUNK = server_env_u32("LLAMA_SERV
 // decode iteration after every N committed chunks, while 0 waits for prompt
 // completion except for the empty-batch liveness escape.
 static const uint32_t SERVER_PREFILL_DECODE_EVERY = server_env_u32("LLAMA_SERVER_PREFILL_DECODE_EVERY", 0);
-// Exact M2 Ultra/DeepSeek V4 Flash rollback lever for the measured DSpark
-// single-request depth. The request JSON may still select a shallower depth;
-// this only caps the server-configured ceiling.
+// Exact M2 Ultra/DeepSeek V4 Flash experiment lever for the DSpark
+// single-request depth. 0 (default) leaves the configured --spec-draft-n-max
+// in charge; a positive value caps only the server-configured ceiling (the
+// request JSON may still select a shallower depth).
 static const uint32_t SERVER_DSV4_DSPARK_SINGLE_N_MAX =
-        server_env_u32("LLAMA_DSV4_DSPARK_SINGLE_N_MAX", 3);
+        server_env_u32("LLAMA_DSV4_DSPARK_SINGLE_N_MAX", 0);
 
 static server_capture::proposer server_capture_proposer(enum common_speculative_type type) {
     switch (type) {
@@ -1306,10 +1307,11 @@ private:
     common_speculative_ptr spec;
 
     // Measured M2 Ultra concurrency limits for the two DSV4 proposal engines.
-    // MTP remains useful through four streams. DSpark uses at most depth three
-    // at one stream, depth one at two or three, and is bypassed at four. Once
-    // bypassed, keep the cohort target-only until every slot drains because
-    // its draft context is no longer advanced.
+    // MTP remains useful through four streams. DSpark uses its configured
+    // single-stream depth at one stream (optionally capped by
+    // LLAMA_DSV4_DSPARK_SINGLE_N_MAX), depth one at two or three, and is
+    // bypassed at four. Once bypassed, keep the cohort target-only until every
+    // slot drains because its draft context is no longer advanced.
     static constexpr size_t DSV4_MTP_MAX_ACTIVE_REQUESTS = 4;
     static constexpr size_t DSV4_DSPARK_MAX_ACTIVE_REQUESTS = 3;
     bool spec_mtp = false;
@@ -1637,9 +1639,9 @@ private:
         prefill_publications.clear();
         prefill_terminal_slots.clear();
         prefill_prompt_eval_slots.clear();
-        dspark_n_max_single = spec_dspark
+        dspark_n_max_single = (spec_dspark && SERVER_DSV4_DSPARK_SINGLE_N_MAX > 0)
                 ? std::min<int32_t>(params_base.speculative.draft.n_max,
-                                    std::max<uint32_t>(1, SERVER_DSV4_DSPARK_SINGLE_N_MAX))
+                                    (int32_t) SERVER_DSV4_DSPARK_SINGLE_N_MAX)
                 : params_base.speculative.draft.n_max;
         dspark_n_max_active = params_base.speculative.draft.n_max;
         dspark_p_min_single = params_base.speculative.draft.p_min;
