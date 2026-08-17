@@ -144,6 +144,12 @@ static const uint32_t SERVER_PREFILL_PRIORITY_CHUNK = server_env_u32("LLAMA_SERV
 // decode iteration after every N committed chunks, while 0 waits for prompt
 // completion except for the empty-batch liveness escape.
 static const uint32_t SERVER_PREFILL_DECODE_EVERY = server_env_u32("LLAMA_SERVER_PREFILL_DECODE_EVERY", 0);
+// Exact M2 Ultra/DeepSeek V4 Flash rollback lever for the measured DSpark
+// single-request depth. The request JSON may still select a shallower depth;
+// this only caps the server-configured ceiling.
+static const uint32_t SERVER_DSV4_DSPARK_SINGLE_N_MAX =
+        server_env_u32("LLAMA_DSV4_DSPARK_SINGLE_N_MAX", 3);
+
 
 static server_prefill::coordinator_config server_prefill_config_from_environment() {
     server_prefill::coordinator_config config;
@@ -1281,10 +1287,10 @@ private:
     common_speculative_ptr spec;
 
     // Measured M2 Ultra concurrency limits for the two DSV4 proposal engines.
-    // MTP remains useful through four streams. DSpark uses its configured
-    // single-stream mode at one stream, depth one at two or three, and is
-    // bypassed at four. Once bypassed, keep the cohort target-only until every
-    // slot drains because its draft context is no longer advanced.
+    // MTP remains useful through four streams. DSpark uses at most depth three
+    // at one stream, depth one at two or three, and is bypassed at four. Once
+    // bypassed, keep the cohort target-only until every slot drains because
+    // its draft context is no longer advanced.
     static constexpr size_t DSV4_MTP_MAX_ACTIVE_REQUESTS = 4;
     static constexpr size_t DSV4_DSPARK_MAX_ACTIVE_REQUESTS = 3;
     bool spec_mtp = false;
@@ -1295,6 +1301,10 @@ private:
     float dspark_p_min_single = 0.0f;
     float dspark_p_min_active = 0.0f;
     uint32_t spec_rs_depth = 0;
+    // Floor for spec_rs_depth: the draftless (n-gram) speculators keep drafting
+    // when the draft model's depth is reduced or it is bypassed entirely, so the
+    // active rollback depth must never fall below what they can emit.
+    uint32_t spec_rs_depth_min = 0;
 
     bool add_bos_token = true;
 
@@ -1479,11 +1489,16 @@ private:
         prefill_publications.clear();
         prefill_terminal_slots.clear();
         prefill_prompt_eval_slots.clear();
-        dspark_n_max_single = params_base.speculative.draft.n_max;
-        dspark_n_max_active = dspark_n_max_single;
+        dspark_n_max_single = spec_dspark
+                ? std::min<int32_t>(params_base.speculative.draft.n_max,
+                                    std::max<uint32_t>(1, SERVER_DSV4_DSPARK_SINGLE_N_MAX))
+                : params_base.speculative.draft.n_max;
+        dspark_n_max_active = params_base.speculative.draft.n_max;
         dspark_p_min_single = params_base.speculative.draft.p_min;
         dspark_p_min_active = dspark_p_min_single;
-        spec_rs_depth = (uint32_t) std::max(0, common_speculative_n_max(&params_base.speculative));
+        spec_rs_depth_min = params_base.speculative.need_n_rs_seq_draftless();
+        spec_rs_depth = std::max(spec_rs_depth_min,
+                (uint32_t) std::max(0, common_speculative_n_max(&params_base.speculative)));
         const bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
@@ -4793,7 +4808,9 @@ private:
             dspark_n_max_active = n_max;
             dspark_p_min_active = p_min;
         }
-        spec_rs_depth = (uint32_t) n_max;
+        // n-gram speculators are unaffected by the draft model's adaptive depth
+        // and keep drafting, so never lower the rollback depth below their reach
+        spec_rs_depth = std::max(spec_rs_depth_min, (uint32_t) n_max);
         return changed;
     }
 
@@ -4867,7 +4884,8 @@ private:
             if (spec_dspark) {
                 GGML_ASSERT(common_speculative_set_enabled(
                         spec.get(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, false));
-                spec_rs_depth = 0;
+                // the bypass disables DSpark only; draftless speculators stay on
+                spec_rs_depth = spec_rs_depth_min;
             }
         }
 

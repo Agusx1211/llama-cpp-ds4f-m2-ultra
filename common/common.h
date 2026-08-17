@@ -385,12 +385,82 @@ struct common_params_speculative {
         return !draft.mparams.empty();
     }
 
-    uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-        });
+    // Depth of the DSV4 recurrent-state rollback ring the target context must
+    // allocate. It has to cover the deepest draft that ANY configured speculator
+    // can produce, because the server requests exactly that depth: it derives
+    // spec_rs_depth from common_speculative_n_max() (tools/server/server-context.cpp).
+    //
+    // Keep the per-type arms below in sync with common_speculative_n_max(). If
+    // the ring ends up smaller than the draft:
+    //   - with a draft model, every speculative step silently falls back to full
+    //     checkpoint save/restore + sampler clone (server-context.cpp use_ckpt_tgt
+    //     / may_use_ckpt_tgt), which is a large per-step cost;
+    //   - without one, llama_kv_cache_dsv4::set_rs_depth throws outright
+    //     ("DSV4 active rollback depth exceeds allocated capacity").
+    //
+    // The draftless (n-gram) types were originally missing here, so any n-gram-only
+    // configuration allocated a zero-depth ring and crashed on its first draft,
+    // and an n-gram + draft-model configuration whose size_m exceeded draft.n_max
+    // took the checkpoint path on every drafted step.
+    //
+    // COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE stays excluded deliberately: an
+    // ordinary draft model keeps using checkpoints for the target, as before.
+    // Deepest draft the DRAFTLESS (n-gram) speculators can emit.
+    //
+    // This is a floor on the *active* rollback depth, not just the allocated
+    // one. The server adapts the draft model's depth at runtime (DSpark single
+    // vs active cohort, and the parallel bypass that disables it entirely) and
+    // writes that value straight into the active rollback depth. Those
+    // adjustments know nothing about the n-gram speculators, which keep drafting
+    // regardless — so without this floor a later n-gram draft cannot be rolled
+    // back and llama_kv_cache_dsv4::seq_rm fails its
+    // `rollback > n_rs_seq_active` check, which GGML_ABORTs the server from
+    // common_context_seq_rm.
+    uint32_t need_n_rs_seq_draftless() const {
+        uint32_t n_rs_seq = 0;
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        for (const auto t : types) {
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                    n_rs_seq = std::max(n_rs_seq, (uint32_t) ngram_simple.size_m);
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+                    n_rs_seq = std::max(n_rs_seq, (uint32_t) ngram_map_k.size_m);
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+                    n_rs_seq = std::max(n_rs_seq, (uint32_t) ngram_map_k4v.size_m);
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+                    n_rs_seq = std::max(n_rs_seq, (uint32_t) std::max(0, ngram_mod.n_max));
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+                    n_rs_seq = std::max(n_rs_seq, 8u); // fixed draft length, see common_speculative_n_max
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        return n_rs_seq;
+    }
+
+    uint32_t need_n_rs_seq() const {
+        uint32_t n_rs_seq = need_n_rs_seq_draftless();
+
+        for (const auto t : types) {
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                    n_rs_seq = std::max(n_rs_seq, (uint32_t) std::max(0, draft.n_max));
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        return n_rs_seq;
     }
 };
 
