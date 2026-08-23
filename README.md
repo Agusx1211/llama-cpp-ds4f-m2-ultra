@@ -30,7 +30,7 @@ Other models and hardware are unsupported unless they help develop, validate, or
 
 ## Project status
 
-The fork is in production on the target machine. Beyond upstream llama.cpp it currently carries, among other things: a dedicated DSV4 Metal kernel stack; DSpark speculative decoding; elastic multi-lane serving (up to 4 concurrent conversations sharing one 512k-token KV budget with physical-page admission); a prompt cache with RAM and SSD tiers plus cross-conversation zero-copy prefix reuse; and the fork-owned `gguf-m2` weight artifact format below.
+The fork is in production on the target machine, serving eight concurrent conversations against a shared 1M-token KV budget. The table below states what it adds over mainline.
 
 Build for the target:
 
@@ -38,6 +38,42 @@ Build for the target:
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DLLAMA_BUILD_MTMD=OFF
 cmake --build build --target llama-server -j
 ```
+
+## Performance
+
+Single-lane, DSV4 Flash 0731 as a lossless `gguf-m2` artifact (141.3 GiB), 1M context, speculation on. Measured from 64 h of production traffic on one build (`97c68a32c`, 2026-08-20 → 08-23): 1442 requests that ran with no other lane active, 1.3M generated tokens.
+
+| single-lane | median | p90 | n |
+|---|---|---|---|
+| decode, prose | 24.2 t/s | 30.0 | 930 |
+| decode, code | 29.9 t/s | 37.0 | 411 |
+| decode, copy-heavy (edits, refactors) | 42.0 t/s | 56.2 | 84 |
+| decode, all requests | 25.8 t/s | 35.2 | 1442 |
+| prefill, 2k–8k prompt | 141 t/s | 219 | 229 |
+| prefill, 8k–32k prompt | 222 t/s | 292 | 23 |
+| prompt-cache restore from SSD | 179k tok/s | 299k | 33 |
+
+Decode holds up with context — median t/s by prompt size: **26.8** (<1k), **25.0** (1–4k), **23.2** (4–16k), **25.1** (16–64k), **22.8** (64k+).
+
+The cache restore row is the difference between resuming a conversation and recomputing it: the largest restore in the window rebuilt a 358k-token prefix in 1.2 s, against ~24 min to prefill it. Speculation over the same window: 0.673 pooled acceptance, median 4.21 accepted tokens per step.
+
+Multi-lane costs more than it looks: with a second lane active, per-request decode falls to a 17.0 t/s median (n=52). Aggregate throughput still rises; individual latency does not.
+
+## What this fork adds over mainline
+
+DeepSeek V4 Flash itself is **not** a differentiator: the architecture, the DSpark drafter, and the `ngram-mod` / `ngram-map-k` speculators are all mainline llama.cpp. Everything below is additional, measured against the current merge base (`08659901c`, fully merged as of this commit).
+
+| capability | mainline | here |
+|---|---|---|
+| Weight artifacts | stock GGUF; FP8 dense planes upcast to BF16 | `gguf-m2` (`E4M3_M2` + `MXFP4_M2`, ggml ids 90–99), bit-exact, 141.3 GiB vs 162 GB stock Q8, loader-gated by `m2.layout.version` |
+| DSV4 Metal kernels | generic paths plus upstream's DSV4 ops | 83 fork-only kernels: sparse pack/compress, radix top-k, `e4m3_m2`/`mxfp4_m2` mm+mv families, lightning-indexer tails |
+| Prompt cache | RAM only (`--cache-ram`), plus manual slot save/restore | adds an SSD tier (`--cache-disk`, `--cache-disk-limit`) that survives restarts — 179k tok/s median restore |
+| Prefix reuse | per-slot, same conversation | cross-conversation zero-copy prefix reuse |
+| Multi-lane serving | `-np` slots over a fixed KV split | elastic lanes over one shared budget with physical-page admission and deterministic victim selection |
+| Scheduling | FIFO | priority lanes (`/fast`, `/normal`, `/low`) with a trusted-LAN ingress path |
+| Speculation plumbing | DSpark + ngram speculators | rollback ring sized from every configured speculator, so deep and draftless configs neither crash nor fall back to per-step checkpoint save/restore |
+| Observability | log lines; `--metrics` | live dashboard (SSE, per-request timelines with restore-vs-recompute provenance, cache map) and a durable request-history store (`--request-history*`) |
+| Training capture | — | speculative-cycle and request-stream capture with a resync journal |
 
 ## The gguf-m2 artifact format
 
