@@ -41,17 +41,29 @@ cmake --build build --target llama-server -j
 
 ## Performance
 
-Single-lane, DSV4 Flash 0731 as a lossless `gguf-m2` artifact (141.3 GiB), 1M context, speculation on. Measured from 64 h of production traffic on one build (`97c68a32c`, 2026-08-20 → 08-23): 1442 requests that ran with no other lane active, 1.3M generated tokens.
+DSV4 Flash 0731 as a lossless `gguf-m2` artifact (141.3 GiB), 1M context, speculation on, single lane. All figures come from one build (`97c68a32c`) on the target — a 60-core M2 Ultra with 192 GiB.
 
-| single-lane | median | p90 | n |
+Prefill, isolated runs (three samples each, spread under 0.2%):
+
+| prompt | prefill |
+|---|---|
+| 2048 | **350.0 t/s** |
+| 4096 | **333.5 t/s** |
+
+That is roughly 9 TFLOP/s against the machine's ~21.6 TFLOPS FP32 peak, at 13B active parameters per token. Raw data in `notes/2026-08-20-private-ane-prefill-experiment.md`.
+
+Everything else is observed rather than benchmarked: 64 h of production traffic (2026-08-20 → 08-23), restricted to the 1442 requests that ran with no other lane active, 1.3M generated tokens.
+
+| single-lane, in production | median | p90 | n |
 |---|---|---|---|
 | decode, prose | 24.2 t/s | 30.0 | 930 |
 | decode, code | 29.9 t/s | 37.0 | 411 |
 | decode, copy-heavy (edits, refactors) | 42.0 t/s | 56.2 | 84 |
 | decode, all requests | 25.8 t/s | 35.2 | 1442 |
-| prefill, 2k–8k prompt | 141 t/s | 219 | 229 |
 | prefill, 8k–32k prompt | 222 t/s | 292 | 23 |
 | prompt-cache restore from SSD | 179k tok/s | 299k | 33 |
+
+The production prefill row sits below the isolated figure because those requests shared the GPU with active decode; treat 350 t/s as the machine's rate and 222 t/s as what a prompt sees while the server is working.
 
 Decode holds up with context — median t/s by prompt size: **26.8** (<1k), **25.0** (1–4k), **23.2** (4–16k), **25.1** (16–64k), **22.8** (64k+).
 
