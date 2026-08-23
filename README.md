@@ -105,7 +105,64 @@ Interoperability is deliberately one-way: this fork still loads stock GGUFs, but
 
 Measured on the target (M2 Ultra, DSV4 Flash 0731 UD-Q8_K_XL source, 2026-08-07): decode +4.4%, prefill −3.5%, artifact 150.7 → 141.3 GiB, outputs byte-identical. Details, alternatives considered, and the measurement ladder live in the local research notes and the commit history of the `gguf-m2` changes.
 
-See [the build guide](docs/build.md) and its [Metal build section](docs/build.md#metal-build) for the inherited build options. Target-specific build and run commands will replace this section as they stabilize.
+See [the build guide](docs/build.md) and its [Metal build section](docs/build.md#metal-build) for the inherited build options.
+
+## Reproducing the deployment
+
+This is the exact pipeline behind the numbers above, on a 192 GiB M2 Ultra. Budget ~173 GB of downloads and ~142 GiB for the artifacts; the source GGUFs can be deleted afterwards.
+
+**1. Fetch the stock weights.** The target is Unsloth's lossless 8-bit build; the drafter is the matching DSpark checkpoint from the same repo. The `0731` in both names must agree — a DSpark built against a different checkpoint will load and draft badly.
+
+```sh
+hf download unsloth/DeepSeek-V4-Flash-0731-GGUF --include "UD-Q8_K_XL/*" \
+    --local-dir ~/unsloth/DeepSeek-V4-Flash-0731-GGUF          # 5 shards, ~162 GB
+hf download unsloth/DeepSeek-V4-Flash-0731-GGUF --include "dspark/dspark-DeepSeek-V4-Flash-0731-BF16.gguf" \
+    --local-dir ~/unsloth/DeepSeek-V4-Flash-DSpark-0731        # ~11.3 GB
+```
+
+**2. Repack both into `gguf-m2` artifacts.** Pass the shards in order; the converter self-checks every block and publishes atomically. It is I/O-heavy — do not co-run it with anything latency-sensitive.
+
+```sh
+python3 conversion/gguf_m2_repack.py \
+    ~/unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-0000{1,2,3,4,5}-of-00005.gguf \
+    -o ~/unsloth/gguf-m2/dsv4-flash-0731-full.m2.gguf          # -> 141.3 GiB
+
+python3 conversion/gguf_m2_repack.py \
+    ~/unsloth/DeepSeek-V4-Flash-DSpark-0731/dspark/dspark-DeepSeek-V4-Flash-0731-BF16.gguf \
+    -o ~/unsloth/gguf-m2/dspark-0731.m2.gguf                   # -> ~10.3 GiB
+```
+
+**3. Serve.** This is the production invocation, eight lanes over a shared 1M-token budget:
+
+```sh
+LLAMA_DSV4_ADMISSION_VERTICAL=1 \
+LLAMA_DSV4_AGGREGATE_POOL_DISABLE=1 \
+GGML_E4M3_MM_NT2_MIN_N=512 \
+build/bin/llama-server \
+    -m  ~/unsloth/gguf-m2/dsv4-flash-0731-full.m2.gguf \
+    -md ~/unsloth/gguf-m2/dspark-0731.m2.gguf \
+    --spec-type ngram-mod,draft-dspark \
+    --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 12 --spec-ngram-mod-n-max 16 \
+    --spec-draft-n-max 5 --spec-draft-n-min 1 --spec-draft-p-min 0.5 \
+    -c 1048576 -np 8 --kv-unified --no-context-shift \
+    -ngl 999 -ngld 999 -ctk f16 -ctv f16 -fa on -fit on -ub 2048 -b 2048 \
+    --cache-ram 8192 --cache-disk ~/llama-kv-cache --cache-disk-limit 400 \
+    --host 0.0.0.0 --port 8080
+```
+
+### Which flags actually carry the performance
+
+| flag | why |
+|---|---|
+| `--spec-ngram-mod-n-max 16` | The single most sensitive knob. It sizes the DSV4 recurrent rollback ring, and a deep ring costs per decode step **even when the speculator emits nothing**: 64 measured −23% on prose, 16 costs −2.4% and buys +41% on copy-heavy work. Raise it only with a measurement. |
+| `--spec-type ngram-mod,draft-dspark` | The gated ngram runs ahead of the drafter and discards its whole draft below `n-min`; ungated ngram variants regress prose badly. |
+| `GGML_E4M3_MM_NT2_MIN_N=512` | Enables the double-tile e4m3 matmul only for 64-aligned chunks ≥512. Without the gate the NT2 path collapses in-graph — it benches faster in isolation and is slower in the real graph. |
+| `LLAMA_DSV4_ADMISSION_VERTICAL=1` | Exact physical-page admission across the eight lanes. Without it, concurrent long contexts contend for sparse pages. |
+| `-ub 2048 -b 2048` | Measured optimum; 4096 was not better. |
+| `--cache-ram` / `--cache-disk` | The prompt-cache tiers. This is what turns a repeat 358k-token prefix into a 1.2 s restore instead of a re-prefill. |
+| `--kv-unified --no-context-shift` | Required for elastic lanes to share one KV budget rather than a fixed per-slot split. |
+
+Rollback switches for each of the riskier paths (`LLAMA_SERVER_PREFILL_PRIORITY=0`, `LLAMA_DSV4_SPARSE_RESIDENT_DISABLE=1`, `GGML_FA_MSKIP_BALLOT=0`, `GGML_METAL_SPARSE_BRIDGE_DRAIN_DISABLE=1`) each revert one optimization exactly, which is the fastest way to bisect a regression on your own hardware.
 
 ## Development
 
